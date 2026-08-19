@@ -36,7 +36,8 @@ translation into buildable steps.
   finished in Step 6).
 - Zero secrets, zero real hosts/IPs, zero client names anywhere — including in test
   fixtures and example output. Use `example.com`, `user@host`, `<profile>` only.
-- All code and comments in English (docs stay French — see project `CLAUDE.md`).
+- All code, comments, and docs in US English — the whole repo is public (see
+  project `CLAUDE.md`).
 
 ---
 
@@ -838,7 +839,7 @@ manifest_compute_unclaimed() {
     '[$all[] | select(($claimed | index(.)) | not)]')
   echo "$manifest" | jq --argjson u "$unclaimed_pt" \
     '.protect._unclaimed = {post_types: $u, tables: [], option_keys: [],
-      note: "détecté sur B, aucun module ne le réclame — protégé par défaut-deny"}'
+      note: "found on B, unclaimed by any module — protected by default-deny"}'
 }
 ```
 
@@ -1584,7 +1585,7 @@ graft_search_replace_domain() {
   run_or_echo wp_remote b search-replace "$from_escaped" "$to_escaped" --skip-columns=guid --precise
 }
 
-# Design doc §11 "réimport idempotent": before importing, delete any post B already
+# Design doc §11 "idempotent reimport": before importing, delete any post B already
 # has from a previous sitegraft run (marked with _sitegraft_source_id), for the
 # post_types in this run's manifest. Distinct from the optional `clean` step, which
 # removes B's pre-existing ORIGINAL content instead.
@@ -2078,8 +2079,8 @@ git commit -m "docs(readme): sync usage section with final CLI flags, add instal
       bottom against the actual `lib/`/`modules/`/`bin/` code**
 
 For each design doc section (§3 module contract, §4 manifest format, §5 profile
-format, §6 phase deroulé, §7 mu-plugin, §8 media/import ordering, §9 remaps, §11 edge
-cases), confirm the shipped code matches what's documented. Fix any drift in
+format, §6 phase walkthrough, §7 mu-plugin, §8 media/import ordering, §9 remaps,
+§11 edge cases), confirm the shipped code matches what's documented. Fix any drift in
 whichever side is wrong (usually the code, since the design doc is the spec — but if
 implementation revealed the spec was wrong, update the design doc and note it in
 `docs/status.md`).
