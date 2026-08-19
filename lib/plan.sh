@@ -266,7 +266,11 @@ phase_plan() {
     esac
   done
   [ -n "$profile" ] || { log_error "plan requires --profile <name>"; return 1; }
-  profile_load "$profile"
+  # Explicit check, not reliance on the caller's `set -e` (bin/sitegraft has
+  # it, bats' function-call context doesn't always): phase_scan already
+  # established this exact pattern (lib/inventory.sh) — the plan's own Task
+  # 2.3 pseudocode for phase_plan omitted it, an inconsistency fixed here.
+  profile_load "$profile" || return 1
   [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1)
   [ -n "$run_dir" ] || { log_error "no scan run found for profile ${profile} — run 'sitegraft scan' first"; return 1; }
 
