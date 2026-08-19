@@ -1600,8 +1600,12 @@ manifest_compute_unclaimed() {
   local claimed_pt all_pt unclaimed_pt
   claimed_pt=$(echo "$manifest" | jq -c '[.migrate[]?.post_types[]?, .protect[]?.post_types[]?] | unique')
   all_pt=$(echo "$scan_b" | jq -c '[.post_types[].name]')
+  # `$claimed | index(.)` rebinds `.` to $claimed before index runs, so it
+  # always searches $claimed for $claimed and unclaimed is always [] — silently
+  # defeating default-deny. Bind the element with `as $x` so index searches for
+  # the right thing. (Bug caught via TDD in Step 2; see lib/manifest.sh.)
   unclaimed_pt=$(jq -n --argjson all "$all_pt" --argjson claimed "$claimed_pt" \
-    '[$all[] | select(($claimed | index(.)) | not)]')
+    '[$all[] as $x | select(($claimed | index($x)) | not) | $x]')
   echo "$manifest" | jq --argjson u "$unclaimed_pt" \
     '.protect._unclaimed = {post_types: $u, tables: [], option_keys: [],
       note: "found on B, unclaimed by any module — protected by default-deny"}'
@@ -2935,8 +2939,13 @@ graft_integrity_gate() {
   local found_types leaked
   found_types=$(grep -o '<wp:post_type>[^<]*</wp:post_type>' "$file" \
     | sed -E 's#</?wp:post_type>##g' | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
+  # `$allowed | index(.)` rebinds `.` to $allowed before index runs, so it
+  # always searches $allowed for $allowed and `leaked` is always [] — silently
+  # defeating this integrity gate. Bind the element with `as $x` so index
+  # searches for the right thing. (Same trap as manifest_compute_unclaimed;
+  # the leak test below fails against the buggy form, so keep it.)
   leaked=$(jq -n --argjson found "$found_types" --argjson allowed "$allowed_json" \
-    '[$found[] | select(($allowed | index(.)) | not)]')
+    '[$found[] as $x | select(($allowed | index($x)) | not) | $x]')
   if [ "$(echo "$leaked" | jq 'length')" != "0" ]; then
     log_error "WXR contains post_type(s) outside the manifest allowlist: $(echo "$leaked" | jq -r 'join(", ")')"
     return 1
