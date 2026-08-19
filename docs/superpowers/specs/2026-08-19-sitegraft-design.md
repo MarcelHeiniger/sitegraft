@@ -1,127 +1,129 @@
-# sitegraft — Design doc
+# sitegraft — Design Doc
 
-**Date :** 2026-08-19 · **Auteur :** Rosalinde · **Statut :** accepté (self-review faite)
+**Date:** 2026-08-19 · **Author:** Rosalinde · **Status:** accepted (self-review done)
 
-> Ce document est la spec complète de sitegraft. Le plan d'implémentation
-> (`docs/plans/2026-08-19-sitegraft-implementation.md`) argumente à partir de ce
-> document — les deux voyagent ensemble.
-
----
-
-## 0. Décisions déjà actées (ne pas rouvrir)
-
-Brainstorming complet avec Marcel, 2026-08-19. Résumé pour mémoire (détail dans le
-prompt de mission, pas reproduit ici) :
-
-1. Nom **sitegraft**, commande CLI `sitegraft`.
-2. CLI bash modulaire à phases — pas de monolithe, pas de Python/Node, pas de plugin
-   WP, pas de web-UI, pas de MCP.
-3. Base technique WP-CLI + WXR natif pour le contenu ; options copiées individuellement
-   (`wp option get/update`) ; tables propres à un plugin via `wp db export --tables=`.
-4. Système de modules enfichables (« graft modules ») — le point d'extensibilité.
-5. Phases séparées, re-exécutables : `scan → plan → backup → graft → verify → restore`.
-6. Sélection interactive granularité post-types + option-keys, via `gum choose`
-   (fallback `fzf`), résultat = manifest figé.
-7. Backup intégré à l'outil, host-agnostique, avec `restore.sh` généré.
-8. ID-mapping alt→neu via mu-plugin temporaire sur B, hooké sur wordpress-importer.
-9. Credentials à deux voies (fichier par profil OU saisie interactive) ; profils
-   commitables sans secret.
-10. Portabilité bash, dépendances minimales, jamais `scp`.
-11. Etch : templates en DB uniquement (pas de fallback fichier) ; navigation souvent
-    un bloc dynamique `wp:page-list` — à vérifier par site dans `scan`.
-12. Étape optionnelle `clean` dans `graft`.
-13. Hardening : `set -euo pipefail`, mktemp+trap, integrity-gate WXR, `--dry-run`
-    global, `--authors=skip`, logs colorés, jamais `scp`.
-
-**Précision reçue en cours de conception (déjà intégrée dans tout ce document et tout
-le repo) :** `repo/` sera publié en repo GitHub **public** sous le compte
-MarcelHeiniger. Conséquences : zéro secret/host réel/IP/nom de client nulle part, pas
-même en exemple « réaliste » — uniquement des placeholders génériques
-(`example.com`, `user@host`, `<profile>`) ; LICENSE MIT ; README racine en anglais.
-
-### 0.1 Décisions prises seule par Rosalinde pendant la conception (à valider)
-
-Le prompt de mission laissait plusieurs points d'implémentation ouverts
-(« décide et documente »). Voici les choix faits, avec justification, à valider par
-Marcel avant l'étape 1 du plan :
-
-| # | Décision | Justification |
-|---|----------|----------------|
-| D1 | **`jq`** comme dépendance pour lire/écrire le manifest en **JSON** | Le manifest a une structure imbriquée par module (post_types × option_keys × tables). Un format KEY=VALUE plat ne le représente pas proprement. `jq` est quasi-universel (`brew install jq` / `apt install jq`), léger, et bien plus sûr qu'un parseur JSON maison en bash. |
-| D2 | **Portabilité ciblée bash 3.2** (pas d'associative arrays, pas de `mapfile`) plutôt qu'exiger bash ≥ 4 | macOS système reste en bash 3.2 (licence GPLv3 sur bash 4+). Exiger `brew install bash` casserait la promesse « tourne sur n'importe quel Mac sans rien installer de plus que les dépendances listées ». Le registre de modules est donc une liste de noms (string), pas un tableau associatif — voir §3.4. |
-| D3 | **State-dir** : `~/.sitegraft/runs/<profile>-<timestamp>/` sur l'orchestrateur, **jamais nettoyé automatiquement** | Ce dossier contient les seules copies de sécurité inspectables d'un run (manifest, id-map, logs, backup). Une purge automatique serait dangereuse — la rétention/purge reste un geste manuel de l'opérateur (`sitegraft prune` pourrait être ajouté plus tard, YAGNI pour v1). |
-| D4 | **Mu-plugin de mapping livré par dépôt de fichier `rsync`** dans `wp-content/mu-plugins/`, pas par `wp plugin install` | Les mu-plugins WordPress se chargent automatiquement dès qu'ils sont présents dans `mu-plugins/` — aucune activation nécessaire, donc aucun état à gérer côté `wp plugin activate/deactivate`. Un simple dépôt + suppression de fichier est plus simple et plus sûr (rien à désactiver si le run crash). |
-| D5 | **`bats-core`** comme framework de test unitaire pour les fonctions pures de `lib/` | Standard de facto pour tester du bash, syntaxe proche de test unitaire classique, s'intègre nativement avec `set -euo pipefail`, largement documenté. |
-
-### 0.2 Points à challenger (risques identifiés par Rosalinde)
-
-Signalés explicitement pour que Nat les fasse trancher par Marcel plutôt que de les
-enterrer dans le détail technique :
-
-- **R1 — Réimport idempotent (§9.6) repose sur une convention de metadata
-  (`_sitegraft_source_id`) que sitegraft doit poser lui-même via le mu-plugin.**
-  Si un opérateur importe un jour du contenu sur B par un autre moyen que
-  sitegraft, ce garde-fou ne le verra pas. Acceptable pour v1 (outil personnel,
-  usage contrôlé) mais à garder en tête si l'outil est un jour utilisé par un tiers.
-- **R2 — Le remapping d'ID dans le contenu Etch (§9.1) utilise une technique de
-  sentinelles à deux passes sur `wp search-replace --regex`.** C'est robuste sur le
-  papier mais n'a encore été validé que par le raisonnement, pas par un run réel
-  contre du vrai contenu Etch exporté par une vraie licence. Le harnais DDEV (§10)
-  simule ce format sans licence Etch réelle — un écart de format réel vs simulé est
-  possible et ne serait détecté qu'au premier vrai run.
-- **R3 — Défaut-deny sur les tables/options non réclamées par un module (§3.5) protège
-  bien, mais si le scan ne détecte PAS une table (ex. table sans préfixe `$table_prefix`
-  standard, ou plugin qui stocke ses données ailleurs qu'en DB), elle n'apparaît jamais
-  dans le manifest — ni côté protégé ni côté ignoré. Le risque n'est pas une
-  contamination (rien n'est touché si rien n'est sélectionné) mais un faux sentiment
-  de complétude du scan.** À documenter clairement dans la sortie de `scan` (« ce scan
-  couvre X tables sur Y trouvées en base, vérifiez manuellement si le plugin protégé
-  stocke des données hors de ces tables »).
-- **R4 — Pas de run pilote prévu avant la fin de la construction complète de l'outil.**
-  Le harnais DDEV teste la mécanique, pas la variété réelle du contenu Etch/plugins
-  tiers rencontrés en usage réel. Le premier vrai run restera un moment de vérité,
-  même avec 100% de tests verts en DDEV.
+> This document is the full spec for sitegraft. The implementation plan
+> (`docs/plans/2026-08-19-sitegraft-implementation.md`) argues from this document —
+> the two travel together.
 
 ---
 
-## 1. Vue d'ensemble
+## 0. Decisions already made (do not reopen)
+
+Full brainstorming session with Marcel, 2026-08-19. Summarized here for the record
+(detail lives in the original mission brief, not reproduced here):
+
+1. Name **sitegraft**, CLI command `sitegraft`.
+2. Modular bash CLI organized in phases — no monolith, no Python/Node, no WordPress
+   plugin, no web UI, no MCP.
+3. Technical base: WP-CLI + native WXR for content; options copied individually
+   (`wp option get/update`); tables owned by a plugin via `wp db export --tables=`.
+4. Pluggable module system ("graft modules") — the extensibility point.
+5. Separate, re-runnable phases: `scan → plan → backup → graft → verify → restore`.
+6. Interactive selection at post-type + option-key granularity, via `gum choose`
+   (fallback `fzf`), result = a frozen manifest.
+7. Backup built into the tool, host-agnostic, with a generated `restore.sh`.
+8. Old→new ID mapping via a temporary mu-plugin on B, hooked into wordpress-importer.
+9. Two credential paths (per-profile file OR interactive prompt); profiles are
+   committable with no secrets.
+10. Bash portability, minimal dependencies, never `scp`.
+11. Etch specifics: templates live in the database only (no file fallback);
+    navigation is often a dynamic `wp:page-list` block — verify per site in `scan`,
+    never assume.
+12. Optional `clean` sub-step inside `graft`.
+13. Hardening: `set -euo pipefail`, mktemp+trap, WXR integrity gate, a global
+    `--dry-run`, `--authors=skip`, colored logs, never `scp`.
+
+**Clarification received mid-design (already reflected throughout this document and
+the whole repo):** `repo/` will be published as a **public** GitHub repo under the
+MarcelHeiniger account. Consequence: zero secrets, zero real hosts/IPs, zero client
+names anywhere — not even as "realistic-looking" examples — only generic placeholders
+(`example.com`, `user@host`, `<profile>`); MIT LICENSE; the entire repo, including
+every doc, is US English.
+
+### 0.1 Decisions Rosalinde made alone during design (need validation)
+
+The original mission brief left several implementation points open ("decide and
+document it"). Here are the choices made, with rationale, to be validated by Marcel
+before Step 1 of the plan starts:
+
+| # | Decision | Rationale |
+|---|----------|-----------|
+| D1 | **`jq`** as a dependency to read/write the manifest as **JSON** | The manifest has a structure nested per module (post_types × option_keys × tables). A flat KEY=VALUE format can't represent that cleanly. `jq` is nearly universal (`brew install jq` / `apt install jq`), lightweight, and far safer than a hand-rolled JSON parser in bash. |
+| D2 | **Target bash 3.2 compatibility** (no associative arrays, no `mapfile`) instead of requiring bash ≥ 4 | Stock macOS still ships bash 3.2 (bash 4+ is GPLv3, which Apple won't bundle). Requiring `brew install bash` would break the promise of "runs on any Mac with nothing extra beyond the listed dependencies." The module registry is therefore a plain list of names (a string), not an associative array — see §3.4. |
+| D3 | **State directory**: `~/.sitegraft/runs/<profile>-<timestamp>/` on the orchestrator, **never cleaned up automatically** | This directory holds the only inspectable safety copies of a run (manifest, ID map, logs, backup). Automatic purging would be dangerous — retention/cleanup stays a manual operator action (`sitegraft prune` could be added later, YAGNI for v1). |
+| D4 | **Mapping mu-plugin delivered by dropping a file via `rsync`** into `wp-content/mu-plugins/`, not via `wp plugin install` | WordPress must-use plugins load automatically the moment they're present in `mu-plugins/` — no activation needed, so there's no `wp plugin activate/deactivate` state to manage. A plain file drop + delete is simpler and safer (nothing to deactivate if the run crashes). |
+| D5 | **`bats-core`** as the unit test framework for `lib/`'s pure functions | The de facto standard for testing bash, syntax close to conventional unit tests, integrates natively with `set -euo pipefail`, well documented. |
+
+### 0.2 Points to challenge (risks flagged by Rosalinde)
+
+Called out explicitly so Nat has Marcel rule on them rather than burying them in
+technical detail:
+
+- **R1 — Idempotent reimport (§11) relies on a metadata convention
+  (`_sitegraft_source_id`) that sitegraft itself must set via the mu-plugin.**
+  If an operator ever imports content onto B by any means other than sitegraft, this
+  safeguard won't see it. Acceptable for v1 (personal tool, controlled usage) but
+  worth keeping in mind if the tool is ever used by a third party.
+- **R2 — ID remapping inside Etch content (§9.1) uses a two-pass sentinel technique
+  on `wp search-replace --regex`.** It's robust on paper but has only been validated
+  by reasoning, not by a real run against actual Etch content exported under a real
+  license. The DDEV harness (§10) simulates this format without a real Etch license —
+  a gap between the real format and the simulated one is possible and would only
+  surface on the first real run.
+- **R3 — Default-deny on tables/options unclaimed by any module (§3.5) protects well,
+  but if `scan` fails to detect a table (e.g. a table without the standard
+  `$table_prefix`, or a plugin that stores data somewhere other than the database),
+  it never shows up in the manifest — neither on the protected side nor the ignored
+  side. The risk isn't contamination (nothing is touched if nothing is selected) but
+  a false sense of scan completeness.** This should be documented clearly in `scan`'s
+  output ("this scan covers X tables out of Y found in the database — manually verify
+  whether the protected plugin stores data outside these tables").
+- **R4 — No pilot run is planned before the tool is fully built.**
+  The DDEV harness tests the mechanics, not the real-world variety of Etch content
+  and third-party plugins encountered in actual use. The first real run will remain
+  a moment of truth, even with 100% green tests in DDEV.
+
+---
+
+## 1. Overview
 
 ```
-site A (Etch/ACSS, source)  ──┐
-                               ├──►  sitegraft (orchestrateur)  ──►  site B (cible, vivant)
-site B (cible, vivant, read)  ─┘
+site A (Etch/ACSS, source)   ──┐
+                                ├──►  sitegraft (orchestrator)  ──►  site B (target, live)
+site B (target, live, read)  ──┘
 ```
 
-sitegraft tourne sur une machine tierce (« l'orchestrateur » — le Mac de Marcel, ou
-tout poste avec les dépendances). Il pilote A et B via SSH+wp-cli (ou `ddev wp` en
-local). Rien n'est installé de façon permanente sur A ou B — seul un mu-plugin
-temporaire touche B, le temps d'un import, puis est retiré.
+sitegraft runs on a third machine (the "orchestrator" — Marcel's Mac, or any machine
+with the dependencies). It drives A and B via SSH+wp-cli (or `ddev wp` locally).
+Nothing is installed permanently on A or B — only a temporary mu-plugin touches B,
+for the duration of an import, and is then removed.
 
-## 2. Arborescence de l'outil
+## 2. Tool layout
 
 ```
 sitegraft/
 ├── bin/
-│   └── sitegraft                       # entrypoint : parse phase + --profile + flags, dispatch vers lib/
+│   └── sitegraft                       # entrypoint: parses phase + --profile + flags, dispatches into lib/
 ├── lib/
-│   ├── core.sh                         # logging, couleurs, require_cmd, mktemp+trap, dry-run helper, wrappers ssh/rsync/wp
-│   ├── profile.sh                      # chargement profil (profiles/*.conf) + credentials
-│   ├── modules.sh                      # découverte/registre/dispatch des modules (convention-based, bash 3.2)
-│   ├── inventory.sh                    # phase scan : introspection d'un site (post_types, options, tables, plugins)
-│   ├── manifest.sh                     # phase plan : construction, validation, lecture/écriture JSON (jq) du manifest
-│   ├── backup.sh                       # phase backup + génération restore.sh
-│   ├── graft.sh                        # phase graft : médias, WXR, mu-plugin, remaps, clean optionnel
-│   └── verify.sh                       # phase verify : smoke checks + comparaison checksums protégés
+│   ├── core.sh                         # logging, colors, require_cmd, mktemp+trap, dry-run helper, ssh/rsync/wp wrappers
+│   ├── profile.sh                      # profile loading (profiles/*.conf) + credentials
+│   ├── modules.sh                      # module discovery/registry/dispatch (convention-based, bash 3.2)
+│   ├── inventory.sh                    # scan phase: introspects a site (post_types, options, tables, plugins)
+│   ├── manifest.sh                     # plan phase: builds, validates, reads/writes the manifest (JSON via jq)
+│   ├── backup.sh                       # backup phase + restore.sh generation
+│   ├── graft.sh                        # graft phase: media, WXR, mu-plugin, remaps, optional clean
+│   └── verify.sh                       # verify phase: smoke checks + protected-data checksum comparison
 ├── modules/
-│   ├── _template.sh                    # squelette documenté pour écrire un nouveau module
-│   ├── core-wp.sh                      # pages, posts, blocks, navigation, templates, styles globaux, médias
-│   ├── etch.sh                         # CPTs/options Etch
-│   ├── acss.sh                         # options ACSS
-│   └── motopress.sh.example            # exemple pédagogique complet — PAS auto-chargé (suffixe .example)
+│   ├── _template.sh                    # documented skeleton for writing a new module
+│   ├── core-wp.sh                      # pages, posts, blocks, navigation, templates, global styles, media
+│   ├── etch.sh                         # Etch CPTs/options
+│   ├── acss.sh                         # ACSS options
+│   └── motopress.sh.example            # full worked example — NOT auto-loaded (`.example` suffix)
 ├── mu-plugins/
-│   └── sitegraft-id-mapper.php         # template rsyncé sur B pendant graft, retiré après (voir §8)
+│   └── sitegraft-id-mapper.php         # template rsynced onto B during graft, removed after (see §8)
 ├── profiles/
-│   └── example.conf                    # profil d'exemple, aucun secret
+│   └── example.conf                    # example profile, zero secrets
 ├── tests/
 │   ├── unit/
 │   │   ├── test_core.bats
@@ -129,60 +131,60 @@ sitegraft/
 │   │   ├── test_modules.bats
 │   │   └── test_graft_remap.bats
 │   └── integration/
-│       ├── ddev-harness.sh             # orchestration complète du harnais (voir §10)
+│       ├── ddev-harness.sh             # full harness orchestration (see §10)
 │       └── fixtures/
-│           ├── site-a-seed.sh          # seed contenu Etch simulé sur A
+│           ├── site-a-seed.sh          # seeds simulated Etch content on A
 │           └── site-b-fake-plugin/
-│               └── fake-plugin.php     # faux plugin protégé, son CPT, sa table, ses options
-├── docs/                               # ce dossier
+│               └── fake-plugin.php     # fake protected plugin, its own CPT, table, options
+├── docs/                               # this directory
 ├── LICENSE
 ├── README.md
 └── .gitignore
 ```
 
-Convention de nommage : le préfixe des fonctions d'un module est le nom de fichier
-sans extension, tirets remplacés par underscores. `modules/core-wp.sh` → préfixe
-`core_wp_`. `modules/motopress.sh.example` → préfixe `motopress_` (voir §3).
+Naming convention: a module's function prefix is its filename without the
+extension, hyphens replaced with underscores. `modules/core-wp.sh` → prefix
+`core_wp_`. `modules/motopress.sh.example` → prefix `motopress_` (see §3).
 
-## 3. Le contrat des modules
+## 3. The module contract
 
-### 3.1 Principe
+### 3.1 Principle
 
-Le cœur de l'outil ne connaît **aucun** plugin par son nom. Il connaît uniquement des
-« modules » — des fichiers `modules/<nom>.sh` qui déclarent, via des fonctions à
-préfixe conventionné, ce qu'ils possèdent. Ajouter un plugin demain = un fichier,
-zéro modification de `lib/` ou `bin/`.
+The tool's core knows **no** plugin by name. It only knows "modules" — files
+`modules/<name>.sh` that declare, through functions with a conventioned prefix, what
+they own. Adding support for a plugin tomorrow means adding one file, with zero
+changes to `lib/` or `bin/`.
 
-Chaque module sert **dans les deux sens** :
-- Côté A (source) : ce module dit quoi migrer.
-- Côté B (cible) : ce même module dit quoi protéger — si détecté sur B et non
-  sélectionné pour migration, tout ce qu'il déclare passe automatiquement en liste
-  « ne pas toucher ».
+Every module serves **in both directions**:
+- On side A (source): the module says what to migrate.
+- On side B (target): the same module says what to protect — if detected on B and not
+  selected for migration, everything it declares automatically moves to the
+  "hands off" list.
 
-### 3.2 Fonctions conventionnées
+### 3.2 Conventioned functions
 
-Pour un module de préfixe `<mod>` (ex. `core_wp`, `etch`, `acss`, `motopress`) :
+For a module with prefix `<mod>` (e.g. `core_wp`, `etch`, `acss`, `motopress`):
 
-| Fonction | Obligatoire | Signature | Rôle |
-|----------|:-----------:|-----------|------|
-| `<mod>_name` | oui | `<mod>_name` → stdout: nom lisible | Nom affiché dans les prompts `gum choose` |
-| `<mod>_detect` | oui | `<mod>_detect <scan_json_path>` → exit 0/1 | Le plugin/domaine est-il présent sur le site scanné ? |
-| `<mod>_post_types` | non* | `<mod>_post_types` → stdout: un post_type par ligne | Post types possédés par ce module |
-| `<mod>_option_keys` | non* | `<mod>_option_keys` → stdout: une clé `wp_options` par ligne | Options possédées par ce module |
-| `<mod>_option_keys_exclude` | non | `<mod>_option_keys_exclude` → stdout: un pattern glob par ligne | Exclusions à l'intérieur d'un préfixe large (ex. licences, versions de DB) |
-| `<mod>_tables` | non* | `<mod>_tables` → stdout: un suffixe de table par ligne (sans `$table_prefix`) | Tables SQL propres, hors contenu WXR |
-| `<mod>_post_import` | non | `<mod>_post_import <state_dir> <id_map_tsv> <wp_cmd_b>` | Hook exécuté après import WXR + remaps génériques, pour des remaps spécifiques au module |
+| Function | Required | Signature | Role |
+|----------|:--------:|-----------|------|
+| `<mod>_name` | yes | `<mod>_name` → stdout: human-readable name | Name shown in `gum choose` prompts |
+| `<mod>_detect` | yes | `<mod>_detect <scan_json_path>` → exit 0/1 | Is this plugin/domain present on the scanned site? |
+| `<mod>_post_types` | no* | `<mod>_post_types` → stdout: one post_type per line | Post types owned by this module |
+| `<mod>_option_keys` | no* | `<mod>_option_keys` → stdout: one `wp_options` key per line | Options owned by this module |
+| `<mod>_option_keys_exclude` | no | `<mod>_option_keys_exclude` → stdout: one glob pattern per line | Exclusions within a broad prefix (e.g. licenses, DB versions) |
+| `<mod>_tables` | no* | `<mod>_tables` → stdout: one table suffix per line (without `$table_prefix`) | Plugin-owned SQL tables, outside WXR content |
+| `<mod>_post_import` | no | `<mod>_post_import <state_dir> <id_map_tsv> <wp_cmd_b>` | Hook run after WXR import + generic remaps, for module-specific fixups |
 
-\* Au moins UNE des trois fonctions `_post_types` / `_option_keys` / `_tables` doit
-exister — un module qui ne déclare rien n'a pas de raison d'exister.
+\* At least ONE of the three functions `_post_types` / `_option_keys` / `_tables`
+must exist — a module that declares nothing has no reason to exist.
 
-`lib/modules.sh` découvre les modules par glob `modules/*.sh` (le suffixe `.example`
-est explicitement exclu, tout comme `_template.sh`), source chaque fichier, et
-construit `SITEGRAFT_MODULES` — une chaîne de noms séparés par espace (pas de tableau
-associatif, contrainte bash 3.2 — voir D2). La présence de chaque fonction optionnelle
-est testée avec `type -t <mod>_xxx >/dev/null 2>&1` avant appel.
+`lib/modules.sh` discovers modules via the glob `modules/*.sh` (the `.example`
+suffix is explicitly excluded, as is `_template.sh`), sources each file, and builds
+`SITEGRAFT_MODULES` — a space-separated string of names (no associative array,
+bash 3.2 constraint — see D1). Each optional function's presence is checked with
+`type -t <mod>_xxx >/dev/null 2>&1` before being called.
 
-### 3.3 Exemple concret — `modules/etch.sh`
+### 3.3 Concrete example — `modules/etch.sh`
 
 ```bash
 #!/usr/bin/env bash
@@ -220,11 +222,11 @@ EOF
 }
 ```
 
-### 3.4 Exemple de futur module — `modules/motopress.sh.example`
+### 3.4 Example of a future module — `modules/motopress.sh.example`
 
-Fourni comme exemple pédagogique complet (pas un vrai module v1 — MotoPress n'est pas
-implémenté). Copier ce fichier en `modules/motopress.sh` (sans `.example`) et
-l'adapter est le geste attendu pour ajouter un vrai support MotoPress plus tard.
+Shipped as a full worked example (not a real v1 module — MotoPress support isn't
+implemented). Copying this file to `modules/motopress.sh` (dropping the `.example`
+suffix) and adapting it is the expected move for adding real MotoPress support later.
 
 ```bash
 #!/usr/bin/env bash
@@ -261,10 +263,10 @@ mphb_room_type_meta
 EOF
 }
 
-# Example post-import hook: not used for migration in v1 (MotoPress data is always
-# in the "protect" bucket, never in "migrate", for the case Marcel described — a live
-# B with real bookings). Shown here purely to document the hook signature for a
-# future module that DOES migrate a plugin's content.
+# Example post-import hook: not used for migration in v1 (MotoPress data always
+# lands in the "protect" bucket, never in "migrate", for the case Marcel described —
+# a live B with real bookings). Shown here purely to document the hook signature for
+# a future module that DOES migrate a plugin's content.
 motopress_post_import() {
   state_dir="$1"
   id_map_tsv="$2"
@@ -281,18 +283,18 @@ motopress_post_import() {
 }
 ```
 
-### 3.5 Défaut sûr (default-deny)
+### 3.5 Safe default (default-deny)
 
-Pendant `plan`, après avoir fait dialoguer chaque module connu avec les scans de A et
-B, tout ce qui reste sur B — post_type, table, ou clé d'option — non réclamé par
-aucun module (migré ou protégé) tombe dans un bucket automatique `_unclaimed` du
-manifest, marqué protégé. **Rien n'est jamais migré ou effacé par défaut.** Un
-opérateur qui veut migrer un élément non couvert doit écrire un module pour lui
-(même minimal) — c'est une friction voulue, pas un oubli.
+During `plan`, after every known module has been checked against the scans of A and
+B, anything left on B — post_type, table, or option key — unclaimed by any module
+(migrate or protect) falls into an automatic `_unclaimed` bucket in the manifest,
+marked protected. **Nothing is ever migrated or wiped by default.** An operator who
+wants to migrate something not yet covered has to write a module for it (even a
+minimal one) — that's deliberate friction, not an oversight.
 
-## 4. Format du manifest
+## 4. Manifest format
 
-Produit par `plan`, figé, consommé tel quel par `graft`. JSON, parsé via `jq`.
+Produced by `plan`, frozen, consumed as-is by `graft`. JSON, parsed via `jq`.
 
 ```jsonc
 {
@@ -326,7 +328,7 @@ Produit par `plan`, figé, consommé tel quel par `graft`. JSON, parsé via `jq`
       "post_types": ["unknown_cpt_found_on_b"],
       "tables": [],
       "option_keys": [],
-      "note": "détecté sur B, aucun module ne le réclame — protégé par défaut-deny"
+      "note": "found on B, unclaimed by any module — protected by default-deny"
     }
   },
   "clean": {
@@ -342,16 +344,16 @@ Produit par `plan`, figé, consommé tel quel par `graft`. JSON, parsé via `jq`
 }
 ```
 
-Règles de validation (`lib/manifest.sh :: manifest_validate`) :
-- `frozen` doit être `true` pour que `graft` accepte le manifest.
-- Aucun post_type/table/option-key ne doit apparaître à la fois dans `migrate` et
-  `protect` (conflit → `plan` refuse de figer).
-- `checksums_protected_pre_graft` est calculé et écrit par la phase `backup` (pas par
-  `plan`), consommé par `verify`.
+Validation rules (`lib/manifest.sh :: manifest_validate`):
+- `frozen` must be `true` for `graft` to accept the manifest.
+- No post_type/table/option-key may appear in both `migrate` and `protect`
+  (conflict → `plan` refuses to freeze).
+- `checksums_protected_pre_graft` is computed and written by the `backup` phase (not
+  by `plan`), and consumed by `verify`.
 
-## 5. Format du profil + credentials
+## 5. Profile + credentials format
 
-### 5.1 Profil — `profiles/<nom>.conf` (commitable, zéro secret)
+### 5.1 Profile — `profiles/<name>.conf` (committable, zero secrets)
 
 ```sh
 # profiles/example.conf — sitegraft profile. No secrets here — safe to commit.
@@ -372,144 +374,145 @@ SITEGRAFT_STATE_DIR="${HOME}/.sitegraft/runs"
 SITEGRAFT_CREDS_FILE="${HOME}/.config/sitegraft/example.creds"
 ```
 
-`SITE_*_SSH_HOST` étant vide signifie « site local, piloté via `SITE_*_WP_CMD`
-directement sans SSH » (cas d'un site DDEV local sur l'orchestrateur lui-même).
+An empty `SITE_*_SSH_HOST` means "local site, driven directly through
+`SITE_*_WP_CMD` with no SSH" (the case of a local DDEV site on the orchestrator
+itself).
 
-### 5.2 Credentials — deux voies
+### 5.2 Credentials — two paths
 
-**(a) Fichier** `~/.config/sitegraft/<profile>.creds` (chmod 600, gitignored, jamais
-commité) :
+**(a) File** at `~/.config/sitegraft/<profile>.creds` (chmod 600, gitignored, never
+committed):
 
 ```sh
 SITE_A_SSH_KEY="/absolute/path/to/private_key_a"
 SITE_B_SSH_KEY="/absolute/path/to/private_key_b"
 ```
 
-**(b) Saisie interactive** au lancement (`gum input --password` pour les valeurs
-sensibles) si le fichier de credentials référencé par le profil n'existe pas — avec
-proposition explicite d'enregistrement (« sauvegarder dans `~/.config/sitegraft/
-example.creds` pour ne plus resaisir ? [y/N] »), jamais automatique.
+**(b) Interactive prompt** at launch (`gum input --password` for sensitive values)
+if the credentials file referenced by the profile doesn't exist — with an explicit
+offer to save it ("save to `~/.config/sitegraft/example.creds` so you don't have to
+re-enter it? [y/N]"), never automatic.
 
-`lib/profile.sh :: profile_load` lit le `.conf` (source shell, donc uniquement des
-assignations `KEY="value"` — pas de code arbitraire), puis charge le `.creds`
-correspondant s'il existe, sinon déclenche (b).
+`lib/profile.sh :: profile_load` reads the `.conf` file (a shell source, so only
+`KEY="value"` assignments — no arbitrary code), then loads the matching `.creds`
+file if it exists, otherwise triggers (b).
 
-## 6. Déroulé exact des phases
+## 6. Exact phase walkthrough
 
-### 6.1 `scan` (read-only, A et B)
+### 6.1 `scan` (read-only, A and B)
 
 ```sh
 wp --path="$WP_PATH" post-type list --format=json
-wp --path="$WP_PATH" option list --format=json          # dump complet — filtré ensuite par module
+wp --path="$WP_PATH" option list --format=json          # full dump — filtered later per module
 wp --path="$WP_PATH" db tables --format=json --all-tables-with-prefix
-wp --path="$WP_PATH" plugin list --format=json           # aide à la détection des modules
+wp --path="$WP_PATH" plugin list --format=json           # helps with module detection
 ```
-Écrit `scan-a.json` et `scan-b.json` dans le state-dir. Read-only strict — aucune
-écriture sur A ou B. Rejouable à volonté.
+Writes `scan-a.json` and `scan-b.json` to the state directory. Strictly read-only —
+no writes to A or B. Freely re-runnable.
 
-Vérification spécifique Etch demandée par Marcel (§0 point 11) : le scan interroge
-aussi si la navigation de chaque site est un bloc dynamique `wp:page-list` (pas d'IDs
-en dur) en inspectant le contenu des `wp_navigation` trouvés — jamais supposé, toujours
-vérifié par site, résultat consigné dans `scan-*.json` (`"nav_uses_dynamic_page_list":
-true/false`).
+The Etch-specific check Marcel asked for (§0, point 11): `scan` also checks whether
+each site's navigation is a dynamic `wp:page-list` block (no hardcoded IDs) by
+inspecting the content of the `wp_navigation` posts it finds — never assumed, always
+verified per site, result recorded in `scan-*.json`
+(`"nav_uses_dynamic_page_list": true/false`).
 
-### 6.2 `plan` (interactif, écrit seulement en local)
+### 6.2 `plan` (interactive, writes only locally)
 
-1. Charge `scan-a.json` / `scan-b.json`.
-2. Pour chaque module découvert, appelle `<mod>_detect` sur les deux scans.
-3. Construit les défauts : modules détectés sur A avec du contenu Etch/ACSS →
-   pré-cochés côté migration ; modules détectés sur B et absents de la sélection de
-   migration → pré-cochés côté protection.
-4. `gum choose --no-limit` (fallback `fzf`, fallback liste numérotée + prompt texte)
-   pour ajuster la sélection granulaire (post_types et option_keys individuels).
-5. Valide (aucun conflit migrate/protect, voir §4), calcule le bucket `_unclaimed`
-   automatiquement, écrit `manifest.json` avec `"frozen": false`.
-6. Confirmation explicite (`gum confirm "Figer ce manifest ?"`) → `"frozen": true`.
+1. Loads `scan-a.json` / `scan-b.json`.
+2. For each discovered module, calls `<mod>_detect` against both scans.
+3. Builds the defaults: modules detected on A with Etch/ACSS content → pre-checked
+   on the migration side; modules detected on B and absent from the migration
+   selection → pre-checked on the protection side.
+4. `gum choose --no-limit` (fallback `fzf`, fallback a numbered list + text prompt)
+   to fine-tune the selection (individual post_types and option_keys).
+5. Validates (no migrate/protect conflict, see §4), computes the `_unclaimed` bucket
+   automatically, writes `manifest.json` with `"frozen": false`.
+6. Explicit confirmation (`gum confirm "Freeze this manifest?"`) → `"frozen": true`.
 
-### 6.3 `backup` (écrit uniquement dans le state-dir orchestrateur — B pas encore touché en profondeur)
+### 6.3 `backup` (writes only to the orchestrator's state dir — B not deeply touched yet)
 
 ```sh
-# sur B :
+# on B:
 ssh "$SITE_B_SSH_HOST" "wp --path=$SITE_B_WP_PATH db export - --add-drop-table | gzip" \
   > "$STATE_DIR/backup/b-db.sql.gz"
 ssh "$SITE_B_SSH_HOST" "tar czf - -C $(dirname "$SITE_B_WP_PATH") wp-content" \
   > "$STATE_DIR/backup/b-wp-content.tar.gz"
 ```
-Puis génère `$STATE_DIR/restore.sh` — un script autonome, portant en dur (dans le
-run, pas dans le repo) le chemin du backup et les mêmes commandes wp-cli/rsync
-inversées, prêt à relancer sans autre contexte. Calcule aussi
-`checksums_protected_pre_graft` (sha256 des exports de tables/options protégées) et
-les écrit dans `manifest.json`. Marque `$STATE_DIR/backup.complete` — `graft` refuse
-de démarrer sans ce marqueur.
+Then generates `$STATE_DIR/restore.sh` — a self-contained script that hardcodes
+(inside the run, not the repo) the backup path and the same wp-cli/rsync commands in
+reverse, ready to run with no other context needed. Also computes
+`checksums_protected_pre_graft` (sha256 of the protected tables/options exports) and
+writes them into `manifest.json`. Marks `$STATE_DIR/backup.complete` — `graft`
+refuses to start without this marker.
 
 ### 6.4 `graft`
 
-1. **Médias** : `rsync -avz --ignore-existing` de `wp-content/uploads/` A → B (jamais
-   d'écrasement d'un fichier déjà présent sur B — protège les médias déjà utilisés
-   par le plugin protégé en cas de collision de nom).
-2. **Mu-plugin** : dépôt de `mu-plugins/sitegraft-id-mapper.php` sur B via `rsync`.
-3. **Export WXR sur A**, filtré aux post_types du manifest :
+1. **Media**: `rsync -avz --ignore-existing` of `wp-content/uploads/` A → B (never
+   overwriting a file already present on B — protects media already used by the
+   protected plugin in case of a filename collision).
+2. **Mu-plugin**: drop `mu-plugins/sitegraft-id-mapper.php` onto B via `rsync`.
+3. **WXR export on A**, filtered to the manifest's post_types:
    ```sh
    wp --path="$SITE_A_WP_PATH" export --post_type=page,post,etch_cfs,... --dir=/tmp/sitegraft-export/
    ```
-4. **Integrity-gate** (avant tout transfert) sur chaque fichier `.xml` produit :
-   taille > 0, présence de `<wp:wxr_version>`, ≥ 1 `<item>`, et **tout**
-   `<wp:post_type>` trouvé dans le fichier ∈ la liste `post_types` du manifest —
-   abort sinon (protège contre un export wp-cli qui inclurait plus que demandé).
-5. **Transfert** WXR A → orchestrateur → B via `rsync` (deux sauts, jamais de
-   connexion directe A↔B supposée).
-6. **`wordpress-importer`** installé + activé sur B si absent (état pré-existant noté
-   pour restauration exacte après import).
-7. **Import** :
+4. **Integrity gate** (before any transfer) on every `.xml` file produced: size > 0,
+   `<wp:wxr_version>` present, ≥ 1 `<item>`, and **every** `<wp:post_type>` found in
+   the file ∈ the manifest's `post_types` list — abort otherwise (protects against a
+   wp-cli export that includes more than requested).
+5. **Transfer** the WXR A → orchestrator → B via `rsync` (two hops, never assuming a
+   direct A↔B connection).
+6. **`wordpress-importer`** installed + activated on B if absent (pre-existing state
+   noted so it can be restored exactly after the import).
+7. **Import**:
    ```sh
    wp --path="$SITE_B_WP_PATH" import /tmp/sitegraft-import/*.xml --authors=skip
    ```
-   Jamais `--fetch_attachments` — les médias sont déjà en place (étape 1), et le
-   comportement par défaut de `wordpress-importer` sans ce flag ne retélécharge rien,
-   il attend que le fichier existe déjà au bon chemin (voir §9 pour le détail de ce
-   comportement, important à comprendre).
-8. **Options** : `wp option get --format=json` sur A pour chaque `option_keys` du
-   manifest, `wp option update --format=json` sur B (moins `page_on_front` — voir §9.3).
-9. **Rapatriement du log de mapping** (`wp-content/sitegraft-id-map.log` sur B) →
+   Never `--fetch_attachments` — media is already in place (step 1), and
+   `wordpress-importer`'s default behavior without that flag doesn't re-download
+   anything; it expects the file to already exist at the right path (see §9 for the
+   important detail of this behavior).
+8. **Options**: `wp option get --format=json` on A for every `option_keys` in the
+   manifest, `wp option update --format=json` on B (except `page_on_front` — see
+   §9.3).
+9. **Retrieving the mapping log** (`wp-content/sitegraft-id-map.log` on B) →
    `$STATE_DIR/id-map.tsv` via `rsync`.
-10. **Retrait du mu-plugin** de B, désactivation/désinstallation de
-    `wordpress-importer` si sitegraft l'avait installé lui-même.
-11. **Remaps** — voir §9 en détail.
-12. **`clean` optionnel** (§6.6) si `manifest.clean.enabled = true`.
+10. **Removing the mu-plugin** from B, deactivating/uninstalling
+    `wordpress-importer` if sitegraft installed it itself.
+11. **Remaps** — see §9 for details.
+12. **Optional `clean`** (§6.6) if `manifest.clean.enabled = true`.
 
-Chaque sous-étape pose un marqueur `$STATE_DIR/graft.step<N>.done` — un `graft`
-interrompu reprend à la sous-étape suivant le dernier marqueur, jamais depuis zéro.
+Each sub-step drops a marker `$STATE_DIR/graft.step<N>.done` — an interrupted
+`graft` resumes at the sub-step after the last marker, never from scratch.
 
-### 6.5 `verify` (read-only sur B)
+### 6.5 `verify` (read-only on B)
 
-- Recompte les post_types migrés (A avant vs B après, cohérence attendue).
-- Recalcule les checksums des données protégées, compare à
-  `manifest.checksums_protected_pre_graft` — **toute divergence = échec dur**.
-- Vérifie que `show_on_front`/`page_on_front` de B résout vers une page existante.
-- Vérifie la présence de la navigation attendue.
-- Vérifie (best-effort, `curl -sS -o /dev/null -w '%{http_code}'`) que l'URL racine de
-  B répond 200.
-- Écrit `$STATE_DIR/verify-report.md`, exit non-zéro sur échec dur.
+- Recounts migrated post_types (A before vs. B after, expecting consistency).
+- Recomputes checksums of protected data, compares against
+  `manifest.checksums_protected_pre_graft` — **any mismatch is a hard failure**.
+- Verifies that B's `show_on_front`/`page_on_front` resolves to an existing page.
+- Verifies the expected navigation is present.
+- Verifies (best-effort, `curl -sS -o /dev/null -w '%{http_code}'`) that B's root
+  URL returns 200.
+- Writes `$STATE_DIR/verify-report.md`, exits non-zero on a hard failure.
 
-### 6.6 `clean` (sous-étape optionnelle de `graft`, jamais seule)
+### 6.6 `clean` (an optional sub-step of `graft`, never run on its own)
 
-Supprime sur B les types de contenu **sélectionnés pour migration** qui existaient
-déjà côté « ancienne couche design » de B avant le graft (jamais les types protégés).
-Requiert `backup.complete`. N'agit que sur les post_types listés dans
-`manifest.clean.post_types` (sous-ensemble explicite de `migrate`, jamais déduit
-automatiquement).
+Removes on B the **migrated** content types that already existed as B's "old design
+layer" before the graft (never the protected types). Requires `backup.complete`.
+Only acts on the post_types listed in `manifest.clean.post_types` (an explicit
+subset of `migrate`, never inferred automatically).
 
 ### 6.7 `restore`
 
 ```sh
 sitegraft restore --profile <profile> --run <run-id> [--yes]
 ```
-Exécute `$STATE_DIR/restore.sh` du run désigné. Avant toute restauration, prend un
-mini-backup de l'état courant de B (« backup du backup ») dans un sous-dossier
-`pre-restore/` du même run — même une restauration doit rester réversible. Demande
-confirmation (`gum confirm`) sauf `--yes`.
+Runs `$STATE_DIR/restore.sh` for the designated run. Before restoring anything, it
+takes a mini-backup of B's current state ("a backup of the backup") into a
+`pre-restore/` subfolder of the same run — even a restore has to stay reversible.
+Asks for confirmation (`gum confirm`) unless `--yes` is passed.
 
-## 7. Le mu-plugin de mapping — `mu-plugins/sitegraft-id-mapper.php`
+## 7. The mapping mu-plugin — `mu-plugins/sitegraft-id-mapper.php`
 
 ```php
 <?php
@@ -523,7 +526,7 @@ add_action( 'wp_import_insert_post', function ( $post_id, $original_post_id, $po
     $log = WP_CONTENT_DIR . '/sitegraft-id-map.log';
     $post_type = isset( $postdata['post_type'] ) ? $postdata['post_type'] : 'unknown';
     file_put_contents( $log, "{$original_post_id}\t{$post_id}\t{$post_type}\n", FILE_APPEND | LOCK_EX );
-    update_post_meta( $post_id, '_sitegraft_source_id', $original_post_id ); // pour l'idempotence, voir §9.6
+    update_post_meta( $post_id, '_sitegraft_source_id', $original_post_id ); // for idempotence, see §11
 }, 10, 4 );
 
 add_action( 'wp_import_insert_term', function ( $term_id, $term, $original_id ) {
@@ -532,34 +535,34 @@ add_action( 'wp_import_insert_term', function ( $term_id, $term, $original_id ) 
 }, 10, 3 );
 ```
 
-Format du log (`id-map.tsv` après rapatriement) : `old_id<TAB>new_id<TAB>post_type`,
-une ligne par post/terme importé. C'est la seule source de vérité pour tout remap
-d'ID post-import.
+Log format (`id-map.tsv` after retrieval): `old_id<TAB>new_id<TAB>post_type`, one
+line per imported post/term. This is the single source of truth for every
+post-import ID remap.
 
-## 8. Comportement par défaut de `wp import` vis-à-vis des médias (important)
+## 8. `wp import`'s default behavior around media (important)
 
-`wordpress-importer` **ne retélécharge pas** les fichiers joints par défaut — le flag
-`--fetch_attachments` est nécessaire pour ça, et sitegraft ne le passe jamais. Sans
-ce flag, l'import crée les posts `attachment` et leur metadata en supposant que le
-fichier existe déjà au chemin calculé (`wp-content/uploads/YYYY/MM/fichier.ext`).
-C'est exactement pourquoi l'ordre est : **médias en premier** (rsync, étape 1 de
-`graft`), **import WXR ensuite** (étape 7). Si l'ordre était inversé, l'import
-laisserait des attachments avec fichier manquant.
+`wordpress-importer` **does not re-download** attached files by default — the
+`--fetch_attachments` flag is required for that, and sitegraft never passes it.
+Without that flag, the import creates `attachment` posts and their metadata
+assuming the file already exists at the computed path
+(`wp-content/uploads/YYYY/MM/file.ext`). This is exactly why the order is: **media
+first** (rsync, step 1 of `graft`), **WXR import second** (step 7). If the order
+were reversed, the import would leave attachments with a missing file.
 
-## 9. Stratégie de remapping post-import
+## 9. Post-import remapping strategy
 
-### 9.1 Références d'ID d'image doublement embarquées (contenu Etch)
+### 9.1 Doubly-embedded image ID references (Etch content)
 
-Etch embarque une référence image de deux façons dans un même bloc : l'attribut
-`"id":X` (JSON dans `post_content`) ET une URL absolue `<img src="https://…">`. Le
-domaine est traité séparément (§9.4). L'ID doit être remappé précisément, sans
-collision.
+Etch embeds an image reference two ways in the same block: the `"id":X` attribute
+(JSON inside `post_content`) AND an absolute URL (`<img src="https://…">`). The
+domain is handled separately (§9.4). The ID must be remapped precisely, with no
+collisions.
 
-**Technique à deux passes (sentinelles)** — pour éviter tout risque qu'un nouvel ID
-déjà substitué soit re-matché par un ID ancien traité plus tard dans le même batch :
+**Two-pass sentinel technique** — to eliminate any risk that a new ID already
+substituted gets re-matched by an old ID processed later in the same batch:
 
 ```sh
-# Passe 1 : old_id → jeton sentinelle unique
+# Pass 1: old_id -> unique sentinel token
 while IFS=$'\t' read -r old_id new_id post_type; do
   [ "$post_type" = "attachment" ] || continue
   wp --path="$SITE_B_WP_PATH" search-replace \
@@ -570,7 +573,7 @@ while IFS=$'\t' read -r old_id new_id post_type; do
     --regex --precise --skip-columns=guid
 done < "$STATE_DIR/id-map.tsv"
 
-# Passe 2 : jeton sentinelle → new_id réel
+# Pass 2: sentinel token -> real new_id
 while IFS=$'\t' read -r old_id new_id post_type; do
   [ "$post_type" = "attachment" ] || continue
   wp --path="$SITE_B_WP_PATH" search-replace \
@@ -578,25 +581,25 @@ while IFS=$'\t' read -r old_id new_id post_type; do
 done < "$STATE_DIR/id-map.tsv"
 ```
 
-Les jetons sentinelles garantissent qu'aucune substitution de la passe 2 ne peut être
-re-matchée par une règle de la passe 1 restée à exécuter (impossible, les deux passes
-sont strictement séquentielles et disjointes par construction).
+The sentinel tokens guarantee that no pass-2 substitution can ever be re-matched by
+a pass-1 rule still waiting to run (impossible, since the two passes are strictly
+sequential and disjoint by construction).
 
 ### 9.2 `post_parent`
 
-`wordpress-importer` remappe déjà nativement `post_parent` (et le thumbnail féatured
-image) en interne pendant l'import, via sa propre table de correspondance construite
-pendant le run — **à condition que le post parent soit inclus dans le même import**
-(voir §11 « hiérarchies de pages profondes »). `verify` vérifie qu'aucun
-`post_parent` de B ne pointe vers un ID qui n'existe pas côté B (orphelin) ; en cas
-d'orphelin détecté, un remap explicite via `id-map.tsv` est proposé en correction
-manuelle (pas automatique — ce cas signale une erreur de sélection dans le manifest).
+`wordpress-importer` already natively remaps `post_parent` (and the featured-image
+thumbnail) internally during import, via its own correspondence table built during
+the run — **provided the parent post is included in the same import** (see §11,
+"deep page hierarchies"). `verify` checks that no `post_parent` on B points to an ID
+that doesn't exist on B (an orphan); if an orphan is found, an explicit remap via
+`id-map.tsv` is offered as a manual fix (not automatic — this case signals a
+manifest selection mistake).
 
 ### 9.3 `page_on_front` / `show_on_front`
 
-`page_on_front` sur A contient l'ID **de A** d'une page. Un simple `wp option update`
-copierait cet ID tel quel sur B — faux. Traité comme un remap dédié dans
-`core_wp_post_import` (hook du module `core-wp`, pas un cas générique du cœur) :
+`page_on_front` on A holds **A's** page ID. A plain `wp option update` would copy
+that ID as-is onto B — wrong. Handled as a dedicated remap in
+`core_wp_post_import` (the `core-wp` module's hook, not a generic core case):
 
 ```sh
 core_wp_post_import() {
@@ -608,10 +611,10 @@ core_wp_post_import() {
 }
 ```
 
-### 9.4 Search-replace de domaine A→B
+### 9.4 Domain search-replace, A→B
 
-Deux passes obligatoires (variante brute et variante JSON-échappée, Etch stocke des
-blobs JSON dans certaines options/postmeta) :
+Two mandatory passes (a plain variant and a JSON-escaped variant, since Etch stores
+some data as JSON blobs in certain options/postmeta):
 
 ```sh
 wp --path="$SITE_B_WP_PATH" search-replace 'https://a.example.com' 'https://b.example.com' \
@@ -620,58 +623,58 @@ wp --path="$SITE_B_WP_PATH" search-replace 'https:\/\/a.example.com' 'https:\/\/
   --skip-columns=guid --precise
 ```
 
-`--skip-columns=guid` : le `guid` WordPress n'est pas censé changer après création,
-laisser wp-cli/l'import gérer sa valeur nativement plutôt que le réécrire à la main.
+`--skip-columns=guid`: WordPress's `guid` isn't supposed to change after creation —
+let wp-cli/the import handle its value natively instead of rewriting it by hand.
 
-## 10. Harnais de test DDEV
+## 10. DDEV test harness
 
-`tests/integration/ddev-harness.sh` orchestre :
+`tests/integration/ddev-harness.sh` orchestrates:
 
-1. `ddev config` + `ddev start` pour deux projets jetables (site "A" et site "B"),
-   WP core installé via `wp core install`.
-2. **Seed A** (`fixtures/site-a-seed.sh`) : un mu-plugin jetable enregistre les CPTs
-   `etch_cfs`/`etch_cpts`/`etch_loops` (nécessaire pour que `--post_type=` de `wp
-   export` les reconnaisse), puis seed du contenu factice (`wp post create`) et des
-   options factices (`wp option update etch_settings '...' --format=json`) — **sans
-   licence Etch réelle**, uniquement la forme des données (CPTs + options),
-   suffisante pour tester la mécanique de migration.
-3. **Seed B** (`fixtures/site-b-fake-plugin/fake-plugin.php`) : faux plugin mu-plugin
-   déposé sur B, enregistre un CPT `fakebooking_reservation`, crée une table
-   `{$prefix}fakebooking_reservations` via `dbDelta`, seed quelques lignes + une
-   option `fakebooking_settings`.
-4. Snapshot checksums des données protégées de B (avant tout run sitegraft).
-5. Run complet : `sitegraft scan/plan/backup/graft/verify --profile ddev-test`
-   (le `plan` interactif est piloté en mode non-interactif via un manifest
-   pré-rempli passé en argument, pour automatiser le test).
-6. **Assertion centrale** : recalcul des checksums des données protégées de B,
-   comparaison byte-identique au snapshot de l'étape 4.
-7. Assertion secondaire : le contenu migré d'A est bien présent et rendu sur B.
-8. `sitegraft restore` puis nouvelle comparaison : B revient exactement à son état
-   pré-graft (design ET données protégées).
-9. `trap` de teardown : `ddev delete -O` sur les deux projets, qu'il y ait succès ou
-   échec — rien de persistant ne doit survivre à un run de test.
+1. `ddev config` + `ddev start` for two disposable projects (site "A" and site "B"),
+   WP core installed via `wp core install`.
+2. **Seed A** (`fixtures/site-a-seed.sh`): a throwaway mu-plugin registers the
+   `etch_cfs`/`etch_cpts`/`etch_loops` CPTs (needed so `wp export`'s
+   `--post_type=` recognizes them), then seeds fake content (`wp post create`) and
+   fake options (`wp option update etch_settings '...' --format=json`) — **with no
+   real Etch license**, only the shape of the data (CPTs + options), which is
+   enough to test the migration mechanics.
+3. **Seed B** (`fixtures/site-b-fake-plugin/fake-plugin.php`): a fake plugin
+   dropped onto B as an mu-plugin, registering a `fakebooking_reservation` CPT,
+   creating a `{$prefix}fakebooking_reservations` table via `dbDelta`, seeding a
+   few rows plus a `fakebooking_settings` option.
+4. Snapshots checksums of B's protected data (before any sitegraft run).
+5. Full run: `sitegraft scan/plan/backup/graft/verify --profile ddev-test`
+   (the interactive `plan` step is driven non-interactively via a pre-filled
+   manifest passed as an argument, to automate the test).
+6. **Central assertion**: recompute checksums of B's protected data, compare
+   byte-for-byte against step 4's snapshot.
+7. Secondary assertion: A's migrated content is present and rendered on B.
+8. `sitegraft restore`, then another comparison: B returns exactly to its
+   pre-graft state (both the design layer and the protected data).
+9. Teardown `trap`: `ddev delete -O` on both projects, whether the run succeeded or
+   failed — nothing persistent should survive a test run.
 
 ## 11. Edge cases
 
-| Cas | Comportement sitegraft |
-|-----|------------------------|
-| CPT avec référence d'ID interne en postmeta (ex. « produit lié ») | Hors remap générique du cœur — c'est le rôle du hook `<mod>_post_import` du module concerné (exemple complet en §3.4). |
-| Doublons de slugs entre contenu existant de B et contenu importé | WordPress gère nativement (suffixe `-2` automatique à l'insertion). `verify` diffe `post_name` A vs B post-import et **avertit** (pas un échec dur) si des slugs ont été renommés — signal pour vérifier les liens internes à la main. |
-| `page_on_front` / `show_on_front` | Remap dédié via `core_wp_post_import`, voir §9.3. |
-| Hiérarchies de pages profondes | `plan` **valide** que si un post_type hiérarchique (`page`) est sélectionné, TOUS ses ancêtres potentiels le sont aussi (même post_type, migration totale ou rien) — un import partiel d'une hiérarchie n'est pas un cas supporté en v1 (YAGNI : sitegraft migre des post_types entiers, pas des sous-arbres). |
-| Réimport idempotent | Chaque post importé par sitegraft porte `_sitegraft_source_id` (posé par le mu-plugin, §7). Avant tout import, `graft` liste et supprime (`wp post delete --force`) les posts des post_types sélectionnés portant cette meta d'un run précédent — un re-run ne duplique jamais. Distinct de l'étape `clean` (qui supprime le contenu **pré-existant original** de B, pas le contenu posé par sitegraft lui-même). |
+| Case | sitegraft behavior |
+|------|---------------------|
+| A CPT with an internal ID reference in postmeta (e.g. "related product") | Outside the core's generic remap — that's the job of the relevant module's `<mod>_post_import` hook (full example in §3.4). |
+| Slug collisions between B's existing content and the imported content | Handled natively by WordPress (automatic `-2` suffix on insert). `verify` diffs `post_name` A vs. post-import B and **warns** (not a hard failure) if any slugs were renamed — a signal to manually check internal links. |
+| `page_on_front` / `show_on_front` | Dedicated remap via `core_wp_post_import`, see §9.3. |
+| Deep page hierarchies | `plan` **validates** that if a hierarchical post_type (`page`) is selected, ALL of its potential ancestors are selected too (same post_type, all-or-nothing migration) — a partial hierarchy import isn't a supported case in v1 (YAGNI: sitegraft migrates whole post_types, not subtrees). |
+| Idempotent reimport | Every post imported by sitegraft carries `_sitegraft_source_id` (set by the mu-plugin, §7). Before any import, `graft` lists and deletes (`wp post delete --force`) any post of the selected post_types carrying this meta from a previous run — a rerun never duplicates content. Distinct from the `clean` step (which removes B's **original pre-existing** content, not content sitegraft placed itself). |
 
 ## 12. Self-review (2026-08-19)
 
-Passe de relecture faite par Rosalinde après rédaction complète :
-- **Placeholders/TBD** : aucun trouvé — toutes les commandes wp-cli, formats de
-  fichiers et exemples de code sont concrets et exécutables tels quels (une fois les
-  placeholders `example.com`/`user@host` remplacés par de vraies valeurs de profil).
-- **Contradictions internes** : none identifiée entre §6.4 (ordre médias avant WXR) et
-  §8 (comportement par défaut de `wp import`) — cohérents.
-- **Ambiguïté corrigée en cours de rédaction** : la distinction entre `clean`
-  (contenu pré-existant de B) et la purge d'idempotence (contenu posé par sitegraft
-  lui-même) n'était pas explicite dans le brief initial — clarifiée et documentée
-  séparément en §6.6 et §11 pour éviter toute confusion dans le plan d'implémentation.
-- **Risques** : consignés explicitement en §0.2 (R1-R4) plutôt que noyés dans le
-  texte, pour que Nat les fasse trancher par Marcel sans avoir à les extraire elle-même.
+Review pass done by Rosalinde after the full write-up:
+- **Placeholders/TBD**: none found — every wp-cli command, file format, and code
+  example is concrete and directly runnable (once the `example.com`/`user@host`
+  placeholders are swapped for real profile values).
+- **Internal contradictions**: none found between §6.4 (media before WXR ordering)
+  and §8 (`wp import`'s default behavior) — consistent.
+- **Ambiguity fixed during writing**: the distinction between `clean` (B's
+  pre-existing content) and idempotence pruning (content sitegraft placed itself)
+  wasn't explicit in the original brief — clarified and documented separately in
+  §6.6 and §11 to avoid any confusion in the implementation plan.
+- **Risks**: recorded explicitly in §0.2 (R1-R4) rather than buried in the prose, so
+  Nat can have Marcel rule on them without having to extract them herself.
