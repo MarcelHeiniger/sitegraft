@@ -95,7 +95,9 @@ site B (target, live, read)  ──┘
 ```
 
 sitegraft runs on a third machine (the "orchestrator" — Marcel's Mac, or any machine
-with the dependencies). It drives A and B via SSH+wp-cli (or `ddev wp` locally).
+with the dependencies). It drives A and B via SSH+wp-cli (or `ddev exec --raw
+-p <project> -- wp` locally — see §5.1 for why, verified against a real DDEV
+install during Step 1 implementation).
 Nothing is installed permanently on A or B — only a temporary mu-plugin touches B,
 for the duration of an import, and is then removed.
 
@@ -473,7 +475,7 @@ Validation rules (`lib/manifest.sh :: manifest_validate`):
 SITE_A_ALIAS="a"
 SITE_A_SSH_HOST="user@host-a.example.com"
 SITE_A_WP_PATH="/var/www/site-a/htdocs"
-SITE_A_WP_CMD="wp"                      # or "ddev wp" for a local DDEV site
+SITE_A_WP_CMD="wp"                      # or "ddev exec --raw -p <project> -- wp" for a local DDEV site — see note below
 SITE_A_URL="https://a.example.com"
 
 SITE_B_ALIAS="b"
@@ -485,6 +487,24 @@ SITE_B_URL="https://b.example.com"
 SITEGRAFT_STATE_DIR="${HOME}/.sitegraft/runs"
 SITEGRAFT_CREDS_FILE="${HOME}/.config/sitegraft/example.creds"
 ```
+
+**DDEV local sites — verified against a real install (v1.25.2) during Step 1
+implementation, corrected from an earlier draft that assumed `SITE_*_WP_CMD="ddev
+wp"`:** `ddev wp` is not a real command outside a project's own directory —
+`wp` only exists as a project-scoped custom command DDEV resolves from the
+current working directory, and `ddev --project <name> wp ...` is not valid
+syntax at all (`ddev` has no such flag). The correct wrapper is
+`ddev exec --raw -p <project> -- wp`, which runs from any directory. `--raw`
+is required, not optional: without it, `ddev exec` reparses the command
+through an inner shell before it reaches the container, which silently
+mangles any PHP `$variable` inside a `wp eval` snippet (bash expands it to
+empty before PHP ever sees it) — exactly what §14's custom-code-signal
+detection relies on. Because this command runs *inside* the container,
+`SITE_*_WP_PATH` must be the **container-internal** docroot (typically
+`/var/www/html` for a DDEV project configured with `--docroot=.`), never the
+orchestrator's host path — the host path doesn't exist inside the container,
+and `wp --path=<host-path>` fails wp-cli's "is this a WordPress install?"
+check.
 
 An empty `SITE_*_SSH_HOST` means "local site, driven directly through
 `SITE_*_WP_CMD` with no SSH" (the case of a local DDEV site on the orchestrator
@@ -516,7 +536,9 @@ file if it exists, otherwise triggers (b).
 ```sh
 wp --path="$WP_PATH" post-type list --format=json
 wp --path="$WP_PATH" option list --format=json          # full dump — filtered later per module
-wp --path="$WP_PATH" db tables --format=json --all-tables-with-prefix
+# `wp db tables` has no --format=json (only "list" or "csv", verified against a
+# real wp-cli install) — request the default list and build the JSON array with jq.
+wp --path="$WP_PATH" db tables --format=list --all-tables-with-prefix
 wp --path="$WP_PATH" plugin list --format=json           # helps with module detection
 ```
 ```sh
