@@ -542,7 +542,10 @@ Expected: PASS (3 tests)
 # my_plugin_name() { echo "My Plugin"; }
 
 # Required: does $1 (a scan-*.json path) show this plugin/domain present?
-# my_plugin_detect() { jq -e '.plugins[] | select(.slug == "my-plugin")' "$1" >/dev/null 2>&1; }
+# "name" matches wp-cli's own `plugin list` field (which is also the plugin's
+# real folder name) — the same field inventory_stack_diff resolves against
+# (design doc §3.2, §12).
+# my_plugin_detect() { jq -e '.plugins[] | select(.name == "my-plugin")' "$1" >/dev/null 2>&1; }
 
 # At least one of the three below must exist.
 # my_plugin_post_types() { printf 'my_cpt\n'; }
@@ -552,6 +555,14 @@ Expected: PASS (3 tests)
 
 # Optional: run after WXR import + generic remaps, for module-specific fixups.
 # my_plugin_post_import() { local state_dir="$1" id_map_tsv="$2" wp_cmd_b="$3"; }
+
+# Optional: this module's plugin is also a §12 stack-sync component (like etch
+# or acss) — one candidate slug per line, most-preferred/current first. A
+# plugin's real folder name can change across versions (see the ACSS v4 case,
+# design doc §3.4) — detection may match multiple candidate slugs; paths
+# always come from scan resolution, never from the module. Omit this function
+# entirely if the module isn't a stack-syncable plugin (most won't be).
+# my_plugin_stack_candidates() { printf 'my-plugin\nmy-plugin-legacy-slug\n'; }
 ```
 
 - [ ] **Step 6: Commit**
@@ -706,32 +717,51 @@ git commit -m "test(integration): add DDEV harness skeleton and fixtures (grown 
 - Test: `tests/unit/test_inventory.bats`
 
 **Interfaces:**
-- Consumes: `run_or_echo`, `log_info` (Task 1.1); `SITE_A_*`/`SITE_B_*` env vars (Task 1.2).
+- Consumes: `run_or_echo`, `log_info` (Task 1.1); `SITE_A_*`/`SITE_B_*` env vars
+  (Task 1.2); `SITEGRAFT_MODULES`, `module_has_fn`, `module_call` (Task 1.3) —
+  `inventory_stack_diff` depends on the module registry, so `modules_discover`
+  must have run before it's called (already true in `phase_plan`/`phase_graft`,
+  both of which source `lib/modules.sh` and call `modules_discover` early).
 - Produces: `wp_remote <alias> <wp-cli args...>` (dispatches to SSH+wp-cli or local
   `$SITE_*_WP_CMD` depending on whether `SITE_*_SSH_HOST` is set); `inventory_scan_site
   <alias> <out_json_path>` (writes the JSON shape consumed by `module_call <mod>
   detect <path>` and by `inventory_stack_diff` below — see design doc §6.1);
-  `inventory_stack_diff <scan_a_json> <scan_b_json>` (pure — returns a JSON object
-  keyed by `theme`/`etch`/`acss`, one entry per component where A and B differ,
-  each `{on_a, on_b}` with `on_b: null` meaning absent on B; components already
-  matching are simply omitted — design doc §12, Marcel's revision of review finding
-  B1: this is what lets `plan` offer to *copy* a missing/mismatched component
-  instead of only ever refusing); `inventory_stack_matches <scan_a_json>
-  <scan_b_json>` (exit 0/1 — a convenience wrapper: true iff `inventory_stack_diff`
-  is empty); `phase_scan` (the function `bin/sitegraft` dispatches to for the
-  `scan` phase).
+  `inventory_resolve_slug <scan_json> <candidates_newline_list>` (pure — returns
+  the first candidate actually present in that site's own `plugin list`, or
+  empty; **the only** place a candidate slug is ever turned into a "real" slug —
+  design doc §3.2's rule); `inventory_stack_diff <scan_a_json> <scan_b_json>`
+  (pure, but needs the module registry loaded — returns a JSON object keyed by
+  `theme` plus every module declaring `<mod>_stack_candidates` [`etch`, `acss`],
+  one entry per component where A's and B's *resolved* slug or version differ,
+  each `{slug_a, slug_b, version_a, version_b}` with `slug_b: null` meaning
+  absent on B; components already matching are omitted — design doc §12,
+  Marcel's revision of review finding B1, further amended for the case where
+  the resolved slug itself differs between sites, e.g. ACSS's v4 plugin-folder
+  rename, design doc §3.4); `inventory_stack_matches <scan_a_json> <scan_b_json>`
+  (exit 0/1 — a convenience wrapper: true iff `inventory_stack_diff` is empty);
+  `phase_scan` (the function `bin/sitegraft` dispatches to for the `scan` phase).
 
 - [ ] **Step 1: Write the failing test for `wp_remote` dispatch and `inventory_stack_diff`**
 
 This test only checks the *dispatch decision* (SSH vs local) and the pure
 stack-comparison logic, not a real wp-cli call — that is covered by the DDEV
-integration harness (step 5 below).
+integration harness (step 5 below). The stack-diff tests fabricate a throwaway
+module (never a real one from `modules/`) declaring `_stack_candidates`, the
+same isolation pattern Task 1.3's module-registry tests already use — real
+module files don't need to exist yet for this task's tests to be meaningful.
 
 ```bash
 # tests/unit/test_inventory.bats
 setup() {
   load '../../lib/core.sh'
+  load '../../lib/modules.sh'
   load '../../lib/inventory.sh'
+  export SITEGRAFT_MODULES_DIR="$BATS_TEST_TMPDIR/modules"
+  mkdir -p "$SITEGRAFT_MODULES_DIR"
+  cat > "$SITEGRAFT_MODULES_DIR/acss.sh" <<'EOF'
+acss_stack_candidates() { printf 'automatic-css\nacss-legacy-slug\n'; }
+EOF
+  modules_discover
 }
 
 @test "wp_remote builds an ssh command when SITE_A_SSH_HOST is set" {
@@ -754,29 +784,53 @@ setup() {
   [[ "$output" == *"ddev wp"* ]]
 }
 
-@test "inventory_stack_diff is empty when theme and Etch/ACSS versions are identical" {
+@test "inventory_resolve_slug returns the first candidate actually present, never an absent one" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  echo '{"plugins":[{"name":"acss-legacy-slug","version":"3.9"}]}' > "$scan"
+  run inventory_resolve_slug "$scan" "$(printf 'automatic-css\nacss-legacy-slug\n')"
+  [ "$output" = "acss-legacy-slug" ]
+}
+
+@test "inventory_resolve_slug returns empty when no candidate is present" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  echo '{"plugins":[]}' > "$scan"
+  run inventory_resolve_slug "$scan" "$(printf 'automatic-css\nacss-legacy-slug\n')"
+  [ -z "$output" ]
+}
+
+@test "inventory_stack_diff is empty when everything resolves the same on both sites" {
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
-  echo '{"active_theme":{"stylesheet":"etch-theme","version":"1.0"},"plugins":[{"name":"etch","version":"2.0"},{"name":"automatic-css","version":"3.0"}]}' > "$a"
-  echo '{"active_theme":{"stylesheet":"etch-theme","version":"1.0"},"plugins":[{"name":"etch","version":"2.0"},{"name":"automatic-css","version":"3.0"}]}' > "$b"
+  echo '{"active_theme":{"stylesheet":"etch-theme","version":"1.0"},"plugins":[{"name":"automatic-css","version":"4.1"}]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"etch-theme","version":"1.0"},"plugins":[{"name":"automatic-css","version":"4.1"}]}' > "$b"
   run inventory_stack_diff "$a" "$b"
   [ "$status" -eq 0 ]
   [ "$(echo "$output" | jq 'length')" = "0" ]
 }
 
-@test "inventory_stack_diff reports theme as a mismatch with both versions when they differ" {
+@test "inventory_stack_diff reports theme as a mismatch with both resolved values when they differ" {
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
-  echo '{"active_theme":{"stylesheet":"etch-theme"},"plugins":[]}' > "$a"
-  echo '{"active_theme":{"stylesheet":"divi"},"plugins":[]}' > "$b"
+  echo '{"active_theme":{"stylesheet":"etch-theme","version":"1.0"},"plugins":[]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"divi","version":"4.2"},"plugins":[]}' > "$b"
   run inventory_stack_diff "$a" "$b"
-  echo "$output" | jq -e '.theme.on_a == "etch-theme" and .theme.on_b == "divi"' >/dev/null
+  echo "$output" | jq -e '.theme.slug_a == "etch-theme" and .theme.slug_b == "divi"' >/dev/null
 }
 
-@test "inventory_stack_diff reports on_b as null when the component is absent on B (the common case, §13)" {
+@test "inventory_stack_diff reports slug_b as null when the component is absent on B (the common case, §13)" {
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
-  echo '{"active_theme":{"stylesheet":"t"},"plugins":[{"name":"etch","version":"2.0"}]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[{"name":"automatic-css","version":"4.1"}]}' > "$a"
   echo '{"active_theme":{"stylesheet":"t"},"plugins":[]}' > "$b"
   run inventory_stack_diff "$a" "$b"
-  echo "$output" | jq -e '.etch.on_a == "2.0" and .etch.on_b == null' >/dev/null
+  echo "$output" | jq -e '.acss.slug_a == "automatic-css" and .acss.slug_b == null' >/dev/null
+}
+
+@test "inventory_stack_diff resolves each site's own real slug — the ACSS v4 plugin-folder-rename case (design doc §3.4)" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[{"name":"automatic-css","version":"4.1"}]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[{"name":"acss-legacy-slug","version":"3.9"}]}' > "$b"
+  run inventory_stack_diff "$a" "$b"
+  echo "$output" | jq -e \
+    '.acss.slug_a == "automatic-css" and .acss.slug_b == "acss-legacy-slug" and .acss.version_a == "4.1" and .acss.version_b == "3.9"' \
+    >/dev/null
 }
 
 @test "inventory_stack_matches wraps inventory_stack_diff (true iff it's empty)" {
@@ -857,32 +911,73 @@ inventory_scan_site() {
     > "$out_json"
 }
 
-# design doc §12 (Marcel's revision of review finding B1): per-component diff
-# between A's and B's rendering stack (active theme, Etch, ACSS). Returns only
-# the components that differ, `on_b: null` meaning "absent on B" — this is
-# deliberately NOT just a pass/fail: B running a completely different stack
-# (Divi, Elementor, a classic theme, nothing at all) is the *normal* case per
-# §13, and `plan`/`graft` need to know exactly which component to offer copying,
-# not just that "something" doesn't match.
+# design doc §3.2's rule: the ONLY function allowed to turn a module's
+# candidate-slug list into a "this is the real slug" answer, by checking which
+# candidate the site's own `plugin list` actually contains. Preference order
+# from the module's list is respected — first match wins.
+inventory_resolve_slug() {
+  local scan_json="$1" candidates="$2"
+  local c
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    if jq -e --arg c "$c" '.plugins[]? | select(.name == $c)' "$scan_json" >/dev/null 2>&1; then
+      echo "$c"
+      return 0
+    fi
+  done <<< "$candidates"
+}
+
+# design doc §12 (Marcel's revision of review finding B1, amended for the ACSS
+# v4 plugin-folder-rename case, §3.4): per-component diff between A's and B's
+# rendering stack. `theme` is compared directly (a site has exactly one active
+# theme, no candidate-slug ambiguity). Every other component comes from a
+# module declaring <mod>_stack_candidates (§3.2) — never a slug hardcoded here.
+# A component's real slug can legitimately differ between A and B (that's
+# exactly what "absent on B" and "renamed folder on B" both look like); this
+# function resolves each site's own real slug independently via
+# inventory_resolve_slug before comparing, so it correctly flags a mismatch
+# even when both sites DO have the plugin, just under different real names.
 inventory_stack_diff() {
   local scan_a="$1" scan_b="$2"
-  local theme_a theme_b etch_a etch_b acss_a acss_b
+  local diff='{}'
+
+  local theme_a theme_b theme_ver_a theme_ver_b
   theme_a=$(jq -r '.active_theme.stylesheet // ""' "$scan_a")
   theme_b=$(jq -r '.active_theme.stylesheet // ""' "$scan_b")
-  etch_a=$(jq -r '.plugins[]? | select(.name=="etch") | .version // ""' "$scan_a")
-  etch_b=$(jq -r '.plugins[]? | select(.name=="etch") | .version // ""' "$scan_b")
-  acss_a=$(jq -r '.plugins[]? | select(.name=="automatic-css") | .version // ""' "$scan_a")
-  acss_b=$(jq -r '.plugins[]? | select(.name=="automatic-css") | .version // ""' "$scan_b")
+  theme_ver_a=$(jq -r '.active_theme.version // ""' "$scan_a")
+  theme_ver_b=$(jq -r '.active_theme.version // ""' "$scan_b")
+  if [ "$theme_a" != "$theme_b" ] || [ "$theme_ver_a" != "$theme_ver_b" ]; then
+    diff=$(echo "$diff" | jq \
+      --arg sa "$theme_a" --arg sb "$theme_b" --arg va "$theme_ver_a" --arg vb "$theme_ver_b" \
+      '.theme = {
+        slug_a: ($sa | if length > 0 then . else null end),
+        slug_b: ($sb | if length > 0 then . else null end),
+        version_a: $va, version_b: $vb
+      }')
+  fi
 
-  jq -n \
-    --arg theme_a "$theme_a" --arg theme_b "$theme_b" \
-    --arg etch_a "$etch_a" --arg etch_b "$etch_b" \
-    --arg acss_a "$acss_a" --arg acss_b "$acss_b" \
-    '{
-      theme: (if $theme_a != $theme_b then {on_a: $theme_a, on_b: ($theme_b | if length > 0 then . else null end)} else null end),
-      etch:  (if $etch_a  != $etch_b  then {on_a: $etch_a,  on_b: ($etch_b  | if length > 0 then . else null end)} else null end),
-      acss:  (if $acss_a  != $acss_b  then {on_a: $acss_a,  on_b: ($acss_b  | if length > 0 then . else null end)} else null end)
-    } | with_entries(select(.value != null))'
+  local mod
+  for mod in $SITEGRAFT_MODULES; do
+    module_has_fn "$mod" stack_candidates || continue
+    local candidates slug_a slug_b ver_a ver_b
+    candidates=$(module_call "$mod" stack_candidates)
+    slug_a=$(inventory_resolve_slug "$scan_a" "$candidates")
+    slug_b=$(inventory_resolve_slug "$scan_b" "$candidates")
+    ver_a=""; [ -n "$slug_a" ] && ver_a=$(jq -r --arg s "$slug_a" '.plugins[]? | select(.name==$s) | .version // ""' "$scan_a")
+    ver_b=""; [ -n "$slug_b" ] && ver_b=$(jq -r --arg s "$slug_b" '.plugins[]? | select(.name==$s) | .version // ""' "$scan_b")
+    if [ "$slug_a" = "$slug_b" ] && [ "$ver_a" = "$ver_b" ]; then
+      continue
+    fi
+    diff=$(echo "$diff" | jq \
+      --arg m "$mod" --arg sa "$slug_a" --arg sb "$slug_b" --arg va "$ver_a" --arg vb "$ver_b" \
+      '.[$m] = {
+        slug_a: ($sa | if length > 0 then . else null end),
+        slug_b: ($sb | if length > 0 then . else null end),
+        version_a: $va, version_b: $vb
+      }')
+  done
+
+  echo "$diff"
 }
 
 # Convenience wrapper for call sites that only need a yes/no answer.
@@ -918,7 +1013,7 @@ phase_scan() {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `bats tests/unit/test_inventory.bats`
-Expected: PASS (6 tests)
+Expected: PASS (9 tests)
 
 - [ ] **Step 5: Grow the DDEV harness — add the `scan` call and its assertions**
 
@@ -965,7 +1060,7 @@ Expected: `SCAN OK (SITEGRAFT_HARNESS_STOP_AFTER=scan)`.
 
 ```bash
 git add lib/inventory.sh tests/unit/test_inventory.bats tests/integration/ddev-harness.sh
-git commit -m "feat(scan): add site introspection (post_types, options, tables, plugins, active theme, classic menus) and wire the scan phase"
+git commit -m "feat(scan): add site introspection and module-driven stack-slug resolution (never hardcoded — design doc §3.2/§3.4) and wire the scan phase"
 ```
 
 ### Task 1.6: custom-code-on-B signals — child theme, `functions.php`, mu-plugins, snippet plugins
@@ -1301,7 +1396,7 @@ git commit -m "feat(manifest): add pure build/validate/freeze functions for the 
 - Consumes: `SITEGRAFT_MODULES`, `module_call` (Task 1.3); `manifest_new`,
   `manifest_add_migrate`, `manifest_add_protect` (Task 2.1).
 - Produces: `manifest_compute_unclaimed <manifest_json> <scan_b_json>` (adds a
-  `protect._unclaimed` bucket per design doc §3.5, pure function); `plan_defaults
+  `protect._unclaimed` bucket per design doc §3.6, pure function); `plan_defaults
   <scan_a_json> <scan_b_json>` (builds the default migrate/protect selections by
   calling `module_call <mod> detect` against both scans — not a pure function, reads
   from disk via the scan file paths, so tested separately from the pure manifest
@@ -1416,14 +1511,13 @@ plan_defaults() {
   manifest_compute_unclaimed "$manifest" "$(cat "$scan_b_json")"
 }
 
-# design doc §12/§13 (review findings B1/B2): plan only ever builds a manifest, it
-# never touches B, so these are warnings, never a hard failure — graft is where the
-# stack mismatch becomes a hard precondition (Task 4.1).
+# design doc §13 (review finding B2): plan only ever builds a manifest, it
+# never touches B, so this is a warning, never a hard failure. The rendering-
+# stack mismatch has its own, more useful per-component treatment now
+# (plan_resolve_stack, Task 2.4) instead of a generic warning here — offering
+# a fix beats restating that something doesn't match.
 plan_warn_scope_gaps() {
   local scan_a_json="$1" scan_b_json="$2"
-  if ! inventory_stack_matches "$scan_a_json" "$scan_b_json"; then
-    log_warn "B's rendering stack (active theme / Etch / ACSS version) does not match A's — the migrated content may render as nothing on B until the stack is aligned (design doc §12). 'graft' will refuse to run unless --allow-stack-mismatch is passed."
-  fi
   if jq -e '.classic_menus_detected == true' "$scan_a_json" >/dev/null 2>&1; then
     log_warn "A has classic nav menu(s) with items ($(jq -r '.classic_menu_names | join(", ")' "$scan_a_json")) — sitegraft v1 does not migrate classic menu assignments (design doc §13). Migrate them by hand or write a module."
   fi
@@ -1555,15 +1649,18 @@ deliberately its own task rather than folded into Task 2.2, since it is new
 scope Marcel asked for after that task was already written, not a revision of it.
 
 **Interfaces:**
-- Consumes: `inventory_stack_diff` (Task 1.5).
+- Consumes: `inventory_stack_diff` (Task 1.5) — and transitively the module
+  registry it resolves candidate slugs against (`modules_discover` already runs
+  earlier in `phase_plan`, Task 2.2/2.3, before this is ever called).
 - Produces: `plan_resolve_stack <manifest_json> <scan_a_json> <scan_b_json>`
   (interactive — for every component `inventory_stack_diff` reports, prompts and
   writes the decision into `manifest.stack.<component>` per design doc §4; prints
   the updated manifest JSON); `_plan_confirm <prompt>` / `_plan_confirm_strong
   <prompt>` (the two confirmation strengths §12 requires — a plain yes/no for
-  "absent on B," and a distinct, harder-to-trigger confirmation for "present on B
-  but a different version," which is a heavier decision since it overwrites
-  something that already exists).
+  "absent on B," and a distinct, harder-to-trigger confirmation whenever B
+  already has *something* under that module — same slug at a different
+  version, or a different resolved slug entirely (the ACSS v4 legacy-slug
+  case, §3.4) — a heavier decision than filling a plain absence).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1578,9 +1675,19 @@ would have asked the question.
 # tests/unit/test_plan_stack.bats
 setup() {
   load '../../lib/core.sh'
+  load '../../lib/modules.sh'
   load '../../lib/inventory.sh'
   load '../../lib/manifest.sh'
   load '../../lib/plan.sh'
+  export SITEGRAFT_MODULES_DIR="$BATS_TEST_TMPDIR/modules"
+  mkdir -p "$SITEGRAFT_MODULES_DIR"
+  cat > "$SITEGRAFT_MODULES_DIR/acss.sh" <<'EOF'
+acss_stack_candidates() { printf 'automatic-css\nacss-legacy-slug\n'; }
+EOF
+  cat > "$SITEGRAFT_MODULES_DIR/etch.sh" <<'EOF'
+etch_stack_candidates() { printf 'etch\n'; }
+EOF
+  modules_discover
 }
 
 @test "plan_resolve_stack records resolution=copy for an absent component when confirmed" {
@@ -1592,7 +1699,7 @@ setup() {
   local manifest; manifest=$(manifest_new "https://a.example.com" "https://b.example.com")
   run plan_resolve_stack "$manifest" "$a" "$b"
   [ "$status" -eq 0 ]
-  echo "$output" | jq -e '.stack.etch.resolution == "copy" and .stack.etch.on_b == null' >/dev/null
+  echo "$output" | jq -e '.stack.etch.resolution == "copy" and .stack.etch.slug_a == "etch" and .stack.etch.slug_b == null' >/dev/null
 }
 
 @test "plan_resolve_stack records resolution=skip for an absent component when declined" {
@@ -1605,15 +1712,15 @@ setup() {
   echo "$output" | jq -e '.stack.etch.resolution == "skip"' >/dev/null
 }
 
-@test "plan_resolve_stack uses the STRONG confirm (not the plain one) for a version mismatch, never auto-overwriting" {
+@test "plan_resolve_stack uses the STRONG confirm (not the plain one) when B already has the plugin under a different slug — the ACSS v4 case" {
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
-  echo '{"active_theme":{"stylesheet":"t"},"plugins":[{"name":"automatic-css","version":"3.0"}]}' > "$a"
-  echo '{"active_theme":{"stylesheet":"t"},"plugins":[{"name":"automatic-css","version":"2.5"}]}' > "$b"
-  _plan_confirm() { echo "PLAIN CONFIRM CALLED — WRONG PATH FOR A VERSION MISMATCH" >&2; return 1; }
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[{"name":"automatic-css","version":"4.1"}]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[{"name":"acss-legacy-slug","version":"3.9"}]}' > "$b"
+  _plan_confirm() { echo "PLAIN CONFIRM CALLED — WRONG PATH FOR A MISMATCH WHERE B ALREADY HAS SOMETHING" >&2; return 1; }
   _plan_confirm_strong() { return 0; } # simulate the operator explicitly accepting the overwrite
   local manifest; manifest=$(manifest_new "https://a.example.com" "https://b.example.com")
   run plan_resolve_stack "$manifest" "$a" "$b"
-  echo "$output" | jq -e '.stack.acss.resolution == "copy" and .stack.acss.on_b == "2.5"' >/dev/null
+  echo "$output" | jq -e '.stack.acss.resolution == "copy" and .stack.acss.slug_a == "automatic-css" and .stack.acss.slug_b == "acss-legacy-slug"' >/dev/null
   [[ "$output" != *"WRONG PATH"* ]]
 }
 
@@ -1661,37 +1768,47 @@ _plan_confirm_strong() {
   fi
 }
 
-# design doc §12 (Marcel's revision of review finding B1): for each stack
-# component inventory_stack_diff reports, offer to copy it from A, using a
-# stronger confirmation when B already has something installed. Never installs
-# from anywhere but A. Declining leaves the component "skip" — graft's hard
-# precondition (Task 4.1) picks it up from there.
+# design doc §12 (Marcel's revision of review finding B1, amended for the ACSS
+# v4 plugin-folder-rename case, §3.4): for each stack component
+# inventory_stack_diff reports, offer to copy A's resolved slug to B, using a
+# stronger confirmation whenever B already has *something* under that module
+# (slug_b not null) — whether that's literally the same slug at a different
+# version, or a different slug entirely (the legacy-vs-current ACSS case).
+# Never installs from anywhere but A. Declining leaves the component "skip" —
+# graft's hard precondition (Task 4.1) picks it up from there.
 plan_resolve_stack() {
   local manifest="$1" scan_a_json="$2" scan_b_json="$3"
   local diff; diff=$(inventory_stack_diff "$scan_a_json" "$scan_b_json")
   local component
   for component in $(echo "$diff" | jq -r 'keys[]'); do
-    local on_a on_b resolution
-    on_a=$(echo "$diff" | jq -r --arg c "$component" '.[$c].on_a')
-    on_b=$(echo "$diff" | jq -r --arg c "$component" '.[$c].on_b')
-    if [ "$on_b" = "null" ]; then
-      log_warn "${component} is on A (${on_a}) but not on B."
+    local slug_a slug_b ver_a ver_b resolution
+    slug_a=$(echo "$diff" | jq -r --arg c "$component" '.[$c].slug_a')
+    slug_b=$(echo "$diff" | jq -r --arg c "$component" '.[$c].slug_b')
+    ver_a=$(echo "$diff" | jq -r --arg c "$component" '.[$c].version_a')
+    ver_b=$(echo "$diff" | jq -r --arg c "$component" '.[$c].version_b')
+    if [ "$slug_b" = "null" ]; then
+      log_warn "${component} is on A (${slug_a} v${ver_a}) but not on B."
       if _plan_confirm "Copy ${component} from A and activate it on B?"; then
         resolution="copy"
       else
         resolution="skip"
       fi
     else
-      log_warn "B already has ${component} v${on_b} installed — A has v${on_a}. Copying A's version will REPLACE B's existing install."
-      if _plan_confirm_strong "Overwrite B's ${component} (v${on_b}) with A's version (v${on_a})?"; then
+      log_warn "B already has ${component} installed as '${slug_b}' (v${ver_b}) — A has it as '${slug_a}' (v${ver_a}). Copying A's version will add A's folder alongside B's existing one and activate it."
+      if _plan_confirm_strong "Copy A's ${component} ('${slug_a}' v${ver_a}) to B and activate it, leaving B's existing '${slug_b}' folder in place but inactive?"; then
         resolution="copy"
       else
         resolution="skip"
       fi
     fi
     manifest=$(echo "$manifest" | jq \
-      --arg c "$component" --arg a "$on_a" --arg b "$on_b" --arg r "$resolution" \
-      '.stack[$c] = {on_a: $a, on_b: (if $b == "null" then null else $b end), resolution: $r}')
+      --arg c "$component" --arg sa "$slug_a" --arg sb "$slug_b" --arg va "$ver_a" --arg vb "$ver_b" --arg r "$resolution" \
+      '.stack[$c] = {
+        slug_a: $sa,
+        slug_b: (if $sb == "null" then null else $sb end),
+        version_a: $va, version_b: $vb,
+        resolution: $r
+      }')
   done
   echo "$manifest"
 }
@@ -2263,15 +2380,18 @@ rendering-stack hard precondition).
 - Consumes: `SITE_A_*`/`SITE_B_*` (Task 1.2), `run_or_echo` (Task 1.1),
   `inventory_stack_diff` (Task 1.5).
 - Produces: `graft_sync_stack <run_dir> <manifest_json>` (design doc §6.4 step 0a,
-  Marcel's revision of finding B1 — for every `stack.<component>` in the manifest
-  with `"resolution": "copy"`, `rsync`s that component's plugin/theme directory
-  A → orchestrator → B, then activates it; the **only** place `graft` ever writes
-  to B's `wp-content/themes/` or `wp-content/plugins/`, and it only ever copies
-  from A); `graft_check_stack_precondition <scan_a_json> <scan_b_json>
-  <manifest_json> <allow_mismatch: 0|1>` (design doc §6.4 step 0b — **revised
-  signature**: takes the manifest now, so it never re-litigates a mismatch
-  `graft_sync_stack` already resolved; exit 0 if every remaining mismatch is
-  resolved or `allow_mismatch=1`, exit 1 otherwise); a two-hop media sync:
+  Marcel's revision of finding B1, further amended for the ACSS v4
+  plugin-folder-rename case (§3.4) — for every `stack.<component>` in the
+  manifest with `"resolution": "copy"`, `rsync`s **`slug_a`, read directly from
+  the manifest** (never a hardcoded name, never re-derived — design doc §3.2's
+  rule) A → orchestrator → B, then activates that same slug; the **only** place
+  `graft` ever writes to B's `wp-content/themes/` or `wp-content/plugins/`, and
+  it only ever copies from A); `graft_check_stack_precondition <scan_a_json>
+  <scan_b_json> <manifest_json> <allow_mismatch: 0|1>` (design doc §6.4 step 0b
+  — **revised signature**: takes the manifest now, so it never re-litigates a
+  mismatch `graft_sync_stack` already resolved; exit 0 if every remaining
+  mismatch is resolved or `allow_mismatch=1`, exit 1 otherwise); a two-hop
+  media sync:
   `graft_media_pull_cmd`/`graft_media_push_cmd` (pure functions returning argv for
   inspection) wrapping the real `graft_media_sync`, which routes A → orchestrator
   (into the run directory) → B instead of assuming A is directly reachable from B
@@ -2287,16 +2407,44 @@ setup() {
   load '../../lib/graft.sh'
 }
 
-@test "graft_sync_stack copies and activates every component marked resolution=copy" {
+@test "graft_sync_stack copies and activates every component marked resolution=copy, skipping resolution=skip" {
   local run_dir="$BATS_TEST_TMPDIR/run"
   mkdir -p "$run_dir"
-  local manifest='{"stack":{"etch":{"on_a":"2.0","on_b":null,"resolution":"copy"},"acss":{"on_a":"3.0","on_b":"2.5","resolution":"skip"}}}'
+  local manifest='{"stack":{"etch":{"slug_a":"etch","slug_b":null,"version_a":"2.0","version_b":null,"resolution":"copy"},"theme":{"slug_a":"etch-theme","slug_b":"divi","version_a":"1.0","version_b":"4.2","resolution":"skip"}}}'
   SITE_A_WP_PATH="/site-a"; SITE_B_WP_PATH="/site-b"; SITEGRAFT_DRY_RUN=1
   run graft_sync_stack "$run_dir" "$manifest"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"etch"* ]]
-  [[ "$output" == *"plugin activate"* ]]
-  [[ "$output" != *"acss"* ]]  # resolution=skip must never be touched here
+  [[ "$output" == *"wp-content/plugins/etch"* ]]
+  [[ "$output" == *"plugin activate etch"* ]]
+  [[ "$output" != *"divi"* ]]  # resolution=skip must never be touched here
+}
+
+@test "graft_sync_stack uses slug_a from the manifest, never a hardcoded name — the ACSS v4 legacy-slug case" {
+  # This is the exact bug Marcel caught: an earlier draft hardcoded "automatic-css"
+  # for the acss component instead of reading the manifest's resolved slug_a. A
+  # plugin under a legacy folder name on B must still be correctly synced FROM
+  # A's real (possibly different) resolved path — never guessed from the
+  # component's internal key name.
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"stack":{"acss":{"slug_a":"automatic-css","slug_b":"acss-legacy-slug","version_a":"4.1","version_b":"3.9","resolution":"copy"}}}'
+  SITE_A_WP_PATH="/site-a"; SITE_B_WP_PATH="/site-b"; SITEGRAFT_DRY_RUN=1
+  run graft_sync_stack "$run_dir" "$manifest"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"wp-content/plugins/automatic-css/"* ]]  # pulled FROM A under A's resolved slug
+  [[ "$output" == *"plugin activate automatic-css"* ]]      # activated under that same resolved slug
+  [[ "$output" != *"wp-content/plugins/acss/"* ]]            # never the internal component key "acss"
+  [[ "$output" != *"acss-legacy-slug"* ]]                    # never B's old slug either — A's is authoritative
+}
+
+@test "graft_sync_stack reads theme's slug_a the same way as any other component (no special-casing)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"stack":{"theme":{"slug_a":"etch-theme","slug_b":null,"version_a":"1.0","version_b":null,"resolution":"copy"}}}'
+  SITE_A_WP_PATH="/site-a"; SITE_B_WP_PATH="/site-b"; SITEGRAFT_DRY_RUN=1
+  run graft_sync_stack "$run_dir" "$manifest"
+  [[ "$output" == *"wp-content/themes/etch-theme"* ]]
+  [[ "$output" == *"theme activate etch-theme"* ]]
 }
 
 @test "graft_sync_stack does nothing when the manifest has no stack key" {
@@ -2329,7 +2477,7 @@ setup() {
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
   echo '{"active_theme":{"stylesheet":"theme-a"},"plugins":[]}' > "$a"
   echo '{"active_theme":{"stylesheet":"theme-b"},"plugins":[]}' > "$b"
-  local manifest='{"stack":{"theme":{"on_a":"theme-a","on_b":"theme-b","resolution":"skip"}}}'
+  local manifest='{"stack":{"theme":{"slug_a":"theme-a","slug_b":"theme-b","version_a":"1.0","version_b":"4.2","resolution":"skip"}}}'
   run graft_check_stack_precondition "$a" "$b" "$manifest" 0
   [ "$status" -eq 1 ]
   [[ "$output" == *"--allow-stack-mismatch"* ]]
@@ -2339,7 +2487,7 @@ setup() {
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
   echo '{"active_theme":{"stylesheet":"theme-a"},"plugins":[]}' > "$a"
   echo '{"active_theme":{"stylesheet":"theme-b"},"plugins":[]}' > "$b"
-  local manifest='{"stack":{"theme":{"on_a":"theme-a","on_b":"theme-b","resolution":"copy"}}}'
+  local manifest='{"stack":{"theme":{"slug_a":"theme-a","slug_b":"theme-b","version_a":"1.0","version_b":"4.2","resolution":"copy"}}}'
   run graft_check_stack_precondition "$a" "$b" "$manifest" 0
   [ "$status" -eq 0 ]
 }
@@ -2348,7 +2496,7 @@ setup() {
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
   echo '{"active_theme":{"stylesheet":"theme-a"},"plugins":[]}' > "$a"
   echo '{"active_theme":{"stylesheet":"theme-b"},"plugins":[]}' > "$b"
-  local manifest='{"stack":{"theme":{"on_a":"theme-a","on_b":"theme-b","resolution":"skip"}}}'
+  local manifest='{"stack":{"theme":{"slug_a":"theme-a","slug_b":"theme-b","version_a":"1.0","version_b":"4.2","resolution":"skip"}}}'
   run graft_check_stack_precondition "$a" "$b" "$manifest" 1
   [ "$status" -eq 0 ]
 }
@@ -2393,30 +2541,35 @@ Expected: FAIL — `lib/graft.sh` does not exist.
 # WXR export/import, mu-plugin mapping, ID/domain remaps, options migration,
 # optional clean/idempotence pruning. See design doc §6.4, §9, §12.
 
-# design doc §6.4 step 0a (Marcel's revision of finding B1): rsync every
-# manifest.stack.<component> marked resolution=copy from A to B, then activate
-# it. Never touches a component marked "skip" — those are graft_check_stack_
+# design doc §6.4 step 0a (Marcel's revision of finding B1, amended for the
+# ACSS v4 plugin-folder-rename case, §3.4): rsync every manifest.stack.
+# <component> marked resolution=copy from A to B, then activate it.
+#
+# CORRECTION (caught by Marcel, not by review or self-review): an earlier
+# draft of this function hardcoded slug="etch" / slug="automatic-css" per
+# component via a case statement. That's exactly the bug design doc §3.2's
+# rule exists to prevent: ACSS's plugin folder changed with the v4 release, so
+# a hardcoded "automatic-css" would silently do nothing (or worse, sync the
+# wrong path) against any pre-4.0 install. The ONLY source of truth for a
+# slug, here, is manifest.stack.<component>.slug_a — resolved once by `scan`
+# (via inventory_resolve_slug, Task 1.5) and frozen into the manifest by
+# `plan` (Task 2.4). This function never re-derives, guesses, or hardcodes a
+# slug for any component, theme included.
+#
+# Never touches a component marked "skip" — those are graft_check_stack_
 # precondition's problem below, not this function's.
 graft_sync_stack() {
   local run_dir="$1" manifest="$2"
   local component
   for component in $(echo "$manifest" | jq -r '.stack // {} | to_entries[] | select(.value.resolution == "copy") | .key'); do
     local slug rel_dir
-    case "$component" in
-      theme)
-        slug=$(echo "$manifest" | jq -r '.stack.theme.on_a')
-        rel_dir="wp-content/themes/${slug}"
-        ;;
-      etch)
-        slug="etch" # matches the "name" field inventory_stack_diff (Task 1.5) filters plugin list on
-        rel_dir="wp-content/plugins/${slug}"
-        ;;
-      acss)
-        slug="automatic-css" # NOT "acss" — the internal component key and the plugin's real slug differ
-        rel_dir="wp-content/plugins/${slug}"
-        ;;
-    esac
-    log_info "syncing stack component '${component}' (${slug}) from A to B (design doc §12)..."
+    slug=$(echo "$manifest" | jq -r --arg c "$component" '.stack[$c].slug_a')
+    if [ "$component" = "theme" ]; then
+      rel_dir="wp-content/themes/${slug}"
+    else
+      rel_dir="wp-content/plugins/${slug}"
+    fi
+    log_info "syncing stack component '${component}' (resolved slug: ${slug}) from A to B (design doc §12)..."
     local staging="${run_dir}/stack-staging/${component}"
     mkdir -p "$staging"
     # Only this one theme/plugin's own directory is synced — never the whole
@@ -2535,13 +2688,13 @@ add_action( 'wp_import_insert_term', function ( $term_id, $term, $original_id ) 
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `bats tests/unit/test_graft_mediastep.bats tests/unit/test_graft_precondition.bats tests/unit/test_graft_stack_sync.bats`
-Expected: PASS (9 tests)
+Expected: PASS (11 tests)
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add lib/graft.sh mu-plugins/sitegraft-id-mapper.php tests/unit/test_graft_mediastep.bats tests/unit/test_graft_precondition.bats tests/unit/test_graft_stack_sync.bats
-git commit -m "feat(graft): sync approved stack components from A, then enforce the precondition on what's left (design doc §12, B1 revision); route media sync through the orchestrator"
+git commit -m "feat(graft): sync stack components using only the manifest's resolved slug, never a hardcoded name (fixes the ACSS v4 legacy-slug bug); enforce the precondition on what's left; route media sync through the orchestrator"
 ```
 
 ### Task 4.2: WXR export/import (routed through the orchestrator), integrity-gate, `wordpress-importer` provisioning
