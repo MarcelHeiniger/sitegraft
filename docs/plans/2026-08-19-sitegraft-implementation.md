@@ -7,11 +7,14 @@ a freshly built WordPress site (A) onto a live target site (B) without touching 
 plugin data, in six independently shippable steps matching the phase model
 (`scan → plan → backup → graft → verify → restore`).
 
-**Architecture:** A thin `bin/sitegraft` dispatcher sources `lib/*.sh` (one file per
-phase plus shared helpers) and a convention-based module registry (`modules/*.sh`).
-Every phase writes to a per-run state directory on the orchestrating machine and is
-independently re-runnable. No code touches A or B outside of read-only `wp-cli`
-introspection until `backup.complete` exists for a run.
+**Architecture:** A thin `bin/sitegraft` dispatcher sources, per phase, only the
+`lib/*.sh` files that phase needs, plus a convention-based module registry
+(`modules/*.sh`). Every phase writes to a per-run state directory on the
+orchestrating machine and is independently re-runnable. No code touches A or B
+outside of read-only `wp-cli` introspection until `backup.complete` exists for a
+run. The DDEV integration harness is **not** a Step 5 afterthought: a minimal
+skeleton (two disposable sites, fixtures, teardown) ships in Step 1, and each
+later step grows its assertions — see the revision note below.
 
 **Tech Stack:** bash (3.2-compatible), `wp-cli`, `jq`, `rsync`, `ssh`, `gum`
 (fallback `fzf`, fallback plain prompts), `bats-core` for unit tests, `ddev` for the
@@ -22,6 +25,13 @@ from that document; every task below cites the design doc section it implements.
 Read the design doc first — this plan does not repeat its rationale, only its
 translation into buildable steps.
 
+**Revision note (2026-08-19):** this plan was rewritten after an independent review
+(`docs/plans/2026-08-19-sitegraft-plan-review.md`) found 7 concrete code defects
+(A1-A7) and 3 scope gaps (B1-B3) in the first draft, plus a sequencing
+recommendation (C1). Every finding is resolved in the tasks below; the review file
+records one resolution line per finding. If you read an older copy of this plan,
+discard it — this version supersedes it entirely, not incrementally.
+
 ## Global Constraints
 
 - Bash 3.2 compatible: no `declare -A`, no `mapfile`, no `${var,,}` (design doc ADR 0003).
@@ -30,6 +40,20 @@ translation into buildable steps.
   options via `wp option get/update --format=json`; plugin-owned tables via
   `wp db export --tables=`.
 - Never `sed`/raw regex on WordPress DB content — always `wp search-replace`.
+- **Every `wp search-replace` call is scoped with `--tables=` to content tables
+  only** (`{$prefix}posts,{$prefix}postmeta,{$prefix}options`) — never run
+  unscoped, which would reach into a protected plugin's own tables (design doc
+  §9.1/§9.4, review finding A6).
+- **Every checksum of protected data uses the exact same normalization function**
+  (`backup_checksum` in `lib/backup.sh`, strips `mysqldump`'s `-- ` comment lines
+  before hashing) in `backup`, `verify`, and the DDEV harness — never three
+  separate implementations (design doc §6.3, review finding A5).
+- Any file transfer whose source is A is routed **A → orchestrator → B**, through
+  the run directory, never assumed to flow directly between A and B (design doc
+  §6.4 step 1/step 5, review finding A4).
+- Any script generated as an artifact for later standalone use (`restore.sh`)
+  bakes in literal, resolved commands and never calls back into a sitegraft bash
+  function (design doc §6.3, review finding A2).
 - Every script starts with `set -euo pipefail` and a `mktemp -d` + `trap cleanup EXIT`
   pattern for any local temp directory it creates.
 - Every phase that writes must support `--dry-run` (wired incrementally per task,
@@ -41,12 +65,14 @@ translation into buildable steps.
 
 ---
 
-## Step 1 — Core + profiles/credentials + scan
+## Step 1 — Core + profiles/credentials + scan + DDEV harness skeleton
 
 Delivers: `sitegraft scan --profile <name>` runs end-to-end against two real (or
-DDEV) WordPress sites and produces valid `scan-a.json` / `scan-b.json`.
+DDEV) WordPress sites and produces valid `scan-a.json` / `scan-b.json` — plus a
+running DDEV harness skeleton that later steps grow instead of writing from
+scratch in Step 5 (design doc §10, review finding C1).
 
-### Task 1.1: `lib/core.sh` — logging, dependency checks, safe temp/trap, dry-run helper
+### Task 1.1: `lib/core.sh` + `bin/sitegraft` — logging, dependency checks, safe temp/trap, dry-run helper, per-phase dispatch
 
 **Files:**
 - Create: `lib/core.sh`
@@ -155,7 +181,14 @@ sitegraft_mktemp_dir() {
 Run: `bats tests/unit/test_core.bats`
 Expected: PASS (3 tests)
 
-- [ ] **Step 5: Write `bin/sitegraft` as a minimal dispatcher**
+- [ ] **Step 5: Write `bin/sitegraft` — dispatches to a phase, sourcing only what that phase needs**
+
+Each phase sources only the `lib/*.sh` files it actually depends on, rather than
+sourcing every file for every phase. This matters in practice: within Step 1, only
+`scan` can run at all (the other phases' `lib/*.sh` files don't exist yet), and a
+harness that tries `sitegraft scan` as soon as Step 1 lands (see Task 1.5) would
+fail on a missing `lib/manifest.sh` if the dispatcher tried to source it
+unconditionally for every phase.
 
 ```bash
 #!/usr/bin/env bash
@@ -187,16 +220,45 @@ main() {
   done
 
   case "$phase" in
-    scan|plan|backup|graft|verify|restore)
-      # shellcheck source=../lib/inventory.sh
+    scan)
+      . "${SITEGRAFT_ROOT}/lib/profile.sh"
+      . "${SITEGRAFT_ROOT}/lib/modules.sh"
+      . "${SITEGRAFT_ROOT}/lib/inventory.sh"
+      phase_scan "$@"
+      ;;
+    plan)
       . "${SITEGRAFT_ROOT}/lib/profile.sh"
       . "${SITEGRAFT_ROOT}/lib/modules.sh"
       . "${SITEGRAFT_ROOT}/lib/inventory.sh"
       . "${SITEGRAFT_ROOT}/lib/manifest.sh"
+      . "${SITEGRAFT_ROOT}/lib/plan.sh"
+      phase_plan "$@"
+      ;;
+    backup)
+      . "${SITEGRAFT_ROOT}/lib/profile.sh"
+      . "${SITEGRAFT_ROOT}/lib/inventory.sh"
+      . "${SITEGRAFT_ROOT}/lib/backup.sh"
+      phase_backup "$@"
+      ;;
+    graft)
+      . "${SITEGRAFT_ROOT}/lib/profile.sh"
+      . "${SITEGRAFT_ROOT}/lib/modules.sh"
+      . "${SITEGRAFT_ROOT}/lib/inventory.sh"
+      . "${SITEGRAFT_ROOT}/lib/graft.sh"
+      phase_graft "$@"
+      ;;
+    verify)
+      . "${SITEGRAFT_ROOT}/lib/profile.sh"
+      . "${SITEGRAFT_ROOT}/lib/inventory.sh"
       . "${SITEGRAFT_ROOT}/lib/backup.sh"
       . "${SITEGRAFT_ROOT}/lib/graft.sh"
       . "${SITEGRAFT_ROOT}/lib/verify.sh"
-      "phase_${phase}" "$@"
+      phase_verify "$@"
+      ;;
+    restore)
+      . "${SITEGRAFT_ROOT}/lib/profile.sh"
+      . "${SITEGRAFT_ROOT}/lib/backup.sh"
+      phase_restore "$@"
       ;;
     -h|--help|help) usage ;;
     *) log_error "unknown phase: ${phase}"; usage; exit 1 ;;
@@ -499,11 +561,148 @@ git add lib/modules.sh modules/_template.sh tests/unit/test_modules.bats
 git commit -m "feat(modules): add convention-based module discovery and registry"
 ```
 
-### Task 1.4: `lib/inventory.sh` + wired `scan` phase
+### Task 1.4: DDEV integration harness skeleton + fixtures
+
+**Files:**
+- Create: `tests/integration/fixtures/site-a-seed.sh`
+- Create: `tests/integration/fixtures/site-b-fake-plugin/fake-plugin.php`
+- Create: `tests/integration/ddev-harness.sh` (skeleton only — spins up, seeds, tears
+  down; every later step appends to this same file rather than writing a new one)
+- Test: none (integration-only; run manually, see step 4)
+
+**Interfaces:**
+- Produces: two disposable DDEV projects (`sitegraft-test-a`, `sitegraft-test-b`)
+  seeded with fixture content, torn down unconditionally on exit. This is the
+  review's finding C1: the harness exists from Step 1 onward instead of being
+  written as a single monolithic script in what used to be Step 5, so every later
+  task gets real integration feedback the moment it lands.
+
+- [ ] **Step 1: Write `tests/integration/fixtures/site-b-fake-plugin/fake-plugin.php`**
+
+A minimal fake plugin standing in for a real business plugin (design doc §10): its
+own CPT, its own SQL table via `dbDelta`, its own option — everything sitegraft
+must treat as protected data.
+
+```php
+<?php
+/**
+ * Plugin Name: sitegraft Test Fixture — Fake Booking Plugin
+ * Description: Simulates a live business plugin for the sitegraft DDEV integration
+ * harness. Not a real plugin — do not use outside tests/integration/.
+ */
+
+add_action( 'init', function () {
+    register_post_type( 'fakebooking_reservation', [
+        'label' => 'Fake Reservations',
+        'public' => false,
+        'show_ui' => true,
+        'supports' => [ 'title' ],
+    ] );
+} );
+
+register_activation_hook( __FILE__, function () {
+    global $wpdb;
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+    $table = $wpdb->prefix . 'fakebooking_reservations';
+    $charset_collate = $wpdb->get_charset_collate();
+    dbDelta( "CREATE TABLE {$table} (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        guest_name VARCHAR(191) NOT NULL,
+        room_number INT NOT NULL,
+        PRIMARY KEY (id)
+    ) {$charset_collate};" );
+
+    $wpdb->insert( $table, [ 'guest_name' => 'Example Guest', 'room_number' => 12 ] );
+    update_option( 'fakebooking_settings', [ 'currency' => 'CHF', 'tax_rate' => 3.7 ] );
+} );
+```
+
+- [ ] **Step 2: Write `tests/integration/fixtures/site-a-seed.sh`**
+
+Seeds a "Home" page and points `page_on_front`/`show_on_front` at it — this is
+what later lets the harness assert `page_on_front` was remapped to the **correct**
+page on B, not merely to *some* existing page (design doc §10, review finding B3).
+
+```bash
+#!/usr/bin/env bash
+# tests/integration/fixtures/site-a-seed.sh — seed fake Etch-shaped content on
+# site A for the DDEV harness. No real Etch license required — only the shape of
+# the data (CPTs + options) matters for testing sitegraft's mechanics.
+set -euo pipefail
+DDEV_PROJECT="$1" # e.g. sitegraft-test-a
+
+ddev --project "$DDEV_PROJECT" wp eval '
+  register_post_type("etch_cfs", ["label" => "Etch CFS", "public" => false, "show_ui" => true, "supports" => ["title","custom-fields"]]);
+  register_post_type("etch_cpts", ["label" => "Etch CPTs", "public" => false, "show_ui" => true, "supports" => ["title"]]);
+'
+HOME_ID=$(ddev --project "$DDEV_PROJECT" wp post create --post_type=page --post_title="Home" --post_status=publish --porcelain)
+ddev --project "$DDEV_PROJECT" wp post create --post_type=etch_cfs --post_title="Hero CFS" --post_status=publish
+ddev --project "$DDEV_PROJECT" wp option update show_on_front page
+ddev --project "$DDEV_PROJECT" wp option update page_on_front "$HOME_ID"
+ddev --project "$DDEV_PROJECT" wp option update etch_settings '{"theme_mode":"dark"}' --format=json
+ddev --project "$DDEV_PROJECT" wp option update etch_styles '{"primary_color":"#111"}' --format=json
+ddev --project "$DDEV_PROJECT" wp option update automatic_css_settings '{"spacing_scale":"1.25"}' --format=json
+```
+
+- [ ] **Step 3: Write the harness skeleton, `tests/integration/ddev-harness.sh`**
+
+No sitegraft phases run yet — that's added incrementally in Tasks 1.5, 3.2, and 5.2.
+`SITEGRAFT_HARNESS_STOP_AFTER` lets each later task validate its own increment
+without needing every later phase to exist yet.
+
+```bash
+#!/usr/bin/env bash
+# tests/integration/ddev-harness.sh — the real safety proof of sitegraft.
+# Grows incrementally as each phase lands (design doc §10, review finding C1).
+# Spins up two disposable DDEV sites, seeds fixtures, and tears down unconditionally.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PROJECT_A="sitegraft-test-a"
+PROJECT_B="sitegraft-test-b"
+
+cleanup() {
+  ddev delete -Oy "$PROJECT_A" >/dev/null 2>&1 || true
+  ddev delete -Oy "$PROJECT_B" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+echo "==> starting disposable DDEV sites"
+( mkdir -p "/tmp/${PROJECT_A}" && cd "/tmp/${PROJECT_A}" && ddev config --project-name="$PROJECT_A" --project-type=wordpress --docroot=. && ddev start && ddev wp core download && ddev wp core install --url=https://a.example.com --title=A --admin_user=admin --admin_password=admin --admin_email=admin@example.com )
+( mkdir -p "/tmp/${PROJECT_B}" && cd "/tmp/${PROJECT_B}" && ddev config --project-name="$PROJECT_B" --project-type=wordpress --docroot=. && ddev start && ddev wp core download && ddev wp core install --url=https://b.example.com --title=B --admin_user=admin --admin_password=admin --admin_email=admin@example.com )
+
+echo "==> seeding fixtures"
+"${ROOT}/tests/integration/fixtures/site-a-seed.sh" "$PROJECT_A"
+mkdir -p "/tmp/${PROJECT_B}/wp-content/mu-plugins"
+cp "${ROOT}/tests/integration/fixtures/site-b-fake-plugin/fake-plugin.php" "/tmp/${PROJECT_B}/wp-content/mu-plugins/fake-plugin.php"
+ddev --project "$PROJECT_B" wp eval 'do_action("activate_fake-plugin.php");' # dbDelta + seed via activation hook logic, invoked directly since it's an mu-plugin (no real activation event)
+
+if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "seed" ]; then
+  echo "SEED OK (SITEGRAFT_HARNESS_STOP_AFTER=seed)"
+  exit 0
+fi
+
+echo "no later phase wired yet — see Task 1.5 (scan), 3.2 (backup), 5.2 (graft/verify/restore)"
+```
+
+- [ ] **Step 4: Run the skeleton manually**
+
+Run: `SITEGRAFT_HARNESS_STOP_AFTER=seed tests/integration/ddev-harness.sh`
+Expected: `SEED OK (SITEGRAFT_HARNESS_STOP_AFTER=seed)`, then both DDEV projects
+torn down (`ddev list` shows neither afterward).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add tests/integration/
+git commit -m "test(integration): add DDEV harness skeleton and fixtures (grown incrementally per step)"
+```
+
+### Task 1.5: `lib/inventory.sh` + wired `scan` phase — post_types/options/tables/plugins, rendering stack, classic menus
 
 **Files:**
 - Create: `lib/inventory.sh`
-- Modify: `bin/sitegraft` (already sources it — no change needed if Task 1.1 step 5 used verbatim)
+- Modify: `tests/integration/ddev-harness.sh` (add the `scan` call + its assertions)
 - Test: `tests/unit/test_inventory.bats`
 
 **Interfaces:**
@@ -511,13 +710,17 @@ git commit -m "feat(modules): add convention-based module discovery and registry
 - Produces: `wp_remote <alias> <wp-cli args...>` (dispatches to SSH+wp-cli or local
   `$SITE_*_WP_CMD` depending on whether `SITE_*_SSH_HOST` is set); `inventory_scan_site
   <alias> <out_json_path>` (writes the JSON shape consumed by `module_call <mod>
-  detect <path>` — see design doc §6.1); `phase_scan` (the function `bin/sitegraft`
-  dispatches to for the `scan` phase).
+  detect <path>` and by `inventory_stack_matches` below — see design doc §6.1);
+  `inventory_stack_matches <scan_a_json> <scan_b_json>` (exit 0/1 — do A and B run
+  the same active theme and the same Etch/ACSS versions? design doc §12, review
+  finding B1); `phase_scan` (the function `bin/sitegraft` dispatches to for the
+  `scan` phase).
 
-- [ ] **Step 1: Write the failing test for `wp_remote` dispatch logic**
+- [ ] **Step 1: Write the failing test for `wp_remote` dispatch and `inventory_stack_matches`**
 
-This test only checks the *dispatch decision* (SSH vs local), not a real wp-cli call —
-that is covered by the DDEV integration harness in Step 5.
+This test only checks the *dispatch decision* (SSH vs local) and the pure
+stack-comparison logic, not a real wp-cli call — that is covered by the DDEV
+integration harness (step 5 below).
 
 ```bash
 # tests/unit/test_inventory.bats
@@ -544,6 +747,22 @@ setup() {
   run wp_remote b post-type list --format=json
   [[ "$output" != *"ssh"* ]]
   [[ "$output" == *"ddev wp"* ]]
+}
+
+@test "inventory_stack_matches passes when theme and Etch/ACSS versions are identical" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"active_theme":{"stylesheet":"etch-theme","version":"1.0"},"plugins":[{"name":"etch","version":"2.0"},{"name":"automatic-css","version":"3.0"}]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"etch-theme","version":"1.0"},"plugins":[{"name":"etch","version":"2.0"},{"name":"automatic-css","version":"3.0"}]}' > "$b"
+  run inventory_stack_matches "$a" "$b"
+  [ "$status" -eq 0 ]
+}
+
+@test "inventory_stack_matches fails when B's active theme differs from A's" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"active_theme":{"stylesheet":"etch-theme","version":"1.0"},"plugins":[]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"some-other-theme","version":"1.0"},"plugins":[]}' > "$b"
+  run inventory_stack_matches "$a" "$b"
+  [ "$status" -eq 1 ]
 }
 ```
 
@@ -579,22 +798,61 @@ wp_remote() {
   fi
 }
 
+# graft/verify also need B's live table prefix (design doc §9.1/§9.4, finding A6) —
+# defined here since it's a read-only wp-cli query, alongside the rest of scan.
+inventory_table_prefix() {
+  local alias_lc="$1"
+  wp_remote "$alias_lc" eval 'global $wpdb; echo $wpdb->prefix;'
+}
+
 inventory_scan_site() {
   local alias_lc="$1" out_json="$2"
   log_info "scanning site '${alias_lc}' -> ${out_json}"
-  local post_types options tables plugins
+  local post_types options tables plugins active_theme menus
   post_types=$(wp_remote "$alias_lc" post-type list --format=json)
   options=$(wp_remote "$alias_lc" option list --format=json)
   tables=$(wp_remote "$alias_lc" db tables --format=json --all-tables-with-prefix)
   plugins=$(wp_remote "$alias_lc" plugin list --format=json)
+  active_theme=$(wp_remote "$alias_lc" theme list --status=active --format=json | jq '.[0] // {}')
+  menus=$(wp_remote "$alias_lc" menu list --format=json 2>/dev/null || echo '[]')
 
   jq -n \
     --argjson post_types "$post_types" \
     --argjson options "$options" \
     --argjson tables "$tables" \
     --argjson plugins "$plugins" \
-    '{post_types: $post_types, options: $options, tables: $tables, plugins: $plugins}' \
+    --argjson active_theme "$active_theme" \
+    --argjson menus "$menus" \
+    '{
+      post_types: $post_types,
+      options: $options,
+      tables: $tables,
+      plugins: $plugins,
+      active_theme: $active_theme,
+      classic_menus_detected: ($menus | length > 0),
+      classic_menu_names: [$menus[]?.name]
+    }' \
     > "$out_json"
+}
+
+# design doc §12 (review finding B1): does B run the same design-layer stack as A?
+# Compared: active theme stylesheet, Etch version, ACSS version. A mismatch never
+# means content is corrupted — it means the grafted content would render as
+# nothing on B, which is exactly the failure mode this check exists to catch.
+inventory_stack_matches() {
+  local scan_a="$1" scan_b="$2"
+  local theme_a theme_b etch_a etch_b acss_a acss_b
+  theme_a=$(jq -r '.active_theme.stylesheet // "unknown"' "$scan_a")
+  theme_b=$(jq -r '.active_theme.stylesheet // "unknown"' "$scan_b")
+  [ "$theme_a" = "$theme_b" ] || return 1
+
+  etch_a=$(jq -r '.plugins[]? | select(.name=="etch") | .version // ""' "$scan_a")
+  etch_b=$(jq -r '.plugins[]? | select(.name=="etch") | .version // ""' "$scan_b")
+  [ "$etch_a" = "$etch_b" ] || return 1
+
+  acss_a=$(jq -r '.plugins[]? | select(.name=="automatic-css") | .version // ""' "$scan_a")
+  acss_b=$(jq -r '.plugins[]? | select(.name=="automatic-css") | .version // ""' "$scan_b")
+  [ "$acss_a" = "$acss_b" ]
 }
 
 phase_scan() {
@@ -612,6 +870,11 @@ phase_scan() {
   mkdir -p "$run_dir"
   inventory_scan_site a "${run_dir}/scan-a.json"
   inventory_scan_site b "${run_dir}/scan-b.json"
+
+  if jq -e '.classic_menus_detected == true' "${run_dir}/scan-a.json" >/dev/null 2>&1; then
+    log_warn "site A has classic nav menu(s) with items: $(jq -r '.classic_menu_names | join(", ")' "${run_dir}/scan-a.json") — sitegraft v1 does not migrate classic menu assignments (design doc §13)"
+  fi
+
   log_info "scan complete: ${run_dir}"
 }
 ```
@@ -619,27 +882,67 @@ phase_scan() {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `bats tests/unit/test_inventory.bats`
-Expected: PASS (2 tests)
+Expected: PASS (4 tests)
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Grow the DDEV harness — add the `scan` call and its assertions**
 
 ```bash
-git add lib/inventory.sh tests/unit/test_inventory.bats
-git commit -m "feat(scan): add read-only site introspection and wire the scan phase"
+# Insert into tests/integration/ddev-harness.sh, replacing the
+# "no later phase wired yet" placeholder line from Task 1.4:
+
+echo "==> writing a local sitegraft profile for this harness run"
+cat > "${ROOT}/profiles/ddev-test.conf" <<EOF
+SITE_A_ALIAS="a"
+SITE_A_WP_PATH="/tmp/${PROJECT_A}"
+SITE_A_WP_CMD="ddev --project ${PROJECT_A} wp"
+SITE_A_URL="https://a.example.com"
+SITE_B_ALIAS="b"
+SITE_B_WP_PATH="/tmp/${PROJECT_B}"
+SITE_B_WP_CMD="ddev --project ${PROJECT_B} wp"
+SITE_B_URL="https://b.example.com"
+SITEGRAFT_STATE_DIR="/tmp/sitegraft-ddev-test-runs"
+EOF
+
+echo "==> running scan"
+"${ROOT}/bin/sitegraft" scan --profile ddev-test
+RUN_DIR=$(ls -dt /tmp/sitegraft-ddev-test-runs/ddev-test-* | head -1)
+
+echo "==> asserting fixtures are visible in the scan output"
+jq -e '.post_types[] | select(.name=="etch_cfs")' "${RUN_DIR}/scan-a.json" >/dev/null
+jq -e '.post_types[] | select(.name=="fakebooking_reservation")' "${RUN_DIR}/scan-b.json" >/dev/null
+jq -e '.classic_menus_detected == false' "${RUN_DIR}/scan-a.json" >/dev/null
+
+if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "scan" ]; then
+  echo "SCAN OK (SITEGRAFT_HARNESS_STOP_AFTER=scan)"
+  exit 0
+fi
+
+echo "no later phase wired yet — see Task 3.2 (backup), 5.2 (graft/verify/restore)"
 ```
 
-**Step 1 done when:** `bats tests/unit/` all green, and (manual smoke test against two
-DDEV sites — the harness itself isn't built until Step 5, so this is a throwaway
-manual check) `bin/sitegraft scan --profile <ddev-test-profile>` produces two valid
-`scan-*.json` files.
+- [ ] **Step 6: Run the harness through the scan step**
+
+Run: `SITEGRAFT_HARNESS_STOP_AFTER=scan tests/integration/ddev-harness.sh`
+Expected: `SCAN OK (SITEGRAFT_HARNESS_STOP_AFTER=scan)`.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add lib/inventory.sh tests/unit/test_inventory.bats tests/integration/ddev-harness.sh
+git commit -m "feat(scan): add site introspection (post_types, options, tables, plugins, active theme, classic menus) and wire the scan phase"
+```
+
+**Step 1 done when:** `bats tests/unit/` is all green, and
+`SITEGRAFT_HARNESS_STOP_AFTER=scan tests/integration/ddev-harness.sh` prints
+`SCAN OK`.
 
 ---
 
 ## Step 2 — Manifest + interactive plan
 
 Delivers: `sitegraft plan --profile <name>` reads the two scan files, proposes
-defaults per module, lets the operator adjust selection, and writes a frozen,
-validated `manifest.json`.
+defaults per module, warns on a rendering-stack or classic-menu mismatch, lets the
+operator adjust selection, and writes a frozen, validated `manifest.json`.
 
 ### Task 2.1: `lib/manifest.sh` — read/write/validate
 
@@ -777,30 +1080,33 @@ git add lib/manifest.sh tests/unit/test_manifest.bats
 git commit -m "feat(manifest): add pure build/validate/freeze functions for the run manifest"
 ```
 
-### Task 2.2: `plan` phase logic — module dispatch, defaults, `_unclaimed` bucket
+### Task 2.2: `plan` phase logic — module dispatch, defaults, `_unclaimed` bucket, stack/classic-menu warnings
 
 **Files:**
 - Modify: `lib/manifest.sh` (add `manifest_compute_unclaimed`)
 - Create: `lib/plan.sh`
-- Modify: `bin/sitegraft` (add `. "${SITEGRAFT_ROOT}/lib/plan.sh"` to the phase sourcing list)
 - Test: `tests/unit/test_plan.bats`
 
 **Interfaces:**
 - Consumes: `SITEGRAFT_MODULES`, `module_call` (Task 1.3); `manifest_new`,
-  `manifest_add_migrate`, `manifest_add_protect` (Task 2.1).
+  `manifest_add_migrate`, `manifest_add_protect` (Task 2.1);
+  `inventory_stack_matches` (Task 1.5).
 - Produces: `manifest_compute_unclaimed <manifest_json> <scan_b_json>` (adds a
   `protect._unclaimed` bucket per design doc §3.5, pure function); `plan_defaults
   <scan_a_json> <scan_b_json>` (builds the default migrate/protect selections by
   calling `module_call <mod> detect` against both scans — not a pure function, reads
   from disk via the scan file paths, so tested separately from the pure manifest
-  functions above).
+  functions above); `plan_warn_scope_gaps <scan_a_json> <scan_b_json>` (design doc
+  §12/§13, review findings B1/B2 — loudly warns, never blocks, since `plan` only
+  ever builds a manifest, it doesn't touch B).
 
-- [ ] **Step 1: Write the failing test for `manifest_compute_unclaimed`**
+- [ ] **Step 1: Write the failing test for `manifest_compute_unclaimed` and `plan_warn_scope_gaps`**
 
 ```bash
 # tests/unit/test_plan.bats
 setup() {
   load '../../lib/core.sh'
+  load '../../lib/inventory.sh'
   load '../../lib/manifest.sh'
   load '../../lib/plan.sh'
 }
@@ -818,6 +1124,16 @@ setup() {
   local scan_b='{"post_types":[{"name":"booking"}]}'
   run manifest_compute_unclaimed "$manifest" "$scan_b"
   echo "$output" | jq -e '.protect._unclaimed.post_types == []' >/dev/null
+}
+
+@test "plan_warn_scope_gaps warns on a stack mismatch and on classic menus, but always exits 0" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"active_theme":{"stylesheet":"theme-a"},"plugins":[],"classic_menus_detected":true,"classic_menu_names":["Main Menu"]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"theme-b"},"plugins":[]}' > "$b"
+  run plan_warn_scope_gaps "$a" "$b"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"stack"* ]]
+  [[ "$output" == *"Main Menu"* ]]
 }
 ```
 
@@ -848,7 +1164,8 @@ manifest_compute_unclaimed() {
 ```bash
 #!/usr/bin/env bash
 # lib/plan.sh — phase: plan. Builds default selections from module detection,
-# drives interactive adjustment (Task 2.3), freezes the manifest.
+# warns on scope gaps (design doc §12/§13), drives interactive adjustment
+# (Task 2.3), freezes the manifest.
 
 plan_defaults() {
   local scan_a_json="$1" scan_b_json="$2"
@@ -875,18 +1192,31 @@ plan_defaults() {
 
   manifest_compute_unclaimed "$manifest" "$(cat "$scan_b_json")"
 }
+
+# design doc §12/§13 (review findings B1/B2): plan only ever builds a manifest, it
+# never touches B, so these are warnings, never a hard failure — graft is where the
+# stack mismatch becomes a hard precondition (Task 4.1).
+plan_warn_scope_gaps() {
+  local scan_a_json="$1" scan_b_json="$2"
+  if ! inventory_stack_matches "$scan_a_json" "$scan_b_json"; then
+    log_warn "B's rendering stack (active theme / Etch / ACSS version) does not match A's — the migrated content may render as nothing on B until the stack is aligned (design doc §12). 'graft' will refuse to run unless --allow-stack-mismatch is passed."
+  fi
+  if jq -e '.classic_menus_detected == true' "$scan_a_json" >/dev/null 2>&1; then
+    log_warn "A has classic nav menu(s) with items ($(jq -r '.classic_menu_names | join(", ")' "$scan_a_json")) — sitegraft v1 does not migrate classic menu assignments (design doc §13). Migrate them by hand or write a module."
+  fi
+}
 ```
 
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `bats tests/unit/test_plan.bats`
-Expected: PASS (2 tests)
+Expected: PASS (3 tests)
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add lib/manifest.sh lib/plan.sh tests/unit/test_plan.bats
-git commit -m "feat(plan): compute default migrate/protect selections and default-deny bucket"
+git commit -m "feat(plan): compute default migrate/protect selections, default-deny bucket, and scope-gap warnings"
 ```
 
 ### Task 2.3: interactive selection (`gum`/`fzf`/plain fallback) + `phase_plan`
@@ -894,10 +1224,10 @@ git commit -m "feat(plan): compute default migrate/protect selections and defaul
 **Files:**
 - Modify: `lib/plan.sh` (add `plan_select_interactive`, `phase_plan`)
 - Test: manual (interactive UI is not unit-testable — covered end-to-end by the
-  DDEV harness in Step 5 using a pre-filled, non-interactive manifest)
+  DDEV harness, Task 3.2 onward, using a pre-filled, non-interactive manifest)
 
 **Interfaces:**
-- Consumes: `plan_defaults` (Task 2.2), `manifest_freeze` (Task 2.1).
+- Consumes: `plan_defaults`, `plan_warn_scope_gaps` (Task 2.2), `manifest_freeze` (Task 2.1).
 - Produces: `plan_select_interactive <manifest_json>` (prints the adjusted manifest
   JSON — presents every `migrate`/`protect` post_type and option_key as a toggle via
   `gum choose --no-limit`, falls back to `fzf -m`, falls back to a numbered prompt
@@ -936,8 +1266,8 @@ plan_select_interactive() {
   # spacebar away from being lifted).
   echo "$manifest" | jq -r '.migrate | to_entries[] | .key as $m | .value.post_types[]? | "\($m): \(.)"'
   # Full interactive wiring (mapping choices back into the manifest JSON) is a
-  # manual-QA item, not unit-testable — verified against the DDEV harness (Step 5)
-  # via a non-interactive manifest path (SITEGRAFT_MANIFEST_PREFILLED=<path>).
+  # manual-QA item, not unit-testable — verified against the DDEV harness (Task
+  # 3.2 onward) via a non-interactive manifest path (SITEGRAFT_MANIFEST_PREFILLED=<path>).
   echo "$manifest"
 }
 
@@ -956,6 +1286,8 @@ phase_plan() {
   [ -n "$run_dir" ] || { log_error "no scan run found for profile ${profile} — run 'sitegraft scan' first"; return 1; }
 
   modules_discover
+  plan_warn_scope_gaps "${run_dir}/scan-a.json" "${run_dir}/scan-b.json"
+
   local manifest
   manifest=$(plan_defaults "${run_dir}/scan-a.json" "${run_dir}/scan-b.json")
 
@@ -973,42 +1305,50 @@ phase_plan() {
 
 - [ ] **Step 2: Manual smoke test**
 
-Run against a DDEV pair once Step 5's fixtures exist (forward reference — acceptable
-here since interactive UI genuinely cannot be unit tested; tracked as a TODO comment
-in the file until Step 5 lands): `bin/sitegraft plan --profile ddev-test`, confirm a
-`manifest.json` is written and `jq -e '.frozen == true'` on it succeeds.
+Run against the DDEV harness pair once Task 3.2's fixtures/manifest exist (forward
+reference — acceptable here since interactive UI genuinely cannot be unit tested):
+`bin/sitegraft plan --profile ddev-test`, confirm a `manifest.json` is written and
+`jq -e '.frozen == true'` on it succeeds.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add lib/plan.sh bin/sitegraft
-git commit -m "feat(plan): wire interactive selection (gum/fzf/plain fallback) and freeze the manifest"
+git add lib/plan.sh
+git commit -m "feat(plan): wire interactive selection (gum/fzf/plain fallback), scope-gap warnings, and freeze the manifest"
 ```
 
 ---
 
 ## Step 3 — Backup + restore
 
-Delivers: `sitegraft backup --profile <name>` produces a full DB+files backup of B on
-the orchestrator plus a working `restore.sh`; `sitegraft restore` rolls B back.
+Delivers: `sitegraft backup --profile <name>` produces a full DB **and files**
+backup of B on the orchestrator plus a genuinely self-contained `restore.sh`;
+`sitegraft restore` rolls B back completely, including its files. Resolves review
+findings A2 (restore.sh self-containment), A3 (missing wp-content backup), and A5
+(unstable checksums).
 
-### Task 3.1: `lib/backup.sh` — DB export, wp-content archive, checksums
+### Task 3.1: `lib/backup.sh` — DB export, wp-content archive, normalized checksums, literal `restore.sh`
 
 **Files:**
 - Create: `lib/backup.sh`
 - Test: `tests/unit/test_backup.bats`
 
 **Interfaces:**
-- Consumes: `wp_remote` (Task 1.4), `run_or_echo` (Task 1.1).
-- Produces: `backup_checksum_protected <manifest_json> <scan_b_json>` (pure-ish
-  function taking a JSON blob of already-fetched protected data instead of hitting
-  the network itself, so it stays unit-testable — see step 1); `phase_backup`.
+- Consumes: `wp_remote`, `inventory_table_prefix` (Task 1.5), `run_or_echo` (Task 1.1).
+- Produces: `backup_checksum <content>` (pure function — sha256 of `<content>` with
+  every `mysqldump`-style `-- ` comment line stripped first, so pre/post-graft
+  checksums of identical data are stable regardless of dump timestamps — design doc
+  §6.3, review finding A5; this exact function is reused, unmodified, by `verify`
+  and by the DDEV harness, so the three call sites can never drift);
+  `backup_wp_cmd_literal <alias>` (prints the literal, resolved ssh/wp-cli command
+  prefix for `<alias>` — e.g. `ssh user@host "wp --path=/var/www/site"` or
+  `wp --path=/var/www/site` — with no reference to any sitegraft function, for
+  baking into `restore.sh`); `phase_backup`.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
-`backup_checksum_protected` is deliberately factored to take pre-fetched data as
-input (a map of `table/option name -> content string`) rather than calling `wp`
-itself, so the checksum logic is testable without a live site.
+`backup_checksum`'s normalization is the crux of finding A5 — test it directly
+against a fabricated mysqldump-shaped string with a fake timestamp comment.
 
 ```bash
 # tests/unit/test_backup.bats
@@ -1031,6 +1371,36 @@ setup() {
   run backup_checksum "hello world!"
   [ "$output" != "$a" ]
 }
+
+@test "backup_checksum ignores mysqldump comment lines (timestamp instability, finding A5)" {
+  local dump1="INSERT INTO t VALUES (1);
+-- Dump completed on 2026-08-19 10:00:00"
+  local dump2="INSERT INTO t VALUES (1);
+-- Dump completed on 2026-08-19 10:00:07"
+  run backup_checksum "$dump1"
+  local sum1="$output"
+  run backup_checksum "$dump2"
+  [ "$output" = "$sum1" ]
+}
+
+@test "backup_wp_cmd_literal builds a literal ssh-wrapped command for a remote site" {
+  SITE_B_SSH_HOST="user@host-b.example.com"
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="wp"
+  run backup_wp_cmd_literal b
+  [[ "$output" == *"ssh"* ]]
+  [[ "$output" == *"user@host-b.example.com"* ]]
+  [[ "$output" != *"wp_remote"* ]]
+}
+
+@test "backup_wp_cmd_literal builds a plain local command with no ssh for a local site" {
+  unset SITE_B_SSH_HOST
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="ddev wp"
+  run backup_wp_cmd_literal b
+  [[ "$output" != *"ssh"* ]]
+  [[ "$output" == *"ddev wp"* ]]
+}
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1043,14 +1413,62 @@ Expected: FAIL — `lib/backup.sh` does not exist.
 ```bash
 #!/usr/bin/env bash
 # lib/backup.sh — phase: backup. Full DB + wp-content export of B, pulled to the
-# orchestrator, plus checksum snapshot of protected data and a generated restore.sh.
+# orchestrator, plus a normalized checksum snapshot of protected data and a
+# genuinely self-contained restore.sh (design doc §6.3; review findings A2, A3, A5).
 
+# Strips every mysqldump "-- " comment line (including the "Dump completed on ..."
+# timestamp) before hashing, so two exports of byte-identical data always produce
+# the same checksum. Used identically by backup, verify, and the DDEV harness.
 backup_checksum() {
-  printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+  printf '%s' "$1" | grep -v '^-- ' | shasum -a 256 | awk '{print $1}'
+}
+
+# Prints a literal command prefix for <alias> with no reference to any sitegraft
+# function — safe to bake into a generated script that must run standalone.
+backup_wp_cmd_literal() {
+  local alias_lc="$1"
+  local alias_uc; alias_uc=$(printf '%s' "$alias_lc" | tr '[:lower:]' '[:upper:]')
+  local host_var="SITE_${alias_uc}_SSH_HOST"
+  local path_var="SITE_${alias_uc}_WP_PATH"
+  local cmd_var="SITE_${alias_uc}_WP_CMD"
+  local host="${!host_var:-}"
+  local path="${!path_var:?missing ${path_var}}"
+  local wp_cmd="${!cmd_var:-wp}"
+
+  if [ -n "$host" ]; then
+    printf 'ssh %s "%s --path=%s"' "$host" "$wp_cmd" "$path"
+  else
+    printf '%s --path=%s' "$wp_cmd" "$path"
+  fi
+}
+
+backup_db_export() {
+  local run_dir="$1"
+  log_info "exporting B database..."
+  mkdir -p "${run_dir}/backup"
+  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
+    run_or_echo bash -c "ssh '${SITE_B_SSH_HOST}' \"${SITE_B_WP_CMD} --path='${SITE_B_WP_PATH}' db export - --add-drop-table\" | gzip > '${run_dir}/backup/b-db.sql.gz'"
+  else
+    run_or_echo bash -c "${SITE_B_WP_CMD} --path='${SITE_B_WP_PATH}' db export - --add-drop-table | gzip > '${run_dir}/backup/b-db.sql.gz'"
+  fi
+}
+
+# design doc §6.3 / review finding A3: without this, restore.sh can never return
+# B's files (media uploaded by graft, any theme/plugin file changes) to their
+# pre-graft state — only the database.
+backup_wp_content() {
+  local run_dir="$1"
+  log_info "archiving B wp-content..."
+  mkdir -p "${run_dir}/backup/b-wp-content"
+  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
+    run_or_echo rsync -avz "${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/wp-content/" "${run_dir}/backup/b-wp-content/"
+  else
+    run_or_echo rsync -avz "${SITE_B_WP_PATH}/wp-content/" "${run_dir}/backup/b-wp-content/"
+  fi
 }
 
 phase_backup() {
-  local profile=""
+  local profile="" run_dir=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --profile) profile="$2"; shift 2 ;;
@@ -1066,13 +1484,11 @@ phase_backup() {
     return 1
   }
 
-  mkdir -p "${run_dir}/backup"
-  log_info "exporting B database..."
-  run_or_echo bash -c "wp_remote b db export - --add-drop-table | gzip > '${run_dir}/backup/b-db.sql.gz'"
-  log_info "archiving B wp-content..."
-  run_or_echo bash -c "wp_remote b eval 'echo WP_CONTENT_DIR;' > '${run_dir}/backup/.wp-content-path'"
+  backup_db_export "$run_dir"
+  backup_wp_content "$run_dir"
 
-  # Checksum the protected buckets declared in the manifest (design doc §6.3).
+  # Checksum the protected buckets declared in the manifest (design doc §6.3),
+  # using the exact same normalized function verify and the harness will use later.
   local manifest checksums='{}'
   manifest=$(cat "${run_dir}/manifest.json")
   local mod
@@ -1090,16 +1506,34 @@ phase_backup() {
   log_info "backup complete: ${run_dir}/backup.complete"
 }
 
+# design doc §6.3 / review finding A2: every command below is resolved and baked in
+# literally at generation time. restore.sh never sources any sitegraft lib file and
+# never calls a sitegraft function — it needs only ssh, rsync, and gzip to run.
 backup_generate_restore_script() {
   local run_dir="$1"
+  local wp_cmd_b restore_db_cmd restore_wp_content_cmd
+  wp_cmd_b="$(backup_wp_cmd_literal b)"
+
+  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
+    restore_db_cmd="gunzip -c '${run_dir}/backup/b-db.sql.gz' | ssh '${SITE_B_SSH_HOST}' \"${SITE_B_WP_CMD} --path='${SITE_B_WP_PATH}' db import -\""
+    restore_wp_content_cmd="ssh '${SITE_B_SSH_HOST}' \"mkdir -p '${SITE_B_WP_PATH}/wp-content'\" && rsync -avz --delete '${run_dir}/backup/b-wp-content/' '${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/wp-content/'"
+  else
+    restore_db_cmd="gunzip -c '${run_dir}/backup/b-db.sql.gz' | ${SITE_B_WP_CMD} --path='${SITE_B_WP_PATH}' db import -"
+    restore_wp_content_cmd="rsync -avz --delete '${run_dir}/backup/b-wp-content/' '${SITE_B_WP_PATH}/wp-content/'"
+  fi
+
   cat > "${run_dir}/restore.sh" <<EOF
 #!/usr/bin/env bash
 # Generated by 'sitegraft backup' for run: ${run_dir}
-# Restores site B to the state captured in this run's backup/ directory.
+# Self-contained: every command below is a literal, baked-in ssh/rsync/wp-cli
+# invocation (wp-cli literal prefix: ${wp_cmd_b}). This script never calls a
+# sitegraft function and never sources a sitegraft lib file — it runs standalone
+# with nothing but ssh, rsync, and gzip.
 set -euo pipefail
-RUN_DIR="${run_dir}"
-echo "Restoring B database from \${RUN_DIR}/backup/b-db.sql.gz ..."
-gunzip -c "\${RUN_DIR}/backup/b-db.sql.gz" | wp_remote b db import -
+echo "Restoring B wp-content from ${run_dir}/backup/b-wp-content/ ..."
+${restore_wp_content_cmd}
+echo "Restoring B database from ${run_dir}/backup/b-db.sql.gz ..."
+${restore_db_cmd}
 echo "Restore complete."
 EOF
   chmod +x "${run_dir}/restore.sh"
@@ -1109,27 +1543,30 @@ EOF
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `bats tests/unit/test_backup.bats`
-Expected: PASS (2 tests)
+Expected: PASS (5 tests)
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add lib/backup.sh tests/unit/test_backup.bats
-git commit -m "feat(backup): export B database, checksum protected data, generate restore.sh"
+git commit -m "feat(backup): export B database and wp-content, normalize checksums, generate a literal self-contained restore.sh"
 ```
 
-### Task 3.2: `restore` phase with pre-restore safety backup
+### Task 3.2: `restore` phase with pre-restore safety backup + grow the DDEV harness through `backup`
 
 **Files:**
 - Modify: `lib/backup.sh` (add `phase_restore`)
-- Test: covered by DDEV integration harness (Step 5) — restoring a real site is not
+- Modify: `tests/integration/ddev-harness.sh` (add the `backup` call + its assertions)
+- Test: covered by DDEV integration harness — restoring a real site is not
   meaningfully unit-testable; the function is a thin orchestration wrapper around
   already-tested pieces (`backup_generate_restore_script`'s output, `gum confirm`).
 
 **Interfaces:**
-- Consumes: `run_or_echo`, `log_info`/`log_warn` (Task 1.1).
+- Consumes: `run_or_echo`, `log_info`/`log_warn` (Task 1.1); `backup_checksum`
+  (Task 3.1).
 - Produces: `phase_restore` (the function `bin/sitegraft` dispatches to for the
-  `restore` phase).
+  `restore` phase); a DDEV harness that now runs `scan → plan → backup` and asserts
+  the backup is complete and checksum-stable (design doc §10, review finding C1).
 
 - [ ] **Step 1: Add `phase_restore` to `lib/backup.sh`**
 
@@ -1155,18 +1592,26 @@ phase_restore() {
 
   if [ "$yes" -ne 1 ]; then
     if command -v gum >/dev/null 2>&1; then
-      gum confirm "Restore B from ${run_dir}? This overwrites B's current database." || return 1
+      gum confirm "Restore B from ${run_dir}? This overwrites B's current database and wp-content." || return 1
     else
-      read -r -p "Restore B from ${run_dir}? This overwrites B's current database. [y/N] " ans
+      read -r -p "Restore B from ${run_dir}? This overwrites B's current database and wp-content. [y/N] " ans
       [ "${ans:-n}" = "y" ] || return 1
     fi
   fi
 
-  # Restoring is itself made reversible: snapshot B's current state first.
+  # Restoring is itself made reversible: snapshot B's current state first. Uses
+  # the same literal-command pattern as backup_db_export (Task 3.1) — never
+  # `wp_remote` inside a `bash -c "..."` string, since that spawns a fresh shell
+  # where the function isn't defined (this was the same class of bug as finding
+  # A2, just in a second spot the original review didn't call out by name).
   local pre_restore_dir="${run_dir}/pre-restore-$(date +%Y%m%dT%H%M%S)"
   mkdir -p "$pre_restore_dir"
   log_info "snapshotting B's current state before restoring (safety net)..."
-  run_or_echo bash -c "wp_remote b db export - --add-drop-table | gzip > '${pre_restore_dir}/b-db.sql.gz'"
+  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
+    run_or_echo bash -c "ssh '${SITE_B_SSH_HOST}' \"${SITE_B_WP_CMD} --path='${SITE_B_WP_PATH}' db export - --add-drop-table\" | gzip > '${pre_restore_dir}/b-db.sql.gz'"
+  else
+    run_or_echo bash -c "${SITE_B_WP_CMD} --path='${SITE_B_WP_PATH}' db export - --add-drop-table | gzip > '${pre_restore_dir}/b-db.sql.gz'"
+  fi
 
   log_info "running ${run_dir}/restore.sh ..."
   run_or_echo "${run_dir}/restore.sh"
@@ -1174,42 +1619,129 @@ phase_restore() {
 }
 ```
 
-- [ ] **Step 2: Manual smoke test**
+Note: `phase_restore` itself does not need `lib/inventory.sh` sourced (`bin/sitegraft`
+only loads `lib/profile.sh` + `lib/backup.sh` for the `restore` phase) — the snapshot
+above uses the same literal `ssh`/`$SITE_B_WP_CMD` construction as
+`backup_db_export`, not `wp_remote`, so it never needed it in the first place.
 
-Deferred to the DDEV harness in Step 5 (Task 5.2/5.3), which runs a full
-`graft` → `restore` cycle and asserts B returns to its pre-graft state.
-
-- [ ] **Step 3: Commit**
+- [ ] **Step 2: Grow the DDEV harness — add the `plan` and `backup` calls and their assertions**
 
 ```bash
-git add lib/backup.sh
-git commit -m "feat(restore): add restore phase with a pre-restore safety snapshot"
+# Insert into tests/integration/ddev-harness.sh, replacing the
+# "no later phase wired yet" placeholder line from Task 1.5:
+
+echo "==> running plan (non-interactive, pre-filled manifest)"
+SITEGRAFT_MANIFEST_PREFILLED="${ROOT}/tests/integration/fixtures/prefilled-manifest.json" \
+  "${ROOT}/bin/sitegraft" plan --profile ddev-test --run "$RUN_DIR"
+
+echo "==> running backup"
+"${ROOT}/bin/sitegraft" backup --profile ddev-test --run "$RUN_DIR"
+
+echo "==> asserting the backup is complete and checksum-stable"
+[ -f "${RUN_DIR}/backup/b-db.sql.gz" ]
+[ -d "${RUN_DIR}/backup/b-wp-content" ] && [ -n "$(ls -A "${RUN_DIR}/backup/b-wp-content")" ]
+[ -x "${RUN_DIR}/restore.sh" ]
+
+# shellcheck source=../../lib/backup.sh
+. "${ROOT}/lib/backup.sh"   # reuse the exact same normalized checksum (finding A5)
+b_table() { ddev --project "$PROJECT_B" wp eval "global \$wpdb; echo \$wpdb->prefix.'$1';"; }
+b_protected_checksum() { backup_checksum "$(ddev --project "$PROJECT_B" wp db export - --tables="$(b_table fakebooking_reservations)")"; }
+
+CHECKSUM_1=$(b_protected_checksum)
+CHECKSUM_2=$(b_protected_checksum)
+[ "$CHECKSUM_1" = "$CHECKSUM_2" ]  # same data, re-hashed immediately: must be stable
+
+if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "backup" ]; then
+  echo "BACKUP OK (SITEGRAFT_HARNESS_STOP_AFTER=backup)"
+  exit 0
+fi
+
+echo "no later phase wired yet — see Task 5.2 (graft/verify/restore)"
+```
+
+Note: `tests/integration/fixtures/prefilled-manifest.json` referenced above is
+generated once by hand as part of this task (run `plan` interactively once against
+the two DDEV sites, inspect the resulting `manifest.json`, save it as the fixture)
+— it is a real, valid frozen manifest for the fixture data, committed to the repo
+so the harness runs non-interactively.
+
+- [ ] **Step 3: Run the harness through the backup step**
+
+Run: `SITEGRAFT_HARNESS_STOP_AFTER=backup tests/integration/ddev-harness.sh`
+Expected: `BACKUP OK (SITEGRAFT_HARNESS_STOP_AFTER=backup)`.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add lib/backup.sh tests/integration/ddev-harness.sh tests/integration/fixtures/prefilled-manifest.json
+git commit -m "feat(restore): add restore phase with a pre-restore safety snapshot; grow the DDEV harness through backup"
 ```
 
 ---
 
-## Step 4 — Graft: media, WXR, mu-plugin mapping, remaps
+## Step 4 — Graft: stack precondition, media, WXR, mu-plugin mapping, remaps, options
 
-Delivers: `sitegraft graft --profile <name>` performs the actual transfer, per design
-doc §6.4 and §9. This is the highest-risk step — every sub-step is individually
-marker-gated for resumability (design doc §6.4, last paragraph).
+Delivers: `sitegraft graft --profile <name>` performs the actual transfer, per
+design doc §6.4, §9, §12. This is the highest-risk step — every sub-step is
+individually marker-gated for resumability, and this rewrite resolves review
+findings A1 (missing options migration), A4 (remote-A transfers), A6 (unscoped
+search-replace), A7 (missing wordpress-importer provisioning), and B1 (the
+rendering-stack hard precondition).
 
-### Task 4.1: media sync + mu-plugin deploy/remove
+### Task 4.1: rendering-stack precondition + media sync (routed through the orchestrator) + mu-plugin deploy/remove
 
 **Files:**
 - Create: `lib/graft.sh`
 - Create: `mu-plugins/sitegraft-id-mapper.php`
-- Test: `tests/unit/test_graft_mediastep.bats` (tests the rsync flag construction, not
-  a real transfer — real transfer is DDEV-only, Task 5.3)
+- Test: `tests/unit/test_graft_mediastep.bats`, `tests/unit/test_graft_precondition.bats`
 
 **Interfaces:**
-- Consumes: `SITE_A_*`/`SITE_B_*` (Task 1.2), `run_or_echo` (Task 1.1).
-- Produces: `graft_media_rsync_cmd <site_a_uploads_path> <site_b_ssh_host>
-  <site_b_uploads_path>` (pure function, returns the exact `rsync` argv as a
-  newline-separated list for inspection — actual execution is a thin wrapper around
-  it); `graft_deploy_mu_plugin`, `graft_remove_mu_plugin`.
+- Consumes: `SITE_A_*`/`SITE_B_*` (Task 1.2), `run_or_echo` (Task 1.1),
+  `inventory_stack_matches` (Task 1.5).
+- Produces: `graft_check_stack_precondition <scan_a_json> <scan_b_json>
+  <allow_mismatch: 0|1>` (design doc §12, review finding B1 — exit 0 if the stack
+  matches, or if it doesn't but `allow_mismatch=1`; exit 1 otherwise); a two-hop
+  media sync: `graft_media_pull_cmd`/`graft_media_push_cmd` (pure functions
+  returning argv for inspection) wrapping the real `graft_media_sync`, which now
+  routes A → orchestrator (into the run directory) → B instead of assuming A is
+  directly reachable from B (design doc §6.4 step 1, review finding A4);
+  `graft_deploy_mu_plugin`, `graft_remove_mu_plugin`.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
+
+```bash
+# tests/unit/test_graft_precondition.bats
+setup() {
+  load '../../lib/core.sh'
+  load '../../lib/inventory.sh'
+  load '../../lib/graft.sh'
+}
+
+@test "graft_check_stack_precondition passes when the stack matches" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[]}' > "$b"
+  run graft_check_stack_precondition "$a" "$b" 0
+  [ "$status" -eq 0 ]
+}
+
+@test "graft_check_stack_precondition refuses a mismatch without the override" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"active_theme":{"stylesheet":"theme-a"},"plugins":[]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"theme-b"},"plugins":[]}' > "$b"
+  run graft_check_stack_precondition "$a" "$b" 0
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"--allow-stack-mismatch"* ]]
+}
+
+@test "graft_check_stack_precondition allows a mismatch with the override flag" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"active_theme":{"stylesheet":"theme-a"},"plugins":[]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"theme-b"},"plugins":[]}' > "$b"
+  run graft_check_stack_precondition "$a" "$b" 1
+  [ "$status" -eq 0 ]
+}
+```
 
 ```bash
 # tests/unit/test_graft_mediastep.bats
@@ -1218,50 +1750,87 @@ setup() {
   load '../../lib/graft.sh'
 }
 
-@test "graft_media_rsync_cmd never overwrites existing files on B" {
-  run graft_media_rsync_cmd "/site-a/wp-content/uploads/" "user@host-b.example.com" "/site-b/wp-content/uploads/"
-  [[ "$output" == *"--ignore-existing"* ]]
+@test "graft_media_pull_cmd routes A's uploads to a local staging dir via ssh when A is remote" {
+  run graft_media_pull_cmd "user@host-a.example.com" "/site-a/wp-content/uploads/" "/run/media-staging/"
+  [[ "$output" == *"rsync"* ]]
+  [[ "$output" == *"user@host-a.example.com"* ]]
+  [[ "$output" != *"scp"* ]]
 }
 
-@test "graft_media_rsync_cmd never uses scp" {
-  run graft_media_rsync_cmd "/site-a/wp-content/uploads/" "user@host-b.example.com" "/site-b/wp-content/uploads/"
+@test "graft_media_pull_cmd has no ssh hop when A is local" {
+  run graft_media_pull_cmd "" "/site-a/wp-content/uploads/" "/run/media-staging/"
+  [[ "$output" != *"ssh"* ]] || [[ "$output" != *"@"* ]]
+}
+
+@test "graft_media_push_cmd never overwrites existing files on B" {
+  run graft_media_push_cmd "user@host-b.example.com" "/run/media-staging/" "/site-b/wp-content/uploads/"
+  [[ "$output" == *"--ignore-existing"* ]]
   [[ "$output" != *"scp"* ]]
-  [[ "$output" == *"rsync"* ]]
 }
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `bats tests/unit/test_graft_mediastep.bats`
+Run: `bats tests/unit/test_graft_mediastep.bats tests/unit/test_graft_precondition.bats`
 Expected: FAIL — `lib/graft.sh` does not exist.
 
-- [ ] **Step 3: Write the media + mu-plugin functions in `lib/graft.sh`**
+- [ ] **Step 3: Write the precondition, media, and mu-plugin functions in `lib/graft.sh`**
 
 ```bash
 #!/usr/bin/env bash
-# lib/graft.sh — phase: graft. Media sync, WXR export/import, mu-plugin mapping,
-# ID/URL remaps, optional clean/idempotence pruning. See design doc §6.4, §9.
+# lib/graft.sh — phase: graft. Rendering-stack precondition, media sync, WXR
+# export/import, mu-plugin mapping, ID/domain remaps, options migration, optional
+# clean/idempotence pruning. See design doc §6.4, §9, §12.
 
-graft_media_rsync_cmd() {
-  local src="$1" dst_host="$2" dst_path="$3"
-  cat <<EOF
-rsync
--avz
---ignore-existing
-${src}
-${dst_host}:${dst_path}
-EOF
+# design doc §12 (review finding B1): a hard precondition, not a warning like
+# plan's version — graft is the phase that actually touches B.
+graft_check_stack_precondition() {
+  local scan_a="$1" scan_b="$2" allow_mismatch="$3"
+  if inventory_stack_matches "$scan_a" "$scan_b"; then
+    return 0
+  fi
+  if [ "$allow_mismatch" != "1" ]; then
+    log_error "B's rendering stack (active theme / Etch / ACSS version) does not match A's — refusing to graft. Re-run with --allow-stack-mismatch to override (the grafted content may render as nothing on B until the stack is aligned — design doc §12)."
+    return 1
+  fi
+  log_warn "STACK MISMATCH OVERRIDDEN (--allow-stack-mismatch) — B's rendering stack does not match A's. The grafted content may render as nothing on B until the stack is aligned by hand."
+  if command -v gum >/dev/null 2>&1; then
+    gum confirm "Proceed anyway? This is not the usual confirmation — B's theme/Etch/ACSS genuinely does not match A's." || return 1
+  else
+    read -r -p "Type EXACTLY 'proceed anyway' to continue despite the stack mismatch: " ans
+    [ "$ans" = "proceed anyway" ] || return 1
+  fi
 }
 
-graft_media_sync() {
-  local src="${SITE_A_WP_PATH}/wp-content/uploads/"
-  local dst_path="${SITE_B_WP_PATH}/wp-content/uploads/"
-  log_info "syncing media (never overwriting existing files on B)..."
-  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
-    run_or_echo rsync -avz --ignore-existing "$src" "${SITE_B_SSH_HOST}:${dst_path}"
+graft_media_pull_cmd() {
+  local site_a_ssh_host="$1" src="$2" dst="$3"
+  if [ -n "$site_a_ssh_host" ]; then
+    printf 'rsync\n-avz\n%s:%s\n%s\n' "$site_a_ssh_host" "$src" "$dst"
   else
-    run_or_echo rsync -avz --ignore-existing "$src" "$dst_path"
+    printf 'rsync\n-avz\n%s\n%s\n' "$src" "$dst"
   fi
+}
+
+graft_media_push_cmd() {
+  local site_b_ssh_host="$1" src="$2" dst="$3"
+  if [ -n "$site_b_ssh_host" ]; then
+    printf 'rsync\n-avz\n--ignore-existing\n%s\n%s:%s\n' "$src" "$site_b_ssh_host" "$dst"
+  else
+    printf 'rsync\n-avz\n--ignore-existing\n%s\n%s\n' "$src" "$dst"
+  fi
+}
+
+# design doc §6.4 step 1 / review finding A4: A's uploads are pulled to the
+# orchestrator's run directory first, then pushed to B — A is never assumed
+# reachable from B directly, exactly like the WXR transfer in step 5.
+graft_media_sync() {
+  local run_dir="$1"
+  local staging="${run_dir}/media-staging"
+  mkdir -p "$staging"
+  log_info "pulling A's media to the orchestrator..."
+  run_or_echo rsync -avz ${SITE_A_SSH_HOST:+"${SITE_A_SSH_HOST}:"}"${SITE_A_WP_PATH}/wp-content/uploads/" "${staging}/"
+  log_info "pushing media to B (never overwriting existing files)..."
+  run_or_echo rsync -avz --ignore-existing "${staging}/" ${SITE_B_SSH_HOST:+"${SITE_B_SSH_HOST}:"}"${SITE_B_WP_PATH}/wp-content/uploads/"
 }
 
 graft_deploy_mu_plugin() {
@@ -1311,29 +1880,35 @@ add_action( 'wp_import_insert_term', function ( $term_id, $term, $original_id ) 
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `bats tests/unit/test_graft_mediastep.bats`
-Expected: PASS (2 tests)
+Run: `bats tests/unit/test_graft_mediastep.bats tests/unit/test_graft_precondition.bats`
+Expected: PASS (6 tests)
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add lib/graft.sh mu-plugins/sitegraft-id-mapper.php tests/unit/test_graft_mediastep.bats
-git commit -m "feat(graft): add media sync (never overwrite) and mu-plugin deploy/remove"
+git add lib/graft.sh mu-plugins/sitegraft-id-mapper.php tests/unit/test_graft_mediastep.bats tests/unit/test_graft_precondition.bats
+git commit -m "feat(graft): add the rendering-stack hard precondition and route media sync through the orchestrator"
 ```
 
-### Task 4.2: WXR export, integrity-gate, transfer, import
+### Task 4.2: WXR export/import (routed through the orchestrator), integrity-gate, `wordpress-importer` provisioning
 
 **Files:**
-- Modify: `lib/graft.sh` (add `graft_export_wxr`, `graft_integrity_gate`, `graft_import_wxr`)
-- Test: `tests/unit/test_graft_integrity_gate.bats`
+- Modify: `lib/graft.sh` (add `graft_export_wxr`, `graft_integrity_gate`,
+  `graft_import_wxr`, `graft_ensure_importer`, `graft_restore_importer_state`)
+- Test: `tests/unit/test_graft_integrity_gate.bats`, `tests/unit/test_graft_importer.bats`
 
 **Interfaces:**
-- Consumes: nothing new.
+- Consumes: nothing new from earlier tasks besides `wp_remote`.
 - Produces: `graft_integrity_gate <wxr_file_path> <allowed_post_types_json>` (pure
   function over a file's content — exit 0/1, per design doc §6.4 step 4: non-empty,
-  has `<wp:wxr_version>`, ≥1 `<item>`, every `<wp:post_type>` found ∈ allowlist).
+  has `<wp:wxr_version>`, ≥1 `<item>`, every `<wp:post_type>` found ∈ allowlist);
+  `graft_export_wxr`/`graft_import_wxr` now route through the run directory
+  (review finding A4, same as media in Task 4.1); `graft_ensure_importer
+  <run_dir>` / `graft_restore_importer_state <run_dir>` (design doc §6.4 step 6,
+  review finding A7 — install+activate `wordpress-importer` on B if absent,
+  recording its exact prior install/active state so it can be restored afterward).
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
 ```bash
 # tests/unit/test_graft_integrity_gate.bats
@@ -1374,10 +1949,35 @@ EOF
 }
 ```
 
+```bash
+# tests/unit/test_graft_importer.bats
+setup() {
+  load '../../lib/core.sh'
+  load '../../lib/graft.sh'
+}
+
+@test "graft_restore_importer_state does nothing if no pre-state file was recorded" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  SITEGRAFT_DRY_RUN=1
+  run graft_restore_importer_state "$run_dir"
+  [ "$status" -eq 0 ]
+}
+
+@test "graft_restore_importer_state uninstalls the importer if it was absent before graft" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf 'absent\n' > "${run_dir}/.wordpress-importer-pre-state"
+  SITEGRAFT_DRY_RUN=1
+  run graft_restore_importer_state "$run_dir"
+  [[ "$output" == *"plugin uninstall wordpress-importer"* ]]
+}
+```
+
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `bats tests/unit/test_graft_integrity_gate.bats`
-Expected: FAIL — `graft_integrity_gate` does not exist yet.
+Run: `bats tests/unit/test_graft_integrity_gate.bats tests/unit/test_graft_importer.bats`
+Expected: FAIL — the referenced functions do not exist yet.
 
 - [ ] **Step 3: Add the functions to `lib/graft.sh`**
 
@@ -1402,43 +2002,101 @@ graft_integrity_gate() {
   fi
 }
 
+# design doc §6.4 step 3/5 / review finding A4: export lands in the run directory
+# on the orchestrator, pulled from A first if A is remote — never assumed directly
+# visible to B.
 graft_export_wxr() {
-  local post_types_csv="$1" export_dir="$2"
-  run_or_echo wp_remote a export --post_type="$post_types_csv" --dir="$export_dir"
+  local post_types_csv="$1" run_dir="$2"
+  local staging="${run_dir}/export"
+  mkdir -p "$staging"
+  if [ -n "${SITE_A_SSH_HOST:-}" ]; then
+    local remote_dir="/tmp/sitegraft-export-$$"
+    run_or_echo ssh "$SITE_A_SSH_HOST" "mkdir -p '${remote_dir}'"
+    run_or_echo wp_remote a export --post_type="$post_types_csv" --dir="$remote_dir"
+    run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${remote_dir}/" "${staging}/"
+    run_or_echo ssh "$SITE_A_SSH_HOST" "rm -rf '${remote_dir}'"
+  else
+    run_or_echo wp_remote a export --post_type="$post_types_csv" --dir="$staging"
+  fi
 }
 
 graft_import_wxr() {
-  local xml_glob="$1"
-  run_or_echo wp_remote b import "$xml_glob" --authors=skip
+  local run_dir="$1"
+  local staging="${run_dir}/export"
+  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
+    local remote_dir="/tmp/sitegraft-import-$$"
+    run_or_echo ssh "$SITE_B_SSH_HOST" "mkdir -p '${remote_dir}'"
+    run_or_echo rsync -avz "${staging}/" "${SITE_B_SSH_HOST}:${remote_dir}/"
+    run_or_echo wp_remote b import "${remote_dir}/*.xml" --authors=skip
+    run_or_echo ssh "$SITE_B_SSH_HOST" "rm -rf '${remote_dir}'"
+  else
+    run_or_echo wp_remote b import "${staging}/*.xml" --authors=skip
+  fi
+}
+
+# design doc §6.4 step 6 / review finding A7: install+activate on B if absent,
+# recording exactly what B had before so graft can put it back afterward.
+graft_ensure_importer() {
+  local run_dir="$1"
+  local state_file="${run_dir}/.wordpress-importer-pre-state"
+  if wp_remote b plugin is-installed wordpress-importer >/dev/null 2>&1; then
+    printf 'installed\n' > "$state_file"
+    if wp_remote b plugin is-active wordpress-importer >/dev/null 2>&1; then
+      printf 'active\n' >> "$state_file"
+    else
+      printf 'inactive\n' >> "$state_file"
+      run_or_echo wp_remote b plugin activate wordpress-importer
+    fi
+  else
+    printf 'absent\n' > "$state_file"
+    run_or_echo wp_remote b plugin install wordpress-importer --activate
+  fi
+}
+
+graft_restore_importer_state() {
+  local run_dir="$1"
+  local state_file="${run_dir}/.wordpress-importer-pre-state"
+  [ -f "$state_file" ] || return 0
+  local pre_installed pre_active
+  pre_installed=$(sed -n '1p' "$state_file")
+  pre_active=$(sed -n '2p' "$state_file")
+  if [ "$pre_installed" = "absent" ]; then
+    run_or_echo wp_remote b plugin uninstall wordpress-importer --deactivate
+  elif [ "$pre_active" = "inactive" ]; then
+    run_or_echo wp_remote b plugin deactivate wordpress-importer
+  fi
 }
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `bats tests/unit/test_graft_integrity_gate.bats`
-Expected: PASS (3 tests)
+Run: `bats tests/unit/test_graft_integrity_gate.bats tests/unit/test_graft_importer.bats`
+Expected: PASS (5 tests)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add lib/graft.sh tests/unit/test_graft_integrity_gate.bats
-git commit -m "feat(graft): add WXR export, integrity-gate, and import"
+git add lib/graft.sh tests/unit/test_graft_integrity_gate.bats tests/unit/test_graft_importer.bats
+git commit -m "feat(graft): route WXR export/import through the orchestrator; provision wordpress-importer with record-and-restore"
 ```
 
-### Task 4.3: ID-map remap (two-pass sentinel technique)
+### Task 4.3: ID-map remap (two-pass sentinel technique), scoped to content tables
 
 **Files:**
-- Modify: `lib/graft.sh` (add `graft_remap_attachment_ids`, `graft_check_orphan_parents`)
+- Modify: `lib/graft.sh` (add `graft_content_tables_csv`, `graft_remap_attachment_ids`, `graft_check_orphan_parents`)
 - Test: `tests/unit/test_graft_remap.bats`
 
 **Interfaces:**
 - Consumes: `id-map.tsv` format `old_id<TAB>new_id<TAB>post_type` (Task 4.1's
-  mu-plugin log format).
-- Produces: `graft_build_sentinel_commands <id_map_tsv>` (pure function — given a
-  TSV, prints the exact two-pass `wp search-replace` argument tuples per design doc
-  §9.1, one per line, for inspection/testing without a live site); the real
-  `graft_remap_attachment_ids` wraps this and actually invokes `wp_remote b
-  search-replace` for each line.
+  mu-plugin log format); `inventory_table_prefix` (Task 1.5).
+- Produces: `graft_content_tables_csv <alias>` (returns
+  `{$prefix}posts,{$prefix}postmeta,{$prefix}options` for the given site alias —
+  design doc §9.1/§9.4, review finding A6: this is the **only** table scope any
+  `search-replace` call in this tool is allowed to use); `graft_build_sentinel_commands
+  <id_map_tsv>` (pure function — given a TSV, prints the exact two-pass `wp
+  search-replace` argument tuples, one per line, for inspection/testing without a
+  live site); the real `graft_remap_attachment_ids` wraps this and actually invokes
+  `wp_remote b search-replace --tables=<content_tables>` for each line.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1463,6 +2121,14 @@ setup() {
   run graft_build_sentinel_commands "$tsv"
   [[ "$output" == *'__SITEGRAFT_10__'*'42'* ]]
 }
+
+@test "graft_remap_attachment_ids scopes every search-replace to content tables only (finding A6)" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '10\t42\tattachment\n' > "$tsv"
+  SITEGRAFT_DRY_RUN=1
+  run graft_remap_attachment_ids "$tsv" "wp_prefix_posts,wp_prefix_postmeta,wp_prefix_options"
+  [[ "$output" == *"--tables=wp_prefix_posts,wp_prefix_postmeta,wp_prefix_options"* ]]
+}
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1474,6 +2140,15 @@ Expected: FAIL — `graft_build_sentinel_commands` does not exist.
 
 ```bash
 # Appended to lib/graft.sh
+
+# design doc §9.1/§9.4 / review finding A6: the only table scope any
+# search-replace call is allowed to use — a protected plugin's own tables are
+# never in this list, so they can never be touched by a remap, even by accident.
+graft_content_tables_csv() {
+  local alias_lc="$1"
+  local prefix; prefix=$(inventory_table_prefix "$alias_lc")
+  printf '%sposts,%spostmeta,%soptions' "$prefix" "$prefix" "$prefix"
+}
 
 # Prints, one per line, tab-separated "pass<TAB>pattern<TAB>replacement" tuples
 # implementing the two-pass sentinel technique from design doc §9.1. Pass 1: old_id
@@ -1491,17 +2166,17 @@ graft_build_sentinel_commands() {
 }
 
 graft_remap_attachment_ids() {
-  local id_map_tsv="$1"
+  local id_map_tsv="$1" content_tables_csv="$2"
   local pass pattern replacement
   # Pass 1 fully before pass 2, per design doc §9.1 (sentinels must all land before
   # any get resolved to a real ID).
   while IFS=$'\t' read -r pass pattern replacement; do
     [ "$pass" = "1" ] || continue
-    run_or_echo wp_remote b search-replace "$pattern" "$replacement" --regex --precise --skip-columns=guid
+    run_or_echo wp_remote b search-replace "$pattern" "$replacement" --tables="$content_tables_csv" --regex --precise --skip-columns=guid
   done < <(graft_build_sentinel_commands "$id_map_tsv")
   while IFS=$'\t' read -r pass pattern replacement; do
     [ "$pass" = "2" ] || continue
-    run_or_echo wp_remote b search-replace "$pattern" "$replacement" --precise --skip-columns=guid
+    run_or_echo wp_remote b search-replace "$pattern" "$replacement" --tables="$content_tables_csv" --precise --skip-columns=guid
   done < <(graft_build_sentinel_commands "$id_map_tsv")
 }
 
@@ -1521,52 +2196,63 @@ graft_check_orphan_parents() {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `bats tests/unit/test_graft_remap.bats`
-Expected: PASS (2 tests)
+Expected: PASS (3 tests)
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add lib/graft.sh tests/unit/test_graft_remap.bats
-git commit -m "feat(graft): add two-pass sentinel ID remap and orphan post_parent check"
+git commit -m "feat(graft): add two-pass sentinel ID remap and orphan post_parent check, scoped to content tables only"
 ```
 
-### Task 4.4: domain search-replace, module post_import hooks, idempotence pruning, `phase_graft`
+### Task 4.4: options migration, domain search-replace (scoped), module hooks, idempotence pruning, `phase_graft` assembly
 
 **Files:**
-- Modify: `lib/graft.sh` (add `graft_search_replace_domain`, `graft_prune_previous_run`,
-  `graft_run_module_post_import`, `phase_graft`)
-- Test: `tests/unit/test_graft_phase_wiring.bats` (tests step ordering/marker logic,
-  not live execution)
+- Modify: `lib/graft.sh` (add `graft_migrate_options`, `graft_search_replace_domain`,
+  `graft_prune_previous_run`, `graft_run_module_post_import`, `phase_graft`)
+- Test: `tests/unit/test_graft_options.bats`, `tests/unit/test_graft_phase_wiring.bats`
 
 **Interfaces:**
 - Consumes: everything from Tasks 4.1-4.3, `module_call` (Task 1.3),
   `manifest.migrate`/`manifest.clean` (Task 2.1).
-- Produces: `phase_graft` (the function `bin/sitegraft` dispatches to for `graft`).
+- Produces: `graft_migrate_options <run_dir> <manifest_json>` (design doc §6.4 step
+  8, review finding A1 — this step was entirely missing from the previous draft of
+  this plan; it now fetches every `option_keys` entry from A via `wp option get
+  --format=json`, writes each to `${run_dir}/option-<key>.value` — the exact file
+  `core_wp_post_import` reads per design doc §9.3 — and pushes every key **except**
+  `page_on_front`/`page_for_posts` directly onto B, leaving those two for the
+  module hook to remap through `id-map.tsv`); `phase_graft` (the function
+  `bin/sitegraft` dispatches to for `graft`, now gated by
+  `graft_check_stack_precondition` before anything else runs).
 
-- [ ] **Step 1: Write the failing test for marker-based step skipping**
+- [ ] **Step 1: Write the failing test for `graft_migrate_options`**
 
 ```bash
-# tests/unit/test_graft_phase_wiring.bats
+# tests/unit/test_graft_options.bats
 setup() {
   load '../../lib/core.sh'
   load '../../lib/graft.sh'
 }
 
-@test "graft_step_done and graft_mark_step track completion via marker files" {
+@test "graft_migrate_options writes an option file per key and skips page_on_front for direct push" {
   local run_dir="$BATS_TEST_TMPDIR/run"
   mkdir -p "$run_dir"
-  run graft_step_done "$run_dir" media_sync
-  [ "$status" -eq 1 ]
-  graft_mark_step "$run_dir" media_sync
-  run graft_step_done "$run_dir" media_sync
+  local manifest='{"migrate":{"core-wp":{"option_keys":["show_on_front","page_on_front"]}}}'
+  SITE_A_WP_PATH="/site-a"; SITE_A_WP_CMD="wp"; SITEGRAFT_DRY_RUN=1
+  wp_remote() { # stub: pretend A always returns a fixed JSON value for any option
+    if [ "$1" = "a" ]; then echo '"stub-value"'; fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest"
   [ "$status" -eq 0 ]
+  [ -f "${run_dir}/option-show_on_front.value" ]
+  [ -f "${run_dir}/option-page_on_front.value" ]
 }
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `bats tests/unit/test_graft_phase_wiring.bats`
-Expected: FAIL — `graft_step_done`/`graft_mark_step` do not exist.
+Run: `bats tests/unit/test_graft_options.bats`
+Expected: FAIL — `graft_migrate_options` does not exist yet.
 
 - [ ] **Step 3: Add the remaining functions to `lib/graft.sh`**
 
@@ -1576,16 +2262,34 @@ Expected: FAIL — `graft_step_done`/`graft_mark_step` do not exist.
 graft_step_done() { [ -f "${1}/graft.${2}.done" ]; }
 graft_mark_step() { touch "${1}/graft.${2}.done"; }
 
+# design doc §6.4 step 8 / review finding A1: this step was missing entirely from
+# the previous draft — sitegraft migrated content but never the Etch/ACSS settings.
+# page_on_front/page_for_posts are written to disk (for core_wp_post_import, §9.3)
+# but never blind-copied here, since A's value is A's own page ID.
+graft_migrate_options() {
+  local run_dir="$1" manifest="$2"
+  local key
+  for key in $(echo "$manifest" | jq -r '[.migrate[].option_keys[]?] | unique[]'); do
+    local value
+    value=$(wp_remote a option get "$key" --format=json 2>/dev/null || echo 'null')
+    printf '%s' "$value" > "${run_dir}/option-${key}.value"
+    case "$key" in
+      page_on_front|page_for_posts) continue ;; # remapped by core_wp_post_import, §9.3
+    esac
+    run_or_echo wp_remote b option update "$key" "$value" --format=json
+  done
+}
+
 graft_search_replace_domain() {
-  local from="$1" to="$2"
-  run_or_echo wp_remote b search-replace "$from" "$to" --skip-columns=guid --precise
+  local from="$1" to="$2" content_tables_csv="$3"
+  run_or_echo wp_remote b search-replace "$from" "$to" --tables="$content_tables_csv" --skip-columns=guid --precise
   local from_escaped to_escaped
   from_escaped=$(printf '%s' "$from" | sed 's#/#\\/#g')
   to_escaped=$(printf '%s' "$to" | sed 's#/#\\/#g')
-  run_or_echo wp_remote b search-replace "$from_escaped" "$to_escaped" --skip-columns=guid --precise
+  run_or_echo wp_remote b search-replace "$from_escaped" "$to_escaped" --tables="$content_tables_csv" --skip-columns=guid --precise
 }
 
-# Design doc §11 "idempotent reimport": before importing, delete any post B already
+# design doc §11 "idempotent reimport": before importing, delete any post B already
 # has from a previous sitegraft run (marked with _sitegraft_source_id), for the
 # post_types in this run's manifest. Distinct from the optional `clean` step, which
 # removes B's pre-existing ORIGINAL content instead.
@@ -1611,11 +2315,12 @@ graft_run_module_post_import() {
 }
 
 phase_graft() {
-  local profile="" run_dir=""
+  local profile="" run_dir="" allow_mismatch=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --profile) profile="$2"; shift 2 ;;
       --run) run_dir="$2"; shift 2 ;;
+      --allow-stack-mismatch) allow_mismatch=1; shift ;;
       *) log_error "unknown flag for graft: $1"; return 1 ;;
     esac
   done
@@ -1627,31 +2332,37 @@ phase_graft() {
     return 1
   }
 
+  graft_check_stack_precondition "${run_dir}/scan-a.json" "${run_dir}/scan-b.json" "$allow_mismatch" || return 1
+
   modules_discover
   local manifest; manifest=$(cat "${run_dir}/manifest.json")
   local post_types_csv; post_types_csv=$(echo "$manifest" | jq -r '[.migrate[].post_types[]?] | join(",")')
+  local content_tables_csv; content_tables_csv=$(graft_content_tables_csv b)
 
-  graft_step_done "$run_dir" media_sync    || { graft_media_sync; graft_mark_step "$run_dir" media_sync; }
+  graft_step_done "$run_dir" media_sync    || { graft_media_sync "$run_dir"; graft_mark_step "$run_dir" media_sync; }
   graft_step_done "$run_dir" mu_plugin     || { graft_deploy_mu_plugin; graft_mark_step "$run_dir" mu_plugin; }
   graft_step_done "$run_dir" prune         || { graft_prune_previous_run "$post_types_csv"; graft_mark_step "$run_dir" prune; }
+  graft_step_done "$run_dir" importer_setup || { graft_ensure_importer "$run_dir"; graft_mark_step "$run_dir" importer_setup; }
   graft_step_done "$run_dir" export        || {
-    graft_export_wxr "$post_types_csv" "${run_dir}/export"
+    graft_export_wxr "$post_types_csv" "$run_dir"
     for f in "${run_dir}/export"/*.xml; do
       graft_integrity_gate "$f" "$(echo "$manifest" | jq -c '[.migrate[].post_types[]?]')" || return 1
     done
     graft_mark_step "$run_dir" export
   }
-  graft_step_done "$run_dir" import        || { graft_import_wxr "${run_dir}/export/*.xml"; graft_mark_step "$run_dir" import; }
+  graft_step_done "$run_dir" import        || { graft_import_wxr "$run_dir"; graft_mark_step "$run_dir" import; }
   graft_step_done "$run_dir" fetch_id_map  || {
-    run_or_echo rsync -avz "${SITE_B_SSH_HOST:+${SITE_B_SSH_HOST}:}${SITE_B_WP_PATH}/wp-content/sitegraft-id-map.log" "${run_dir}/id-map.tsv"
+    run_or_echo rsync -avz ${SITE_B_SSH_HOST:+"${SITE_B_SSH_HOST}:"}"${SITE_B_WP_PATH}/wp-content/sitegraft-id-map.log" "${run_dir}/id-map.tsv"
     graft_mark_step "$run_dir" fetch_id_map
   }
   graft_step_done "$run_dir" mu_cleanup    || { graft_remove_mu_plugin; graft_mark_step "$run_dir" mu_cleanup; }
-  graft_step_done "$run_dir" remap_ids     || { graft_remap_attachment_ids "${run_dir}/id-map.tsv"; graft_mark_step "$run_dir" remap_ids; }
+  graft_step_done "$run_dir" importer_cleanup || { graft_restore_importer_state "$run_dir"; graft_mark_step "$run_dir" importer_cleanup; }
+  graft_step_done "$run_dir" remap_ids     || { graft_remap_attachment_ids "${run_dir}/id-map.tsv" "$content_tables_csv"; graft_mark_step "$run_dir" remap_ids; }
   graft_step_done "$run_dir" remap_domain  || {
-    graft_search_replace_domain "$(echo "$manifest" | jq -r '.options.search_replace.from')" "$(echo "$manifest" | jq -r '.options.search_replace.to')"
+    graft_search_replace_domain "$(echo "$manifest" | jq -r '.options.search_replace.from')" "$(echo "$manifest" | jq -r '.options.search_replace.to')" "$content_tables_csv"
     graft_mark_step "$run_dir" remap_domain
   }
+  graft_step_done "$run_dir" migrate_options || { graft_migrate_options "$run_dir" "$manifest"; graft_mark_step "$run_dir" migrate_options; }
   graft_step_done "$run_dir" module_hooks  || { graft_run_module_post_import "$run_dir" "${run_dir}/id-map.tsv"; graft_mark_step "$run_dir" module_hooks; }
 
   if [ "$(echo "$manifest" | jq -r '.clean.enabled')" = "true" ]; then
@@ -1666,39 +2377,67 @@ phase_graft() {
 }
 ```
 
+Note the ordering: `migrate_options` runs **after** `remap_ids`/`remap_domain` but
+**before** `module_hooks` — `core_wp_post_import` (the module hook that remaps
+`page_on_front`, design doc §9.3) needs `option-page_on_front.value` to already be
+on disk, which `migrate_options` is what writes it.
+
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `bats tests/unit/test_graft_phase_wiring.bats`
-Expected: PASS (1 test)
+```bash
+# tests/unit/test_graft_phase_wiring.bats
+setup() {
+  load '../../lib/core.sh'
+  load '../../lib/graft.sh'
+}
+
+@test "graft_step_done and graft_mark_step track completion via marker files" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  run graft_step_done "$run_dir" media_sync
+  [ "$status" -eq 1 ]
+  graft_mark_step "$run_dir" media_sync
+  run graft_step_done "$run_dir" media_sync
+  [ "$status" -eq 0 ]
+}
+```
+
+Run: `bats tests/unit/test_graft_options.bats tests/unit/test_graft_phase_wiring.bats`
+Expected: PASS (2 tests)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add lib/graft.sh tests/unit/test_graft_phase_wiring.bats
-git commit -m "feat(graft): wire full graft phase with per-step markers, domain remap, module hooks, idempotence pruning"
+git add lib/graft.sh tests/unit/test_graft_options.bats tests/unit/test_graft_phase_wiring.bats
+git commit -m "feat(graft): add the missing options-migration step, scope domain remap, and assemble the full graft phase behind the stack precondition"
 ```
 
 ---
 
-## Step 5 — Verify + DDEV integration harness
+## Step 5 — Verify + full DDEV harness assertions
 
-Delivers: `sitegraft verify --profile <name>` plus the DDEV harness that is the
-actual safety proof of the whole tool (design doc §10).
+Delivers: `sitegraft verify --profile <name>` plus a DDEV harness that now proves
+every claim the tool makes, not just "protected data unchanged" (design doc §6.5,
+§10, review finding B3).
 
-### Task 5.1: `lib/verify.sh` — counts, checksums, front page, nav, HTTP, report
+### Task 5.1: `lib/verify.sh` — normalized checksums, migrated-option values, `page_on_front` correctness, domain absence, orphan/nav/HTTP checks, report
 
 **Files:**
 - Create: `lib/verify.sh`
 - Test: `tests/unit/test_verify.bats`
 
 **Interfaces:**
-- Consumes: `manifest.checksums_protected_pre_graft` (Task 3.1), `backup_checksum`
-  (Task 3.1).
+- Consumes: `manifest.checksums_protected_pre_graft`, `backup_checksum` (Task 3.1);
+  `graft_check_orphan_parents`, `graft_content_tables_csv` (Task 4.3).
 - Produces: `verify_compare_checksums <manifest_json> <recomputed_checksums_json>`
   (pure function — exit 0 if identical, 1 with a diff listed otherwise);
-  `phase_verify`.
+  `verify_options_match <run_dir> <manifest_json>` (design doc §6.5, review
+  finding B3 — spot-checks each migrated option's value on B against the
+  `option-<key>.value` file `graft` wrote, exit 0/1 with a diff);
+  `verify_domain_absent <alias> <content_tables_csv> <domain>` (exit 0/1 — is
+  `domain` absent from B's content tables?); `phase_verify`.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
 ```bash
 # tests/unit/test_verify.bats
@@ -1720,6 +2459,27 @@ setup() {
   run verify_compare_checksums "$manifest" "$recomputed"
   [ "$status" -eq 1 ]
   [[ "$output" == *"plugin-x"* ]]
+}
+
+@test "verify_options_match fails when B's live value differs from the file graft wrote" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '{"theme_mode":"dark"}' > "${run_dir}/option-etch_settings.value"
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_settings"]}}}'
+  wp_remote() { echo '{"theme_mode":"light"}'; } # stub: B's live value differs
+  run verify_options_match "$run_dir" "$manifest"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"etch_settings"* ]]
+}
+
+@test "verify_options_match passes when B's live value matches" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '{"theme_mode":"dark"}' > "${run_dir}/option-etch_settings.value"
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_settings"]}}}'
+  wp_remote() { echo '{"theme_mode":"dark"}'; }
+  run verify_options_match "$run_dir" "$manifest"
+  [ "$status" -eq 0 ]
 }
 ```
 
@@ -1744,6 +2504,35 @@ verify_compare_checksums() {
     echo "$diffs"
     return 1
   fi
+}
+
+# design doc §6.5 / review finding B3: catches a silently-skipped or
+# partially-applied options migration, which the old harness could not detect.
+verify_options_match() {
+  local run_dir="$1" manifest="$2"
+  local key mismatched=""
+  for key in $(echo "$manifest" | jq -r '[.migrate[].option_keys[]?] | unique[]'); do
+    local expected actual
+    [ -f "${run_dir}/option-${key}.value" ] || continue
+    expected=$(cat "${run_dir}/option-${key}.value")
+    actual=$(wp_remote b option get "$key" --format=json 2>/dev/null || echo 'null')
+    [ "$expected" = "$actual" ] || mismatched="${mismatched}${key} "
+  done
+  if [ -n "$mismatched" ]; then
+    log_error "migrated option value(s) do not match A's on B: ${mismatched}"
+    return 1
+  fi
+}
+
+# design doc §6.5 / review finding B3: catches an incomplete or broken domain
+# search-replace — scoped to content tables only, same as graft's own remaps.
+verify_domain_absent() {
+  local domain="$1" content_tables_csv="$2"
+  local hit
+  hit=$(wp_remote b db query \
+    "SELECT 1 FROM $(echo "$content_tables_csv" | cut -d, -f1) WHERE post_content LIKE '%${domain}%' LIMIT 1" \
+    --skip-column-names 2>/dev/null || echo "")
+  [ -z "$hit" ]
 }
 
 phase_verify() {
@@ -1782,6 +2571,22 @@ phase_verify() {
     hard_fail=1
   fi
 
+  if verify_options_match "$run_dir" "$manifest" >> "$report" 2>&1; then
+    echo "- [x] migrated options match A's values on B" >> "$report"
+  else
+    echo "- [ ] **HARD FAIL: migrated option value mismatch** — see above" >> "$report"
+    hard_fail=1
+  fi
+
+  local domain; domain=$(echo "$manifest" | jq -r '.options.search_replace.from // ""' | sed -E 's#^https?://##')
+  local content_tables_csv; content_tables_csv=$(graft_content_tables_csv b)
+  if [ -n "$domain" ] && verify_domain_absent "$domain" "$content_tables_csv"; then
+    echo "- [x] A's domain string is absent from B's content" >> "$report"
+  elif [ -n "$domain" ]; then
+    echo "- [ ] **HARD FAIL: A's domain string is still present in B's content**" >> "$report"
+    hard_fail=1
+  fi
+
   local orphans; orphans=$(graft_check_orphan_parents)
   if [ -z "$orphans" ]; then
     echo "- [x] no orphan post_parent references" >> "$report"
@@ -1789,9 +2594,16 @@ phase_verify() {
     echo "- [ ] orphan post_parent references found: ${orphans}" >> "$report"
   fi
 
-  local front_id; front_id=$(wp_remote b option get page_on_front 2>/dev/null || echo "")
+  local front_id front_expected
+  front_id=$(wp_remote b option get page_on_front 2>/dev/null || echo "")
+  front_expected=$(awk -F'\t' -v old="$(cat "${run_dir}/option-page_on_front.value" 2>/dev/null | tr -d '"')" '$1==old{print $2}' "${run_dir}/id-map.tsv" 2>/dev/null || echo "")
   if [ -n "$front_id" ] && wp_remote b post get "$front_id" --field=ID >/dev/null 2>&1; then
-    echo "- [x] page_on_front resolves to an existing page" >> "$report"
+    if [ -z "$front_expected" ] || [ "$front_id" = "$front_expected" ]; then
+      echo "- [x] page_on_front resolves to the correctly remapped page" >> "$report"
+    else
+      echo "- [ ] **HARD FAIL: page_on_front resolves to page ${front_id}, expected the remap of A's front page (${front_expected})**" >> "$report"
+      hard_fail=1
+    fi
   else
     echo "- [ ] page_on_front does not resolve — check manually" >> "$report"
   fi
@@ -1804,157 +2616,41 @@ phase_verify() {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `bats tests/unit/test_verify.bats`
-Expected: PASS (2 tests)
+Expected: PASS (4 tests)
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add lib/verify.sh tests/unit/test_verify.bats
-git commit -m "feat(verify): add checksum comparison, orphan check, front page check, report"
+git commit -m "feat(verify): add migrated-option and domain-absence checks, tighten page_on_front to the correct remap (finding B3)"
 ```
 
-### Task 5.2: DDEV fixtures — fake Etch content on A, fake protected plugin on B
+### Task 5.2: grow the DDEV harness through `graft`, `verify`, and `restore` — the full B3 assertion set
 
 **Files:**
-- Create: `tests/integration/fixtures/site-a-seed.sh`
-- Create: `tests/integration/fixtures/site-b-fake-plugin/fake-plugin.php`
-- Test: none (fixtures are exercised by Task 5.3's integration test, not unit-tested)
-
-- [ ] **Step 1: Write `tests/integration/fixtures/site-b-fake-plugin/fake-plugin.php`**
-
-A minimal fake plugin standing in for a real business plugin (design doc §10.3):
-its own CPT, its own SQL table via `dbDelta`, its own option — everything sitegraft
-must treat as protected data.
-
-```php
-<?php
-/**
- * Plugin Name: sitegraft Test Fixture — Fake Booking Plugin
- * Description: Simulates a live business plugin for the sitegraft DDEV integration
- * harness. Not a real plugin — do not use outside tests/integration/.
- */
-
-add_action( 'init', function () {
-    register_post_type( 'fakebooking_reservation', [
-        'label' => 'Fake Reservations',
-        'public' => false,
-        'show_ui' => true,
-        'supports' => [ 'title' ],
-    ] );
-} );
-
-register_activation_hook( __FILE__, function () {
-    global $wpdb;
-    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
-    $table = $wpdb->prefix . 'fakebooking_reservations';
-    $charset_collate = $wpdb->get_charset_collate();
-    dbDelta( "CREATE TABLE {$table} (
-        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-        guest_name VARCHAR(191) NOT NULL,
-        room_number INT NOT NULL,
-        PRIMARY KEY (id)
-    ) {$charset_collate};" );
-
-    $wpdb->insert( $table, [ 'guest_name' => 'Example Guest', 'room_number' => 12 ] );
-    update_option( 'fakebooking_settings', [ 'currency' => 'CHF', 'tax_rate' => 3.7 ] );
-} );
-```
-
-- [ ] **Step 2: Write `tests/integration/fixtures/site-a-seed.sh`**
-
-```bash
-#!/usr/bin/env bash
-# tests/integration/fixtures/site-a-seed.sh — seed fake Etch-shaped content on
-# site A for the DDEV harness. No real Etch license required — only the shape of
-# the data (CPTs + options) matters for testing sitegraft's mechanics.
-set -euo pipefail
-DDEV_PROJECT="$1" # e.g. sitegraft-test-a
-
-ddev --project "$DDEV_PROJECT" wp eval '
-  register_post_type("etch_cfs", ["label" => "Etch CFS", "public" => false, "show_ui" => true, "supports" => ["title","custom-fields"]]);
-  register_post_type("etch_cpts", ["label" => "Etch CPTs", "public" => false, "show_ui" => true, "supports" => ["title"]]);
-'
-ddev --project "$DDEV_PROJECT" wp post create --post_type=page --post_title="Home" --post_status=publish
-ddev --project "$DDEV_PROJECT" wp post create --post_type=etch_cfs --post_title="Hero CFS" --post_status=publish
-ddev --project "$DDEV_PROJECT" wp option update etch_settings '{"theme_mode":"dark"}' --format=json
-ddev --project "$DDEV_PROJECT" wp option update etch_styles '{"primary_color":"#111"}' --format=json
-ddev --project "$DDEV_PROJECT" wp option update automatic_css_settings '{"spacing_scale":"1.25"}' --format=json
-```
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add tests/integration/fixtures/
-git commit -m "test(integration): add DDEV fixtures for fake Etch content (A) and a fake protected plugin (B)"
-```
-
-### Task 5.3: `tests/integration/ddev-harness.sh` — full pipeline assertion
-
-**Files:**
-- Create: `tests/integration/ddev-harness.sh`
+- Modify: `tests/integration/ddev-harness.sh` (add the `graft`, `verify`, `restore`
+  calls and the full positive-assertion set from design doc §10/review finding B3)
 
 **Interfaces:**
-- Consumes: `bin/sitegraft` (all phases, Steps 1-5), fixtures from Task 5.2.
-- Produces: an exit-code contract — 0 means the full pipeline ran and the protected
-  data was byte-identical before/after both `graft` and `restore`; non-zero means a
-  regression, printed to stderr with which assertion failed.
+- Consumes: `bin/sitegraft` (all phases, Steps 1-5), fixtures from Task 1.4.
+- Produces: an exit-code contract — 0 means the full pipeline ran, protected data
+  was byte-identical before/after both `graft` and `restore`, **and** every B3
+  positive assertion (migrated options, `page_on_front`, domain absence) held;
+  non-zero means a regression, printed to stderr with which assertion failed.
 
-- [ ] **Step 1: Write `tests/integration/ddev-harness.sh`**
+- [ ] **Step 1: Grow the DDEV harness to completion**
 
 ```bash
-#!/usr/bin/env bash
-# tests/integration/ddev-harness.sh — the real safety proof of sitegraft.
-# Spins up two disposable DDEV sites, runs a full scan->plan->backup->graft->verify
-# cycle, and asserts B's protected plugin data is byte-identical before and after.
-set -euo pipefail
+# Insert into tests/integration/ddev-harness.sh, replacing the
+# "no later phase wired yet" placeholder line from Task 3.2:
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-PROJECT_A="sitegraft-test-a"
-PROJECT_B="sitegraft-test-b"
+PRE_CHECKSUM="$CHECKSUM_1"
 
-cleanup() {
-  ddev delete -Oy "$PROJECT_A" >/dev/null 2>&1 || true
-  ddev delete -Oy "$PROJECT_B" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
-
-echo "==> starting disposable DDEV sites"
-( mkdir -p "/tmp/${PROJECT_A}" && cd "/tmp/${PROJECT_A}" && ddev config --project-name="$PROJECT_A" --project-type=wordpress --docroot=. && ddev start && ddev wp core download && ddev wp core install --url=https://a.example.com --title=A --admin_user=admin --admin_password=admin --admin_email=admin@example.com )
-( mkdir -p "/tmp/${PROJECT_B}" && cd "/tmp/${PROJECT_B}" && ddev config --project-name="$PROJECT_B" --project-type=wordpress --docroot=. && ddev start && ddev wp core download && ddev wp core install --url=https://b.example.com --title=B --admin_user=admin --admin_password=admin --admin_email=admin@example.com )
-
-echo "==> seeding fixtures"
-"${ROOT}/tests/integration/fixtures/site-a-seed.sh" "$PROJECT_A"
-cp "${ROOT}/tests/integration/fixtures/site-b-fake-plugin/fake-plugin.php" "/tmp/${PROJECT_B}/wp-content/mu-plugins/fake-plugin.php"
-mkdir -p "/tmp/${PROJECT_B}/wp-content/mu-plugins"
-ddev --project "$PROJECT_B" wp eval 'do_action("activate_fake-plugin.php");' # dbDelta + seed via activation hook logic, invoked directly since it's an mu-plugin (no real activation event)
-
-echo "==> snapshotting B's protected data (pre-graft)"
-PRE_CHECKSUM=$(ddev --project "$PROJECT_B" wp db export - --tables="$(ddev --project "$PROJECT_B" wp eval 'global $wpdb; echo $wpdb->prefix."fakebooking_reservations";')" | shasum -a 256)
-
-echo "==> writing a local sitegraft profile for this harness run"
-cat > "${ROOT}/profiles/ddev-test.conf" <<EOF
-SITE_A_ALIAS="a"
-SITE_A_WP_PATH="/tmp/${PROJECT_A}"
-SITE_A_WP_CMD="ddev --project ${PROJECT_A} wp"
-SITE_A_URL="https://a.example.com"
-SITE_B_ALIAS="b"
-SITE_B_WP_PATH="/tmp/${PROJECT_B}"
-SITE_B_WP_CMD="ddev --project ${PROJECT_B} wp"
-SITE_B_URL="https://b.example.com"
-SITEGRAFT_STATE_DIR="/tmp/sitegraft-ddev-test-runs"
-EOF
-
-echo "==> running scan -> plan -> backup -> graft -> verify"
-"${ROOT}/bin/sitegraft" scan --profile ddev-test
-RUN_DIR=$(ls -dt /tmp/sitegraft-ddev-test-runs/ddev-test-* | head -1)
-SITEGRAFT_MANIFEST_PREFILLED="${ROOT}/tests/integration/fixtures/prefilled-manifest.json" \
-  "${ROOT}/bin/sitegraft" plan --profile ddev-test --run "$RUN_DIR"
-"${ROOT}/bin/sitegraft" backup --profile ddev-test --run "$RUN_DIR"
+echo "==> running graft"
 "${ROOT}/bin/sitegraft" graft --profile ddev-test --run "$RUN_DIR"
-"${ROOT}/bin/sitegraft" verify --profile ddev-test --run "$RUN_DIR"
 
-echo "==> asserting protected data is unchanged (post-graft)"
-POST_CHECKSUM=$(ddev --project "$PROJECT_B" wp db export - --tables="$(ddev --project "$PROJECT_B" wp eval 'global $wpdb; echo $wpdb->prefix."fakebooking_reservations";')" | shasum -a 256)
+echo "==> asserting protected data is unchanged (post-graft) — finding A5/A6 in practice"
+POST_CHECKSUM=$(b_protected_checksum)
 if [ "$PRE_CHECKSUM" != "$POST_CHECKSUM" ]; then
   echo "FAIL: protected fake plugin data changed during graft" >&2
   exit 1
@@ -1963,9 +2659,25 @@ fi
 echo "==> asserting migrated content is present on B"
 ddev --project "$PROJECT_B" wp post list --post_type=etch_cfs --field=post_title | grep -q "Hero CFS"
 
+echo "==> asserting migrated options carry A's exact seeded value (finding A1/B3)"
+ddev --project "$PROJECT_B" wp option get etch_settings --format=json | grep -q '"theme_mode":"dark"'
+
+echo "==> asserting page_on_front resolves to the correctly remapped page (finding B3)"
+FRONT_ID=$(ddev --project "$PROJECT_B" wp option get page_on_front)
+ddev --project "$PROJECT_B" wp post get "$FRONT_ID" --field=post_title | grep -q "Home"
+
+echo "==> asserting A's domain is absent from B's imported content (finding B3)"
+DOMAIN_HITS=$(ddev --project "$PROJECT_B" wp db query \
+  "SELECT COUNT(*) FROM $(b_table posts) WHERE post_content LIKE '%a.example.com%'" \
+  --skip-column-names)
+[ "$DOMAIN_HITS" = "0" ]
+
+echo "==> running verify"
+"${ROOT}/bin/sitegraft" verify --profile ddev-test --run "$RUN_DIR"
+
 echo "==> running restore and re-checking protected + migrated state"
 "${ROOT}/bin/sitegraft" restore --profile ddev-test --run "$RUN_DIR" --yes
-RESTORE_CHECKSUM=$(ddev --project "$PROJECT_B" wp db export - --tables="$(ddev --project "$PROJECT_B" wp eval 'global $wpdb; echo $wpdb->prefix."fakebooking_reservations";')" | shasum -a 256)
+RESTORE_CHECKSUM=$(b_protected_checksum)
 if [ "$PRE_CHECKSUM" != "$RESTORE_CHECKSUM" ]; then
   echo "FAIL: protected fake plugin data differs after restore" >&2
   exit 1
@@ -1975,25 +2687,22 @@ echo "ALL ASSERTIONS PASSED"
 rm -f "${ROOT}/profiles/ddev-test.conf"
 ```
 
-Note: `tests/integration/fixtures/prefilled-manifest.json` referenced above is
-generated once by hand during this task's implementation (run `plan` interactively
-once against the two DDEV sites, inspect the resulting `manifest.json`, save it as
-the fixture) — it is a real, valid frozen manifest for the fixture data, committed
-to the repo so the harness runs non-interactively in CI-less local runs.
-
-- [ ] **Step 2: Run the harness end-to-end and fix whatever the first real run surfaces**
+- [ ] **Step 2: Run the full harness and fix whatever the first real end-to-end run surfaces**
 
 Run: `tests/integration/ddev-harness.sh`
-Expected: `ALL ASSERTIONS PASSED`. This is the first point in the whole plan where
-every earlier task's code actually runs against real WordPress installs — budget
-time for fixing integration-only bugs the unit tests couldn't catch (this is
-expected and normal, not a sign the plan was wrong; see design doc §0.2 R2 and R4).
+Expected: `ALL ASSERTIONS PASSED`. Every earlier task already met a real WordPress
+install incrementally (Tasks 1.4, 1.5, 3.2), so this run is the first time `graft`,
+`verify`, and `restore` specifically run against a live install — budget time for
+fixing integration-only bugs the unit tests couldn't catch (expected and normal,
+not a sign the plan was wrong; see design doc §0.2 R2 and R4, and §14.1's note
+that this second pass does not close R2/R4 either — only a real dry run does, see
+`docs/definition-of-done.md`).
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/integration/ddev-harness.sh tests/integration/fixtures/prefilled-manifest.json
-git commit -m "test(integration): add full DDEV harness proving non-contamination of protected data"
+git add tests/integration/ddev-harness.sh
+git commit -m "test(integration): complete the DDEV harness with the full graft/verify/restore assertion set (finding B3)"
 ```
 
 ---
@@ -2002,7 +2711,7 @@ git commit -m "test(integration): add full DDEV harness proving non-contaminatio
 
 Delivers: a v1 ready to publish per `docs/definition-of-done.md`.
 
-### Task 6.1: `--dry-run` audit across all writing phases
+### Task 6.1: `--dry-run` and `--allow-stack-mismatch` audit across all writing phases
 
 **Files:**
 - Modify: `bin/sitegraft` (parse a global `--dry-run` flag, export `SITEGRAFT_DRY_RUN=1`)
@@ -2023,36 +2732,42 @@ set -- "${args[@]}"
 
 - [ ] **Step 2: Grep every `lib/*.sh` for mutating wp-cli/rsync/ssh calls not wrapped in `run_or_echo`**
 
-Run: `grep -n -E "wp_remote (b|a) (import|option update|search-replace|post delete|db import)|rsync -avz [^-]|ssh " lib/*.sh | grep -v run_or_echo`
+Run: `grep -n -E "wp_remote (b|a) (import|option update|search-replace|post delete|db import|plugin (install|activate|deactivate|uninstall))|rsync -avz [^-]|ssh " lib/*.sh | grep -v run_or_echo`
 Expected: empty output. Fix any hit by wrapping it in `run_or_echo`.
 
-- [ ] **Step 3: Manual smoke test**
+- [ ] **Step 3: Manual smoke tests**
 
 Run: `bin/sitegraft graft --profile ddev-test --dry-run` against the DDEV harness
-sites (fixtures already seeded from Step 5) and confirm no actual DB/file mutation
-occurs (re-run the pre-graft checksum from Task 5.3 and confirm it is unchanged, then
-confirm the command printed the actions it would have taken).
+sites (fixtures already seeded from Step 1) and confirm no actual DB/file mutation
+occurs (re-run the pre-graft checksum and confirm it is unchanged, then confirm the
+command printed the actions it would have taken).
+
+Run: `bin/sitegraft graft --profile ddev-test` against a deliberately mismatched
+stack (swap B's active theme first) without `--allow-stack-mismatch` and confirm it
+refuses with the expected error; re-run with `--allow-stack-mismatch` and confirm
+the loud warning + confirmation prompt appear before it proceeds.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add bin/sitegraft lib/
-git commit -m "fix(dry-run): ensure every mutating call across all phases respects --dry-run"
+git commit -m "fix(dry-run): ensure every mutating call across all phases respects --dry-run; smoke-test the stack-mismatch override"
 ```
 
 ### Task 6.2: usage docs, install instructions
 
 **Files:**
-- Modify: `README.md` (verify the Usage section matches the final CLI flags exactly —
-  update if any task above changed a flag name)
+- Modify: `README.md` (verify the Usage section matches the final CLI flags exactly
+  — including `--allow-stack-mismatch`, added in Step 4)
 - Create (only if README.md's usage section grows too long to stay scannable):
   `docs/usage.md`
 
 - [ ] **Step 1: Re-read `README.md` against the actual final `bin/sitegraft` flag parsing**
 
 Confirm every documented command (`scan`, `plan`, `backup`, `graft`, `verify`,
-`restore`) and flag (`--profile`, `--run`, `--dry-run`, `--yes`) matches what
-`bin/sitegraft`'s `case` statements actually accept. Fix any drift.
+`restore`) and flag (`--profile`, `--run`, `--dry-run`, `--yes`,
+`--allow-stack-mismatch`) matches what `bin/sitegraft`'s `case` statements
+actually accept. Fix any drift.
 
 - [ ] **Step 2: Add a "Requirements install" snippet to `README.md`** (macOS + Linux)
 
@@ -2080,9 +2795,10 @@ git commit -m "docs(readme): sync usage section with final CLI flags, add instal
 
 For each design doc section (§3 module contract, §4 manifest format, §5 profile
 format, §6 phase walkthrough, §7 mu-plugin, §8 media/import ordering, §9 remaps,
-§11 edge cases), confirm the shipped code matches what's documented. Fix any drift in
-whichever side is wrong (usually the code, since the design doc is the spec — but if
-implementation revealed the spec was wrong, update the design doc and note it in
+§11 edge cases, §12 stack precondition, §13 classic-menu scope), confirm the
+shipped code matches what's documented. Fix any drift in whichever side is wrong
+(usually the code, since the design doc is the spec — but if implementation
+revealed the spec was wrong, update the design doc and note it in
 `docs/status.md`).
 
 - [ ] **Step 2: Grep the whole repo for anything that looks like a real secret/host**
@@ -2092,17 +2808,26 @@ Expected: no real IPs, keys, passwords, or tokens — only placeholder text
 (`example.com`, `user@host`) if anything matches at all. This is the last gate before
 the repo is safe to publish publicly (design doc §0, LICENSE task below).
 
-- [ ] **Step 3: Bump `SITEGRAFT_VERSION` in `bin/sitegraft` to `1.0.0`** (per
-      `docs/decisions/`-style versioning convention in project `CLAUDE.md`) once all
-      DoD items in `docs/definition-of-done.md` are checked.
+- [ ] **Step 3: Confirm the pre-v1.0.0 DoD gate is still open, and why that's correct**
 
-- [ ] **Step 4: Update `docs/status.md` and `docs/todo.md`** to reflect v1 complete,
-      move any deferred items (e.g. a real `motopress.sh` module, `docs/usage.md`
-      split) into `docs/todo.md` → Backlog.
+`docs/definition-of-done.md` requires a real dry run against a genuine A/B pair
+staging copy before any `1.0.0` tag — this is deliberate (it's how R2/R4 from
+design doc §0.2 get closed, not by more DDEV-only testing). Do not check that box
+as part of this task; it is Marcel's call, on a real pair, separately.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Bump `SITEGRAFT_VERSION` in `bin/sitegraft`** to a pre-release marker
+      (e.g. `1.0.0-rc1`, not `1.0.0`) once every other DoD item in
+      `docs/definition-of-done.md` is checked — reserve the plain `1.0.0` bump for
+      after the real dry run in Step 3 above has actually happened.
+
+- [ ] **Step 5: Update `docs/status.md` and `docs/todo.md`** to reflect v1 complete
+      modulo the real-dry-run gate, move any deferred items (e.g. a real
+      `motopress.sh` module, `docs/usage.md` split, a classic-menus module) into
+      `docs/todo.md` → Backlog.
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add -A
-git commit -m "chore(release): v1.0.0 — full scan-plan-backup-graft-verify-restore pipeline"
+git commit -m "chore(release): v1.0.0-rc1 — full scan-plan-backup-graft-verify-restore pipeline, pending a real dry run before 1.0.0"
 ```
