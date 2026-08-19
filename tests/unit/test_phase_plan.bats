@@ -72,3 +72,24 @@ EOF
   [ "$status" -eq 1 ]
   [[ "$output" == *"no scan run found"* ]]
 }
+
+@test "phase_plan refuses a prefilled manifest that never acknowledged B's custom-code signal (design doc §14, never a silent skip)" {
+  echo '{"post_types":[],"plugins":[],"classic_menus_detected":false,"custom_code_detected":true,"custom_code_signals":{"child_theme":true},"active_theme":{}}' > "${RUN_DIR}/scan-b.json"
+  cat > "${RUN_DIR}/prefilled.json" <<'EOF'
+{"migrate":{},"protect":{},"clean":{"enabled":false,"post_types":[]},"options":{}}
+EOF
+  SITEGRAFT_MANIFEST_PREFILLED="${RUN_DIR}/prefilled.json" run phase_plan --profile t --run "$RUN_DIR"
+  [ "$status" -eq 1 ]
+  [ ! -f "${RUN_DIR}/manifest.json" ]
+}
+
+@test "phase_plan accepts a prefilled manifest that DOES carry the custom-code acknowledgment" {
+  echo '{"post_types":[],"plugins":[],"classic_menus_detected":false,"custom_code_detected":true,"custom_code_signals":{"child_theme":true},"active_theme":{}}' > "${RUN_DIR}/scan-b.json"
+  cat > "${RUN_DIR}/prefilled.json" <<'EOF'
+{"migrate":{},"protect":{},"clean":{"enabled":false,"post_types":[]},"options":{},"custom_code_review":{"acknowledged":true,"signals":{"child_theme":true}}}
+EOF
+  SITEGRAFT_MANIFEST_PREFILLED="${RUN_DIR}/prefilled.json" run phase_plan --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  run jq -e '.custom_code_review.acknowledged == true' "${RUN_DIR}/manifest.json"
+  [ "$status" -eq 0 ]
+}

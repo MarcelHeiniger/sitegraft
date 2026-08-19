@@ -211,6 +211,51 @@ plan_resolve_stack() {
   echo "$manifest"
 }
 
+# design doc §14 (Marcel's third guardrail): the only truly blocking gate in
+# `plan` — no manifest gets written past this point without an explicit
+# acknowledgment. Uses _plan_confirm_strong (same weight as
+# --allow-stack-mismatch's override), never the plain confirm used elsewhere.
+plan_custom_code_gate() {
+  local manifest="$1" scan_b_json="$2"
+  if [ "$(echo "$scan_b_json" | jq -r '.custom_code_detected // false')" != "true" ]; then
+    echo "$manifest"
+    return 0
+  fi
+  log_warn "B has custom-code signal(s): $(echo "$scan_b_json" | jq -c '.custom_code_signals')"
+  if ! _plan_confirm_strong "Did you review B's theme for custom code (functions.php, code snippets, mu-plugins) before replacing the theme? Custom code living in the old theme will be LOST."; then
+    log_error "custom-code review not acknowledged — refusing to write a manifest. Re-run 'sitegraft plan' once you've reviewed B's theme."
+    return 1
+  fi
+  echo "$manifest" | jq --argjson signals "$(echo "$scan_b_json" | jq '.custom_code_signals')" \
+    '.custom_code_review = {acknowledged: true, signals: $signals}'
+}
+
+# plan_custom_code_gate_check_prefilled <manifest_json> <scan_b_json_path> —
+# non-interactive counterpart to plan_custom_code_gate, used only on the
+# SITEGRAFT_MANIFEST_PREFILLED path (phase_plan below). Deviation from the
+# plan's literal Task 2.5 wiring, which called the INTERACTIVE gate
+# unconditionally, before the prefilled branch — that would block any
+# scripted run against a B with a custom-code signal on a live gum/read
+# prompt with no TTY to answer it (verified live: this is exactly what the
+# DDEV harness's B fixture triggers, via its seeded mu-plugin — see the PR
+# report). This function never prompts and never silently skips the check:
+# it structurally verifies the prefilled manifest already carries the
+# acknowledgment the interactive gate would have required, refusing exactly
+# as hard when it's missing — extending Task 2.4's own stated precedent for
+# `stack` ("a prefilled manifest is expected to already carry whatever
+# decisions its scenario needs") to the custom-code gate.
+plan_custom_code_gate_check_prefilled() {
+  local manifest="$1" scan_b_json_path="$2"
+  if [ "$(jq -r '.custom_code_detected // false' "$scan_b_json_path" 2>/dev/null)" != "true" ]; then
+    return 0
+  fi
+  if [ "$(echo "$manifest" | jq -r '.custom_code_review.acknowledged // false' 2>/dev/null)" = "true" ]; then
+    return 0
+  fi
+  log_error "scan-b.json shows custom_code_detected=true but the prefilled manifest has no custom_code_review.acknowledged=true — refusing (design doc §14: even a scripted/non-interactive plan run must carry an explicit acknowledgment, never a silent skip of the gate)"
+  return 1
+}
+
 phase_plan() {
   local profile="" run_dir=""
   while [ $# -gt 0 ]; do
@@ -231,14 +276,24 @@ phase_plan() {
   local manifest
   manifest=$(plan_defaults "${run_dir}/scan-a.json" "${run_dir}/scan-b.json")
 
+  # design doc §14: runs before any step below — none of them should matter
+  # until this is settled. Deviation from the plan's literal Task 2.5 wiring
+  # (documented in the Task 2.5 commit): the interactive gate is only ever
+  # called on the interactive path now. The prefilled/scripted path gets its
+  # own non-prompting structural check instead of the interactive gate
+  # skipped outright — it can never proceed past a real custom-code signal
+  # without an acknowledgment already recorded in the file it was handed,
+  # same safety property, just verified instead of asked for live.
   if [ -n "${SITEGRAFT_MANIFEST_PREFILLED:-}" ]; then
     # Fully scripted path (DDEV harness / any non-interactive driver): the
-    # prefilled manifest is expected to already carry whatever stack
-    # decisions its scenario needs (design doc §12) — plan_resolve_stack's
-    # prompts are skipped entirely here, same reasoning as
-    # plan_select_interactive below.
+    # prefilled manifest is expected to already carry whatever custom-code
+    # acknowledgment AND stack decisions its scenario needs (design doc §12,
+    # §14) — plan_resolve_stack's and plan_custom_code_gate's prompts are
+    # skipped entirely here, same reasoning as plan_select_interactive below.
     manifest=$(cat "$SITEGRAFT_MANIFEST_PREFILLED")
+    plan_custom_code_gate_check_prefilled "$manifest" "${run_dir}/scan-b.json" || return 1
   else
+    manifest=$(plan_custom_code_gate "$manifest" "$(cat "${run_dir}/scan-b.json")") || return 1
     manifest=$(plan_resolve_stack "$manifest" "${run_dir}/scan-a.json" "${run_dir}/scan-b.json")
     manifest=$(plan_select_interactive "$manifest")
   fi
