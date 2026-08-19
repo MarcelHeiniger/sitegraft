@@ -103,4 +103,57 @@ if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "scan" ]; then
   exit 0
 fi
 
+echo "==> running plan (non-interactive: negative case first)"
+# `plan` genuinely cannot be driven end-to-end with a real gum/fzf/read
+# prompt here (no TTY, no gum/fzf installed on the orchestrator running this
+# harness) — SITEGRAFT_MANIFEST_PREFILLED is the mechanism lib/plan.sh's
+# phase_plan provides for exactly this (design doc §6.2, Task 2.3/2.4/2.5's
+# commits). Negative case run first, against the same scan run, so a bug
+# that made plan_custom_code_gate_check_prefilled a no-op couldn't be masked
+# by the positive case's manifest.json already sitting there.
+BAD_PREFILLED="${RUN_DIR}/manifest-prefilled-bad.json"
+cat > "$BAD_PREFILLED" <<'EOF'
+{"migrate":{},"protect":{},"clean":{"enabled":false,"post_types":[]},"options":{}}
+EOF
+if SITEGRAFT_MANIFEST_PREFILLED="$BAD_PREFILLED" "${ROOT}/bin/sitegraft" plan --profile ddev-test --run "$RUN_DIR"; then
+  echo "plan should have REFUSED — B has a real custom-code signal (the mu-plugin fixture) and this manifest never acknowledged it — aborting"
+  exit 1
+fi
+if [ -f "${RUN_DIR}/manifest.json" ]; then
+  echo "plan wrote manifest.json despite refusing the custom-code gate — aborting"
+  exit 1
+fi
+echo "==> confirmed: plan refuses to write a manifest when B's custom-code signal is unacknowledged (design doc §14)"
+
+echo "==> running plan (non-interactive: positive case, real acknowledgment carried from scan-b.json)"
+GOOD_PREFILLED="${RUN_DIR}/manifest-prefilled-good.json"
+jq -n --argjson signals "$(jq -c '.custom_code_signals' "${RUN_DIR}/scan-b.json")" '{
+  sitegraft_manifest_version: 1,
+  frozen: false,
+  migrate: {},
+  protect: {},
+  clean: {enabled: false, post_types: []},
+  options: {},
+  custom_code_review: {acknowledged: true, signals: $signals}
+}' > "$GOOD_PREFILLED"
+SITEGRAFT_MANIFEST_PREFILLED="$GOOD_PREFILLED" "${ROOT}/bin/sitegraft" plan --profile ddev-test --run "$RUN_DIR"
+
+echo "==> asserting the frozen manifest is correct"
+jq -e '.frozen == true' "${RUN_DIR}/manifest.json" >/dev/null
+jq -e '.custom_code_review.acknowledged == true' "${RUN_DIR}/manifest.json" >/dev/null
+# Default-deny (design doc §3.6), exercised against a REAL scan-b.json, not
+# fabricated test JSON: migrate/protect were both left empty in the prefilled
+# manifest above, so EVERY post_type scan found on B — including the fixture
+# plugin's fake_reservation — must land in protect._unclaimed, protected by
+# default, nothing silently dropped.
+jq -e '.protect._unclaimed.post_types | index("fake_reservation") != null' "${RUN_DIR}/manifest.json" >/dev/null
+jq -e '.protect._unclaimed.post_types | index("page") != null' "${RUN_DIR}/manifest.json" >/dev/null
+MANIFEST_MODE=$(stat -f '%Lp' "${RUN_DIR}/manifest.json" 2>/dev/null || stat -c '%a' "${RUN_DIR}/manifest.json")
+[ "$MANIFEST_MODE" = "600" ] || { echo "manifest.json is not chmod 600 (got ${MANIFEST_MODE}) — aborting"; exit 1; }
+
+if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "plan" ]; then
+  echo "PLAN OK (SITEGRAFT_HARNESS_STOP_AFTER=plan)"
+  exit 0
+fi
+
 echo "no later phase wired yet — see Task 3.2 (backup), 5.2 (graft/verify/restore)"
