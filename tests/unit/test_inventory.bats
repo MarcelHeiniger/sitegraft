@@ -34,6 +34,22 @@ EOF
   [ "$output" = "'it'\\''s a test'" ]
 }
 
+@test "sq preserves a trailing newline in its input instead of silently stripping it (MINOR-1)" {
+  # bats' own "run" captures output via a mechanism that itself strips
+  # trailing newlines (same as a plain command substitution would), so
+  # this appends a sentinel character right after sq's own output — command
+  # substitution only strips newlines at the true END of the captured
+  # stream, so a newline sq embedded *before* the sentinel survives the
+  # capture intact and can be checked with a plain bash string comparison.
+  local val
+  val=$'line with a trailing newline\n'
+  local out
+  out="$(sq "$val")X"
+  local expected
+  expected="'${val}'X"
+  [ "$out" = "$expected" ]
+}
+
 @test "wp_remote builds the EXACT remote command string for a wp eval snippet with \$wpdb, ;, and -> (B1)" {
   # This is the literal case that was broken and unsafe: the old
   # "\$wp_cmd --path='\$path' \$*" construction let the remote shell

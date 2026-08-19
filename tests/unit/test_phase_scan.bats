@@ -163,3 +163,29 @@ EOF
   [ "$status" -eq 1 ]
   [[ "$output" == *"SITEGRAFT_STATE_DIR"* ]]
 }
+
+@test "phase_scan treats a failed classic-menu query as unverified, not as clean (NIT-1, fail closed like M3)" {
+  wp_remote() {
+    local alias_lc="$1"; shift
+    local args="$*"
+    case "$args" in
+      "post-type list --format=json") echo '[]' ;;
+      "option list --format=json") echo '[]' ;;
+      "db tables --format=list --all-tables-with-prefix") echo 'wp_options' ;;
+      "plugin list --format=json") echo '[]' ;;
+      "theme list --status=active --format=json") echo '[{"stylesheet":"t","version":"1"}]' ;;
+      "theme list --status=active --field=name") echo "t" ;;
+      "theme get t --field=template") echo "t" ;;
+      "menu list --format=json") return 1 ;;
+      eval*) echo 'null' ;;
+      *) echo '[]' ;;
+    esac
+  }
+  run phase_scan --profile demo
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"could not verify whether site A has classic nav menu"* ]]
+  local run_dir
+  run_dir=$(ls -dt "$BATS_TEST_TMPDIR"/runs/demo-* | head -1)
+  run jq -e '.classic_menus_unknown == true and .classic_menus_detected == true' "${run_dir}/scan-a.json"
+  [ "$status" -eq 0 ]
+}

@@ -41,11 +41,20 @@ module_validate_contract() {
 modules_discover() {
   SITEGRAFT_MODULES=""
   local file base prefix
-  # *.sh.example alongside *.sh: a documented-but-not-yet-enabled module
-  # (copy it to <name>.sh to activate) must be explicitly skipped below, not
-  # just left unmatched by the glob — the previous *.sh-only glob never
-  # actually matched a *.sh.example file at all, so that skip case was dead
-  # code (harmless by accident, not by design).
+  # NIT-2 (Viktor, second review round) flagged this *.sh.example
+  # glob/skip-case pair as a no-op proving nothing real, and asked for its
+  # removal along with the test covering it. Disagreed, with evidence, and
+  # kept it instead (see the PR/report): the design doc documents this as
+  # a real, intentional convention, not a contrivance —
+  # `modules/motopress.sh.example` is a SHIPPED worked example (§3.5, and
+  # the repo layout in §2), and §2's own text states the mechanism
+  # explicitly: "discovers modules via the glob modules/*.sh (the .example
+  # suffix is explicitly excluded, as is _template.sh)". A plain *.sh glob
+  # can structurally never match a file ending in .example in the first
+  # place (its name does not end in .sh), so the exclusion the design doc
+  # describes is only ever reachable if the loop also enumerates
+  # *.sh.example files and then filters them back out here — which is
+  # exactly what this does.
   for file in "${SITEGRAFT_MODULES_DIR}"/*.sh "${SITEGRAFT_MODULES_DIR}"/*.sh.example; do
     [ -e "$file" ] || continue
     base="$(basename "$file")"

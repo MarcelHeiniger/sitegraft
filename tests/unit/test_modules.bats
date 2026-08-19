@@ -12,16 +12,18 @@ EOF
   cat > "$SITEGRAFT_MODULES_DIR/_template.sh" <<'EOF'
 template_name() { echo "should not be loaded"; }
 EOF
-  cat > "$SITEGRAFT_MODULES_DIR/future.sh.example" <<'EOF'
-future_name() { echo "should not be loaded either"; }
+  # Mirrors the real, documented example the design doc ships
+  # (modules/motopress.sh.example, §3.5/§2) — not a synthetic filename.
+  cat > "$SITEGRAFT_MODULES_DIR/motopress.sh.example" <<'EOF'
+motopress_name() { echo "should not be loaded either"; }
 EOF
 }
 
-@test "modules_discover finds demo-mod but skips _template and .example files" {
+@test "modules_discover finds demo-mod but skips _template.sh and .sh.example files" {
   modules_discover
   [[ " $SITEGRAFT_MODULES " == *" demo_mod "* ]]
   [[ " $SITEGRAFT_MODULES " != *" template "* ]]
-  [[ " $SITEGRAFT_MODULES " != *" future "* ]]
+  [[ " $SITEGRAFT_MODULES " != *" motopress "* ]]
 }
 
 @test "module_has_fn detects an existing function and rejects a missing one" {

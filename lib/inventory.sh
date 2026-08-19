@@ -13,8 +13,21 @@ SITEGRAFT_SNIPPET_PLUGIN_SLUGS='["code-snippets","wpcode","insert-headers-and-fo
 # connection). Replaces each ' with '\'' and wraps the whole thing in outer
 # single quotes — the standard, correct way to shell-quote arbitrary content
 # in POSIX sh/bash, including content that itself contains single quotes.
+#
+# MINOR-1 (Viktor, second review round): pure bash parameter-substitution,
+# no subshell/pipe. The earlier `printf ... | sed ...` version ran the
+# input through a $(...) command substitution, which unconditionally
+# strips ALL trailing newlines from its output — a fidelity bug in a
+# security-relevant quoting helper (not exploitable today, since nothing
+# currently single-quotes a value with a meaningful trailing newline, but
+# a trap for whatever calls this next). $q/$bq hold the quote/backslash
+# characters as data so this reads clearly without a wall of backslashes.
 sq() {
-  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+  local s="$1"
+  local q="'"
+  local bq='\'
+  s="${s//$q/${q}${bq}${q}${q}}"
+  printf "'%s'" "$s"
 }
 
 # wp_remote <alias: a|b> <wp-cli args...>
@@ -146,7 +159,16 @@ inventory_scan_site() {
   # against a real DDEV scan rather than only fabricated test JSON.
   active_theme=$(wp_remote "$alias_lc" theme list --status=active --format=json \
     | jq '(.[0] // {}) | if has("name") then . + {stylesheet: .name} else . end')
-  menus=$(wp_remote "$alias_lc" menu list --format=json 2>/dev/null || echo '[]')
+  # NIT-1: fail CLOSED like M3, not open. The previous
+  # `... 2>/dev/null || echo '[]'` turned any query error into "no classic
+  # menus" — silently suppressing the §13 warning exactly when it is least
+  # trustworthy (the query didn't actually run).
+  local menus_unknown=false
+  if ! menus=$(wp_remote "$alias_lc" menu list --format=json 2>&1); then
+    log_warn "could not list nav menus on site ${alias_lc} — classic-menu detection recorded as unknown, not clean (fail-safe, design doc §13): ${menus}"
+    menus='[]'
+    menus_unknown=true
+  fi
 
   local custom_code_signals='{}' custom_code_detected=false
   if [ "$alias_lc" = "b" ]; then
@@ -176,6 +198,7 @@ inventory_scan_site() {
     --argjson plugins "$plugins" \
     --argjson active_theme "$active_theme" \
     --argjson menus "$menus" \
+    --argjson menus_unknown "$menus_unknown" \
     --argjson custom_code_signals "$custom_code_signals" \
     --argjson custom_code_detected "$custom_code_detected" \
     --argjson nav_uses_dynamic_page_list "$nav_dynamic" \
@@ -185,7 +208,8 @@ inventory_scan_site() {
       tables: $tables,
       plugins: $plugins,
       active_theme: $active_theme,
-      classic_menus_detected: ([$menus[]? | select((.count // 0) > 0)] | length > 0),
+      classic_menus_detected: (($menus_unknown == true) or ([$menus[]? | select((.count // 0) > 0)] | length > 0)),
+      classic_menus_unknown: $menus_unknown,
       classic_menu_names: [$menus[]? | select((.count // 0) > 0) | .name],
       custom_code_signals: $custom_code_signals,
       custom_code_detected: $custom_code_detected,
@@ -343,7 +367,31 @@ inventory_custom_code_signals() {
 # treat "we could not check" as "nothing was found").
 inventory_custom_code_detected() {
   local signals="$1"
-  [ "$(echo "$signals" | jq '
+
+  # MINOR-2 (Viktor, second review round): fail CLOSED on anything that
+  # isn't a well-formed signals object, not just on the four recognized
+  # positive signals. Step 2 reads this back from scan-b.json on disk,
+  # which could plausibly be truncated, hand-edited, or otherwise
+  # corrupted by the time it's read — the previous version let malformed
+  # JSON, a bare `null`/`""`, or any non-object value silently evaluate to
+  # "no custom code found": jq errors on broken JSON, the `$(...)` capture
+  # is then empty, and `[ "" = "true" ]` is false — the exact fail-open
+  # shape §14's blocking gate must never have. Verified live against
+  # broken JSON, {}, null, "", and a JSON array — all now correctly
+  # treated as "detected" (gate fires) rather than "clean".
+  local well_formed
+  well_formed=$(printf '%s' "$signals" | jq -e '
+    type == "object"
+    and has("child_theme")
+    and has("functions_php")
+    and has("mu_plugins")
+    and has("snippet_plugins_detected")
+  ' 2>/dev/null)
+  if [ "$well_formed" != "true" ]; then
+    return 0
+  fi
+
+  [ "$(printf '%s' "$signals" | jq '
     (.child_theme == true)
     or (.functions_php.exists == true)
     or ((.mu_plugins // []) | length > 0)
@@ -431,7 +479,9 @@ phase_scan() {
     chmod 600 "${run_dir}/scan-a.json" "${run_dir}/scan-b.json"
   ) || return 1
 
-  if jq -e '.classic_menus_detected == true' "${run_dir}/scan-a.json" >/dev/null 2>&1; then
+  if jq -e '.classic_menus_unknown == true' "${run_dir}/scan-a.json" >/dev/null 2>&1; then
+    log_warn "could not verify whether site A has classic nav menu(s) with items (the wp-cli query failed) — treat as unverified, not as clean (design doc §13)"
+  elif jq -e '.classic_menus_detected == true' "${run_dir}/scan-a.json" >/dev/null 2>&1; then
     log_warn "site A has classic nav menu(s) with items: $(jq -r '.classic_menu_names | join(", ")' "${run_dir}/scan-a.json") — sitegraft v1 does not migrate classic menu assignments (design doc §13)"
   fi
 

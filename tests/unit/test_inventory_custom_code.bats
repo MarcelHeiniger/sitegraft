@@ -10,6 +10,37 @@ setup() {
   [ "$status" -eq 1 ]
 }
 
+@test "inventory_custom_code_detected fails CLOSED on malformed/broken JSON (MINOR-2)" {
+  # Step 2 reads this back from scan-b.json on disk, which could plausibly
+  # be truncated or hand-edited by the time it's read. jq errors on this
+  # input; the old code's `$(jq ...)` capture then went empty and
+  # `[ "" = "true" ]` was false — a corrupted signals blob silently read as
+  # "no custom code found", the exact fail-open shape a blocking gate must
+  # never have.
+  run inventory_custom_code_detected 'not valid json{{{'
+  [ "$status" -eq 0 ]
+}
+
+@test "inventory_custom_code_detected fails CLOSED on an empty object (MINOR-2)" {
+  run inventory_custom_code_detected '{}'
+  [ "$status" -eq 0 ]
+}
+
+@test "inventory_custom_code_detected fails CLOSED on a bare JSON null (MINOR-2)" {
+  run inventory_custom_code_detected 'null'
+  [ "$status" -eq 0 ]
+}
+
+@test "inventory_custom_code_detected fails CLOSED on an empty string (MINOR-2)" {
+  run inventory_custom_code_detected ''
+  [ "$status" -eq 0 ]
+}
+
+@test "inventory_custom_code_detected fails CLOSED on a JSON array instead of an object (MINOR-2)" {
+  run inventory_custom_code_detected '[]'
+  [ "$status" -eq 0 ]
+}
+
 @test "inventory_custom_code_detected is true when the active theme is a child theme" {
   local signals='{"child_theme":true,"functions_php":{"exists":false},"mu_plugins":[],"snippet_plugins_detected":[]}'
   run inventory_custom_code_detected "$signals"
