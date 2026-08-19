@@ -309,9 +309,36 @@ graft_integrity_gate() {
   local item_count; item_count=$(grep -c '<item>' "$file" || true)
   [ "$item_count" -ge 1 ] || { log_error "no <item> found in: ${file}"; return 1; }
 
+  # CDATA-tolerant on purpose, even though it's NOT what triggers against a
+  # real `wp export`: verified live (a real WP 7.1 / wp-cli export, both by
+  # direct output inspection and by reading wp-cli's own
+  # WP_Export_WXR_Formatter.php source — the `wp:post_type` line uses the
+  # plain ->tag() form, not ->contains->cdata(), unlike title/content/meta_value,
+  # which DO get CDATA-wrapped) that `<wp:post_type>` is emitted as plain
+  # text, not `<wp:post_type><![CDATA[...]]></wp:post_type>` — so `[^<]*`
+  # matches it today without any changes. Widened to `.*` plus a CDATA-marker
+  # strip anyway, purely as defense-in-depth against a wp-cli version, a
+  # different export path (e.g. wp-admin's own native exporter, which does
+  # CDATA-wrap this field), or a hand-edited WXR ever changing that shape —
+  # cheap to add, and this is a security control, not a place to bet on one
+  # observed version's behavior never changing.
   local found_types leaked
-  found_types=$(grep -o '<wp:post_type>[^<]*</wp:post_type>' "$file" \
-    | sed -E 's#</?wp:post_type>##g' | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
+  found_types=$(grep -o '<wp:post_type>.*</wp:post_type>' "$file" \
+    | sed -E 's#</?wp:post_type>##g; s#<!\[CDATA\[##g; s#\]\]>##g' \
+    | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+  # Fail CLOSED, not open: an `<item>` count >=1 (checked above) with ZERO
+  # post_type actually extracted means the regex above didn't recognize
+  # this file's shape at all — exactly the silent "leaked is always []"
+  # failure mode commit 770e4c1's jq fix (below) exists to prevent, just
+  # one layer up (a parsing gap instead of a comparison-logic gap). Refusing
+  # here means a future export-format change this regex doesn't understand
+  # aborts loudly instead of the gate quietly rubber-stamping everything.
+  if [ "$(echo "$found_types" | jq 'length')" = "0" ]; then
+    log_error "no <wp:post_type> could be parsed out of a WXR file that has ${item_count} <item>(s): ${file} — refusing to trust an integrity gate that found nothing to check"
+    return 1
+  fi
+
   # `$allowed | index(.)` rebinds `.` to $allowed before index runs, so it
   # always searches $allowed for $allowed and `leaked` is always [] — silently
   # defeating this integrity gate (fixed in commit 770e4c1, per the design
@@ -368,7 +395,15 @@ graft_import_attachments() {
   for old_id in $ids; do
     [ -n "$old_id" ] || continue
     local rel_path title new_id
-    rel_path=$(wp_remote a post meta get "$old_id" _wp_attached_file 2>/dev/null)
+    # Same set -e fragility class as graft_remap_featured_images' own fix
+    # (this file, MAJOR-1 fix-pack) — `post meta get` on a missing key
+    # exits non-zero, which would silently kill the whole graft under
+    # bin/sitegraft's `set -e` the first time an attachment genuinely has
+    # no _wp_attached_file (an external/offloaded media entry, say). Never
+    # actually reproduced for THIS call (the harness fixture's one
+    # attachment always has it), but fixed proactively rather than waiting
+    # to hit it live a second time.
+    rel_path=$(wp_remote a post meta get "$old_id" _wp_attached_file 2>/dev/null || true)
     if [ -z "$rel_path" ]; then
       log_warn "attachment ${old_id} on A has no _wp_attached_file meta — skipping (not a locally-stored file, e.g. an external/offloaded media library entry)"
       continue
@@ -378,7 +413,12 @@ graft_import_attachments() {
       printf '[dry-run] wp_remote b media import %s/wp-content/uploads/%s --skip-copy --title=%s --porcelain\n' "$SITE_B_WP_PATH" "$rel_path" "$title"
       continue
     fi
-    new_id=$(wp_remote b media import "${SITE_B_WP_PATH}/wp-content/uploads/${rel_path}" --skip-copy --title="$title" --porcelain 2>/dev/null)
+    # Same set -e fragility class fixed elsewhere in this function/file
+    # (MAJOR-1 fix-pack) — `wp media import` failing (a corrupt file, an
+    # unsupported type) exits non-zero, which would otherwise abort the
+    # whole graft right here instead of reaching the graceful
+    # skip-and-warn handling immediately below.
+    new_id=$(wp_remote b media import "${SITE_B_WP_PATH}/wp-content/uploads/${rel_path}" --skip-copy --title="$title" --porcelain 2>/dev/null || true)
     if [ -z "$new_id" ]; then
       log_warn "failed to import attachment (A id ${old_id}, file ${rel_path}) onto B — was it actually placed by graft_media_sync? skipping"
       continue
@@ -580,46 +620,184 @@ graft_build_sentinel_commands() {
   done < "$id_map_tsv"
 }
 
+# graft_migrated_post_ids_json <id_map_tsv> — every NEW post ID this run
+# imported, as a JSON array of strings, in id-map.tsv's own row order.
+# Shared by graft_remap_attachment_ids/graft_search_replace_domain below —
+# both need exactly this same "which posts did THIS run actually touch"
+# scope, so it's computed once instead of twice.
+graft_migrated_post_ids_json() {
+  local id_map_tsv="$1"
+  awk -F'\t' '{print $2}' "$id_map_tsv" | jq -R -s -c 'split("\n") | map(select(length > 0))'
+}
+
+# graft_push_remap_payload <run_dir> <json> <remote_filename> — writes
+# <json> to a local temp file and pushes it onto B via graft_push_file
+# (wrapper-aware, same helper every other B-bound file transfer in this
+# file uses), returning the CONTAINER-side path the PHP payload below reads
+# from. Caller is responsible for removing it afterward via graft_remove_file.
+graft_push_remap_payload() {
+  local run_dir="$1" json="$2" remote_filename="$3"
+  local local_payload="${run_dir}/.${remote_filename}"
+  printf '%s' "$json" > "$local_payload"
+  chmod 600 "$local_payload" 2>/dev/null || true
+  graft_push_file b "$local_payload" "${SITE_B_WP_PATH}/wp-content" "$remote_filename"
+  rm -f "$local_payload"
+  printf '%s/wp-content/%s' "$SITE_B_WP_PATH" "$remote_filename"
+}
+
+# MAJOR-2 (review, Viktor — this is the important fix in this file):
+# `wp search-replace` has no row-level scoping at all — the previous
+# implementation ran it against the WHOLE content tables
+# (wp_posts/wp_postmeta/wp_options), which means ANY row there, including a
+# protected plugin's own settings in wp_options or its own postmeta, was in
+# scope for this regex substitution. Reproduced live: a protected option
+# carrying a colliding `"id":<N>` payload (N = an old attachment ID this run
+# also happened to migrate) got silently rewritten — a real corruption of
+# data this tool's core promise says it will never touch.
+#
+# Rebuilt to touch ONLY what this run actually imported, never a table
+# scan: pushes a small JSON payload (the attachment old->new map, and the
+# full list of migrated post IDs) onto B, then a SINGLE `wp eval` fetches
+# post_content/post_excerpt for exactly those post IDs — never anything
+# else — applies the identical two-pass sentinel technique (pass 1: every
+# `"id":X`/`wp-image-X` -> a unique sentinel, ALL attachments, before pass
+# 2 resolves any sentinel to its real new ID — same ordering guarantee as
+# before, per design doc §9.1), and writes back only the posts that
+# actually changed. A protected plugin's row anywhere else is never read,
+# matched, or written — not filtered out after the fact, structurally
+# unreachable by this function.
+#
+# PHP's own preg_replace (full PCRE, including the negative-lookahead the
+# sentinel patterns need) does the substitution — not sed/grep -E, neither
+# of which supports `(?!\d)` — and not a naive bash string replace either,
+# which would be unsafe generically (this codebase's own CLAUDE.md: "never
+# sed/raw regex on WordPress data") — post_content/post_excerpt specifically
+# are plain TEXT columns, never PHP-serialized, so a direct fetch/modify/
+# `wp_update_post()` write-back is safe for exactly these two fields. This
+# is why the scope is content-field-only: wp_postmeta values CAN be
+# serialized PHP, and safely rewriting an arbitrary serialized structure
+# needs WordPress's own maybe_unserialize()/maybe_serialize() round-trip —
+# out of scope here, same as design doc §11's existing position that a
+# CPT-specific meta reference is the relevant module's post_import hook's
+# job, not a generic core remap's.
+#
+# The payload is pushed to a real file rather than embedded via bash string
+# interpolation into the PHP source: keeps the PHP body 100% static (no
+# bash-side escaping of PHP's own quotes/`$`/backslashes to get wrong), and
+# reuses the exact same wrapper-aware transfer helper every other B-bound
+# file in this codebase already goes through.
 graft_remap_attachment_ids() {
-  local id_map_tsv="$1" content_tables_csv="$2"
-  local pass pattern replacement
-  # `wp search-replace <old> <new> [<table>...]` takes table names as
-  # REPEATABLE POSITIONAL arguments, not a --tables= flag — verified live
-  # against a real wp-cli install (`wp search-replace --help`): the plan's
-  # own pseudocode used --tables= throughout Tasks 4.3/4.4, which wp-cli
-  # rejects outright ("unknown --tables parameter"). $tables is
-  # deliberately left UNQUOTED below so it word-splits into separate argv
-  # elements, same convention this codebase already uses for $wp_cmd/$prefix
-  # (lib/inventory.sh's wp_remote, lib/backup.sh's _backup_local_exec_prefix).
-  local tables="${content_tables_csv//,/ }"
-  # MAJOR bug found live (reproduced via the DDEV harness, not caught by any
-  # unit test — see tests/unit/test_graft_remap.bats's own dry-run-only
-  # coverage, which never exercises a real child process here): `done <
-  # <(...)` binds the process substitution to the loop's OWN fd0. wp_remote's
-  # wrapped-local branch execs `ddev exec ... -- wp ...` for EVERY iteration
-  # of the loop body, and `ddev exec` inherits/forwards the calling
-  # process's stdin into the container by default — draining bytes still
-  # buffered in the SAME pipe the outer `read` is consuming from. Reproduced
-  # live: with two attachment sentinel substitutions queued in pass 1 (the
-  # `"id":X` pattern and the `wp-image-X` pattern), only the FIRST ever
-  # actually ran as a real wp-cli invocation — the second was silently
-  # dropped, the loop reading EOF early — leaving `wp-image-X` never
-  # rewritten while `"id":X` correctly was. Exact same root cause and exact
-  # same fix already proven elsewhere in this codebase for the identical
-  # symptom: lib/plan.sh's `_plan_prompt_items` ("MAJOR bug fixed here...").
-  # Reading from fd 3 instead of fd 0 frees fd0 entirely for whatever the
-  # loop body's own child processes do with it.
-  #
-  # Pass 1 fully before pass 2, per design doc §9.1 (sentinels must all land before
-  # any get resolved to a real ID).
-  while IFS=$'\t' read -r pass pattern replacement <&3; do
-    [ "$pass" = "1" ] || continue
-    run_or_echo wp_remote b search-replace "$pattern" "$replacement" $tables --regex --precise --skip-columns=guid
-  done 3< <(graft_build_sentinel_commands "$id_map_tsv")
-  while IFS=$'\t' read -r pass pattern replacement <&3; do
-    [ "$pass" = "2" ] || continue
-    run_or_echo wp_remote b search-replace "$pattern" "$replacement" $tables --precise --skip-columns=guid
-  done 3< <(graft_build_sentinel_commands "$id_map_tsv")
+  local id_map_tsv="$1" run_dir="$2"
+  [ -s "$id_map_tsv" ] || return 0
+
+  local attach_map_json post_ids_json payload_json remote_path
+  attach_map_json=$(awk -F'\t' '$3=="attachment"{printf "%s\t%s\n", $1, $2}' "$id_map_tsv" \
+    | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {old: .[0], new: .[1]})')
+  [ "$(echo "$attach_map_json" | jq 'length')" != "0" ] || return 0
+  post_ids_json=$(graft_migrated_post_ids_json "$id_map_tsv")
+  payload_json=$(jq -n --argjson attachments "$attach_map_json" --argjson post_ids "$post_ids_json" \
+    '{attachments: $attachments, post_ids: $post_ids}')
+  remote_path=$(graft_push_remap_payload "$run_dir" "$payload_json" "sitegraft-id-remap-payload.json")
+
+  run_or_echo wp_remote b eval '
+    $payload_path = WP_CONTENT_DIR . "/sitegraft-id-remap-payload.json";
+    $payload = json_decode( file_get_contents( $payload_path ), true );
+    if ( ! $payload ) { echo "sitegraft: no id-remap payload found or unreadable\n"; return; }
+    $count = 0;
+    foreach ( $payload["post_ids"] as $post_id ) {
+      $post_id = (int) $post_id;
+      $post = get_post( $post_id );
+      if ( ! $post ) { continue; }
+      $content = $post->post_content;
+      $excerpt = $post->post_excerpt;
+      $orig_content = $content;
+      $orig_excerpt = $excerpt;
+      // Pass 1 fully before pass 2, per design doc §9.1: every attachment
+      // gets a unique sentinel FIRST, so a later pass can never re-match an
+      // already-resolved ID from an earlier one in the same batch.
+      foreach ( $payload["attachments"] as $row ) {
+        $old_id = $row["old"];
+        $sentinel = "__SITEGRAFT_" . $old_id . "__";
+        $content = preg_replace( "/\"id\":" . $old_id . "(?!\\d)/", "\"id\":" . $sentinel, $content );
+        $content = preg_replace( "/wp-image-" . $old_id . "(?!\\d)/", "wp-image-" . $sentinel, $content );
+        $excerpt = preg_replace( "/\"id\":" . $old_id . "(?!\\d)/", "\"id\":" . $sentinel, $excerpt );
+        $excerpt = preg_replace( "/wp-image-" . $old_id . "(?!\\d)/", "wp-image-" . $sentinel, $excerpt );
+      }
+      foreach ( $payload["attachments"] as $row ) {
+        $sentinel = "__SITEGRAFT_" . $row["old"] . "__";
+        $content = str_replace( $sentinel, $row["new"], $content );
+        $excerpt = str_replace( $sentinel, $row["new"], $excerpt );
+      }
+      if ( $content !== $orig_content || $excerpt !== $orig_excerpt ) {
+        wp_update_post( array( "ID" => $post_id, "post_content" => $content, "post_excerpt" => $excerpt ) );
+        $count++;
+      }
+    }
+    echo "sitegraft: id-remap rewrote {$count} post(s)\n";
+  '
+  graft_remove_file b "$remote_path"
+}
+
+# MAJOR-1 (found by review, Viktor): design doc §9.2 counts on
+# wordpress-importer to natively remap featured-image (_thumbnail_id) and
+# post_parent references during import — but that native remap only fires
+# for a reference INSIDE the same WXR import, via wordpress-importer's own
+# correspondence table. graft_import_attachments (this file, Task 4.1/4.2
+# fix-pack) deliberately migrates attachments OUTSIDE the WXR/`wp import`
+# path entirely (see its own header comment for why) — attachments are
+# never in the WXR wordpress-importer processes, so its native
+# _thumbnail_id remap never runs for them. Left unfixed, every migrated
+# post that had a featured image on A keeps A's OWN attachment ID in its
+# `_thumbnail_id` postmeta after import — pointing at nothing (or, worse,
+# at an unrelated existing attachment on B whose ID happens to collide).
+# The sentinel remap (graft_remap_attachment_ids, above) does not cover
+# this either: `_thumbnail_id` is stored as a bare integer in meta_value,
+# not inside a `"id":X` or `wp-image-X` string pattern.
+#
+# Scoped to exactly the posts THIS run imported (every row of id_map_tsv,
+# read directly — never a table-wide scan or search-replace): for each
+# imported post, if its current `_thumbnail_id` matches an OLD attachment
+# ID this same run also migrated, rewrite it to that attachment's NEW ID.
+# A post whose _thumbnail_id doesn't match anything in id-map.tsv (already
+# correct, unset, or pointing at content outside this run's selection) is
+# left untouched — this is a targeted fix, not a blind sweep.
+#
+# Reads directly from the id-map.tsv FILE on fd 3 (not a process
+# substitution) — no fd0-collision risk (see graft_remap_attachment_ids'
+# own comment on that bug class), but the same fd-3 convention is used here
+# too for consistency and because the loop body execs wp_remote either way.
+#
+# Other CPT-specific attachment-referencing meta keys (a "related_image_id"
+# a business plugin might use, say) are explicitly out of scope here, same
+# as any other module-specific internal reference (design doc §11's edge
+# case table: "outside the core's generic remap — that's the job of the
+# relevant module's post_import hook"). _thumbnail_id is the one universal,
+# WordPress-core-defined key every post_type can carry, which is why it
+# gets a generic, non-module-specific fix.
+graft_remap_featured_images() {
+  local id_map_tsv="$1"
+  local old_id new_id post_type
+  while IFS=$'\t' read -r old_id new_id post_type <&3; do
+    [ "$post_type" != "attachment" ] || continue
+    local current_thumb
+    # MAJOR-1 fix-pack bug found live: `wp post meta get` exits non-zero
+    # for a post that has no _thumbnail_id at all (the common case — most
+    # migrated posts never had a featured image) — under bin/sitegraft's
+    # `set -e`, an unguarded `var=$(cmd)` assignment where cmd fails aborts
+    # the WHOLE graft immediately, silently (stderr already redirected to
+    # /dev/null), the instant it hit the first post with no thumbnail.
+    # Reproduced live: the full DDEV harness run died right after the
+    # id-remap step, no error printed, no further log lines at all.
+    # `|| true` keeps the (correctly empty) result and lets the `[ -n ... ]`
+    # check below do its job as originally intended.
+    current_thumb=$(wp_remote b post meta get "$new_id" _thumbnail_id 2>/dev/null || true)
+    [ -n "$current_thumb" ] || continue
+    local new_thumb
+    new_thumb=$(awk -F'\t' -v old="$current_thumb" '$1==old && $3=="attachment"{print $2}' "$id_map_tsv")
+    if [ -n "$new_thumb" ]; then
+      run_or_echo wp_remote b post meta update "$new_id" _thumbnail_id "$new_thumb"
+    fi
+  done 3< "$id_map_tsv"
 }
 
 # design doc §9.2 — verify.sh is where orphan post_parent gets reported; this
@@ -643,12 +821,48 @@ graft_mark_step() { touch "${1}/graft.${2}.done"; }
 # the previous draft — sitegraft migrated content but never the Etch/ACSS settings.
 # page_on_front/page_for_posts are written to disk (for core_wp_post_import, §9.3)
 # but never blind-copied here, since A's value is A's own page ID.
+# graft_migrate_options <run_dir> <manifest> [domain_from] [domain_to] —
+# domain_from/domain_to are optional (both default to "", meaning no
+# rewrite) purely to keep this backward-compatible with every existing
+# call/test that only ever passed the first two arguments.
+#
+# MAJOR-2 fix-pack addition: this is now also where design doc §9.4's
+# "Etch stores some data as JSON blobs in certain options" case is
+# handled — graft_search_replace_domain (above) deliberately stopped
+# covering wp_options entirely (a table-wide search-replace there could
+# reach a protected plugin's own settings). This function already only
+# ever touches the manifest's explicitly-listed option_keys, one at a
+# time, never a table scan — so applying the same plain-text domain
+# substitution to the already-fetched VALUE here, before it's pushed to B,
+# closes that gap with the exact same "only what's explicitly selected"
+# safety property this function already had for everything else.
 graft_migrate_options() {
-  local run_dir="$1" manifest="$2"
+  local run_dir="$1" manifest="$2" domain_from="${3:-}" domain_to="${4:-}"
   local key
   for key in $(echo "$manifest" | jq -r '[.migrate[].option_keys[]?] | unique[]'); do
     local value
     value=$(wp_remote a option get "$key" --format=json 2>/dev/null || echo 'null')
+    if [ -n "$domain_from" ]; then
+      # jq's own decode/encode round-trip, deliberately NOT a bash/sed
+      # string or regex replace: `value` is valid JSON text (from
+      # `--format=json`), which can spell the exact same domain string two
+      # different ways depending on nesting/re-encoding (plain "https://..."
+      # vs. JSON-escaped "https:\/\/..."). Walking the DECODED structure and
+      # doing a plain, non-regex substring split/join on every string leaf
+      # (jq's `split($x) | join($y)` idiom — never `gsub`, which IS regex
+      # and would need its own dot-escaping) handles both forms in one pass
+      # for free, since jq re-serializes consistently regardless of which
+      # form the input used. Also sidesteps a real bug found while building
+      # this: bash's `${var//pattern/replacement}` treats a LITERAL
+      # backslash in `pattern` as glob escape syntax, not as a character to
+      # match — a hand-rolled "plain + escaped" bash double-pass here
+      # silently failed to rewrite the escaped form at all (reproduced live
+      # via this function's own test).
+      local rewritten
+      rewritten=$(printf '%s' "$value" | jq -c --arg from "$domain_from" --arg to "$domain_to" \
+        'def replace_domain: if type == "string" then split($from) | join($to) else . end; walk(replace_domain)' 2>/dev/null)
+      [ -n "$rewritten" ] && value="$rewritten"
+    fi
     printf '%s' "$value" > "${run_dir}/option-${key}.value"
     case "$key" in
       page_on_front|page_for_posts) continue ;; # remapped by core_wp_post_import, §9.3
@@ -657,18 +871,56 @@ graft_migrate_options() {
   done
 }
 
-# design doc §9.4: two mandatory passes (plain + JSON-escaped, since Etch
-# stores some data as JSON blobs in certain options/postmeta), scoped with the
-# same content_tables_csv as §9.1 for the same non-negotiable reason.
+# design doc §9.4: two passes (plain + JSON-escaped, since Etch stores some
+# data as JSON blobs inside post_content).
+#
+# MAJOR-2 (review, Viktor) — same fix, same reasoning as
+# graft_remap_attachment_ids immediately above (read that function's own
+# comment for the full explanation): rebuilt from a whole-content-tables
+# `wp search-replace` to a post_content/post_excerpt-only rewrite of
+# exactly the posts THIS run imported, via a pushed JSON payload + a single
+# `wp eval`. A protected plugin's domain-string-shaped data sitting in
+# wp_options or wp_postmeta (a real, if lower-probability, collision than
+# the ID case, but the exact same class of exposure) is never in scope.
+#
+# Migrated OPTIONS' own values (design doc §9.4's original "Etch stores
+# some data as JSON blobs in certain options" case) are handled separately
+# and more narrowly by graft_migrate_options — which already only ever
+# touches the manifest's explicitly-listed option_keys, never a table scan
+# — see that function's own domain-rewrite step.
 graft_search_replace_domain() {
-  local from="$1" to="$2" content_tables_csv="$3"
-  # Same positional-table-argument fix as graft_remap_attachment_ids above.
-  local tables="${content_tables_csv//,/ }"
-  run_or_echo wp_remote b search-replace "$from" "$to" $tables --skip-columns=guid --precise
-  local from_escaped to_escaped
-  from_escaped=$(printf '%s' "$from" | sed 's#/#\\/#g')
-  to_escaped=$(printf '%s' "$to" | sed 's#/#\\/#g')
-  run_or_echo wp_remote b search-replace "$from_escaped" "$to_escaped" $tables --skip-columns=guid --precise
+  local from="$1" to="$2" id_map_tsv="$3" run_dir="$4"
+  [ -n "$from" ] && [ -s "$id_map_tsv" ] || return 0
+
+  local post_ids_json payload_json remote_path
+  post_ids_json=$(graft_migrated_post_ids_json "$id_map_tsv")
+  payload_json=$(jq -n --arg from "$from" --arg to "$to" --argjson post_ids "$post_ids_json" \
+    '{from: $from, to: $to, post_ids: $post_ids}')
+  remote_path=$(graft_push_remap_payload "$run_dir" "$payload_json" "sitegraft-domain-remap-payload.json")
+
+  run_or_echo wp_remote b eval '
+    $payload_path = WP_CONTENT_DIR . "/sitegraft-domain-remap-payload.json";
+    $payload = json_decode( file_get_contents( $payload_path ), true );
+    if ( ! $payload ) { echo "sitegraft: no domain-remap payload found or unreadable\n"; return; }
+    $from = $payload["from"];
+    $to = $payload["to"];
+    $from_escaped = str_replace( "/", "\\/", $from );
+    $to_escaped = str_replace( "/", "\\/", $to );
+    $count = 0;
+    foreach ( $payload["post_ids"] as $post_id ) {
+      $post_id = (int) $post_id;
+      $post = get_post( $post_id );
+      if ( ! $post ) { continue; }
+      $content = str_replace( array( $from, $from_escaped ), array( $to, $to_escaped ), $post->post_content );
+      $excerpt = str_replace( array( $from, $from_escaped ), array( $to, $to_escaped ), $post->post_excerpt );
+      if ( $content !== $post->post_content || $excerpt !== $post->post_excerpt ) {
+        wp_update_post( array( "ID" => $post_id, "post_content" => $content, "post_excerpt" => $excerpt ) );
+        $count++;
+      }
+    }
+    echo "sitegraft: domain-remap rewrote {$count} post(s)\n";
+  '
+  graft_remove_file b "$remote_path"
 }
 
 # design doc §11 "idempotent reimport": before importing, delete any post B already
@@ -782,7 +1034,6 @@ phase_graft() {
   # since a future re-import should still prune any previously-migrated
   # attachment the same way as any other migrated content.
   local wxr_post_types_csv; wxr_post_types_csv=$(echo "$manifest" | jq -r '[.migrate[].post_types[]? | select(. != "attachment")] | join(",")')
-  local content_tables_csv; content_tables_csv=$(graft_content_tables_csv b)
 
   SITEGRAFT_GRAFT_RUN_DIR="$run_dir"
   trap _graft_exit_trap EXIT
@@ -826,19 +1077,38 @@ phase_graft() {
   graft_step_done "$run_dir" fetch_id_map  || { graft_fetch_id_map "$run_dir"; graft_mark_step "$run_dir" fetch_id_map; }
   graft_step_done "$run_dir" mu_cleanup    || { graft_remove_mu_plugin; graft_mark_step "$run_dir" mu_cleanup; }
   graft_step_done "$run_dir" importer_cleanup || { graft_restore_importer_state "$run_dir"; graft_mark_step "$run_dir" importer_cleanup; }
-  graft_step_done "$run_dir" remap_ids     || { graft_remap_attachment_ids "${run_dir}/id-map.tsv" "$content_tables_csv"; graft_mark_step "$run_dir" remap_ids; }
+  graft_step_done "$run_dir" remap_ids     || { graft_remap_attachment_ids "${run_dir}/id-map.tsv" "$run_dir"; graft_mark_step "$run_dir" remap_ids; }
+  # MAJOR-1 fix-pack: featured images (_thumbnail_id), which never go
+  # through wordpress-importer's own native remap since attachments are
+  # migrated outside `wp import` entirely — see graft_remap_featured_images'
+  # own comment. Runs after remap_ids (same id-map.tsv dependency, no
+  # ordering requirement between the two beyond both needing it populated).
+  graft_step_done "$run_dir" remap_featured_images || { graft_remap_featured_images "${run_dir}/id-map.tsv"; graft_mark_step "$run_dir" remap_featured_images; }
+  local domain_from domain_to
+  domain_from=$(echo "$manifest" | jq -r '.options.search_replace.from')
+  domain_to=$(echo "$manifest" | jq -r '.options.search_replace.to')
   graft_step_done "$run_dir" remap_domain  || {
-    graft_search_replace_domain "$(echo "$manifest" | jq -r '.options.search_replace.from')" "$(echo "$manifest" | jq -r '.options.search_replace.to')" "$content_tables_csv"
+    graft_search_replace_domain "$domain_from" "$domain_to" "${run_dir}/id-map.tsv" "$run_dir"
     graft_mark_step "$run_dir" remap_domain
   }
-  graft_step_done "$run_dir" migrate_options || { graft_migrate_options "$run_dir" "$manifest"; graft_mark_step "$run_dir" migrate_options; }
+  graft_step_done "$run_dir" migrate_options || { graft_migrate_options "$run_dir" "$manifest" "$domain_from" "$domain_to"; graft_mark_step "$run_dir" migrate_options; }
   graft_step_done "$run_dir" module_hooks  || { graft_run_module_post_import "$run_dir" "${run_dir}/id-map.tsv"; graft_mark_step "$run_dir" module_hooks; }
 
+  # MINOR-1 (review, Viktor): the plan's own literal Task 4.4 pseudocode for
+  # this block only ever LOGGED "removing B's pre-existing content" and
+  # marked the step done — it never actually deleted anything (§6.6's
+  # clean step, which removes B's pre-existing ORIGINAL content of a
+  # migrated post_type, is not implemented in v1). Dead code today (no
+  # `plan.sh` path ever sets clean.enabled=true — plan_defaults/manifest_new
+  # both default it to false, and nothing in this codebase flips it), but a
+  # hand-written manifest with clean.enabled:true would have gotten a false
+  # "clean step: removing..." success message and silently NOT had anything
+  # removed. Refusing loudly instead of claiming a success that never
+  # happened, until §6.6 is actually implemented.
   if [ "$(echo "$manifest" | jq -r '.clean.enabled')" = "true" ]; then
     graft_step_done "$run_dir" clean || {
-      local clean_types; clean_types=$(echo "$manifest" | jq -r '.clean.post_types | join(",")')
-      log_info "clean step: removing B's pre-existing content for: ${clean_types}"
-      graft_mark_step "$run_dir" clean
+      log_error "manifest.clean.enabled is true, but the clean step (design doc §6.6 — removing B's pre-existing content for a migrated post_type) is not implemented yet in this version of sitegraft. Refusing to report a false success: re-run with clean.enabled=false, or remove B's stale content by hand first."
+      return 1
     }
   fi
 

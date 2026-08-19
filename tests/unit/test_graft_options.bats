@@ -4,6 +4,7 @@
 # key EXCEPT page_on_front/page_for_posts straight to B.
 setup() {
   load '../../lib/core.sh'
+  load '../../lib/backup.sh'
   load '../../lib/graft.sh'
 }
 
@@ -57,17 +58,78 @@ setup() {
   [ "$(cat "${run_dir}/option-page_on_front.value")" = '"5"' ]
 }
 
-@test "graft_search_replace_domain runs both the plain and JSON-escaped passes, scoped to content tables" {
-  # `wp search-replace <old> <new> [<table>...]` takes tables as positional
-  # arguments, not a --tables= flag (verified live against a real wp-cli
-  # install — see lib/graft.sh's own comment on this).
+# MAJOR-2 (review, Viktor): rebuilt from a whole-content-tables
+# `wp search-replace` (which put a protected plugin's own wp_options/
+# wp_postmeta rows in scope) to a post_content/post_excerpt-only rewrite of
+# exactly the posts THIS run migrated, via a pushed JSON payload + a single
+# `wp eval` — same restructuring as graft_remap_attachment_ids
+# (tests/unit/test_graft_remap.bats has the fuller comment on why).
+
+@test "graft_search_replace_domain is a no-op when domain_from is empty or id-map.tsv has no rows" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_payload() { echo "SHOULD NOT BE CALLED"; }
+  run graft_search_replace_domain "" "https://b.example.com" "$tsv" "$run_dir"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]]
+
+  : > "$tsv"
+  run graft_search_replace_domain "https://a.example.com" "https://b.example.com" "$tsv" "$run_dir"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]]
+}
+
+@test "graft_search_replace_domain's payload carries from/to and every migrated post id, never a table name" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '10\t42\tattachment\n5\t105\tpage\n' > "$tsv"
+  local captured="$BATS_TEST_TMPDIR/captured.json"
+  graft_push_remap_payload() { printf '%s' "$2" > "$captured"; echo "/fake/remote/path.json"; }
+  wp_remote() { echo "sitegraft: domain-remap rewrote 0 post(s)"; }
+  graft_remove_file() { :; }
+  run graft_search_replace_domain "https://a.example.com" "https://b.example.com" "$tsv" "$run_dir"
+  [ "$status" -eq 0 ]
+  run jq -e '.from == "https://a.example.com" and .to == "https://b.example.com"' "$captured"
+  [ "$status" -eq 0 ]
+  run jq -e '.post_ids == ["42","105"]' "$captured"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"--tables"* ]]
+}
+
+@test "graft_search_replace_domain's wp eval call rewrites post_content/post_excerpt via wp_update_post, not a table-wide search-replace" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t105\tpage\n' > "$tsv"
+  graft_push_remap_payload() { echo "/fake/remote/path.json"; }
+  graft_remove_file() { :; }
   SITEGRAFT_DRY_RUN=1
-  wp_remote() { echo "[dry-run] wp_remote $*"; }
-  run graft_search_replace_domain "https://a.example.com" "https://b.example.com" "wp_posts,wp_postmeta,wp_options"
-  [[ "$output" == *"https://a.example.com"*"https://b.example.com"* ]]
-  [[ "$output" == *'https:\/\/a.example.com'*'https:\/\/b.example.com'* ]]
-  [[ "$output" == *" wp_posts wp_postmeta wp_options "* ]]
-  [[ "$output" != *"--tables="* ]]
+  run graft_search_replace_domain "https://a.example.com" "https://b.example.com" "$tsv" "$run_dir"
+  [[ "$output" == *"wp_remote b eval"* ]]
+  [[ "$output" == *"wp_update_post"* ]]
+  [[ "$output" == *'str_replace( "/", "\\/", $from )'* ]]
+  [[ "$output" != *"search-replace"* ]]
+}
+
+@test "graft_migrate_options also rewrites the domain string inside a migrated option's own value, scoped only to that explicitly-listed key" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_styles"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then
+      echo '{"logo_url":"https://a.example.com/logo.png","escaped":"https:\/\/a.example.com\/x"}'
+    else
+      echo "[dry-run] wp_remote b $*"
+    fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest" "https://a.example.com" "https://b.example.com"
+  [ "$status" -eq 0 ]
+  local stored; stored=$(cat "${run_dir}/option-etch_styles.value")
+  [[ "$stored" == *"https://b.example.com/logo.png"* ]]
+  [[ "$stored" == *'https:\/\/b.example.com\/x'* ]]
+  [[ "$stored" != *"a.example.com"* ]]
 }
 
 @test "graft_prune_previous_run deletes every post carrying _sitegraft_source_id from a prior run" {

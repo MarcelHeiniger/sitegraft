@@ -227,7 +227,41 @@ echo "==> asserting the protected-data checksum is stable across two immediate r
 # shellcheck source=../../lib/backup.sh
 . "${ROOT}/lib/backup.sh"   # reuse the exact same normalized checksum
 b_table() { ddev exec --raw -p "$PROJECT_B" -- wp eval "global \$wpdb; echo \$wpdb->prefix.'$1';"; }
-b_protected_checksum() { backup_checksum "$(ddev exec --raw -p "$PROJECT_B" -- wp db export - --tables="$(b_table fakebooking_reservations)")"; }
+# MAJOR-2 (review, Viktor): the dedicated fakebooking_reservations table
+# alone is structurally OUTSIDE every remap graft ever runs (never a
+# search-replace target, never a copy-path target) — checksumming only
+# that table made the non-contamination assertion trivially, vacuously
+# true. Real, REACHABLE protected data lives in fakebooking_settings
+# (wp_options, inside every domain/ID remap's old table-wide scope) and in
+# the fake_reservation post's own row (wp_posts, same table every migrated
+# post lands in) — both now included, so this checksum actually covers
+# what the tool's non-contamination promise is supposed to cover.
+b_protected_checksum() {
+  local table_dump options_dump post_id post_dump
+  table_dump=$(ddev exec --raw -p "$PROJECT_B" -- wp db export - --tables="$(b_table fakebooking_reservations)")
+  options_dump=$(ddev exec --raw -p "$PROJECT_B" -- wp option get fakebooking_settings --format=json)
+  post_id=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=fake_reservation --field=ID | head -1)
+  post_dump=""
+  [ -n "$post_id" ] && post_dump=$(ddev exec --raw -p "$PROJECT_B" -- wp post get "$post_id" --field=post_content)
+  # Real bug found live while proving MAJOR-2's exposure: `$(...)` strips
+  # ALL trailing newlines from each captured piece, so plain
+  # "${a}${b}${c}" concatenation glues table_dump's LAST line (a real
+  # `wp db export`'s trailing "-- Dump completed on ..." mysqldump comment)
+  # directly onto options_dump's first character, with no newline between
+  # them — merging them into ONE line that starts with "-- ". backup_checksum's
+  # own comment-stripping filter (`grep -v '^-- '`, there specifically to
+  # normalize mysqldump's own timestamp comments) then discarded that WHOLE
+  # merged line, options_dump's entire content included — silently checksumming
+  # only table_dump's untouched middle lines while options_dump/post_dump
+  # (exactly the two surfaces this harness fix-pack added to make the
+  # non-contamination check real) never affected the hash at all. Reproduced
+  # live: PRE_GRAFT_CHECKSUM and POST_GRAFT_CHECKSUM matched byte-for-byte
+  # even though `wp option get fakebooking_settings` printed visibly
+  # different content before and after. Explicit `\n` separators keep each
+  # piece on its own line, so none of them can be swallowed by the other's
+  # trailing comment.
+  backup_checksum "$(printf '%s\n%s\n%s\n' "$table_dump" "$options_dump" "$post_dump")"
+}
 
 CHECKSUM_1=$(b_protected_checksum)
 CHECKSUM_2=$(b_protected_checksum)
@@ -403,7 +437,18 @@ chmod 600 "${RUN_DIR}/manifest.json"
 echo "==> capturing A's pre-graft state for the residual-ID/domain assertions (design doc §9.1/§9.4)"
 OLD_ATTACH_ID=$(ddev exec --raw -p "$PROJECT_A" -- wp post list --post_type=attachment --field=ID)
 [ -n "$OLD_ATTACH_ID" ]
-PRE_GRAFT_CHECKSUM="$CHECKSUM_1"
+
+echo "==> MAJOR-2 (review, Viktor): injecting a real collision into B's protected data — a domain string AND an \"id\":<A's-attachment-id> payload inside BOTH fakebooking_settings (wp_options) and the protected fake_reservation post's own content (wp_posts) — the two REACHABLE surfaces the previous checksum never covered"
+ddev exec --raw -p "$PROJECT_B" -- wp option update fakebooking_settings \
+  "{\"currency\":\"CHF\",\"tax_rate\":3.7,\"note\":\"see ${DOMAIN_A}/booking for details\",\"decoy\":\"\\\"id\\\":${OLD_ATTACH_ID}\"}" --format=json
+FAKEBOOKING_POST_ID=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=fake_reservation --field=ID | head -1)
+[ -n "$FAKEBOOKING_POST_ID" ]
+ddev exec --raw -p "$PROJECT_B" -- wp post update "$FAKEBOOKING_POST_ID" \
+  --post_content="Booking details at ${DOMAIN_A}/room — internal ref \"id\":${OLD_ATTACH_ID}"
+
+# Recomputed fresh, AFTER the injection above — CHECKSUM_1 (much earlier in
+# this script) predates it and would make this comparison vacuous.
+PRE_GRAFT_CHECKSUM=$(b_protected_checksum)
 
 echo "==> running graft"
 # --allow-stack-mismatch: both A/B get a fresh default WP theme from
@@ -446,6 +491,14 @@ case "$IMAGE_BLOCK_CONTENT" in
   *"\"id\":${NEW_ATTACH_ID}"*) : ;;
   *) echo "FAIL: B's imported content does not reference the correctly remapped NEW attachment id (${NEW_ATTACH_ID}) — the remap dropped the reference instead of rewriting it" >&2; exit 1 ;;
 esac
+# NIT-1 (review, Viktor): symmetry with the "id":NEW check above — the
+# wp-image-X CSS-class pattern is the SECOND of the two shapes the sentinel
+# remap has to rewrite (design doc §9.1); asserting only "id":NEW passed
+# left that half of the remap's own output completely unverified.
+case "$IMAGE_BLOCK_CONTENT" in
+  *"wp-image-${NEW_ATTACH_ID}"*) : ;;
+  *) echo "FAIL: B's imported content does not reference the correctly remapped NEW attachment id via the wp-image-X class either (expected wp-image-${NEW_ATTACH_ID})" >&2; exit 1 ;;
+esac
 case "$IMAGE_BLOCK_CONTENT" in
   *"${PROJECT_A}.ddev.site"*)
     echo "FAIL: B's imported content still contains A's domain string (${PROJECT_A}.ddev.site) — the domain search-replace did not fully rewrite it" >&2
@@ -460,6 +513,30 @@ B_FRONT_ID=$(ddev exec --raw -p "$PROJECT_B" -- wp option get page_on_front)
 ddev exec --raw -p "$PROJECT_B" -- wp post get "$B_FRONT_ID" --field=post_title | grep -q '^Home$'
 NEW_HOME_ID_FROM_MAP=$(awk -F'\t' -v old="$(ddev exec --raw -p "$PROJECT_A" -- wp option get page_on_front)" '$1==old && $3=="page"{print $2}' "${RUN_DIR}/id-map.tsv")
 [ "$B_FRONT_ID" = "$NEW_HOME_ID_FROM_MAP" ]
+
+echo "==> (g) MAJOR-1: asserting a migrated post's featured image (_thumbnail_id) was remapped to the correctly migrated NEW attachment id, not left pointing at A's old one"
+FEATURED_PAGE_ID_B=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=page --title="Featured Image Test Page" --field=ID)
+[ -n "$FEATURED_PAGE_ID_B" ]
+FEATURED_THUMB_ID=$(ddev exec --raw -p "$PROJECT_B" -- wp post meta get "$FEATURED_PAGE_ID_B" _thumbnail_id)
+if [ "$FEATURED_THUMB_ID" = "$OLD_ATTACH_ID" ]; then
+  echo "FAIL: featured image _thumbnail_id on B still points at A's OLD attachment id (${OLD_ATTACH_ID}) — wordpress-importer's native remap never ran (attachments bypass wp import entirely) and graft_remap_featured_images did not fix it" >&2
+  exit 1
+fi
+[ "$FEATURED_THUMB_ID" = "$NEW_ATTACH_ID" ]
+
+echo "==> (h) MAJOR-2: content-level confirmation that B's protected data (already proven byte-identical by (b)'s checksum, now carrying a real domain-string + colliding-attachment-ID payload) genuinely was not touched — not just that its checksum happens to match"
+FAKEBOOKING_SETTINGS_AFTER=$(ddev exec --raw -p "$PROJECT_B" -- wp option get fakebooking_settings --format=json)
+case "$FAKEBOOKING_SETTINGS_AFTER" in
+  *"${PROJECT_B}.ddev.site"*|*"${NEW_ATTACH_ID}"*)
+    echo "FAIL: fakebooking_settings was rewritten (contains B's domain or the NEW attachment id) even though the checksum matched — investigate immediately, this should never happen" >&2
+    exit 1
+    ;;
+esac
+case "$FAKEBOOKING_SETTINGS_AFTER" in
+  *"${PROJECT_A}.ddev.site"*) : ;;
+  *) echo "FAIL: fakebooking_settings no longer contains A's domain string at all — the fixture injection itself didn't survive, this assertion would be meaningless" >&2; exit 1 ;;
+esac
+echo "==> confirmed: protected data (wp_options AND wp_posts) carrying a real domain-string + colliding-ID payload is untouched by graft"
 
 echo "==> (f) asserting the mapping mu-plugin was removed from B after graft"
 if ddev exec --raw -p "$PROJECT_B" -- test -f /var/www/html/wp-content/mu-plugins/sitegraft-id-mapper.php 2>/dev/null; then

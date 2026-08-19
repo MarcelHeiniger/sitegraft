@@ -32,5 +32,23 @@ register_activation_hook( __FILE__, function () {
     ) {$charset_collate};" );
 
     $wpdb->insert( $table, [ 'guest_name' => 'Example Guest', 'room_number' => 12 ] );
+
+    // MAJOR-2 fix-pack fixture (review, Viktor): the dedicated
+    // fakebooking_reservations table is structurally OUTSIDE any
+    // search-replace/copy path graft ever touches — checksumming only
+    // that table made the harness's non-contamination assertion trivially
+    // true, never actually exercising the real exposure. fake_reservation
+    // (a post_type sharing wp_posts with every migrated post) is protected
+    // content that WAS previously seeded with zero rows — nothing to
+    // contaminate. Seeded here with real content; the harness script
+    // itself injects a domain-string + colliding-attachment-ID payload
+    // into both this post AND fakebooking_settings once it knows A's real
+    // attachment ID and domain (ddev-harness.sh, after seeding both sites).
+    wp_insert_post( [
+        'post_type'   => 'fake_reservation',
+        'post_title'  => 'Fake Reservation #1',
+        'post_status' => 'publish',
+        'post_content' => 'placeholder — overwritten by ddev-harness.sh once A\'s real attachment id/domain are known',
+    ] );
     update_option( 'fakebooking_settings', [ 'currency' => 'CHF', 'tax_rate' => 3.7 ] );
 } );

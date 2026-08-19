@@ -41,3 +41,13 @@ ATTACH_ID=$(ddev exec --raw -p "$DDEV_PROJECT" -- wp media import /var/www/html/
 ATTACH_URL=$(ddev exec --raw -p "$DDEV_PROJECT" -- wp post get "$ATTACH_ID" --field=guid)
 ddev exec --raw -p "$DDEV_PROJECT" -- wp post create --post_type=etch_cfs --post_title="Image Block CFS" --post_status=publish \
   --post_content="<!-- wp:etch/image {\"id\":${ATTACH_ID}} --><img class=\"wp-image-${ATTACH_ID}\" src=\"${ATTACH_URL}\" /><!-- /wp:etch/image -->"
+
+# MAJOR-1 fixture (review, Viktor): a migrated page carrying A's own
+# attachment as its WordPress-core featured image (_thumbnail_id) — the
+# reference wordpress-importer would normally remap natively during a WXR
+# import, but never does here since attachments are migrated outside
+# `wp import` entirely (see lib/graft.sh's graft_remap_featured_images own
+# comment). Without this fixture, a featured-image regression is invisible
+# to the harness.
+FEATURED_PAGE_ID=$(ddev exec --raw -p "$DDEV_PROJECT" -- wp post create --post_type=page --post_title="Featured Image Test Page" --post_status=publish --porcelain)
+ddev exec --raw -p "$DDEV_PROJECT" -- wp post meta update "$FEATURED_PAGE_ID" _thumbnail_id "$ATTACH_ID"
