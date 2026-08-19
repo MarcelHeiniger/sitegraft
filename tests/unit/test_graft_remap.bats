@@ -29,11 +29,17 @@ setup() {
 }
 
 @test "graft_remap_attachment_ids scopes every search-replace to content tables only (finding A6)" {
+  # `wp search-replace <old> <new> [<table>...]` takes tables as positional
+  # arguments, not a --tables= flag (verified live against a real wp-cli
+  # install — the plan's own pseudocode had this wrong; wp-cli rejects
+  # --tables= outright). Asserts the three table names appear as separate
+  # words AND that no --tables= flag is ever emitted.
   local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
   printf '10\t42\tattachment\n' > "$tsv"
   SITEGRAFT_DRY_RUN=1
   run graft_remap_attachment_ids "$tsv" "wp_prefix_posts,wp_prefix_postmeta,wp_prefix_options"
-  [[ "$output" == *"--tables=wp_prefix_posts,wp_prefix_postmeta,wp_prefix_options"* ]]
+  [[ "$output" == *" wp_prefix_posts wp_prefix_postmeta wp_prefix_options "* ]]
+  [[ "$output" != *"--tables="* ]]
 }
 
 @test "graft_remap_attachment_ids runs all pass-1 substitutions before any pass-2 (sentinel ordering)" {

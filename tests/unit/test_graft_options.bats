@@ -58,12 +58,16 @@ setup() {
 }
 
 @test "graft_search_replace_domain runs both the plain and JSON-escaped passes, scoped to content tables" {
+  # `wp search-replace <old> <new> [<table>...]` takes tables as positional
+  # arguments, not a --tables= flag (verified live against a real wp-cli
+  # install — see lib/graft.sh's own comment on this).
   SITEGRAFT_DRY_RUN=1
   wp_remote() { echo "[dry-run] wp_remote $*"; }
   run graft_search_replace_domain "https://a.example.com" "https://b.example.com" "wp_posts,wp_postmeta,wp_options"
   [[ "$output" == *"https://a.example.com"*"https://b.example.com"* ]]
   [[ "$output" == *'https:\/\/a.example.com'*'https:\/\/b.example.com'* ]]
-  [[ "$output" == *"--tables=wp_posts,wp_postmeta,wp_options"* ]]
+  [[ "$output" == *" wp_posts wp_postmeta wp_options "* ]]
+  [[ "$output" != *"--tables="* ]]
 }
 
 @test "graft_prune_previous_run deletes every post carrying _sitegraft_source_id from a prior run" {

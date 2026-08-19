@@ -327,6 +327,72 @@ graft_integrity_gate() {
   fi
 }
 
+# design doc §8 does not hold against the currently-shipped wordpress-importer
+# (0.9.5, the version wp-cli installs from wp.org): verified live, its
+# process_attachment() unconditionally requires fetch_attachments=true, and
+# even then does a REAL wp_safe_remote_get() of A's own attachment URL —
+# there is no "assume the file already exists locally, just create the
+# post" code path at all. Passing --skip=attachment (as graft_import_wxr
+# now does) makes it hard-error per attachment instead ("Fetching
+# attachments is not enabled"); the alternative, fetch_attachments=true,
+# means an ACTUAL live HTTP fetch of A from B for every attachment — which
+# wp_safe_remote_get's own SSRF protection can reject outright depending on
+# network topology (reproduced live via the DDEV harness: "A valid URL was
+# not provided" against a *.ddev.site hostname) and, more fundamentally,
+# directly contradicts this tool's own non-negotiable "never assume A is
+# reachable from B" principle (design doc §6.4 step 1, review finding A4).
+#
+# Attachments are migrated OURSELVES instead, entirely independent of
+# wp-cli's `import` command. graft_media_sync (Task 4.1) has already
+# rsync'd/tar-streamed the real files onto B by the time this runs, at the
+# exact same relative wp-content/uploads/<path> A used — so this only ever
+# needs `wp media import --skip-copy` (register the already-placed local
+# file in place, per wp-cli's own docs: "media files ... are imported to
+# the library but not moved on disk") against a file already on B's own
+# filesystem. No network fetch, no dependency on A being reachable from B —
+# closer to sitegraft's own stated architecture than a WXR-based attachment
+# import could ever be.
+#
+# Writes id-map.tsv rows in the exact same format the mapping mu-plugin
+# produces (old_id<TAB>new_id<TAB>post_type, §7) by APPENDING — graft_fetch_id_map
+# (below) appends B's own post/term log to the same file afterward, so by
+# the time graft_remap_attachment_ids (Task 4.3) runs, id-map.tsv already
+# has a complete picture regardless of which mechanism produced which row.
+graft_import_attachments() {
+  local run_dir="$1"
+  local id_map_tsv="${run_dir}/id-map.tsv"
+  local ids
+  ids=$(wp_remote a post list --post_type=attachment --format=csv --fields=ID 2>/dev/null | tail -n +2)
+  [ -n "$ids" ] || return 0
+  local old_id
+  for old_id in $ids; do
+    [ -n "$old_id" ] || continue
+    local rel_path title new_id
+    rel_path=$(wp_remote a post meta get "$old_id" _wp_attached_file 2>/dev/null)
+    if [ -z "$rel_path" ]; then
+      log_warn "attachment ${old_id} on A has no _wp_attached_file meta — skipping (not a locally-stored file, e.g. an external/offloaded media library entry)"
+      continue
+    fi
+    title=$(wp_remote a post get "$old_id" --field=post_title 2>/dev/null)
+    if is_dry_run; then
+      printf '[dry-run] wp_remote b media import %s/wp-content/uploads/%s --skip-copy --title=%s --porcelain\n' "$SITE_B_WP_PATH" "$rel_path" "$title"
+      continue
+    fi
+    new_id=$(wp_remote b media import "${SITE_B_WP_PATH}/wp-content/uploads/${rel_path}" --skip-copy --title="$title" --porcelain 2>/dev/null)
+    if [ -z "$new_id" ]; then
+      log_warn "failed to import attachment (A id ${old_id}, file ${rel_path}) onto B — was it actually placed by graft_media_sync? skipping"
+      continue
+    fi
+    # Same idempotent-reimport marker the mapping mu-plugin sets on every
+    # other imported post (§7/§11) — attachments bypass the mu-plugin
+    # entirely (see this function's own header comment), so this is set by
+    # hand here instead, to keep graft_prune_previous_run's coverage
+    # consistent across every migrated post_type, attachments included.
+    wp_remote b post meta update "$new_id" _sitegraft_source_id "$old_id" >/dev/null 2>&1
+    printf '%s\t%s\tattachment\n' "$old_id" "$new_id" >> "$id_map_tsv"
+  done
+}
+
 # design doc §6.4 step 3/5 / review finding A4: export lands in the run directory
 # on the orchestrator, pulled from A first if A is remote — never assumed
 # directly visible to B.
@@ -387,7 +453,7 @@ graft_import_wxr() {
     for f in "${staging}"/*.xml; do
       [ -e "$f" ] || continue
       base=$(basename "$f")
-      run_or_echo wp_remote b import "${remote_dir}/${base}" --authors=skip
+      run_or_echo wp_remote b import "${remote_dir}/${base}" --authors=skip --skip=attachment
     done
     run_or_echo ssh -- "$SITE_B_SSH_HOST" "rm -rf $(sq "$remote_dir")"
   else
@@ -398,13 +464,13 @@ graft_import_wxr() {
       for f in "${staging}"/*.xml; do
         [ -e "$f" ] || continue
         base=$(basename "$f")
-        run_or_echo wp_remote b import "${container_dir}/${base}" --authors=skip
+        run_or_echo wp_remote b import "${container_dir}/${base}" --authors=skip --skip=attachment
       done
       graft_remove_dir b "$container_dir"
     else
       for f in "${staging}"/*.xml; do
         [ -e "$f" ] || continue
-        run_or_echo wp_remote b import "$f" --authors=skip
+        run_or_echo wp_remote b import "$f" --authors=skip --skip=attachment
       done
     fi
   fi
@@ -444,35 +510,42 @@ graft_restore_importer_state() {
 }
 
 # graft_fetch_id_map <run_dir> — pull B's mapping log (design doc §6.4 step 9)
-# into ${run_dir}/id-map.tsv, wrapper-aware (see the helpers block above). A
-# missing log (no post/term was actually imported by the mu-plugin — should
-# not happen once the integrity gate requires >=1 <item>, but fails safe
-# rather than aborting the whole run on a `cat`/rsync error) yields an empty
-# id-map.tsv instead of a hard failure — every consumer of id-map.tsv already
-# treats "no matching row" as a no-op.
+# and APPEND it to ${run_dir}/id-map.tsv, wrapper-aware (see the helpers
+# block above). Deliberately APPENDS, never overwrites: graft_import_attachments
+# (above) already wrote its own rows to this same file earlier in the run
+# (attachments never go through the mu-plugin/WXR-import log at all, see its
+# own comment) — this function must never truncate those. A missing log (no
+# post/term was actually imported by the mu-plugin — should not happen once
+# the integrity gate requires >=1 <item>, but fails safe rather than
+# aborting the whole run on a `cat`/rsync error) is a no-op: whatever
+# id-map.tsv already had (possibly just attachment rows, possibly nothing)
+# is left exactly as-is.
 graft_fetch_id_map() {
   local run_dir="$1"
   local src="${SITE_B_WP_PATH}/wp-content/sitegraft-id-map.log"
   local dest="${run_dir}/id-map.tsv"
+  local tmp="${run_dir}/.id-map-fetch.tmp"
   if [ -n "${SITE_B_SSH_HOST:-}" ]; then
-    run_or_echo rsync -avz "${SITE_B_SSH_HOST}:${src}" "$dest"
+    run_or_echo rsync -avz "${SITE_B_SSH_HOST}:${src}" "$tmp"
   else
     local prefix; prefix=$(graft_local_prefix b)
     if [ -n "$prefix" ]; then
       if ! is_dry_run && ! $prefix test -f "$src" >/dev/null 2>&1; then
-        log_warn "no id-map.log found on B (no posts/terms were imported?) — writing an empty id-map.tsv"
-        : > "$dest"
+        log_warn "no id-map.log found on B (no posts/terms were imported via WXR?) — id-map.tsv left as-is"
         return 0
       fi
-      run_or_echo bash -c "${prefix} cat '${src}' > '${dest}'"
+      run_or_echo bash -c "${prefix} cat '${src}' > '${tmp}'"
     else
       if ! is_dry_run && [ ! -f "$src" ]; then
-        log_warn "no id-map.log found on B (no posts/terms were imported?) — writing an empty id-map.tsv"
-        : > "$dest"
+        log_warn "no id-map.log found on B (no posts/terms were imported via WXR?) — id-map.tsv left as-is"
         return 0
       fi
-      run_or_echo rsync -avz "$src" "$dest"
+      run_or_echo rsync -avz "$src" "$tmp"
     fi
+  fi
+  if ! is_dry_run && [ -f "$tmp" ]; then
+    cat "$tmp" >> "$dest"
+    rm -f "$tmp"
   fi
 }
 
@@ -510,16 +583,43 @@ graft_build_sentinel_commands() {
 graft_remap_attachment_ids() {
   local id_map_tsv="$1" content_tables_csv="$2"
   local pass pattern replacement
+  # `wp search-replace <old> <new> [<table>...]` takes table names as
+  # REPEATABLE POSITIONAL arguments, not a --tables= flag — verified live
+  # against a real wp-cli install (`wp search-replace --help`): the plan's
+  # own pseudocode used --tables= throughout Tasks 4.3/4.4, which wp-cli
+  # rejects outright ("unknown --tables parameter"). $tables is
+  # deliberately left UNQUOTED below so it word-splits into separate argv
+  # elements, same convention this codebase already uses for $wp_cmd/$prefix
+  # (lib/inventory.sh's wp_remote, lib/backup.sh's _backup_local_exec_prefix).
+  local tables="${content_tables_csv//,/ }"
+  # MAJOR bug found live (reproduced via the DDEV harness, not caught by any
+  # unit test — see tests/unit/test_graft_remap.bats's own dry-run-only
+  # coverage, which never exercises a real child process here): `done <
+  # <(...)` binds the process substitution to the loop's OWN fd0. wp_remote's
+  # wrapped-local branch execs `ddev exec ... -- wp ...` for EVERY iteration
+  # of the loop body, and `ddev exec` inherits/forwards the calling
+  # process's stdin into the container by default — draining bytes still
+  # buffered in the SAME pipe the outer `read` is consuming from. Reproduced
+  # live: with two attachment sentinel substitutions queued in pass 1 (the
+  # `"id":X` pattern and the `wp-image-X` pattern), only the FIRST ever
+  # actually ran as a real wp-cli invocation — the second was silently
+  # dropped, the loop reading EOF early — leaving `wp-image-X` never
+  # rewritten while `"id":X` correctly was. Exact same root cause and exact
+  # same fix already proven elsewhere in this codebase for the identical
+  # symptom: lib/plan.sh's `_plan_prompt_items` ("MAJOR bug fixed here...").
+  # Reading from fd 3 instead of fd 0 frees fd0 entirely for whatever the
+  # loop body's own child processes do with it.
+  #
   # Pass 1 fully before pass 2, per design doc §9.1 (sentinels must all land before
   # any get resolved to a real ID).
-  while IFS=$'\t' read -r pass pattern replacement; do
+  while IFS=$'\t' read -r pass pattern replacement <&3; do
     [ "$pass" = "1" ] || continue
-    run_or_echo wp_remote b search-replace "$pattern" "$replacement" --tables="$content_tables_csv" --regex --precise --skip-columns=guid
-  done < <(graft_build_sentinel_commands "$id_map_tsv")
-  while IFS=$'\t' read -r pass pattern replacement; do
+    run_or_echo wp_remote b search-replace "$pattern" "$replacement" $tables --regex --precise --skip-columns=guid
+  done 3< <(graft_build_sentinel_commands "$id_map_tsv")
+  while IFS=$'\t' read -r pass pattern replacement <&3; do
     [ "$pass" = "2" ] || continue
-    run_or_echo wp_remote b search-replace "$pattern" "$replacement" --tables="$content_tables_csv" --precise --skip-columns=guid
-  done < <(graft_build_sentinel_commands "$id_map_tsv")
+    run_or_echo wp_remote b search-replace "$pattern" "$replacement" $tables --precise --skip-columns=guid
+  done 3< <(graft_build_sentinel_commands "$id_map_tsv")
 }
 
 # design doc §9.2 — verify.sh is where orphan post_parent gets reported; this
@@ -562,11 +662,13 @@ graft_migrate_options() {
 # same content_tables_csv as §9.1 for the same non-negotiable reason.
 graft_search_replace_domain() {
   local from="$1" to="$2" content_tables_csv="$3"
-  run_or_echo wp_remote b search-replace "$from" "$to" --tables="$content_tables_csv" --skip-columns=guid --precise
+  # Same positional-table-argument fix as graft_remap_attachment_ids above.
+  local tables="${content_tables_csv//,/ }"
+  run_or_echo wp_remote b search-replace "$from" "$to" $tables --skip-columns=guid --precise
   local from_escaped to_escaped
   from_escaped=$(printf '%s' "$from" | sed 's#/#\\/#g')
   to_escaped=$(printf '%s' "$to" | sed 's#/#\\/#g')
-  run_or_echo wp_remote b search-replace "$from_escaped" "$to_escaped" --tables="$content_tables_csv" --skip-columns=guid --precise
+  run_or_echo wp_remote b search-replace "$from_escaped" "$to_escaped" $tables --skip-columns=guid --precise
 }
 
 # design doc §11 "idempotent reimport": before importing, delete any post B already
@@ -580,9 +682,18 @@ graft_prune_previous_run() {
   ids=$(wp_remote b post list --post_type="$post_types_csv" --meta_key=_sitegraft_source_id --field=ID)
   [ -n "$ids" ] || return 0
   log_warn "pruning $(echo "$ids" | wc -l | tr -d ' ') post(s) left by a previous sitegraft run before re-importing"
-  echo "$ids" | while read -r id; do
+  # Same fd0-collision class as graft_remap_attachment_ids's own fix above
+  # (`echo | while read` binds the loop's fd0 to the pipe; wp_remote's
+  # wrapped-local branch execs a child that inherits/drains that same fd0
+  # on every iteration) — reading from fd 3 instead avoids it here too,
+  # even though this specific loop wasn't the one caught live (the DDEV
+  # harness only has one leftover post to prune, one iteration, nothing to
+  # silently truncate) — fixed proactively rather than waiting to reproduce
+  # it a second time with a multi-post fixture.
+  local id
+  while read -r id <&3; do
     [ -n "$id" ] && run_or_echo wp_remote b post delete "$id" --force
-  done
+  done 3<<< "$ids"
 }
 
 graft_run_module_post_import() {
@@ -663,6 +774,14 @@ phase_graft() {
   modules_discover
   local manifest; manifest=$(cat "${run_dir}/manifest.json")
   local post_types_csv; post_types_csv=$(echo "$manifest" | jq -r '[.migrate[].post_types[]?] | join(",")')
+  # attachment is deliberately excluded from the WXR export's own post_type
+  # filter — graft_import_attachments handles attachments itself (see its
+  # own comment for why the standard WXR/wordpress-importer path doesn't
+  # work at all against the currently-shipped wordpress-importer). Kept in
+  # the full post_types_csv (used by prune and the integrity-gate allowlist)
+  # since a future re-import should still prune any previously-migrated
+  # attachment the same way as any other migrated content.
+  local wxr_post_types_csv; wxr_post_types_csv=$(echo "$manifest" | jq -r '[.migrate[].post_types[]? | select(. != "attachment")] | join(",")')
   local content_tables_csv; content_tables_csv=$(graft_content_tables_csv b)
 
   SITEGRAFT_GRAFT_RUN_DIR="$run_dir"
@@ -677,10 +796,21 @@ phase_graft() {
 
   graft_step_done "$run_dir" media_sync    || { graft_media_sync "$run_dir"; graft_mark_step "$run_dir" media_sync; }
   graft_step_done "$run_dir" mu_plugin     || { graft_deploy_mu_plugin; graft_mark_step "$run_dir" mu_plugin; }
+  # prune MUST run before import_attachments (bug found live): prune deletes
+  # every post carrying _sitegraft_source_id as leftover from a PREVIOUS
+  # run — import_attachments sets that exact meta on whatever it creates,
+  # in THIS run. Reversed, prune would delete the attachment(s)
+  # import_attachments just created a moment earlier, mistaking this run's
+  # own fresh content for a prior run's leftovers (reproduced live: the
+  # attachment vanished, and WordPress's next auto-increment ID for the
+  # "Home" page happened to land exactly on the deleted attachment's old ID
+  # — reading as "the page overwrote the attachment" until traced back to
+  # prune actually deleting it first).
   graft_step_done "$run_dir" prune         || { graft_prune_previous_run "$post_types_csv"; graft_mark_step "$run_dir" prune; }
+  graft_step_done "$run_dir" import_attachments || { graft_import_attachments "$run_dir"; graft_mark_step "$run_dir" import_attachments; }
   graft_step_done "$run_dir" importer_setup || { graft_ensure_importer "$run_dir"; graft_mark_step "$run_dir" importer_setup; }
   graft_step_done "$run_dir" export        || {
-    graft_export_wxr "$post_types_csv" "$run_dir"
+    graft_export_wxr "$wxr_post_types_csv" "$run_dir"
     if ! is_dry_run; then
       local f found_any=0
       for f in "${run_dir}/export"/*.xml; do

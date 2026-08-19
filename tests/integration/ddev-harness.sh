@@ -11,6 +11,15 @@ PROJECT_B="sitegraft-test-b"
 cleanup() {
   ddev delete -Oy "$PROJECT_A" >/dev/null 2>&1 || true
   ddev delete -Oy "$PROJECT_B" >/dev/null 2>&1 || true
+  # Found live while iterating on Step 4 (not present before): `ddev delete`
+  # only tears down the DDEV project registration/containers, never the host
+  # directory it was configured from — a re-run of this harness against a
+  # leftover /tmp/sitegraft-test-a/b (still containing a full WordPress
+  # install) fails immediately at `wp core download` with "WordPress files
+  # seem to already be present here." Nothing here depends on these
+  # directories surviving a run, so wiping them is safe and keeps the
+  # harness genuinely idempotent/rerunnable.
+  rm -rf "/tmp/${PROJECT_A}" "/tmp/${PROJECT_B}"
   # m7: this harness-generated profile (real project names, gitignored) was
   # never removed — left behind after every run instead of being test-only
   # scratch state.
@@ -32,6 +41,17 @@ cp "${ROOT}/tests/integration/fixtures/site-a-fake-etch/fake-etch-cpts.php" "/tm
 "${ROOT}/tests/integration/fixtures/site-a-seed.sh" "$PROJECT_A"
 mkdir -p "/tmp/${PROJECT_B}/wp-content/mu-plugins"
 cp "${ROOT}/tests/integration/fixtures/site-b-fake-plugin/fake-plugin.php" "/tmp/${PROJECT_B}/wp-content/mu-plugins/fake-plugin.php"
+# Step 4 fixture: B also gets the SAME CPT-registering mu-plugin as A — this
+# simulates the CPT-registration effect a real `graft_sync_stack` would have
+# already had on B (copying the actual Etch plugin, which registers
+# etch_cfs) BEFORE the WXR import runs. graft_sync_stack itself is exercised
+# separately (tests/unit/test_graft_stack_sync.bats) — this harness has no
+# real Etch plugin fixture to stack-sync, so this is the pragmatic
+# equivalent for the one thing the WXR import actually needs: the target
+# post_type must be a REGISTERED post_type on B, or wp-cli's importer
+# rejects every post of that type outright ("Invalid post type") — found
+# live, not anticipated by the plan's pseudocode.
+cp "${ROOT}/tests/integration/fixtures/site-a-fake-etch/fake-etch-cpts.php" "/tmp/${PROJECT_B}/wp-content/mu-plugins/fake-etch-cpts.php"
 ddev exec --raw -p "$PROJECT_B" -- wp eval 'do_action("activate_fake-plugin.php");' # dbDelta + seed via activation hook logic, invoked directly since it's an mu-plugin (no real activation event)
 
 echo "==> asserting the site-b-fake-plugin fixture actually created its table+row"
@@ -334,4 +354,159 @@ if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "restore" ]; then
   exit 0
 fi
 
-echo "no later phase wired yet — see Task 5.2 (graft/verify)"
+# --------------------------------------------------------------------------
+# Step 4: graft — the real safety proof of this whole tool. Only
+# graft_integrity_gate (a pure function needing nothing but core.sh) is
+# called directly from the harness below, for the negative/positive gate
+# assertion (e) — the real graft run itself goes through the normal
+# bin/sitegraft subprocess, which sources everything it needs on its own.
+# shellcheck source=../../lib/graft.sh
+. "${ROOT}/lib/graft.sh"
+
+echo "==> writing a real migrate/protect manifest for the graft run (the earlier manifest.json only tested default-deny, with empty migrate/protect)"
+# manifest key names are arbitrary strings from graft's own perspective (it
+# iterates .migrate[]/.protect[] values, never keys) — module post_import
+# hooks are dispatched by SITEGRAFT_MODULES (the real discovered module
+# prefix), not by manifest key, so "core-wp" here does not need to match
+# modules/core-wp.sh's own prefix "core_wp" for its hook to run.
+#
+# options.search_replace.from/to: NOT "https://a.example.com"/"...b..." —
+# found live: DDEV's own wp-config-ddev.php unconditionally defines
+# WP_HOME/WP_SITEURL from DDEV_PRIMARY_URL, which overrides whatever
+# `wp core install --url=` wrote to the DB (get_option('siteurl') applies
+# that constant via WordPress core's own _config_wp_siteurl() filter) — so
+# every URL this install actually generates at runtime (attachment guids,
+# home_url() calls) uses the real "*.ddev.site" domain regardless of the
+# --url flag. Using the real, live-resolved domain here is what makes
+# assertion (c) below a genuine test of graft_search_replace_domain against
+# real embedded content, not a check that happens to vacuously pass because
+# the fixture domain was never actually present anywhere.
+DOMAIN_A="https://${PROJECT_A}.ddev.site"
+DOMAIN_B="https://${PROJECT_B}.ddev.site"
+jq -n --arg da "$DOMAIN_A" --arg db "$DOMAIN_B" '{
+  sitegraft_manifest_version: 1,
+  frozen: true,
+  migrate: {
+    "core-wp": {post_types: ["page","post"], option_keys: ["show_on_front","page_on_front","page_for_posts"]},
+    media: {post_types: ["attachment"], option_keys: []},
+    etch: {post_types: ["etch_cfs"], option_keys: ["etch_settings","etch_styles"]}
+  },
+  protect: {
+    fakebooking: {post_types: ["fake_reservation"], tables: ["fakebooking_reservations"], option_keys: ["fakebooking_settings"]}
+  },
+  stack: {},
+  clean: {enabled: false, post_types: []},
+  options: {search_replace: {from: $da, to: $db}}
+}' > "${RUN_DIR}/manifest.json"
+chmod 600 "${RUN_DIR}/manifest.json"
+
+echo "==> capturing A's pre-graft state for the residual-ID/domain assertions (design doc §9.1/§9.4)"
+OLD_ATTACH_ID=$(ddev exec --raw -p "$PROJECT_A" -- wp post list --post_type=attachment --field=ID)
+[ -n "$OLD_ATTACH_ID" ]
+PRE_GRAFT_CHECKSUM="$CHECKSUM_1"
+
+echo "==> running graft"
+# --allow-stack-mismatch: both A/B get a fresh default WP theme from
+# `ddev wp core install`, normally identical — passed defensively anyway so
+# a real-world theme-version drift between the two disposable installs can
+# never turn into unrelated harness flakiness; no other stack component
+# (etch/acss) is registered as a module in this repo yet, so
+# graft_check_stack_precondition has nothing else to resolve either way.
+"${ROOT}/bin/sitegraft" graft --profile ddev-test --run "$RUN_DIR" --allow-stack-mismatch
+
+echo "==> (a) asserting migrated post_types exist and are visible on B"
+ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=page --field=post_title | grep -q '^Home$'
+ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=etch_cfs --field=post_title | grep -q 'Hero CFS'
+ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=etch_cfs --field=post_title | grep -q 'Image Block CFS'
+B_ATTACH_COUNT=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=attachment --format=count)
+[ "$B_ATTACH_COUNT" -ge 1 ]
+
+echo "==> (b) asserting B's protected fake-plugin data is BYTE-IDENTICAL before/after graft (the central non-contamination proof)"
+POST_GRAFT_CHECKSUM=$(b_protected_checksum)
+if [ "$PRE_GRAFT_CHECKSUM" != "$POST_GRAFT_CHECKSUM" ]; then
+  echo "FAIL: protected fake-plugin data changed during graft — contamination of B's live business data" >&2
+  exit 1
+fi
+FAKE_ROW_COUNT_AFTER=$(ddev exec --raw -p "$PROJECT_B" -- wp eval 'global $wpdb; echo (int) $wpdb->get_var("SELECT COUNT(*) FROM ".$wpdb->prefix."fakebooking_reservations");')
+[ "$FAKE_ROW_COUNT_AFTER" = "$FAKE_ROW_COUNT" ]
+
+echo "==> (c) asserting no residual A ID/domain survived the two-pass sentinel remap + domain search-replace (design doc §9.1/§9.4)"
+NEW_ATTACH_ID=$(awk -F'\t' -v old="$OLD_ATTACH_ID" '$1==old && $3=="attachment"{print $2}' "${RUN_DIR}/id-map.tsv")
+[ -n "$NEW_ATTACH_ID" ]
+[ "$NEW_ATTACH_ID" != "$OLD_ATTACH_ID" ]  # a real DDEV/WP install never reuses A's own ID space on a distinct B install
+IMAGE_BLOCK_ID=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=etch_cfs --title="Image Block CFS" --field=ID)
+IMAGE_BLOCK_CONTENT=$(ddev exec --raw -p "$PROJECT_B" -- wp post get "$IMAGE_BLOCK_ID" --field=post_content)
+case "$IMAGE_BLOCK_CONTENT" in
+  *"\"id\":${OLD_ATTACH_ID}"*|*"wp-image-${OLD_ATTACH_ID}"*)
+    echo "FAIL: B's imported content still references A's OLD attachment id (${OLD_ATTACH_ID}) — the sentinel ID remap did not fully rewrite it" >&2
+    exit 1
+    ;;
+esac
+case "$IMAGE_BLOCK_CONTENT" in
+  *"\"id\":${NEW_ATTACH_ID}"*) : ;;
+  *) echo "FAIL: B's imported content does not reference the correctly remapped NEW attachment id (${NEW_ATTACH_ID}) — the remap dropped the reference instead of rewriting it" >&2; exit 1 ;;
+esac
+case "$IMAGE_BLOCK_CONTENT" in
+  *"${PROJECT_A}.ddev.site"*)
+    echo "FAIL: B's imported content still contains A's domain string (${PROJECT_A}.ddev.site) — the domain search-replace did not fully rewrite it" >&2
+    exit 1
+    ;;
+esac
+echo "$IMAGE_BLOCK_CONTENT" | grep -q "${PROJECT_B}.ddev.site"
+
+echo "==> (d) asserting page_on_front resolves to the correctly remapped page on B (design doc §9.3)"
+B_FRONT_ID=$(ddev exec --raw -p "$PROJECT_B" -- wp option get page_on_front)
+[ -n "$B_FRONT_ID" ] && [ "$B_FRONT_ID" != "0" ]
+ddev exec --raw -p "$PROJECT_B" -- wp post get "$B_FRONT_ID" --field=post_title | grep -q '^Home$'
+NEW_HOME_ID_FROM_MAP=$(awk -F'\t' -v old="$(ddev exec --raw -p "$PROJECT_A" -- wp option get page_on_front)" '$1==old && $3=="page"{print $2}' "${RUN_DIR}/id-map.tsv")
+[ "$B_FRONT_ID" = "$NEW_HOME_ID_FROM_MAP" ]
+
+echo "==> (f) asserting the mapping mu-plugin was removed from B after graft"
+if ddev exec --raw -p "$PROJECT_B" -- test -f /var/www/html/wp-content/mu-plugins/sitegraft-id-mapper.php 2>/dev/null; then
+  echo "FAIL: sitegraft-id-mapper.php is still present on B after graft completed — never left running unattended" >&2
+  exit 1
+fi
+ddev exec --raw -p "$PROJECT_B" -- wp option get sitegraft_test_marker >/dev/null 2>&1 || true # (unrelated to mu-plugin; keeps eval parity with earlier assertions)
+
+echo "==> (e) asserting the integrity gate ABORTS on a real WXR file carrying a post_type outside the manifest allowlist"
+# Uses the REAL WXR file graft's own export step just produced (not a
+# hand-fabricated fixture) — proves the gate works against genuine wp-cli
+# export output, not only the synthetic XML in tests/unit/test_graft_integrity_gate.bats.
+REAL_WXR=$(ls "${RUN_DIR}/export"/*.xml | head -1)
+[ -n "$REAL_WXR" ]
+ALLOWED_TYPES=$(jq -c '[.migrate[].post_types[]?]' "${RUN_DIR}/manifest.json")
+# Sanity check first: the gate must PASS the real, untouched file — otherwise
+# the negative assertion below would be meaningless (the gate might just be
+# rejecting everything).
+if ! graft_integrity_gate "$REAL_WXR" "$ALLOWED_TYPES"; then
+  echo "FAIL: the integrity gate rejected graft's own real, unmutated WXR export — sanity check failed, negative test below would be meaningless" >&2
+  exit 1
+fi
+MUTATED_WXR="${RUN_DIR}/export/mutated-with-injected-post-type.xml"
+# `</channel>` and `</rss>` land on SEPARATE lines in a real wp-cli export
+# (verified live — an earlier version of this sed matched them as one line,
+# which never matches, silently making "mutated" an exact copy of the
+# original and this whole negative assertion vacuous). Targeting the
+# `</channel>` line alone is what actually lands the injected line.
+sed 's#</channel>#<item><wp:post_type>injected_evil_type</wp:post_type></item>\
+</channel>#' "$REAL_WXR" > "$MUTATED_WXR"
+grep -q 'injected_evil_type' "$MUTATED_WXR" || { echo "FAIL: the mutation itself did not land in ${MUTATED_WXR} — the sed pattern didn't match this wp-cli export's actual line structure, the negative assertion below would be meaningless" >&2; exit 1; }
+if graft_integrity_gate "$MUTATED_WXR" "$ALLOWED_TYPES"; then
+  echo "FAIL: the integrity gate ACCEPTED a WXR file carrying a post_type outside the manifest allowlist — the leak gate is not working (this is a security control, design doc §6.4 step 4)" >&2
+  exit 1
+fi
+echo "==> confirmed: the integrity gate aborts on a real WXR file leaking an out-of-allowlist post_type, and passes the same file before mutation"
+
+echo "==> re-running graft is a no-op past the completed markers (marker-gated resumability, design doc §6.4)"
+"${ROOT}/bin/sitegraft" graft --profile ddev-test --run "$RUN_DIR" --allow-stack-mismatch
+POST_RERUN_CHECKSUM=$(b_protected_checksum)
+[ "$POST_RERUN_CHECKSUM" = "$PRE_GRAFT_CHECKSUM" ]
+
+echo "ALL GRAFT ASSERTIONS PASSED"
+
+if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "graft" ]; then
+  echo "GRAFT OK (SITEGRAFT_HARNESS_STOP_AFTER=graft)"
+  exit 0
+fi
+
+echo "no later phase wired yet — see Step 5 (verify)"
