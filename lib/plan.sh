@@ -166,6 +166,51 @@ plan_select_interactive() {
   _plan_apply_selection "$manifest" "$kept"
 }
 
+# design doc §12 (Marcel's revision of review finding B1, amended for the
+# ACSS v4 plugin-folder-rename case, §3.4): for each stack component
+# inventory_stack_diff reports, offer to copy A's resolved slug to B, using a
+# stronger confirmation whenever B already has *something* under that module
+# (slug_b not null) — whether that's literally the same slug at a different
+# version, or a different slug entirely (the legacy-vs-current ACSS case).
+# Never installs from anywhere but A. Declining leaves the component "skip"
+# — graft's hard precondition (Task 4.1) picks it up from there.
+plan_resolve_stack() {
+  local manifest="$1" scan_a_json="$2" scan_b_json="$3"
+  local diff; diff=$(inventory_stack_diff "$scan_a_json" "$scan_b_json")
+  local component
+  for component in $(echo "$diff" | jq -r 'keys[]'); do
+    local slug_a slug_b ver_a ver_b resolution
+    slug_a=$(echo "$diff" | jq -r --arg c "$component" '.[$c].slug_a')
+    slug_b=$(echo "$diff" | jq -r --arg c "$component" '.[$c].slug_b')
+    ver_a=$(echo "$diff" | jq -r --arg c "$component" '.[$c].version_a')
+    ver_b=$(echo "$diff" | jq -r --arg c "$component" '.[$c].version_b')
+    if [ "$slug_b" = "null" ]; then
+      log_warn "${component} is on A (${slug_a} v${ver_a}) but not on B."
+      if _plan_confirm "Copy ${component} from A and activate it on B?"; then
+        resolution="copy"
+      else
+        resolution="skip"
+      fi
+    else
+      log_warn "B already has ${component} installed as '${slug_b}' (v${ver_b}) — A has it as '${slug_a}' (v${ver_a}). Copying A's version will add A's folder alongside B's existing one and activate it."
+      if _plan_confirm_strong "Copy A's ${component} ('${slug_a}' v${ver_a}) to B and activate it, leaving B's existing '${slug_b}' folder in place but inactive?"; then
+        resolution="copy"
+      else
+        resolution="skip"
+      fi
+    fi
+    manifest=$(echo "$manifest" | jq \
+      --arg c "$component" --arg sa "$slug_a" --arg sb "$slug_b" --arg va "$ver_a" --arg vb "$ver_b" --arg r "$resolution" \
+      '.stack[$c] = {
+        slug_a: $sa,
+        slug_b: (if $sb == "null" then null else $sb end),
+        version_a: $va, version_b: $vb,
+        resolution: $r
+      }')
+  done
+  echo "$manifest"
+}
+
 phase_plan() {
   local profile="" run_dir=""
   while [ $# -gt 0 ]; do
@@ -187,8 +232,14 @@ phase_plan() {
   manifest=$(plan_defaults "${run_dir}/scan-a.json" "${run_dir}/scan-b.json")
 
   if [ -n "${SITEGRAFT_MANIFEST_PREFILLED:-}" ]; then
+    # Fully scripted path (DDEV harness / any non-interactive driver): the
+    # prefilled manifest is expected to already carry whatever stack
+    # decisions its scenario needs (design doc §12) — plan_resolve_stack's
+    # prompts are skipped entirely here, same reasoning as
+    # plan_select_interactive below.
     manifest=$(cat "$SITEGRAFT_MANIFEST_PREFILLED")
   else
+    manifest=$(plan_resolve_stack "$manifest" "${run_dir}/scan-a.json" "${run_dir}/scan-b.json")
     manifest=$(plan_select_interactive "$manifest")
   fi
 
