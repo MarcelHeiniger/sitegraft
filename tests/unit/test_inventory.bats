@@ -1,0 +1,103 @@
+# tests/unit/test_inventory.bats
+setup() {
+  load '../../lib/core.sh'
+  load '../../lib/modules.sh'
+  load '../../lib/inventory.sh'
+  export SITEGRAFT_MODULES_DIR="$BATS_TEST_TMPDIR/modules"
+  mkdir -p "$SITEGRAFT_MODULES_DIR"
+  cat > "$SITEGRAFT_MODULES_DIR/acss.sh" <<'EOF'
+acss_stack_candidates() { printf 'automatic-css\nacss-legacy-slug\n'; }
+EOF
+  modules_discover
+}
+
+@test "wp_remote builds an ssh command when SITE_A_SSH_HOST is set" {
+  SITE_A_SSH_HOST="user@host-a.example.com"
+  SITE_A_WP_PATH="/var/www/site-a"
+  SITE_A_WP_CMD="wp"
+  SITEGRAFT_DRY_RUN=1
+  run wp_remote a post-type list --format=json
+  [[ "$output" == *"ssh"* ]]
+  [[ "$output" == *"user@host-a.example.com"* ]]
+}
+
+@test "wp_remote runs the local wp command when no SSH host is set" {
+  unset SITE_B_SSH_HOST
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="ddev wp"
+  SITEGRAFT_DRY_RUN=1
+  run wp_remote b post-type list --format=json
+  [[ "$output" != *"ssh"* ]]
+  [[ "$output" == *"ddev wp"* ]]
+}
+
+@test "wp_remote actually splits a multi-word local WP_CMD into separate argv words on real execution (not just dry-run echo)" {
+  # Caught against the real DDEV harness: a quoted "$wp_cmd" tries to exec a
+  # single binary literally named e.g. "ddev exec -p x -- wp", which doesn't
+  # exist. Dry-run mode never exercises this (it only ever echoes "$*"), so a
+  # dry-run-only test can't catch it — this one runs wp_remote for real.
+  unset SITE_B_SSH_HOST
+  SITE_B_WP_PATH="/var/www/html"
+  SITE_B_WP_CMD="echo CALLED"
+  unset SITEGRAFT_DRY_RUN
+  run wp_remote b option get siteurl
+  [ "$status" -eq 0 ]
+  [ "$output" = "CALLED --path=/var/www/html option get siteurl" ]
+}
+
+@test "inventory_resolve_slug returns the first candidate actually present, never an absent one" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  echo '{"plugins":[{"name":"acss-legacy-slug","version":"3.9"}]}' > "$scan"
+  run inventory_resolve_slug "$scan" "$(printf 'automatic-css\nacss-legacy-slug\n')"
+  [ "$output" = "acss-legacy-slug" ]
+}
+
+@test "inventory_resolve_slug returns empty when no candidate is present" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  echo '{"plugins":[]}' > "$scan"
+  run inventory_resolve_slug "$scan" "$(printf 'automatic-css\nacss-legacy-slug\n')"
+  [ -z "$output" ]
+}
+
+@test "inventory_stack_diff is empty when everything resolves the same on both sites" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"active_theme":{"stylesheet":"etch-theme","version":"1.0"},"plugins":[{"name":"automatic-css","version":"4.1"}]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"etch-theme","version":"1.0"},"plugins":[{"name":"automatic-css","version":"4.1"}]}' > "$b"
+  run inventory_stack_diff "$a" "$b"
+  [ "$status" -eq 0 ]
+  [ "$(echo "$output" | jq 'length')" = "0" ]
+}
+
+@test "inventory_stack_diff reports theme as a mismatch with both resolved values when they differ" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"active_theme":{"stylesheet":"etch-theme","version":"1.0"},"plugins":[]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"divi","version":"4.2"},"plugins":[]}' > "$b"
+  run inventory_stack_diff "$a" "$b"
+  echo "$output" | jq -e '.theme.slug_a == "etch-theme" and .theme.slug_b == "divi"' >/dev/null
+}
+
+@test "inventory_stack_diff reports slug_b as null when the component is absent on B (the common case, §13)" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[{"name":"automatic-css","version":"4.1"}]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[]}' > "$b"
+  run inventory_stack_diff "$a" "$b"
+  echo "$output" | jq -e '.acss.slug_a == "automatic-css" and .acss.slug_b == null' >/dev/null
+}
+
+@test "inventory_stack_diff resolves each site's own real slug — the ACSS v4 plugin-folder-rename case (design doc §3.4)" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[{"name":"automatic-css","version":"4.1"}]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[{"name":"acss-legacy-slug","version":"3.9"}]}' > "$b"
+  run inventory_stack_diff "$a" "$b"
+  echo "$output" | jq -e \
+    '.acss.slug_a == "automatic-css" and .acss.slug_b == "acss-legacy-slug" and .acss.version_a == "4.1" and .acss.version_b == "3.9"' \
+    >/dev/null
+}
+
+@test "inventory_stack_matches wraps inventory_stack_diff (true iff it's empty)" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"active_theme":{"stylesheet":"etch-theme"},"plugins":[]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"some-other-theme"},"plugins":[]}' > "$b"
+  run inventory_stack_matches "$a" "$b"
+  [ "$status" -eq 1 ]
+}
