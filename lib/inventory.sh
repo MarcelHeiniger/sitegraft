@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 # lib/inventory.sh — read-only site introspection (phase: scan).
 
+# sq <string> — single-quote a string safely for embedding in a shell command
+# line that will be re-parsed by another shell (e.g. the far end of an ssh
+# connection). Replaces each ' with '\'' and wraps the whole thing in outer
+# single quotes — the standard, correct way to shell-quote arbitrary content
+# in POSIX sh/bash, including content that itself contains single quotes.
+sq() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 # wp_remote <alias: a|b> <wp-cli args...>
 # Dispatches to SSH+wp-cli if SITE_<ALIAS>_SSH_HOST is set, else runs the local
-# wp command (plain `wp`, or a wrapper like `ddev wp`) directly against
-# SITE_<ALIAS>_WP_PATH.
+# wp command (plain `wp`, or a wrapper like `ddev exec --raw -p <project> --
+# wp`) directly against SITE_<ALIAS>_WP_PATH.
 wp_remote() {
   local alias_lc="$1"; shift
   local alias_uc; alias_uc=$(printf '%s' "$alias_lc" | tr '[:lower:]' '[:upper:]')
@@ -16,7 +25,28 @@ wp_remote() {
   local wp_cmd="${!cmd_var:-wp}"
 
   if [ -n "$host" ]; then
-    run_or_echo ssh "$host" "$wp_cmd --path='$path' $*"
+    # Every argument that will reach the REMOTE shell must be single-quoted
+    # individually via sq() — building the remote command line by hand with
+    # "$wp_cmd --path='$path' $*" (the previous version) was both an
+    # injection risk and functionally broken: `wp eval` snippets containing
+    # `;`, `$wpdb`, `->` etc. get re-parsed by the remote shell before wp-cli
+    # ever sees them (a `;` ends the command early, `$wpdb` is expanded to
+    # empty by the remote shell), silently corrupting exactly the
+    # custom-code-signal detection queries §14's blocking gate depends on —
+    # a bad query there fails open. Passing "$@" as separate argv elements
+    # to ssh does NOT fix this on its own (ssh re-joins them into a single
+    # string for the remote shell regardless), so each one is explicitly
+    # single-quoted here before being joined.
+    #
+    # $wp_cmd itself is deliberately left UNQUOTED in the built string, same
+    # as the local branch below: it may be a multi-word wrapper, and this is
+    # meant to word-split remotely too.
+    local remote_cmd="${wp_cmd} --path=$(sq "$path")"
+    local arg
+    for arg in "$@"; do
+      remote_cmd="${remote_cmd} $(sq "$arg")"
+    done
+    run_or_echo ssh "$host" "$remote_cmd"
   else
     # $wp_cmd is deliberately unquoted here so it word-splits into separate
     # argv elements (e.g. "ddev exec -p my-site -- wp" -> 6 words). A quoted
@@ -24,7 +54,9 @@ wp_remote() {
     # "ddev exec -p my-site -- wp", which does not exist — dry-run mode never
     # exercises this branch (it only ever echoes "$*"), so this only surfaces
     # on real execution. None of sitegraft's own wp_cmd values contain spaces
-    # within a single word, so plain word-splitting is safe here.
+    # within a single word, so plain word-splitting is safe here. Unlike the
+    # ssh branch, "$@" is passed as real, separate argv elements straight to
+    # exec — no re-quoting needed, there is no second shell in between.
     run_or_echo $wp_cmd --path="$path" "$@"
   fi
 }

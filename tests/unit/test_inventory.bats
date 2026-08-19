@@ -21,6 +21,55 @@ EOF
   [[ "$output" == *"user@host-a.example.com"* ]]
 }
 
+@test "sq single-quotes a plain string" {
+  run sq "hello"
+  [ "$output" = "'hello'" ]
+}
+
+@test "sq escapes an embedded single quote so the result is safe to re-parse by another shell (B1)" {
+  run sq "it's a test"
+  [ "$output" = "'it'\\''s a test'" ]
+}
+
+@test "wp_remote builds the EXACT remote command string for a wp eval snippet with \$wpdb, ;, and -> (B1)" {
+  # This is the literal case that was broken and unsafe: the old
+  # "\$wp_cmd --path='\$path' \$*" construction let the remote shell
+  # re-parse \$wpdb (expanded to empty before wp-cli ever saw it), ; (ends
+  # the command early), and -> (harmless here, but the same unescaped-
+  # interpolation problem) — silently corrupting exactly the queries §14's
+  # custom-code-detection gate depends on. Asserts the exact resulting
+  # string, not just a substring, since a substring match previously would
+  # have let the injection-shaped bug through undetected.
+  SITE_A_SSH_HOST="user@host-a.example.com"
+  SITE_A_WP_PATH="/var/www/html"
+  SITE_A_WP_CMD="wp"
+  SITEGRAFT_DRY_RUN=1
+  run wp_remote a eval 'global $wpdb; echo $wpdb->prefix;'
+  [ "$output" = "[dry-run] ssh user@host-a.example.com wp --path='/var/www/html' 'eval' 'global \$wpdb; echo \$wpdb->prefix;'" ]
+}
+
+@test "wp_remote single-quotes an SSH_PATH containing an embedded single quote instead of injecting it (B1)" {
+  SITE_A_SSH_HOST="user@host-a.example.com"
+  SITE_A_WP_PATH="/var/www/o'brien-site"
+  SITE_A_WP_CMD="wp"
+  SITEGRAFT_DRY_RUN=1
+  run wp_remote a option get siteurl
+  [ "$output" = "[dry-run] ssh user@host-a.example.com wp --path='/var/www/o'\\''brien-site' 'option' 'get' 'siteurl'" ]
+}
+
+@test "wp_remote single-quotes a malicious argument instead of letting it inject a second command over ssh (B1)" {
+  SITE_A_SSH_HOST="user@host-a.example.com"
+  SITE_A_WP_PATH="/var/www/html"
+  SITE_A_WP_CMD="wp"
+  SITEGRAFT_DRY_RUN=1
+  run wp_remote a eval "1; touch /tmp/PWNED"
+  # The whole payload must appear as ONE single-quoted argv element to the
+  # remote wp — never as an unquoted "; touch ..." that a remote shell
+  # would execute as a second command.
+  [[ "$output" == *"'1; touch /tmp/PWNED'"* ]]
+  [[ "$output" != *"'1'; touch /tmp/PWNED"* ]]
+}
+
 @test "wp_remote runs the local wp command when no SSH host is set" {
   unset SITE_B_SSH_HOST
   SITE_B_WP_PATH="/var/www/site-b"
