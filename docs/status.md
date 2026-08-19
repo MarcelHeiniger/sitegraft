@@ -40,6 +40,21 @@ decisions Rosalinde made alone (see "Recent decisions" below).
       pre-`1.0.0` real-dry-run gate (item D). See
       `docs/plans/2026-08-19-sitegraft-plan-review.md` for the full
       finding-by-finding resolution log (2026-08-19, Rosalinde).
+- [x] Marcel amended B1/B2 and added a third guardrail before Step 1 started
+      (2026-08-19, Rosalinde): **B1 revised** — `plan` now offers to *copy* a
+      missing/mismatched rendering-stack component from A (never installed from
+      anywhere else), recorded in the manifest's new `stack` key, with the
+      original refuse/`--allow-stack-mismatch` behavior kept only for whatever's
+      declined; **B2 clarified** — design doc reworded so "block themes only"
+      reads unambiguously as A-only, B running Divi/Elementor/Bricks/classic
+      themes is the normal case, not a precondition; **new guardrail** —
+      `scan` detects custom-code signals on B (child theme, `functions.php`,
+      mu-plugins, snippet plugins) and `plan` blocks on any of them until an
+      explicit acknowledgment, since replacing B's theme would otherwise
+      silently drop that code. Design doc gained new §12 rewrite + new §14
+      (self-review renumbered to §15); plan gained Tasks 1.6, 2.4, 2.5, and a
+      revised Task 4.1. See `docs/plans/2026-08-19-sitegraft-plan-review.md` §E
+      for the resolution notes.
 
 ## In progress
 
