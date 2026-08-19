@@ -50,7 +50,7 @@ before Step 1 of the plan starts:
 | # | Decision | Rationale |
 |---|----------|-----------|
 | D1 | **`jq`** as a dependency to read/write the manifest as **JSON** | The manifest has a structure nested per module (post_types × option_keys × tables). A flat KEY=VALUE format can't represent that cleanly. `jq` is nearly universal (`brew install jq` / `apt install jq`), lightweight, and far safer than a hand-rolled JSON parser in bash. |
-| D2 | **Target bash 3.2 compatibility** (no associative arrays, no `mapfile`) instead of requiring bash ≥ 4 | Stock macOS still ships bash 3.2 (bash 4+ is GPLv3, which Apple won't bundle). Requiring `brew install bash` would break the promise of "runs on any Mac with nothing extra beyond the listed dependencies." The module registry is therefore a plain list of names (a string), not an associative array — see §3.4. |
+| D2 | **Target bash 3.2 compatibility** (no associative arrays, no `mapfile`) instead of requiring bash ≥ 4 | Stock macOS still ships bash 3.2 (bash 4+ is GPLv3, which Apple won't bundle). Requiring `brew install bash` would break the promise of "runs on any Mac with nothing extra beyond the listed dependencies." The module registry is therefore a plain list of names (a string), not an associative array — see §3.2. |
 | D3 | **State directory**: `~/.sitegraft/runs/<profile>-<timestamp>/` on the orchestrator, **never cleaned up automatically** | This directory holds the only inspectable safety copies of a run (manifest, ID map, logs, backup). Automatic purging would be dangerous — retention/cleanup stays a manual operator action (`sitegraft prune` could be added later, YAGNI for v1). |
 | D4 | **Mapping mu-plugin delivered by dropping a file via `rsync`** into `wp-content/mu-plugins/`, not via `wp plugin install` | WordPress must-use plugins load automatically the moment they're present in `mu-plugins/` — no activation needed, so there's no `wp plugin activate/deactivate` state to manage. A plain file drop + delete is simpler and safer (nothing to deactivate if the run crashes). |
 | D5 | **`bats-core`** as the unit test framework for `lib/`'s pure functions | The de facto standard for testing bash, syntax close to conventional unit tests, integrates natively with `set -euo pipefail`, well documented. |
@@ -71,7 +71,7 @@ technical detail:
   license. The DDEV harness (§10) simulates this format without a real Etch license —
   a gap between the real format and the simulated one is possible and would only
   surface on the first real run.
-- **R3 — Default-deny on tables/options unclaimed by any module (§3.5) protects well,
+- **R3 — Default-deny on tables/options unclaimed by any module (§3.6) protects well,
   but if `scan` fails to detect a table (e.g. a table without the standard
   `$table_prefix`, or a plugin that stores data somewhere other than the database),
   it never shows up in the manifest — neither on the protected side nor the ignored
@@ -174,6 +174,7 @@ For a module with prefix `<mod>` (e.g. `core_wp`, `etch`, `acss`, `motopress`):
 | `<mod>_option_keys_exclude` | no | `<mod>_option_keys_exclude` → stdout: one glob pattern per line | Exclusions within a broad prefix (e.g. licenses, DB versions) |
 | `<mod>_tables` | no* | `<mod>_tables` → stdout: one table suffix per line (without `$table_prefix`) | Plugin-owned SQL tables, outside WXR content |
 | `<mod>_post_import` | no | `<mod>_post_import <state_dir> <id_map_tsv> <wp_cmd_b>` | Hook run after WXR import + generic remaps, for module-specific fixups |
+| `<mod>_stack_candidates` | no | `<mod>_stack_candidates` → stdout: one candidate plugin slug per line, most-preferred first | Declares this module's plugin for §12's stack-sync — **detection only**, see below and §3.4 |
 
 \* At least ONE of the three functions `_post_types` / `_option_keys` / `_tables`
 must exist — a module that declares nothing has no reason to exist.
@@ -183,6 +184,22 @@ suffix is explicitly excluded, as is `_template.sh`), sources each file, and bui
 `SITEGRAFT_MODULES` — a space-separated string of names (no associative array,
 bash 3.2 constraint — see D1). Each optional function's presence is checked with
 `type -t <mod>_xxx >/dev/null 2>&1` before being called.
+
+**Rule — slugs and paths are never hardcoded to build a sync path, anywhere in
+this tool.** `<mod>_stack_candidates` exists purely to help *detection*: a
+plugin's folder name on disk can legitimately differ between installs (a
+version upgrade renaming the directory, exactly the ACSS v4 case documented in
+§3.4) — a module may know several candidate slugs, in preference order, for
+recognizing "is this module's plugin here at all, and under which name." That
+list is never itself used to construct an `rsync` source or destination path.
+The **real, resolved** folder name — whichever candidate `scan` actually finds
+present on that specific site — is what gets carried forward, first into
+`inventory_stack_diff`'s output, then frozen into the manifest's `stack` key
+(§4), and that manifest value, not the module's candidate list, is the only
+thing `graft_sync_stack` (§12, §6.4 step 0a) is allowed to read when building a
+path. A module's job is to say "these are the names this plugin might go by";
+scan's job is to say which one is actually there; graft's job is to trust only
+that second answer.
 
 ### 3.3 Concrete example — `modules/etch.sh`
 
@@ -222,7 +239,64 @@ EOF
 }
 ```
 
-### 3.4 Example of a future module — `modules/motopress.sh.example`
+### 3.4 Concrete example — `modules/acss.sh` (multiple candidate slugs for detection)
+
+ACSS is the worked example for `<mod>_stack_candidates` (§3.2) because it's a
+real, already-hit case, not a hypothetical: **Automatic.css's plugin folder
+changed with the v4 release** — a site still running a pre-4.0 install has ACSS
+under a different directory name than a fresh v4+ install does. `acss_detect`
+and `acss_stack_candidates` both need to recognize *either* name; only the one
+actually found is ever used to build a path (§3.2's rule, enforced in §12/§6.4
+step 0a — this module never constructs a sync path itself).
+
+```bash
+#!/usr/bin/env bash
+# modules/acss.sh — graft module for Automatic.css (ACSS)
+
+acss_name() { echo "Automatic.css"; }
+
+acss_detect() {
+  # $1 = path to a scan-*.json produced by `sitegraft scan`. True if ANY
+  # candidate slug is present — detection never assumes which one.
+  local candidate
+  while IFS= read -r candidate; do
+    jq -e --arg c "$candidate" '.plugins[] | select(.name == $c)' "$1" >/dev/null 2>&1 && return 0
+  done <<< "$(acss_stack_candidates)"
+  return 1
+}
+
+acss_option_keys() {
+  cat <<'EOF'
+automatic_css_settings
+automatic_css_generated_inventory
+EOF
+}
+
+acss_option_keys_exclude() {
+  cat <<'EOF'
+automatic_css_license_*
+automatic_css_db_version
+EOF
+}
+
+# §3.2/§12: detection-only. Most-preferred (current) slug first. graft_sync_stack
+# never reads this function directly — it reads the specific slug scan already
+# resolved and froze into the manifest (§4).
+#
+# TODO_VERIFY_LEGACY_ACSS_SLUG below is a deliberate placeholder, not a real
+# value — the actual pre-4.0 Automatic.css plugin folder name is not known with
+# certainty here and must be checked against a real pre-4.0 install before the
+# acss module ships (plan Task 4.1). Do not guess a real-looking slug to fill
+# this in without that verification.
+acss_stack_candidates() {
+  cat <<'EOF'
+automatic-css
+TODO_VERIFY_LEGACY_ACSS_SLUG
+EOF
+}
+```
+
+### 3.5 Example of a future module — `modules/motopress.sh.example`
 
 Shipped as a full worked example (not a real v1 module — MotoPress support isn't
 implemented). Copying this file to `modules/motopress.sh` (dropping the `.example`
@@ -283,7 +357,7 @@ motopress_post_import() {
 }
 ```
 
-### 3.5 Safe default (default-deny)
+### 3.6 Safe default (default-deny)
 
 During `plan`, after every known module has been checked against the scans of A and
 B, anything left on B — post_type, table, or option key — unclaimed by any module
@@ -339,9 +413,9 @@ Produced by `plan`, frozen, consumed as-is by `graft`. JSON, parsed via `jq`.
     "search_replace": { "from": "https://a.example.com", "to": "https://b.example.com" }
   },
   "stack": {
-    "theme": { "on_a": "etch-theme", "on_b": null, "resolution": "copy" },
-    "etch": { "on_a": "2.0", "on_b": null, "resolution": "copy" },
-    "acss": { "on_a": "3.0", "on_b": "2.5", "resolution": "skip" }
+    "theme": { "slug_a": "etch-theme", "slug_b": null, "version_a": "1.0", "version_b": null, "resolution": "copy" },
+    "etch": { "slug_a": "etch", "slug_b": null, "version_a": "2.0", "version_b": null, "resolution": "copy" },
+    "acss": { "slug_a": "automatic-css", "slug_b": "acss-legacy-slug-placeholder", "version_a": "4.1", "version_b": "3.9", "resolution": "skip" }
   },
   "custom_code_review": {
     "acknowledged": true,
@@ -359,13 +433,23 @@ Produced by `plan`, frozen, consumed as-is by `graft`. JSON, parsed via `jq`.
 ```
 
 `stack` (§12) records `plan`'s resolution for each of the three tracked stack
-components (theme, `etch`, `acss`) whenever A's and B's versions differ.
-`on_b: null` means the component was entirely absent on B; a version string means
-present but different. `resolution` is `"copy"` (operator confirmed — `graft`
-will `rsync` the component from A to B and activate it) or `"skip"` (operator
-declined, or the mismatch hasn't been resolved yet — `graft`'s hard precondition
-applies, see §6.4 step 0b). A component absent from `stack` entirely means A and
-B already matched at `plan` time — nothing to resolve.
+components (theme, `etch`, `acss`) whenever A and B differ. **`slug_a`/`slug_b`
+are the real, resolved plugin/theme folder names `scan` found present on each
+site** — never a name the module declared as a detection candidate (§3.2), never
+guessed, never hardcoded anywhere downstream. This is what the ACSS example
+above shows: `slug_a` is `"automatic-css"` (A is a fresh v4+ build) while
+`slug_b` is a different, legacy folder name (B predates the v4 rename) — same
+module, two different real directory names, both resolved from what `scan`
+actually found via each site's `plugin list`, not assumed to match. `slug_b:
+null` means the component was entirely absent on B. `version_a`/`version_b`
+are that resolved plugin's version at each site. `resolution` is `"copy"`
+(operator confirmed — `graft` will `rsync` **exactly `slug_a`'s directory**
+from A to B and activate it under that name) or `"skip"` (operator declined, or
+the mismatch hasn't been resolved yet — `graft`'s hard precondition applies,
+see §6.4 step 0b). A component absent from `stack` entirely means A and B
+already matched (same slug, same version) at `plan` time — nothing to resolve.
+`graft_sync_stack` (§6.4 step 0a) reads only `slug_a`/`resolution` from this
+key — it never re-derives a slug from a module or from any hardcoded name.
 
 `custom_code_review` (§14) is present only when `scan-b.json.custom_code_detected`
 was `true` — its `acknowledged: true` is the only way `plan` ever freezes a
@@ -451,12 +535,16 @@ takes, is either being replaced or is none of sitegraft's business (§13).
 
 **Rendering stack (see §12):** `scan` also records each site's active theme
 (`active_theme.stylesheet`/`.version`) and, via the existing `plugin list` dump,
-every plugin's version — this is what `plan` and `graft` use to detect a stack
-mismatch between A and B, and (§12) to offer copying a missing component from A
-to B, before any content is transferred. **This is not a check that B must
-already resemble A** — quite the opposite; see §12 and §13 for why B running
-something entirely different (Divi, Elementor, a classic theme) is the normal
-case this check exists to handle gracefully, not to reject.
+every plugin's version — this raw `plugin list` output is a real per-site
+directory listing (each plugin's `name` field *is* its actual folder name), so
+it's also the only source `inventory_stack_diff` (§12) is ever allowed to
+resolve a plugin's real slug from — never a hardcoded string, never a module's
+own guess. This is what `plan` and `graft` use to detect a stack mismatch
+between A and B, and (§12) to offer copying a missing component from A to B,
+before any content is transferred. **This is not a check that B must already
+resemble A** — quite the opposite; see §12 and §13 for why B running something
+entirely different (Divi, Elementor, a classic theme) is the normal case this
+check exists to handle gracefully, not to reject.
 
 **Classic menus (see §13):** `scan` records, **for both sites**, whether any
 classic nav menus exist with items assigned
@@ -844,7 +932,7 @@ Orchestration:
 
 | Case | sitegraft behavior |
 |------|---------------------|
-| A CPT with an internal ID reference in postmeta (e.g. "related product") | Outside the core's generic remap — that's the job of the relevant module's `<mod>_post_import` hook (full example in §3.4). |
+| A CPT with an internal ID reference in postmeta (e.g. "related product") | Outside the core's generic remap — that's the job of the relevant module's `<mod>_post_import` hook (full example in §3.5). |
 | Slug collisions between B's existing content and the imported content | Handled natively by WordPress (automatic `-2` suffix on insert). `verify` diffs `post_name` A vs. post-import B and **warns** (not a hard failure) if any slugs were renamed — a signal to manually check internal links. |
 | `page_on_front` / `show_on_front` | Dedicated remap via `core_wp_post_import`, see §9.3. |
 | Deep page hierarchies | `plan` **validates** that if a hierarchical post_type (`page`) is selected, ALL of its potential ancestors are selected too (same post_type, all-or-nothing migration) — a partial hierarchy import isn't a supported case in v1 (YAGNI: sitegraft migrates whole post_types, not subtrees). |
@@ -875,26 +963,42 @@ opt-in, never the first.
 Concretely:
 
 - `scan` records each site's active theme (`stylesheet`/`version`) and every
-  plugin's version (already dumped via `plugin list`) — see §6.1.
-- For each stack component (active theme, Etch, ACSS) where A and B differ,
-  `plan` resolves it interactively into the manifest's new `stack` key (§4) — see
-  §6.2 for the exact flow:
-  - **Absent on B:** offers to copy it — `rsync` the plugin/theme directory
+  plugin's version (already dumped via `plugin list`) — see §6.1. **No slug or
+  path is ever hardcoded to interpret this data.** A module may declare several
+  candidate slugs for *detecting* its plugin (`<mod>_stack_candidates`, §3.2 —
+  ACSS's real-world case, §3.4: the plugin folder changed with the v4 release,
+  so a pre-4.0 B and a v4+ A have the *same* module but *different* real
+  directory names); whichever candidate is actually found in a site's own
+  `plugin list` is that site's resolved slug, and only that resolved value ever
+  travels further downstream.
+- For each stack component (active theme, Etch, ACSS) where A and B's resolved
+  slug or version differ, `plan` resolves it interactively into the manifest's
+  new `stack` key (§4) — `slug_a`/`slug_b` are frozen in at this point, exactly
+  as `scan` found them, one resolution per component for the rest of the run.
+  See §6.2 for the exact flow:
+  - **Absent on B:** offers to copy it — `rsync` **`slug_a`'s specific
+    directory** (`wp-content/themes/<slug_a>/` or `wp-content/plugins/<slug_a>/`)
     A → orchestrator → B (never `scp`, never A↔B directly — the same two-hop
-    routing as every other transfer in this tool), then `wp plugin activate` /
-    `wp theme activate` on B. A plain confirm; this is the common case (§13).
-  - **Present on B but a different version than A's:** **warns loudly** and
-    requires an **explicit, separate confirmation** before offering the same
-    copy — this overwrites something that already exists on B, which is a
-    heavier decision than filling an absence, and is never done automatically or
-    by the same quick keystroke as the absent case.
+    routing as every other transfer in this tool, and never the whole
+    `themes/`/`plugins/` tree), then `wp plugin activate` / `wp theme activate`
+    that same slug on B. A plain confirm; this is the common case (§13).
+  - **Present on B but under a different slug or version:** **warns loudly**
+    (naming both resolved slugs/versions explicitly, e.g. "B has ACSS under
+    `slug_b`, A has it under `slug_a`") and requires an **explicit, separate
+    confirmation** before offering the same copy — this leaves B's existing
+    folder in place (never deleted or renamed automatically, out of scope for
+    v1) and adds A's folder alongside it, activating the new one; a heavier
+    decision than filling a plain absence, never done automatically or by the
+    same quick keystroke.
   - **Declined either way:** the component stays an unresolved mismatch — see
     below, unchanged from the original decision.
   - Whatever the operator decides is recorded in the manifest, not re-asked at
     `graft` time.
-- `graft`'s stack-sync step (§6.4 step 0a) executes every `stack.<component>`
-  decision recorded as `copy` — this is the only place sitegraft ever writes to
-  B's `wp-content/themes/` or `wp-content/plugins/`.
+- `graft`'s stack-sync step (§6.4 step 0a, `graft_sync_stack`) executes every
+  `stack.<component>` decision recorded as `copy`, reading only `slug_a` and
+  `resolution` from the manifest — this is the only place sitegraft ever writes
+  to B's `wp-content/themes/` or `wp-content/plugins/`, and it never
+  re-resolves, guesses, or falls back to a hardcoded name of its own.
 - Any component **left unresolved** (declined, or newly detected at `graft` time
   because `scan`/`plan` are re-runnable and B may have changed) is still a **hard
   precondition failure** (§6.4 step 0b) — `graft` refuses to run unless launched
@@ -999,7 +1103,7 @@ frozen copy of the signals that triggered it, for the record.
 
 **What this gate is not:** snippets a snippet-manager *plugin* stores in its own
 database tables or options are already **plugin data** — covered by the
-default-deny module system (§3.5) like any other plugin, protected unless
+default-deny module system (§3.6) like any other plugin, protected unless
 explicitly selected for migration, with no special-casing needed here. The risk
 this section exists for is narrower and different in kind: **code living in
 theme *files*** (`functions.php`, anything a child theme or an mu-plugin loads)
@@ -1094,3 +1198,24 @@ and from data loss, since `backup`'s full `wp-content` archive (§6.3, finding
 A3) already makes the old theme's files recoverable regardless; this gate is
 about not being surprised, not about preventing loss that `backup` already
 prevents.
+
+### 15.4 Fifth pass (2026-08-19) — no hardcoded plugin slugs, ever
+
+Marcel caught a bug in §12's own worked example before Step 1 started: ACSS's
+plugin folder changed with the v4 release, so a pre-4.0 B and a v4+ A can run
+the *same* module under *different* real directory names — and an early draft
+of `graft_sync_stack` had hardcoded `"automatic-css"` for the component, which
+would silently fail to sync a pre-4.0 install correctly. Fixed at the root: §3.2
+gained the optional `<mod>_stack_candidates` function (detection-only, several
+candidate slugs, most-preferred first) and the explicit rule that a candidate
+list is never itself used to build a path — only the specific slug `scan`
+actually finds present on a given site is allowed to. §3.4 is the worked
+example (the ACSS case, with the legacy pre-4.0 slug left as a deliberate,
+clearly marked placeholder — not invented, to be verified against a real
+install before implementation). §4's `stack` schema changed from a single
+version string per component to `{slug_a, slug_b, version_a, version_b}` so
+each site's independently resolved real slug travels all the way from `scan`
+through `plan`'s decision into `graft_sync_stack`, which now reads only
+`slug_a` from the manifest and never re-derives, guesses, or hardcodes
+anything. §3 was renumbered (3.4 inserted, motopress example and default-deny
+shifted to 3.5/3.6) to make room for the ACSS example next to Etch's.
