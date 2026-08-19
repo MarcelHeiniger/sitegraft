@@ -14,9 +14,8 @@ replace the *design/content* layer of B with A's, and never so much as glance at
 anything B's plugins own.
 
 > **Status: design complete, implementation not started.** See
-> [`PROJECT.md`](PROJECT.md) for the current state of the project (in French — the
-> internal project docs are French, this README is the public-facing English entry
-> point). The full design document lives at
+> [`PROJECT.md`](PROJECT.md) for the current state of the project. The full design
+> document lives at
 > [`docs/superpowers/specs/2026-08-19-sitegraft-design.md`](docs/superpowers/specs/2026-08-19-sitegraft-design.md).
 
 ## Why
@@ -69,6 +68,12 @@ settings and generated inventory). A `_template.sh` is provided for writing new 
 - `gum` (falls back to `fzf`, falls back to plain text prompts) — interactive selection
 
 Test-only: `bats-core` for unit tests, `ddev` for the integration test harness.
+
+**Windows without admin rights:** WSL requires admin privileges to install, so it's
+not an option on a locked-down machine. Instead, run sitegraft itself on a remote
+orchestrator machine (any Linux or macOS box you have shell access to — a spare
+server, a cloud VM, even a Raspberry Pi) and connect to it over SSH from Windows.
+The orchestrator only needs the dependencies above; it doesn't need to be A or B.
 
 ## Install
 
