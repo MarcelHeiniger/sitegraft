@@ -378,6 +378,24 @@ profile_load() {
 }
 ```
 
+> **SUPERSEDED — corrected in the post-review fix-pack (B2, verified live):**
+> the `grep -vE` shape check above has no end-of-line anchor, so
+> `SITE_A_ALIAS="a"; touch /tmp/PWNED` matches as a valid *prefix* and is
+> accepted; a double-quoted value can contain anything except a literal `"`,
+> so `SITE_A_ALIAS="$(touch /tmp/PWNED)"` also passes the shape check —
+> either payload then executes on `. "$file"`. The actual `lib/profile.sh`
+> no longer sources the file at all: it parses it itself line by line
+> (`profile_parse_file`, replacing `profile_validate_file`), anchors the
+> assignment regex at both ends via `[[ =~ ^KEY="value"$ ]]`, restricts keys
+> to a fixed whitelist (`SITEGRAFT_PROFILE_KEYS`: `SITE_A_*`/`SITE_B_*`/
+> `SITEGRAFT_*`), and only ever does a plain `export "key=value"` of the
+> literal captured text — never `eval`, never `source`. It also unsets every
+> whitelisted key before parsing (a stale `SITEGRAFT_CREDS_FILE` from an
+> earlier `profile_load` call in the same shell must not leak into a later
+> one, m10) and requires the `.creds` file to be mode 600 (M4/§5.2). See
+> `lib/profile.sh` and `tests/unit/test_profile.bats` for the real,
+> current implementation.
+
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `bats tests/unit/test_profile.bats`
@@ -2189,10 +2207,13 @@ setup() {
 @test "backup_wp_cmd_literal builds a plain local command with no ssh for a local site" {
   unset SITE_B_SSH_HOST
   SITE_B_WP_PATH="/var/www/site-b"
-  SITE_B_WP_CMD="ddev wp"
+  # Multi-word wrapper — "ddev wp" alone is NOT a valid real-world value (see
+  # §5.1 / Step 1's ddev exec --raw fix); this only exercises word-splitting
+  # of an arbitrary multi-word SITE_*_WP_CMD.
+  SITE_B_WP_CMD="ddev exec --raw -p test-b -- wp"
   run backup_wp_cmd_literal b
   [[ "$output" != *"ssh"* ]]
-  [[ "$output" == *"ddev wp"* ]]
+  [[ "$output" == *"ddev exec"* ]]
 }
 ```
 

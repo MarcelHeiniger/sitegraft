@@ -11,8 +11,9 @@
 - **Language:** plain bash, bash 3.2 compatible (stock macOS) — see
   `docs/decisions/0003-bash-compatibility.md`. No Python, no Node, no WP plugin.
 - **Runtime dependencies:** `ssh`, `rsync` (never `scp`), `wp-cli` (on A, on B, or
-  via the `ddev wp` wrapper), `jq` (manifest JSON parsing), `gum` (interactive UI,
-  fallback `fzf`, fallback plain text prompts).
+  via a local wrapper such as `ddev exec --raw -p <project> -- wp` — see the
+  design doc §5.1 for why `--raw` is required), `jq` (manifest JSON parsing),
+  `gum` (interactive UI, fallback `fzf`, fallback plain text prompts).
 - **Test-only dependencies:** `bats-core` (unit tests for `lib/`'s pure functions),
   `ddev` (2-disposable-site integration harness).
 - **No database of its own.** All data flows through A and B's own WordPress

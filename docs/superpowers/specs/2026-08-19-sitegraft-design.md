@@ -513,7 +513,9 @@ itself).
 ### 5.2 Credentials — two paths
 
 **(a) File** at `~/.config/sitegraft/<profile>.creds` (chmod 600, gitignored, never
-committed):
+committed) — **enforced, not just advisory**: `profile_load` refuses to read a
+`.creds` file that is not mode 600 (verified live during the post-review
+fix-pack that the old code never actually checked this):
 
 ```sh
 SITE_A_SSH_KEY="/absolute/path/to/private_key_a"
@@ -525,9 +527,13 @@ if the credentials file referenced by the profile doesn't exist — with an expl
 offer to save it ("save to `~/.config/sitegraft/example.creds` so you don't have to
 re-enter it? [y/N]"), never automatic.
 
-`lib/profile.sh :: profile_load` reads the `.conf` file (a shell source, so only
-`KEY="value"` assignments — no arbitrary code), then loads the matching `.creds`
-file if it exists, otherwise triggers (b).
+`lib/profile.sh :: profile_load` **parses** the `.conf` file itself, line by line
+(never `source`s/`.`s it — corrected during the post-review fix-pack: a
+source-after-shape-check design was verified live to let both trailing shell
+code and an embedded command substitution execute). Only an anchored
+`KEY="value"` / `KEY='value'` line is accepted, and only for a key on a fixed
+SITE_*/SITEGRAFT_* whitelist — no arbitrary code, ever. Then loads the matching
+`.creds` file the same way if it exists, otherwise triggers (b).
 
 ## 6. Exact phase walkthrough
 
@@ -599,13 +605,22 @@ recorded in `scan-b.json` as:
 
 `child_theme` is `true` when the active theme's `template` differs from its own
 `name` (WordPress's own definition of a child theme). `snippet_plugins_detected`
-cross-references the existing `plugin list` dump against a short, deliberately
-extensible list of known snippet-manager slugs (`code-snippets`, `wpcode`,
-`insert-headers-and-footers`, …) — add to the list as new ones come up, don't
-build a general plugin classifier. `custom_code_detected` is `true` iff any of
-the four signals is non-empty/`true` — the single boolean `plan`'s gate (§14)
-checks. None of this is checked on A — A is a fresh Etch build; this signal set
-exists specifically to catch what B might be quietly running.
+cross-references the existing `plugin list` dump, filtered to `status=active`
+(an installed-but-inactive snippet plugin injects nothing at runtime), against
+a short, deliberately extensible list of known snippet-manager slugs
+(`code-snippets`, `wpcode`, `insert-headers-and-footers`, …) — add to the list
+as new ones come up, don't build a general plugin classifier. `custom_code_detected`
+is `true` iff any of the four signals is non-empty/`true` — the single boolean
+`plan`'s gate (§14) checks. None of this is checked on A — A is a fresh Etch
+build; this signal set exists specifically to catch what B might be quietly
+running.
+
+**Fail closed, never fail open (post-review hardening, verified live):** a
+signal this cannot actually determine (a wp-cli query on B errors) is
+recorded by name in a `unknown_signals` array, never silently guessed as
+"absent" — `custom_code_detected` treats any `unknown_signals` entry the
+same as a positive signal. A blocking gate must not pass through on a check
+it could not verify.
 
 ### 6.2 `plan` (interactive, writes only locally)
 
