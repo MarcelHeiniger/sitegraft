@@ -156,4 +156,68 @@ if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "plan" ]; then
   exit 0
 fi
 
-echo "no later phase wired yet — see Task 3.2 (backup), 5.2 (graft/verify/restore)"
+echo "==> running backup"
+"${ROOT}/bin/sitegraft" backup --profile ddev-test --run "$RUN_DIR"
+
+echo "==> asserting the backup is complete and its artifacts are present"
+[ -f "${RUN_DIR}/backup/b-db.sql.gz" ]
+[ -d "${RUN_DIR}/backup/b-wp-content" ] && [ -n "$(ls -A "${RUN_DIR}/backup/b-wp-content")" ]
+[ -x "${RUN_DIR}/restore.sh" ]
+[ -f "${RUN_DIR}/backup.complete" ]
+jq -e 'has("checksums_protected_pre_graft")' "${RUN_DIR}/manifest.json" >/dev/null
+
+echo "==> asserting restore.sh is genuinely self-contained (no sitegraft function/lib reference, review finding A2)"
+# No module in modules/ claims the fixture's fakebooking table yet (that's
+# Step 4's job — a modules/fakebooking.sh doesn't exist until then), so
+# manifest.checksums_protected_pre_graft is legitimately {} for THIS run
+# (manifest_compute_unclaimed always leaves _unclaimed.tables=[], by design,
+# see lib/manifest.sh) — that's not a bug to assert against here, it's the
+# documented, already-tracked v1 gap. The self-containment and checksum-
+# stability properties below are tested independently of which modules
+# happen to be registered.
+if grep -Eqi 'wp_remote|sitegraft_|backup_checksum|phase_backup|phase_restore|^\s*\.\s+.*lib/|^\s*source\s+.*lib/' "${RUN_DIR}/restore.sh"; then
+  echo "restore.sh references a sitegraft function or lib file — not self-contained (finding A2) — aborting"
+  exit 1
+fi
+
+echo "==> asserting the protected-data checksum is stable across two immediate re-hashes (finding A5)"
+# shellcheck source=../../lib/backup.sh
+. "${ROOT}/lib/backup.sh"   # reuse the exact same normalized checksum
+b_table() { ddev exec --raw -p "$PROJECT_B" -- wp eval "global \$wpdb; echo \$wpdb->prefix.'$1';"; }
+b_protected_checksum() { backup_checksum "$(ddev exec --raw -p "$PROJECT_B" -- wp db export - --tables="$(b_table fakebooking_reservations)")"; }
+
+CHECKSUM_1=$(b_protected_checksum)
+CHECKSUM_2=$(b_protected_checksum)
+[ -n "$CHECKSUM_1" ]
+[ "$CHECKSUM_1" = "$CHECKSUM_2" ]  # same data, re-hashed immediately: must be stable
+
+if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "backup" ]; then
+  echo "BACKUP OK (SITEGRAFT_HARNESS_STOP_AFTER=backup)"
+  exit 0
+fi
+
+# Recommended addition beyond Task 3.2's literal scope (nightshift mandate:
+# prefer the safer/more-thorough option): a live restore round-trip is the
+# strongest available proof that restore.sh's self-containment claim is
+# real, not just structurally grep-clean — it actually runs, standalone,
+# against a real WordPress install, and B's protected data must come back
+# byte-identical (same normalized checksum) afterward.
+echo "==> running restore (--yes, non-interactive) and asserting it succeeds"
+"${ROOT}/bin/sitegraft" restore --profile ddev-test --run "$RUN_DIR" --yes
+
+echo "==> asserting restore took a pre-restore safety snapshot of B's CURRENT state (db AND wp-content) before touching anything"
+PRE_RESTORE_DIR=$(ls -dt "${RUN_DIR}"/pre-restore-* 2>/dev/null | head -1)
+[ -n "$PRE_RESTORE_DIR" ]
+[ -s "${PRE_RESTORE_DIR}/b-db.sql.gz" ]
+[ -d "${PRE_RESTORE_DIR}/b-wp-content" ] && [ -n "$(ls -A "${PRE_RESTORE_DIR}/b-wp-content")" ]
+
+echo "==> asserting B's protected data survived the backup+restore round-trip unchanged"
+CHECKSUM_AFTER_RESTORE=$(b_protected_checksum)
+[ "$CHECKSUM_AFTER_RESTORE" = "$CHECKSUM_1" ]
+
+if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "restore" ]; then
+  echo "RESTORE OK (SITEGRAFT_HARNESS_STOP_AFTER=restore)"
+  exit 0
+fi
+
+echo "no later phase wired yet — see Task 5.2 (graft/verify)"
