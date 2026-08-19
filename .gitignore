@@ -1,0 +1,36 @@
+# Dépendances
+node_modules/
+**/node_modules/
+vendor/
+
+# Build / artefacts
+*.zip
+dist/
+
+# Env & secrets (jamais commiter)
+.env
+.env.*
+!.env.example
+
+# sitegraft credentials (jamais commiter — un fichier par profil, chmod 600)
+*.creds
+profiles/*.creds
+profiles/local.conf
+
+# sitegraft run state (backups, manifests, logs, id-maps — local à la machine)
+.sitegraft/
+runs/
+*.sitegraft-run/
+
+# bats-core test framework (submodule/vendored, si utilisé ainsi)
+tests/bats/
+tests/test_helper/bats-support/
+tests/test_helper/bats-assert/
+
+# DDEV local sites (harnais d'intégration)
+.ddev/db_snapshots/
+.ddev/*.local/
+
+# OS / éditeur
+.DS_Store
+*.log
