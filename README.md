@@ -44,7 +44,10 @@ scan → plan → backup → graft → verify → (restore if needed)
 - **restore** — one command, rolls B back to its pre-graft state.
 
 Every phase is independently re-runnable and inspectable. Nothing is destructive
-until `backup` has completed successfully.
+until `backup` has completed successfully. `graft` also refuses to run if B's
+active theme, Etch, or ACSS version doesn't match A's — grafted content with
+nothing to render it is a failure mode, not a success — unless you explicitly
+pass `--allow-stack-mismatch` and confirm you mean it.
 
 ## The module system
 
@@ -91,7 +94,7 @@ cd sitegraft
 sitegraft scan    --profile <profile>
 sitegraft plan    --profile <profile>
 sitegraft backup  --profile <profile>
-sitegraft graft   --profile <profile> [--dry-run]
+sitegraft graft   --profile <profile> [--dry-run] [--allow-stack-mismatch]
 sitegraft verify  --profile <profile>
 sitegraft restore --profile <profile> --run <run-id>
 ```
