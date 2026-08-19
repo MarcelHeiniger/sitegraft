@@ -21,13 +21,33 @@ The v1 project is considered delivered when:
 - [ ] Adding a new module (e.g. the hypothetical `motopress.sh` documented as an
       example in the design doc) requires no change to any file in `lib/` or
       `bin/` — only adding a file under `modules/`.
+- [ ] `graft` refuses to run on a rendering-stack mismatch (active theme / Etch /
+      ACSS version) between A and B unless launched with `--allow-stack-mismatch`,
+      which itself requires an explicit, loud confirmation (design doc §12).
 - [ ] Unit tests (`bats`) are green for every pure function in `lib/`.
-- [ ] DDEV integration tests are green (protected data isn't contaminated).
+- [ ] DDEV integration tests are green: protected data isn't contaminated, AND the
+      positive assertions hold (migrated options carry A's exact values,
+      `page_on_front` resolves to the correctly remapped page, A's domain string is
+      absent from B's imported content — design doc §10, not merely "some content
+      exists on B").
 - [ ] `docs/usage.md` (or a README section) lets someone unfamiliar with the tool
       run a first pass without any other help.
 - [ ] The repo is ready to publish on GitHub: MIT LICENSE present, a
       public-facing English root README, zero secrets/real hosts/IPs/client names
       anywhere in the git history (not just HEAD).
+
+## Pre-`1.0.0` gate (blocks the version tag specifically, not v1 feature-completeness)
+
+- [ ] **A first real dry run on a staging copy of a genuine A/B pair** — not the
+      DDEV harness's simulated fixtures. This is the only thing that closes design
+      doc §0.2's R2 (the two-pass sentinel ID remap has only been validated by
+      reasoning against simulated Etch content, never a real export from a real
+      Etch license) and R4 (no pilot run means the DDEV harness proves the
+      mechanics, not the real-world variety of Etch content and third-party
+      plugins actually encountered). Every other DoD item above can be checked by
+      DDEV-only testing; this one deliberately can't — don't substitute another
+      DDEV run for it. Until this is done, ship pre-releases as `1.0.0-rc*`, not
+      `1.0.0` (see `docs/plans/2026-08-19-sitegraft-implementation.md`, Task 6.3).
 
 ## DoD per task / PR (reminder)
 
