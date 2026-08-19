@@ -42,32 +42,66 @@ run_or_echo() {
 # registered dir; newline-delimited (not read with word-splitting) so a
 # path containing a space (legal on macOS, e.g. under "Application
 # Support") is never torn apart and used to rm -rf the wrong thing.
-SITEGRAFT_TMP_REGISTRY="${TMPDIR:-/tmp}/sitegraft.registry.$$"
+#
+# The registry file itself is created with mktemp, not a predictable
+# "sitegraft.registry.$$" path (verified as a real risk on a Linux box with
+# a world-writable /tmp: an attacker who can predict the PID-based name can
+# pre-create the file — group/world-writable by default umask — and seed it
+# with arbitrary paths that this process will later rm -rf as "cleanup").
+# mktemp's random suffix plus its own 0600 default closes that.
+#
+# Created HERE, eagerly, at source time in the parent shell — NOT lazily
+# inside sitegraft_register_tmp_dir on first use. A lazy create-if-empty
+# check re-introduces the exact subshell problem the file-backed registry
+# exists to solve: sitegraft_mktemp_dir is called as
+# dir=$(sitegraft_mktemp_dir), a subshell, so a lazy assignment to
+# SITEGRAFT_TMP_REGISTRY made *inside* that subshell (on the first call)
+# never reaches the parent either — verified live: two separate
+# dir=$(sitegraft_mktemp_dir) calls each created their own throwaway
+# registry file that only the subshell ever saw, leaving the parent's
+# SITEGRAFT_TMP_REGISTRY permanently empty and cleanup a no-op.
+SITEGRAFT_TMP_REGISTRY=$(mktemp "${TMPDIR:-/tmp}/sitegraft.registry.XXXXXX")
 
 sitegraft_register_tmp_dir() {
   printf '%s\n' "$1" >> "$SITEGRAFT_TMP_REGISTRY"
 }
 
+# sitegraft_cleanup — meant to be installed as `trap sitegraft_cleanup EXIT`
+# by bin/sitegraft (the entrypoint), NOT here at source time (see the note
+# above `require_cmd` at the top of this file's history, and the fix-pack
+# commit that moved it — installing a trap as a side effect of sourcing a
+# library clobbers whatever EXIT trap the *caller* already had, which
+# includes bats' own per-test trap machinery: any bats test that fails
+# after `load`-ing this file used to come out as "Executed 0 instead of
+# expected 1 tests" with no `not ok` line, not a normal failure report).
+#
+# Capture the real exit status FIRST: this function runs as an EXIT trap,
+# and its own last command's status would otherwise silently become the
+# script's final exit status. The bug this specifically fixes (verified
+# live, and the opposite of what an earlier draft of this comment claimed):
+# a *stale* registered dir — one that no longer exists on disk for any
+# reason — makes the loop's last evaluated command `[ -d "$dir" ] && rm -rf
+# "$dir"` end on the FALSE branch (exit 1, since `&&` short-circuits before
+# rm -rf ever runs), and without capturing $? first, that stray 1 replaced
+# the exit status of an otherwise completely successful script — a correct,
+# non-erroring run reported as a failure. Normal command/function failures
+# (`return 1`, `exit N`, a failing command under set -e) were NOT the
+# problem — verified live, both before and after this fix, those already
+# propagated correctly regardless of this trap.
+#
+# Known bash 3.2 limitation this does NOT cover: a raw "unbound
+# variable" parameter-expansion error under set -u reports $?=0 inside
+# *any* EXIT trap regardless of what that trap does (verified: even a
+# bare no-op trap masks it) — the shell's internal exit-status tracking
+# for that one error class isn't visible to trap handlers on this bash
+# version. The fix is to never let code reach an unguarded unbound
+# reference in the first place (explicit arity/existence checks before
+# dereferencing — see phase_scan's --profile and SITEGRAFT_STATE_DIR
+# guards) rather than to try to recover it here.
 sitegraft_cleanup() {
-  # Capture the real exit status FIRST: this function runs as an EXIT trap,
-  # and its own last command's status would otherwise silently become the
-  # script's final exit status regardless of what actually failed —
-  # verified live: without this, a `set -euo pipefail` script whose call
-  # stack fails (function returns 1, explicit exit N, a failing command)
-  # still exits 0. Every path below must end with `return $rc`.
-  #
-  # Known bash 3.2 limitation this does NOT cover: a raw "unbound
-  # variable" parameter-expansion error under set -u reports $?=0 inside
-  # *any* EXIT trap regardless of what that trap does (verified: even a
-  # bare no-op trap masks it) — the shell's internal exit-status tracking
-  # for that one error class isn't visible to trap handlers on this bash
-  # version. The fix is to never let code reach an unguarded unbound
-  # reference in the first place (explicit arity/existence checks before
-  # dereferencing, e.g. phase_scan's --profile argument check) rather than
-  # to try to recover it here.
   local rc=$?
   local dir
-  if [ -f "$SITEGRAFT_TMP_REGISTRY" ]; then
+  if [ -n "$SITEGRAFT_TMP_REGISTRY" ] && [ -f "$SITEGRAFT_TMP_REGISTRY" ]; then
     while IFS= read -r dir; do
       [ -n "$dir" ] || continue
       [ -d "$dir" ] && rm -rf "$dir"
@@ -76,7 +110,6 @@ sitegraft_cleanup() {
   fi
   return $rc
 }
-trap sitegraft_cleanup EXIT
 
 sitegraft_mktemp_dir() {
   local dir

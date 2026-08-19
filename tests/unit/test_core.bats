@@ -23,31 +23,48 @@ setup() {
   [ "$status" -eq 1 ]
 }
 
-@test "the EXIT trap does not mask a failing function's exit status (M1, verified live against a real bash process)" {
-  # Reproduces the real bug: previously, sitegraft_cleanup's own last
-  # command (a loop over an empty SITEGRAFT_TMP_DIRS) always evaluated to
-  # status 0, and since the trap did not preserve $? before running, that 0
-  # became the script's final exit status regardless of what actually
-  # failed — a real fatal error looked like success under set -e. A plain
-  # bats "run" does not catch this (bats own trap handling interferes), so
-  # this writes a tiny script and launches a real bash subprocess to
-  # inspect its actual exit code.
+@test "the EXIT trap does not flip a successful run into a failure over a stale registered temp dir (M1, verified live)" {
+  # This is the REAL bug (corrected from an earlier, wrong description of
+  # it — see the note in lib/core.sh): a *stale* registered dir (one that
+  # no longer exists on disk for any reason) makes the cleanup loop's last
+  # evaluated command, `[ -d "$dir" ] && rm -rf "$dir"`, end on the FALSE
+  # branch — exit 1, since `&&` short-circuits before rm -rf ever runs.
+  # Without capturing $? before that loop runs, that stray 1 silently
+  # replaced the exit status of an otherwise completely successful script.
+  # Verified two ways before writing this test: (a) reproduced against a
+  # minimal reimplementation of the pre-fix cleanup — a genuinely
+  # successful script with a stale dir registered came out exit 1; (b)
+  # confirmed the *opposite* claim an earlier draft of this test/comment
+  # made — that normal failures (return 1/exit N/a failing command) were
+  # being masked to exit 0 — is FALSE: those propagated correctly both
+  # before and after this fix (see the baseline test below).
   #
-  # NOTE on scope: this bash 3.2 build has a separate, narrower quirk for
-  # ONE specific failure class — a raw "unbound variable" parameter-
-  # expansion error under set -u reports $?=0 to *any* EXIT trap,
-  # regardless of what the trap does (verified: even a bare `trap true
-  # EXIT` — no cleanup logic at all — masks that one case, while it never
-  # masks a normal `return 1`/`exit 1`/failing-command exit tested here).
-  # That is a bash 3.2 limitation this trap cannot work around from inside
-  # sitegraft_cleanup. It's why M2 additionally guards `--profile`'s
-  # argument access with an explicit arity check instead of ever letting
-  # bash hit that unbound-variable path: the guard's `return 1` is the
-  # normal, fully-preserved failure class this test proves works.
+  # A plain bats "run" cannot observe this (bats' own trap handling
+  # interferes), so this writes a tiny script that installs the trap
+  # itself — exactly as bin/sitegraft now does, not lib/core.sh — and
+  # launches a real bash subprocess to inspect its actual exit code.
   local probe="$BATS_TEST_TMPDIR/probe.sh"
   {
     echo 'set -euo pipefail'
     echo ". \"${BATS_TEST_DIRNAME}/../../lib/core.sh\""
+    echo 'trap sitegraft_cleanup EXIT'
+    echo 'sitegraft_register_tmp_dir "/tmp/this-dir-does-not-exist-sitegraft-m1-test"'
+    echo 'echo "script succeeding normally now"'
+  } > "$probe"
+  run bash "$probe"
+  [ "$status" -eq 0 ]
+}
+
+@test "the EXIT trap still lets a normal failure propagate (baseline — this was never actually broken)" {
+  # Kept as regression coverage, not as proof of a fix: return 1/exit N/a
+  # failing command under set -e were verified to propagate correctly both
+  # before and after the M1 fix above — this only guards against a future
+  # change to sitegraft_cleanup accidentally breaking that.
+  local probe="$BATS_TEST_TMPDIR/probe.sh"
+  {
+    echo 'set -euo pipefail'
+    echo ". \"${BATS_TEST_DIRNAME}/../../lib/core.sh\""
+    echo 'trap sitegraft_cleanup EXIT'
     echo 'boom() { return 1; }'
     echo 'boom'
   } > "$probe"

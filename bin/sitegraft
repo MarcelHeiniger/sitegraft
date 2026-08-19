@@ -6,7 +6,17 @@ SITEGRAFT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../lib/core.sh
 . "${SITEGRAFT_ROOT}/lib/core.sh"
 
-SITEGRAFT_VERSION="0.1.1"
+# Installed HERE, not as a side effect of sourcing lib/core.sh above —
+# verified live, a real bug fixed in the review fix-pack: a trap installed
+# at a library's source time clobbers whatever EXIT trap the caller already
+# had, which for `bats` is its own per-test pass/fail machinery. Every
+# unit test `load`s lib/core.sh directly; a version that self-installed the
+# trap there made a genuinely FAILING bats test come out as
+# "Executed 0 instead of expected 1 tests" with no `not ok` line at all —
+# invisible, not merely unclear.
+trap sitegraft_cleanup EXIT
+
+SITEGRAFT_VERSION="0.1.2"
 
 usage() {
   cat <<EOF
