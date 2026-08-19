@@ -95,7 +95,9 @@ site B (target, live, read)  ──┘
 ```
 
 sitegraft runs on a third machine (the "orchestrator" — Marcel's Mac, or any machine
-with the dependencies). It drives A and B via SSH+wp-cli (or `ddev wp` locally).
+with the dependencies). It drives A and B via SSH+wp-cli (or `ddev exec --raw
+-p <project> -- wp` locally — see §5.1 for why, verified against a real DDEV
+install during Step 1 implementation).
 Nothing is installed permanently on A or B — only a temporary mu-plugin touches B,
 for the duration of an import, and is then removed.
 
@@ -473,7 +475,7 @@ Validation rules (`lib/manifest.sh :: manifest_validate`):
 SITE_A_ALIAS="a"
 SITE_A_SSH_HOST="user@host-a.example.com"
 SITE_A_WP_PATH="/var/www/site-a/htdocs"
-SITE_A_WP_CMD="wp"                      # or "ddev wp" for a local DDEV site
+SITE_A_WP_CMD="wp"                      # or "ddev exec --raw -p <project> -- wp" for a local DDEV site — see note below
 SITE_A_URL="https://a.example.com"
 
 SITE_B_ALIAS="b"
@@ -486,6 +488,24 @@ SITEGRAFT_STATE_DIR="${HOME}/.sitegraft/runs"
 SITEGRAFT_CREDS_FILE="${HOME}/.config/sitegraft/example.creds"
 ```
 
+**DDEV local sites — verified against a real install (v1.25.2) during Step 1
+implementation, corrected from an earlier draft that assumed `SITE_*_WP_CMD="ddev
+wp"`:** `ddev wp` is not a real command outside a project's own directory —
+`wp` only exists as a project-scoped custom command DDEV resolves from the
+current working directory, and `ddev --project <name> wp ...` is not valid
+syntax at all (`ddev` has no such flag). The correct wrapper is
+`ddev exec --raw -p <project> -- wp`, which runs from any directory. `--raw`
+is required, not optional: without it, `ddev exec` reparses the command
+through an inner shell before it reaches the container, which silently
+mangles any PHP `$variable` inside a `wp eval` snippet (bash expands it to
+empty before PHP ever sees it) — exactly what §14's custom-code-signal
+detection relies on. Because this command runs *inside* the container,
+`SITE_*_WP_PATH` must be the **container-internal** docroot (typically
+`/var/www/html` for a DDEV project configured with `--docroot=.`), never the
+orchestrator's host path — the host path doesn't exist inside the container,
+and `wp --path=<host-path>` fails wp-cli's "is this a WordPress install?"
+check.
+
 An empty `SITE_*_SSH_HOST` means "local site, driven directly through
 `SITE_*_WP_CMD` with no SSH" (the case of a local DDEV site on the orchestrator
 itself).
@@ -493,7 +513,9 @@ itself).
 ### 5.2 Credentials — two paths
 
 **(a) File** at `~/.config/sitegraft/<profile>.creds` (chmod 600, gitignored, never
-committed):
+committed) — **enforced, not just advisory**: `profile_load` refuses to read a
+`.creds` file that is not mode 600 (verified live during the post-review
+fix-pack that the old code never actually checked this):
 
 ```sh
 SITE_A_SSH_KEY="/absolute/path/to/private_key_a"
@@ -505,9 +527,13 @@ if the credentials file referenced by the profile doesn't exist — with an expl
 offer to save it ("save to `~/.config/sitegraft/example.creds` so you don't have to
 re-enter it? [y/N]"), never automatic.
 
-`lib/profile.sh :: profile_load` reads the `.conf` file (a shell source, so only
-`KEY="value"` assignments — no arbitrary code), then loads the matching `.creds`
-file if it exists, otherwise triggers (b).
+`lib/profile.sh :: profile_load` **parses** the `.conf` file itself, line by line
+(never `source`s/`.`s it — corrected during the post-review fix-pack: a
+source-after-shape-check design was verified live to let both trailing shell
+code and an embedded command substitution execute). Only an anchored
+`KEY="value"` / `KEY='value'` line is accepted, and only for a key on a fixed
+SITE_*/SITEGRAFT_* whitelist — no arbitrary code, ever. Then loads the matching
+`.creds` file the same way if it exists, otherwise triggers (b).
 
 ## 6. Exact phase walkthrough
 
@@ -516,7 +542,9 @@ file if it exists, otherwise triggers (b).
 ```sh
 wp --path="$WP_PATH" post-type list --format=json
 wp --path="$WP_PATH" option list --format=json          # full dump — filtered later per module
-wp --path="$WP_PATH" db tables --format=json --all-tables-with-prefix
+# `wp db tables` has no --format=json (only "list" or "csv", verified against a
+# real wp-cli install) — request the default list and build the JSON array with jq.
+wp --path="$WP_PATH" db tables --format=list --all-tables-with-prefix
 wp --path="$WP_PATH" plugin list --format=json           # helps with module detection
 ```
 ```sh
@@ -577,13 +605,22 @@ recorded in `scan-b.json` as:
 
 `child_theme` is `true` when the active theme's `template` differs from its own
 `name` (WordPress's own definition of a child theme). `snippet_plugins_detected`
-cross-references the existing `plugin list` dump against a short, deliberately
-extensible list of known snippet-manager slugs (`code-snippets`, `wpcode`,
-`insert-headers-and-footers`, …) — add to the list as new ones come up, don't
-build a general plugin classifier. `custom_code_detected` is `true` iff any of
-the four signals is non-empty/`true` — the single boolean `plan`'s gate (§14)
-checks. None of this is checked on A — A is a fresh Etch build; this signal set
-exists specifically to catch what B might be quietly running.
+cross-references the existing `plugin list` dump, filtered to `status=active`
+(an installed-but-inactive snippet plugin injects nothing at runtime), against
+a short, deliberately extensible list of known snippet-manager slugs
+(`code-snippets`, `wpcode`, `insert-headers-and-footers`, …) — add to the list
+as new ones come up, don't build a general plugin classifier. `custom_code_detected`
+is `true` iff any of the four signals is non-empty/`true` — the single boolean
+`plan`'s gate (§14) checks. None of this is checked on A — A is a fresh Etch
+build; this signal set exists specifically to catch what B might be quietly
+running.
+
+**Fail closed, never fail open (post-review hardening, verified live):** a
+signal this cannot actually determine (a wp-cli query on B errors) is
+recorded by name in a `unknown_signals` array, never silently guessed as
+"absent" — `custom_code_detected` treats any `unknown_signals` entry the
+same as a positive signal. A blocking gate must not pass through on a check
+it could not verify.
 
 ### 6.2 `plan` (interactive, writes only locally)
 

@@ -378,6 +378,24 @@ profile_load() {
 }
 ```
 
+> **SUPERSEDED — corrected in the post-review fix-pack (B2, verified live):**
+> the `grep -vE` shape check above has no end-of-line anchor, so
+> `SITE_A_ALIAS="a"; touch /tmp/PWNED` matches as a valid *prefix* and is
+> accepted; a double-quoted value can contain anything except a literal `"`,
+> so `SITE_A_ALIAS="$(touch /tmp/PWNED)"` also passes the shape check —
+> either payload then executes on `. "$file"`. The actual `lib/profile.sh`
+> no longer sources the file at all: it parses it itself line by line
+> (`profile_parse_file`, replacing `profile_validate_file`), anchors the
+> assignment regex at both ends via `[[ =~ ^KEY="value"$ ]]`, restricts keys
+> to a fixed whitelist (`SITEGRAFT_PROFILE_KEYS`: `SITE_A_*`/`SITE_B_*`/
+> `SITEGRAFT_*`), and only ever does a plain `export "key=value"` of the
+> literal captured text — never `eval`, never `source`. It also unsets every
+> whitelisted key before parsing (a stale `SITEGRAFT_CREDS_FILE` from an
+> earlier `profile_load` call in the same shell must not leak into a later
+> one, m10) and requires the `.creds` file to be mode 600 (M4/§5.2). See
+> `lib/profile.sh` and `tests/unit/test_profile.bats` for the real,
+> current implementation.
+
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `bats tests/unit/test_profile.bats`
@@ -588,6 +606,21 @@ git commit -m "feat(modules): add convention-based module discovery and registry
   written as a single monolithic script in what used to be Step 5, so every later
   task gets real integration feedback the moment it lands.
 
+> **Corrected during Step 1 implementation, verified against a real DDEV
+> install (v1.25.2):** the version of this task below has three fixes the
+> original draft got wrong. (1) `ddev --project <name> wp ...` is not valid
+> syntax at all — `ddev` has no such flag, `wp` only exists as a
+> project-scoped custom command resolved from the current directory. The
+> fix is `ddev exec --raw -p <name> -- wp ...`, which works from anywhere;
+> `--raw` is required or `ddev exec` reparses the command through an inner
+> shell that mangles PHP `$variable`s. (2) A one-off `wp eval
+> register_post_type(...)` does not persist across separate wp-cli process
+> invocations — site A needs a real mu-plugin fixture, exactly like site B's,
+> or a later `wp post-type list` (including sitegraft's own `scan`) never
+> sees the type. (3) `fakebooking_reservation` (23 chars) exceeds
+> WordPress's 20-character post_type slug limit and floods every request
+> with a notice — renamed to `fake_reservation` (16 chars).
+
 - [ ] **Step 1: Write `tests/integration/fixtures/site-b-fake-plugin/fake-plugin.php`**
 
 A minimal fake plugin standing in for a real business plugin (design doc §10): its
@@ -603,7 +636,12 @@ must treat as protected data.
  */
 
 add_action( 'init', function () {
-    register_post_type( 'fakebooking_reservation', [
+    // Post type slugs are capped at 20 characters by WordPress core
+    // (register_post_type() triggers a _doing_it_wrong() notice past that,
+    // which floods wp-cli's output on every request — verified against a
+    // real install). "fakebooking_reservation" (23 chars) was too long;
+    // "fake_reservation" (16 chars) stays under the limit.
+    register_post_type( 'fake_reservation', [
         'label' => 'Fake Reservations',
         'public' => false,
         'show_ui' => true,
@@ -628,34 +666,80 @@ register_activation_hook( __FILE__, function () {
 } );
 ```
 
-- [ ] **Step 2: Write `tests/integration/fixtures/site-a-seed.sh`**
+Note the table name (`fakebooking_reservations`) and option name
+(`fakebooking_settings`) are unaffected — only the post_type slug had the
+20-character problem; a DB table/option name has no such limit.
+
+- [ ] **Step 2: Write `tests/integration/fixtures/site-a-fake-etch/fake-etch-cpts.php`**
+
+Site A needs the exact same treatment as site B: a real mu-plugin, not a
+one-off `wp eval`, so `etch_cfs`/`etch_cpts` are visible to every later
+wp-cli invocation, including sitegraft's own `scan`.
+
+```php
+<?php
+/**
+ * Plugin Name: sitegraft Test Fixture — Fake Etch CPTs
+ * Description: Registers the CPTs the sitegraft DDEV integration harness seeds
+ * on site A, so they persist across every wp-cli invocation (a one-off
+ * `wp eval register_post_type(...)` only registers it for that single process —
+ * verified against a real install: a later `wp post-type list` in a fresh
+ * process never sees it). Mirrors how site B's fake-plugin.php works. No real
+ * Etch license required — only the shape of the data (the CPT slugs) matters
+ * for testing sitegraft's mechanics. Not a real plugin — do not use outside
+ * tests/integration/.
+ */
+
+add_action( 'init', function () {
+    register_post_type( 'etch_cfs', [
+        'label' => 'Etch CFS',
+        'public' => false,
+        'show_ui' => true,
+        'supports' => [ 'title', 'custom-fields' ],
+    ] );
+    register_post_type( 'etch_cpts', [
+        'label' => 'Etch CPTs',
+        'public' => false,
+        'show_ui' => true,
+        'supports' => [ 'title' ],
+    ] );
+} );
+```
+
+- [ ] **Step 3: Write `tests/integration/fixtures/site-a-seed.sh`**
 
 Seeds a "Home" page and points `page_on_front`/`show_on_front` at it — this is
 what later lets the harness assert `page_on_front` was remapped to the **correct**
 page on B, not merely to *some* existing page (design doc §10, review finding B3).
+Assumes the mu-plugin from step 2 is already dropped into place by the harness
+(step 4) before this runs.
 
 ```bash
 #!/usr/bin/env bash
 # tests/integration/fixtures/site-a-seed.sh — seed fake Etch-shaped content on
 # site A for the DDEV harness. No real Etch license required — only the shape of
 # the data (CPTs + options) matters for testing sitegraft's mechanics.
+#
+# The etch_cfs/etch_cpts post types must already be registered by the time
+# this runs (see fixtures/site-a-fake-etch/fake-etch-cpts.php, dropped into
+# site A's mu-plugins/ by the harness before calling this script) — a one-off
+# `wp eval register_post_type(...)` only registers a post type for that single
+# process; it is invisible to every later wp-cli invocation, including the
+# `wp post create --post_type=etch_cfs` call below and sitegraft's own `scan`
+# (verified against a real install).
 set -euo pipefail
 DDEV_PROJECT="$1" # e.g. sitegraft-test-a
 
-ddev --project "$DDEV_PROJECT" wp eval '
-  register_post_type("etch_cfs", ["label" => "Etch CFS", "public" => false, "show_ui" => true, "supports" => ["title","custom-fields"]]);
-  register_post_type("etch_cpts", ["label" => "Etch CPTs", "public" => false, "show_ui" => true, "supports" => ["title"]]);
-'
-HOME_ID=$(ddev --project "$DDEV_PROJECT" wp post create --post_type=page --post_title="Home" --post_status=publish --porcelain)
-ddev --project "$DDEV_PROJECT" wp post create --post_type=etch_cfs --post_title="Hero CFS" --post_status=publish
-ddev --project "$DDEV_PROJECT" wp option update show_on_front page
-ddev --project "$DDEV_PROJECT" wp option update page_on_front "$HOME_ID"
-ddev --project "$DDEV_PROJECT" wp option update etch_settings '{"theme_mode":"dark"}' --format=json
-ddev --project "$DDEV_PROJECT" wp option update etch_styles '{"primary_color":"#111"}' --format=json
-ddev --project "$DDEV_PROJECT" wp option update automatic_css_settings '{"spacing_scale":"1.25"}' --format=json
+HOME_ID=$(ddev exec --raw -p "$DDEV_PROJECT" -- wp post create --post_type=page --post_title="Home" --post_status=publish --porcelain)
+ddev exec --raw -p "$DDEV_PROJECT" -- wp post create --post_type=etch_cfs --post_title="Hero CFS" --post_status=publish
+ddev exec --raw -p "$DDEV_PROJECT" -- wp option update show_on_front page
+ddev exec --raw -p "$DDEV_PROJECT" -- wp option update page_on_front "$HOME_ID"
+ddev exec --raw -p "$DDEV_PROJECT" -- wp option update etch_settings '{"theme_mode":"dark"}' --format=json
+ddev exec --raw -p "$DDEV_PROJECT" -- wp option update etch_styles '{"primary_color":"#111"}' --format=json
+ddev exec --raw -p "$DDEV_PROJECT" -- wp option update automatic_css_settings '{"spacing_scale":"1.25"}' --format=json
 ```
 
-- [ ] **Step 3: Write the harness skeleton, `tests/integration/ddev-harness.sh`**
+- [ ] **Step 4: Write the harness skeleton, `tests/integration/ddev-harness.sh`**
 
 No sitegraft phases run yet — that's added incrementally in Tasks 1.5, 3.2, and 5.2.
 `SITEGRAFT_HARNESS_STOP_AFTER` lets each later task validate its own increment
@@ -683,10 +767,12 @@ echo "==> starting disposable DDEV sites"
 ( mkdir -p "/tmp/${PROJECT_B}" && cd "/tmp/${PROJECT_B}" && ddev config --project-name="$PROJECT_B" --project-type=wordpress --docroot=. && ddev start && ddev wp core download && ddev wp core install --url=https://b.example.com --title=B --admin_user=admin --admin_password=admin --admin_email=admin@example.com )
 
 echo "==> seeding fixtures"
+mkdir -p "/tmp/${PROJECT_A}/wp-content/mu-plugins"
+cp "${ROOT}/tests/integration/fixtures/site-a-fake-etch/fake-etch-cpts.php" "/tmp/${PROJECT_A}/wp-content/mu-plugins/fake-etch-cpts.php"
 "${ROOT}/tests/integration/fixtures/site-a-seed.sh" "$PROJECT_A"
 mkdir -p "/tmp/${PROJECT_B}/wp-content/mu-plugins"
 cp "${ROOT}/tests/integration/fixtures/site-b-fake-plugin/fake-plugin.php" "/tmp/${PROJECT_B}/wp-content/mu-plugins/fake-plugin.php"
-ddev --project "$PROJECT_B" wp eval 'do_action("activate_fake-plugin.php");' # dbDelta + seed via activation hook logic, invoked directly since it's an mu-plugin (no real activation event)
+ddev exec --raw -p "$PROJECT_B" -- wp eval 'do_action("activate_fake-plugin.php");' # dbDelta + seed via activation hook logic, invoked directly since it's an mu-plugin (no real activation event)
 
 if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "seed" ]; then
   echo "SEED OK (SITEGRAFT_HARNESS_STOP_AFTER=seed)"
@@ -696,13 +782,17 @@ fi
 echo "no later phase wired yet — see Task 1.5 (scan), 3.2 (backup), 5.2 (graft/verify/restore)"
 ```
 
-- [ ] **Step 4: Run the skeleton manually**
+Note site A's mu-plugin only needs to register on `init` — unlike site B's
+fixture, it has no activation-hook logic (no table to create, no rows to
+seed), so no `do_action("activate_...")` trick is needed for it.
+
+- [ ] **Step 5: Run the skeleton manually**
 
 Run: `SITEGRAFT_HARNESS_STOP_AFTER=seed tests/integration/ddev-harness.sh`
 Expected: `SEED OK (SITEGRAFT_HARNESS_STOP_AFTER=seed)`, then both DDEV projects
 torn down (`ddev list` shows neither afterward).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add tests/integration/
@@ -855,8 +945,8 @@ Expected: FAIL — `lib/inventory.sh` does not exist.
 
 # wp_remote <alias: a|b> <wp-cli args...>
 # Dispatches to SSH+wp-cli if SITE_<ALIAS>_SSH_HOST is set, else runs the local
-# wp command (plain `wp`, or a wrapper like `ddev wp`) directly against
-# SITE_<ALIAS>_WP_PATH.
+# wp command (plain `wp`, or a wrapper like `ddev exec --raw -p <project> -- wp`
+# — see §5.1 of the design doc) directly against SITE_<ALIAS>_WP_PATH.
 wp_remote() {
   local alias_lc="$1"; shift
   local alias_uc; alias_uc=$(printf '%s' "$alias_lc" | tr '[:lower:]' '[:upper:]')
@@ -870,7 +960,13 @@ wp_remote() {
   if [ -n "$host" ]; then
     run_or_echo ssh "$host" "$wp_cmd --path='$path' $*"
   else
-    run_or_echo "$wp_cmd" --path="$path" "$@"
+    # $wp_cmd is deliberately UNQUOTED here — it may be a multi-word wrapper
+    # like "ddev exec --raw -p sitegraft-test-a -- wp", and quoting it would
+    # make the shell try to exec a single (nonexistent) binary literally
+    # named with spaces, failing with exit 127. Verified against a real
+    # install: this bug is invisible to dry-run-only unit tests since
+    # run_or_echo never actually execs in dry-run mode.
+    run_or_echo $wp_cmd --path="$path" "$@"
   fi
 }
 
@@ -887,7 +983,12 @@ inventory_scan_site() {
   local post_types options tables plugins active_theme menus
   post_types=$(wp_remote "$alias_lc" post-type list --format=json)
   options=$(wp_remote "$alias_lc" option list --format=json)
-  tables=$(wp_remote "$alias_lc" db tables --format=json --all-tables-with-prefix)
+  # wp-cli's `db tables` only supports --format=list or --format=csv, not json
+  # (verified via `wp db tables --help` against a real install) — request a
+  # plain list and build the JSON array ourselves.
+  local tables_list
+  tables_list=$(wp_remote "$alias_lc" db tables --format=list --all-tables-with-prefix)
+  tables=$(printf '%s' "$tables_list" | jq -R -s -c 'split("\n") | map(select(length > 0))')
   plugins=$(wp_remote "$alias_lc" plugin list --format=json)
   active_theme=$(wp_remote "$alias_lc" theme list --status=active --format=json | jq '.[0] // {}')
   menus=$(wp_remote "$alias_lc" menu list --format=json 2>/dev/null || echo '[]')
@@ -1022,14 +1123,26 @@ Expected: PASS (9 tests)
 # "no later phase wired yet" placeholder line from Task 1.4:
 
 echo "==> writing a local sitegraft profile for this harness run"
+# SITE_*_WP_CMD uses "ddev exec --raw -p <project> -- wp", which runs INSIDE
+# the web container regardless of the orchestrator's current directory
+# (verified against a real DDEV install — "ddev --project <name> wp ..." is
+# not valid: "ddev" has no such flag on "wp", since "wp" only exists as a
+# project-scoped custom command). --raw is required: without it, "ddev exec"
+# re-parses the command through an inner shell before running it in the
+# container, which silently mangles any PHP snippet containing a
+# "$variable" (bash expands it to empty before PHP ever sees it) — this is
+# exactly what breaks `wp eval` calls used later (Task 1.6). Because this
+# command executes inside the container, SITE_*_WP_PATH must be the
+# CONTAINER-internal docroot ("/var/www/html", DDEV's default for
+# --docroot=.), never the orchestrator's host path.
 cat > "${ROOT}/profiles/ddev-test.conf" <<EOF
 SITE_A_ALIAS="a"
-SITE_A_WP_PATH="/tmp/${PROJECT_A}"
-SITE_A_WP_CMD="ddev --project ${PROJECT_A} wp"
+SITE_A_WP_PATH="/var/www/html"
+SITE_A_WP_CMD="ddev exec --raw -p ${PROJECT_A} -- wp"
 SITE_A_URL="https://a.example.com"
 SITE_B_ALIAS="b"
-SITE_B_WP_PATH="/tmp/${PROJECT_B}"
-SITE_B_WP_CMD="ddev --project ${PROJECT_B} wp"
+SITE_B_WP_PATH="/var/www/html"
+SITE_B_WP_CMD="ddev exec --raw -p ${PROJECT_B} -- wp"
 SITE_B_URL="https://b.example.com"
 SITEGRAFT_STATE_DIR="/tmp/sitegraft-ddev-test-runs"
 EOF
@@ -1040,7 +1153,7 @@ RUN_DIR=$(ls -dt /tmp/sitegraft-ddev-test-runs/ddev-test-* | head -1)
 
 echo "==> asserting fixtures are visible in the scan output"
 jq -e '.post_types[] | select(.name=="etch_cfs")' "${RUN_DIR}/scan-a.json" >/dev/null
-jq -e '.post_types[] | select(.name=="fakebooking_reservation")' "${RUN_DIR}/scan-b.json" >/dev/null
+jq -e '.post_types[] | select(.name=="fake_reservation")' "${RUN_DIR}/scan-b.json" >/dev/null
 jq -e '.classic_menus_detected == false' "${RUN_DIR}/scan-a.json" >/dev/null
 
 if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "scan" ]; then
@@ -1186,7 +1299,12 @@ inventory_scan_site() {
   local post_types options tables plugins active_theme menus
   post_types=$(wp_remote "$alias_lc" post-type list --format=json)
   options=$(wp_remote "$alias_lc" option list --format=json)
-  tables=$(wp_remote "$alias_lc" db tables --format=json --all-tables-with-prefix)
+  # wp-cli's `db tables` only supports --format=list or --format=csv, not json
+  # (verified via `wp db tables --help` against a real install) — request a
+  # plain list and build the JSON array ourselves.
+  local tables_list
+  tables_list=$(wp_remote "$alias_lc" db tables --format=list --all-tables-with-prefix)
+  tables=$(printf '%s' "$tables_list" | jq -R -s -c 'split("\n") | map(select(length > 0))')
   plugins=$(wp_remote "$alias_lc" plugin list --format=json)
   active_theme=$(wp_remote "$alias_lc" theme list --status=active --format=json | jq '.[0] // {}')
   menus=$(wp_remote "$alias_lc" menu list --format=json 2>/dev/null || echo '[]')
@@ -1240,6 +1358,19 @@ git commit -m "feat(scan): detect custom-code signals on B (child theme, functio
 **Step 1 done when:** `bats tests/unit/` is all green, and
 `SITEGRAFT_HARNESS_STOP_AFTER=scan tests/integration/ddev-harness.sh` prints
 `SCAN OK`.
+
+> **Flag for whoever implements Step 3 (Task 3.2) and Step 5 (Task 5.2):**
+> the harness code blocks in those tasks still use the old, invalid
+> `ddev --project <name> wp ...` invocation and the over-length
+> `fakebooking_reservation` post_type slug (e.g. the `b_table`/
+> `b_protected_checksum` helpers in Task 3.2, and the `graft`/`verify`
+> assertions in Task 5.2). Both need the identical fix already applied and
+> verified in Task 1.4/1.5 above: `ddev --project X wp ...` →
+> `ddev exec --raw -p X -- wp ...`, and `fakebooking_reservation` →
+> `fake_reservation` (the table name `fakebooking_reservations` is
+> unaffected — only the post_type slug hit WordPress's 20-character limit).
+> Left as-is here since fixing them is out of scope for Step 1, but do not
+> copy this syntax verbatim when those tasks are implemented.
 
 ---
 
@@ -2076,10 +2207,13 @@ setup() {
 @test "backup_wp_cmd_literal builds a plain local command with no ssh for a local site" {
   unset SITE_B_SSH_HOST
   SITE_B_WP_PATH="/var/www/site-b"
-  SITE_B_WP_CMD="ddev wp"
+  # Multi-word wrapper — "ddev wp" alone is NOT a valid real-world value (see
+  # §5.1 / Step 1's ddev exec --raw fix); this only exercises word-splitting
+  # of an arbitrary multi-word SITE_*_WP_CMD.
+  SITE_B_WP_CMD="ddev exec --raw -p test-b -- wp"
   run backup_wp_cmd_literal b
   [[ "$output" != *"ssh"* ]]
-  [[ "$output" == *"ddev wp"* ]]
+  [[ "$output" == *"ddev exec"* ]]
 }
 ```
 
