@@ -22,12 +22,41 @@ SITEGRAFT_PROFILES_DIR="${SITEGRAFT_PROFILES_DIR:-${SITEGRAFT_ROOT:-.}/profiles}
 # Anything else in a profile/.creds file is rejected outright.
 SITEGRAFT_PROFILE_KEYS="SITE_A_ALIAS SITE_A_SSH_HOST SITE_A_SSH_KEY SITE_A_WP_PATH SITE_A_WP_CMD SITE_A_URL SITE_B_ALIAS SITE_B_SSH_HOST SITE_B_SSH_KEY SITE_B_WP_PATH SITE_B_WP_CMD SITE_B_URL SITEGRAFT_STATE_DIR SITEGRAFT_CREDS_FILE"
 
+# Of the keys above, these must actually be present after parsing — not just
+# "allowed if given" but "the profile is broken without it". Everything else
+# (SSH_HOST, SSH_KEY, WP_CMD, URL, CREDS_FILE) has a safe default elsewhere
+# (wp_remote's own "${!cmd_var:-wp}", the derived creds_file path below, or is
+# forward-declared/unused today) or is genuinely optional (a purely local
+# site has no SSH_HOST at all, by design). A missing required key used to
+# surface as a raw bash "unbound variable" crash deep inside inventory.sh —
+# with the class of bug this whole review round is about: under this bash
+# version, that specific error class reports $?=0 to *any* EXIT trap
+# regardless of what it does (verified live, including with a `${VAR:?msg}`
+# guard, which does NOT help either), so the process appeared to succeed.
+# Checking with `${!k:-}` here is safe — it never touches that fatal path,
+# it just reads "" for anything unset — and turns a missing key into a
+# normal, fully-propagated `return 1` before any code downstream ever gets
+# a chance to dereference it unguarded.
+SITEGRAFT_PROFILE_REQUIRED_KEYS="SITE_A_ALIAS SITE_A_WP_PATH SITE_B_ALIAS SITE_B_WP_PATH SITEGRAFT_STATE_DIR"
+
 profile_key_allowed() {
   local key="$1" k
   for k in $SITEGRAFT_PROFILE_KEYS; do
     [ "$k" = "$key" ] && return 0
   done
   return 1
+}
+
+profile_check_required_keys() {
+  local missing="" k v
+  for k in $SITEGRAFT_PROFILE_REQUIRED_KEYS; do
+    v="${!k:-}"
+    [ -n "$v" ] || missing="${missing} ${k}"
+  done
+  if [ -n "$missing" ]; then
+    log_error "profile is missing required key(s):${missing}"
+    return 1
+  fi
 }
 
 # profile_parse_file <path> — read KEY="value" / KEY='value' lines (blank
@@ -107,12 +136,24 @@ profile_load() {
   # this shell (e.g. SITEGRAFT_CREDS_FILE from profile X leaking into a
   # later profile_load for Y in the same process) — a real cross-profile
   # leak, not just a theoretical one.
+  #
+  # Deliberate consequence, decided and documented here rather than left
+  # implicit: an ambient environment variable for any of these keys (e.g.
+  # `SITEGRAFT_STATE_DIR=/custom sitegraft scan --profile x`) is NOT
+  # honored — it is unset here just like a stale value from a previous
+  # call would be, then only ever re-set from the profile file itself. The
+  # profile file is the single source of truth for these keys, on purpose:
+  # the whole point of unsetting first is that nothing about a key's value
+  # should depend on what happened to be sitting in the calling shell's
+  # environment before profile_load ran. To use a different SITEGRAFT_STATE_DIR,
+  # put it in the profile.
   local k
   for k in $SITEGRAFT_PROFILE_KEYS; do
     unset "$k" 2>/dev/null || true
   done
 
   profile_parse_file "$file" || return 1
+  profile_check_required_keys || return 1
 
   local creds_file="${SITEGRAFT_CREDS_FILE:-${HOME}/.config/sitegraft/${name}.creds}"
   if [ -f "$creds_file" ]; then

@@ -60,6 +60,10 @@ EOF
   rm -f "$marker"
   cat > "$SITEGRAFT_PROFILES_DIR/evil3.conf" <<EOF
 SITE_A_ALIAS="\$(touch ${marker})"
+SITE_A_WP_PATH="/tmp/site-a"
+SITE_B_ALIAS="b"
+SITE_B_WP_PATH="/tmp/site-b"
+SITEGRAFT_STATE_DIR="/tmp/sitegraft-runs"
 EOF
   profile_load evil3
   local load_status=$?
@@ -84,6 +88,8 @@ EOF
   cat > "$SITEGRAFT_PROFILES_DIR/homeexp.conf" <<'EOF'
 SITE_A_ALIAS="a"
 SITE_A_WP_PATH="/tmp/site-a"
+SITE_B_ALIAS="b"
+SITE_B_WP_PATH="/tmp/site-b"
 SITEGRAFT_STATE_DIR="${HOME}/.sitegraft/runs"
 EOF
   profile_load homeexp
@@ -95,11 +101,17 @@ EOF
   cat > "$SITEGRAFT_PROFILES_DIR/first.conf" <<EOF
 SITE_A_ALIAS="a"
 SITE_A_WP_PATH="/tmp/site-a"
+SITE_B_ALIAS="b"
+SITE_B_WP_PATH="/tmp/site-b"
+SITEGRAFT_STATE_DIR="/tmp/sitegraft-runs"
 SITEGRAFT_CREDS_FILE="$BATS_TEST_TMPDIR/first.creds"
 EOF
   cat > "$SITEGRAFT_PROFILES_DIR/second.conf" <<'EOF'
 SITE_A_ALIAS="a"
 SITE_A_WP_PATH="/tmp/site-a"
+SITE_B_ALIAS="b"
+SITE_B_WP_PATH="/tmp/site-b"
+SITEGRAFT_STATE_DIR="/tmp/sitegraft-runs"
 EOF
   profile_load first
   [ "$SITEGRAFT_CREDS_FILE" = "$BATS_TEST_TMPDIR/first.creds" ]
@@ -114,6 +126,9 @@ EOF
   cat > "$SITEGRAFT_PROFILES_DIR/withcreds.conf" <<EOF
 SITE_A_ALIAS="a"
 SITE_A_WP_PATH="/tmp/site-a"
+SITE_B_ALIAS="b"
+SITE_B_WP_PATH="/tmp/site-b"
+SITEGRAFT_STATE_DIR="/tmp/sitegraft-runs"
 SITEGRAFT_CREDS_FILE="$BATS_TEST_TMPDIR/loose.creds"
 EOF
   cat > "$BATS_TEST_TMPDIR/loose.creds" <<'EOF'
@@ -124,10 +139,54 @@ EOF
   [ "$status" -eq 1 ]
 }
 
+@test "profile_load fails clearly when SITEGRAFT_STATE_DIR is missing (BLOCKER, second review round)" {
+  # Verified live before this fix: a profile omitting SITEGRAFT_STATE_DIR
+  # made a later "${SITEGRAFT_STATE_DIR}" dereference in phase_scan a raw
+  # bash "unbound variable" crash — and because that specific error class
+  # reports $?=0 to any EXIT trap on this bash version (see lib/core.sh),
+  # the whole process exited 0 as if scan had succeeded, having done
+  # nothing at all. profile_load must reject this itself, before any code
+  # downstream ever gets a chance to dereference the missing key.
+  cat > "$SITEGRAFT_PROFILES_DIR/nostatedir.conf" <<'EOF'
+SITE_A_ALIAS="a"
+SITE_A_WP_PATH="/tmp/site-a"
+SITE_B_ALIAS="b"
+SITE_B_WP_PATH="/tmp/site-b"
+EOF
+  run profile_load nostatedir
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"SITEGRAFT_STATE_DIR"* ]]
+}
+
+@test "profile_load fails clearly when any other required key is missing (BLOCKER, required-keys validation)" {
+  cat > "$SITEGRAFT_PROFILES_DIR/nobwppath.conf" <<'EOF'
+SITE_A_ALIAS="a"
+SITE_A_WP_PATH="/tmp/site-a"
+SITE_B_ALIAS="b"
+SITEGRAFT_STATE_DIR="/tmp/sitegraft-runs"
+EOF
+  run profile_load nobwppath
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"SITE_B_WP_PATH"* ]]
+}
+
+@test "profile_load ignores an ambient SITEGRAFT_STATE_DIR env var not set by the profile file itself (documented decision)" {
+  # Deliberate: the profile file is the sole source of truth for these
+  # keys — see the comment in lib/profile.sh. An env var override is not
+  # supported, on purpose, since honoring one would reopen exactly the
+  # cross-profile leak risk the m10 fix (unset-before-parse) closes.
+  export SITEGRAFT_STATE_DIR="/should/not/survive"
+  profile_load demo
+  [ "$SITEGRAFT_STATE_DIR" = "/tmp/sitegraft-runs" ]
+}
+
 @test "profile_load accepts a mode-600 .creds file" {
   cat > "$SITEGRAFT_PROFILES_DIR/goodcreds.conf" <<EOF
 SITE_A_ALIAS="a"
 SITE_A_WP_PATH="/tmp/site-a"
+SITE_B_ALIAS="b"
+SITE_B_WP_PATH="/tmp/site-b"
+SITEGRAFT_STATE_DIR="/tmp/sitegraft-runs"
 SITEGRAFT_CREDS_FILE="$BATS_TEST_TMPDIR/tight.creds"
 EOF
   cat > "$BATS_TEST_TMPDIR/tight.creds" <<'EOF'

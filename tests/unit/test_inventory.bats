@@ -48,7 +48,7 @@ EOF
   SITE_A_WP_CMD="wp"
   SITEGRAFT_DRY_RUN=1
   run wp_remote a eval 'global $wpdb; echo $wpdb->prefix;'
-  [ "$output" = "[dry-run] ssh user@host-a.example.com wp --path='/var/www/html' 'eval' 'global \$wpdb; echo \$wpdb->prefix;'" ]
+  [ "$output" = "[dry-run] ssh -- user@host-a.example.com wp --path='/var/www/html' 'eval' 'global \$wpdb; echo \$wpdb->prefix;'" ]
 }
 
 @test "wp_remote single-quotes an SSH_PATH containing an embedded single quote instead of injecting it (B1)" {
@@ -57,7 +57,7 @@ EOF
   SITE_A_WP_CMD="wp"
   SITEGRAFT_DRY_RUN=1
   run wp_remote a option get siteurl
-  [ "$output" = "[dry-run] ssh user@host-a.example.com wp --path='/var/www/o'\\''brien-site' 'option' 'get' 'siteurl'" ]
+  [ "$output" = "[dry-run] ssh -- user@host-a.example.com wp --path='/var/www/o'\\''brien-site' 'option' 'get' 'siteurl'" ]
 }
 
 @test "wp_remote single-quotes a malicious argument instead of letting it inject a second command over ssh (B1)" {
@@ -71,6 +71,20 @@ EOF
   # would execute as a second command.
   [[ "$output" == *"'1; touch /tmp/PWNED'"* ]]
   [[ "$output" != *"'1'; touch /tmp/PWNED"* ]]
+}
+
+@test "wp_remote passes -- before the host to ssh so a hostile-looking SITE_*_SSH_HOST can't be read as an option (MINOR-4)" {
+  # Verified live: "ssh -oProxyCommand=..." is only rejected today because
+  # profile-sourced hosts happen to contain characters ssh's own option
+  # parser dislikes — that is not a real barrier. `ssh -- "$host" ...`
+  # makes ssh treat everything after -- as positional, so this can never
+  # be read as an ssh option regardless of its shape.
+  SITE_A_SSH_HOST="-oProxyCommand=touch /tmp/PWNED"
+  SITE_A_WP_PATH="/var/www/html"
+  SITE_A_WP_CMD="wp"
+  SITEGRAFT_DRY_RUN=1
+  run wp_remote a option get siteurl
+  [[ "$output" == "[dry-run] ssh -- "* ]]
 }
 
 @test "wp_remote runs the local wp command when no SSH host is set" {

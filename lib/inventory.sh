@@ -28,7 +28,21 @@ wp_remote() {
   local path_var="SITE_${alias_uc}_WP_PATH"
   local cmd_var="SITE_${alias_uc}_WP_CMD"
   local host="${!host_var:-}"
-  local path="${!path_var:?missing ${path_var}}"
+  # `${!path_var:?msg}` looks like a safe guard but is NOT one on this bash
+  # version (verified live, second review round): that fatal parameter-
+  # expansion error reports $?=0 to any EXIT trap regardless of what the
+  # trap does — same bash 3.2 quirk documented in lib/core.sh — so a
+  # profile missing this key used to make the whole process exit 0 as if
+  # nothing were wrong. profile_load's required-key check (lib/profile.sh)
+  # is the primary defense; this is the belt-and-suspenders fallback for a
+  # future caller that reaches wp_remote without going through it, using an
+  # explicit check + return 1 instead, since that failure class propagates
+  # correctly (verified — see lib/core.sh's M1 fix and its tests).
+  local path="${!path_var:-}"
+  if [ -z "$path" ]; then
+    log_error "missing ${path_var}"
+    return 1
+  fi
   local wp_cmd="${!cmd_var:-wp}"
 
   if [ -n "$host" ]; then
@@ -59,7 +73,16 @@ wp_remote() {
     for arg in "$@"; do
       remote_cmd="${remote_cmd} $(sq "$arg")"
     done
-    run_or_echo ssh "$host" "$remote_cmd"
+    # `--` before the positional args (MINOR-4, verified live): without it,
+    # a SITE_*_SSH_HOST value starting with "-" (e.g.
+    # "-oProxyCommand=...") was only accidentally rejected today, because
+    # profile-sourced hosts happen to contain characters ssh's own option
+    # parser doesn't like — that is not a real barrier. `ssh -- "$host"
+    # ...` makes ssh treat everything after `--` as positional, so a
+    # hostile-looking host string is parsed as a (rejected) literal
+    # hostname instead of as an option, while legitimate hosts are
+    # completely unaffected.
+    run_or_echo ssh -- "$host" "$remote_cmd"
   else
     # $wp_cmd is deliberately unquoted here so it word-splits into separate
     # argv elements (e.g. "ddev exec -p my-site -- wp" -> 6 words). A quoted
@@ -371,24 +394,42 @@ phase_scan() {
 
   profile_load "$profile" || return 1
 
+  # BLOCKER (second review round, verified live): a profile omitting
+  # SITEGRAFT_STATE_DIR used to make the dereference below a raw bash
+  # "unbound variable" crash — and, for the exact reason documented in
+  # lib/core.sh's M1 fix, that specific error class reports $?=0 to any
+  # EXIT trap, so the process exited 0 having done nothing. This is
+  # primarily caught earlier now, by profile_load's own required-key check
+  # (lib/profile.sh) — this is the belt-and-suspenders check right at the
+  # point of use, in case that ever changes. `${SITEGRAFT_STATE_DIR:-}` is
+  # the safe form: it never touches the fatal unbound-variable path, it
+  # just reads "" for unset.
+  if [ -z "${SITEGRAFT_STATE_DIR:-}" ]; then
+    log_error "profile '${profile}' does not set SITEGRAFT_STATE_DIR"
+    return 1
+  fi
+
+  local run_dir="${SITEGRAFT_STATE_DIR}/${profile}-$(date +%Y%m%dT%H%M%S)"
+
   # M4: scan-*.json holds a full `wp option list` dump — this can include
   # license keys, SMTP tokens, or anything else a plugin stores as an
   # option. Neither the run directory nor the files in it may be
   # group/world-readable. umask first (belt) so mkdir/redirection default
   # to owner-only, then explicit chmod (suspenders) so this holds
   # regardless of the caller's ambient umask.
-  local prev_umask
-  prev_umask=$(umask)
-  umask 077
-
-  local run_dir="${SITEGRAFT_STATE_DIR}/${profile}-$(date +%Y%m%dT%H%M%S)"
-  mkdir -p "$run_dir"
-  chmod 700 "$run_dir"
-  inventory_scan_site a "${run_dir}/scan-a.json"
-  inventory_scan_site b "${run_dir}/scan-b.json"
-  chmod 600 "${run_dir}/scan-a.json" "${run_dir}/scan-b.json"
-
-  umask "$prev_umask"
+  #
+  # NIT-3: run in a subshell so the umask change is automatically scoped —
+  # it is restored on the parent shell whether this block succeeds or a
+  # scan step fails partway through, without needing a manual save/restore
+  # that a failure could skip over.
+  (
+    umask 077
+    mkdir -p "$run_dir"
+    chmod 700 "$run_dir"
+    inventory_scan_site a "${run_dir}/scan-a.json"
+    inventory_scan_site b "${run_dir}/scan-b.json"
+    chmod 600 "${run_dir}/scan-a.json" "${run_dir}/scan-b.json"
+  ) || return 1
 
   if jq -e '.classic_menus_detected == true' "${run_dir}/scan-a.json" >/dev/null 2>&1; then
     log_warn "site A has classic nav menu(s) with items: $(jq -r '.classic_menu_names | join(", ")' "${run_dir}/scan-a.json") — sitegraft v1 does not migrate classic menu assignments (design doc §13)"

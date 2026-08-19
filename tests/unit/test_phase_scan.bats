@@ -152,3 +152,14 @@ EOF
   run jq -e '.classic_menus_detected == false' "${run_dir}/scan-a.json"
   [ "$status" -eq 0 ]
 }
+
+@test "phase_scan's own belt-and-suspenders guard rejects a missing SITEGRAFT_STATE_DIR even if profile_load's check were ever bypassed (BLOCKER)" {
+  # profile_load's required-key check is the primary defense (see
+  # test_profile.bats) — this exercises phase_scan's independent second
+  # layer directly, by stubbing profile_load itself to simulate that first
+  # layer having been bypassed or regressed.
+  profile_load() { unset SITEGRAFT_STATE_DIR; SITE_A_WP_PATH=/tmp/a; SITE_B_WP_PATH=/tmp/b; return 0; }
+  run phase_scan --profile demo
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"SITEGRAFT_STATE_DIR"* ]]
+}
