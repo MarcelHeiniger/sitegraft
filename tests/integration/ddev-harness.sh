@@ -284,6 +284,17 @@ echo "==> confirmed: restore's db import genuinely re-imported B's database (mut
 # filesystem property, independent of the DB import step, so this never
 # touches B's database.
 echo "==> asserting deletion semantics on the bare-local restore path (DoD reconciliation — the path 'exact pre-graft state' is actually guaranteed for)"
+# NIT hardening (Viktor, taken in this same PR per house rule — fix now, not
+# as a follow-up): the previous version of this check hand-typed an
+# `rsync -avz --delete ...` line inline, matching what
+# backup_generate_restore_script is BELIEVED to emit for the bare-local
+# branch — that proves rsync's own --delete semantics work, but would NOT
+# catch the generator itself drifting (e.g. losing --delete, or restoring
+# to the wrong path) the way the db-import command's own generation is
+# already covered by tests/unit/test_backup.bats. This version generates a
+# real restore.sh via backup_generate_restore_script and extracts + runs
+# the ACTUAL wp-content-restore command baked into it — so this check fails
+# if the generator ever regresses, not just if rsync itself misbehaves.
 BARE_TEST_DIR=$(mktemp -d)
 (
   unset SITE_B_SSH_HOST
@@ -291,23 +302,31 @@ BARE_TEST_DIR=$(mktemp -d)
   SITE_B_WP_CMD="wp"
   mkdir -p "${BARE_TEST_DIR}/backup"
   backup_wp_content "${BARE_TEST_DIR}/backup/b-wp-content" >/dev/null
+  backup_generate_restore_script "${BARE_TEST_DIR}" >/dev/null
 )
 [ -d "${BARE_TEST_DIR}/backup/b-wp-content/themes" ]
+[ -x "${BARE_TEST_DIR}/restore.sh" ]
 
 # Simulate graft adding a file to B's wp-content AFTER this bare-local backup.
 touch "/tmp/${PROJECT_B}/wp-content/SITEGRAFT_TEST_MARKER_TO_BE_DELETED.txt"
 [ -f "/tmp/${PROJECT_B}/wp-content/SITEGRAFT_TEST_MARKER_TO_BE_DELETED.txt" ]
 
-# The exact command shape backup_generate_restore_script bakes into
-# restore.sh's bare-local branch (lib/backup.sh, the `else` branch with no
-# wrapper prefix): `rsync -avz --delete <backup>/ <target>/`.
-rsync -avz --delete "${BARE_TEST_DIR}/backup/b-wp-content/" "/tmp/${PROJECT_B}/wp-content/" >/dev/null
-
-if [ -f "/tmp/${PROJECT_B}/wp-content/SITEGRAFT_TEST_MARKER_TO_BE_DELETED.txt" ]; then
-  echo "bare-local restore did NOT delete a file added since backup — the one path that's supposed to guarantee exact-state restore is broken — aborting"
+# Extract the exact command backup_generate_restore_script baked into
+# restore.sh's `if ! { <cmd>; }; then` guard for the wp-content step (see
+# lib/backup.sh's own heredoc) — never hand-retyped.
+WP_CONTENT_RESTORE_LINE=$(grep -E '^if ! \{ rsync .*--delete ' "${BARE_TEST_DIR}/restore.sh" | head -1)
+if [ -z "$WP_CONTENT_RESTORE_LINE" ]; then
+  echo "generated restore.sh has no 'rsync ... --delete' wp-content-restore command on the bare-local branch — generator drift, the deletion guarantee would silently break — aborting"
   exit 1
 fi
-echo "==> confirmed: bare-local restore deletes a file added to wp-content since the backup (rsync --delete, design doc §6.7)"
+WP_CONTENT_RESTORE_CMD=$(printf '%s\n' "$WP_CONTENT_RESTORE_LINE" | sed -E 's/^if ! \{ (.*); \}; then$/\1/')
+eval "$WP_CONTENT_RESTORE_CMD" >/dev/null
+
+if [ -f "/tmp/${PROJECT_B}/wp-content/SITEGRAFT_TEST_MARKER_TO_BE_DELETED.txt" ]; then
+  echo "the GENERATED restore.sh's bare-local wp-content command did NOT delete a file added since backup — the one path that's supposed to guarantee exact-state restore is broken — aborting"
+  exit 1
+fi
+echo "==> confirmed: the GENERATED restore.sh's bare-local wp-content command deletes a file added to wp-content since the backup (rsync --delete, design doc §6.7)"
 rm -rf "$BARE_TEST_DIR"
 
 if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "restore" ]; then

@@ -99,7 +99,7 @@ backup_db_export() {
 # execute nonsense, while assuming no wrapper just fails loudly at the
 # direct-filesystem-access attempt if that assumption was wrong).
 #
-# Strips a `--raw ` token from the derived prefix, if present — bug found
+# Strips every `--raw` token from the derived prefix, if present — bug found
 # live running the real DDEV harness (a THIRD one, in the same feature): DDEV's
 # own `--raw` flag exists solely to stop `ddev exec` from re-parsing the
 # command through an inner shell, which otherwise mangles PHP `$variables`
@@ -113,6 +113,19 @@ backup_db_export() {
 # `$variable` to protect, `--raw`'s entire reason for existing doesn't apply
 # here — dropping it is safe and fixes stdin forwarding for exactly the
 # commands this helper's callers need it for.
+#
+# NIT hardening (Viktor, backlog item taken in this same PR per house rule —
+# fix now, not as a follow-up): a single `${prefix/--raw /}` only strips the
+# FIRST `--raw ` occurrence and requires a trailing space, which happens to
+# be fine for every real DDEV invocation (`--raw` always precedes `-p`,
+# never appears twice, never sits at the very end) but is a needlessly
+# narrow implementation for what's meant to be a general "any wrapper
+# shaped like WP_CMD" helper. `${prefix//--raw /}` (double slash: replace
+# ALL occurrences, not just the first) handles repeats; the trailing `case`
+# additionally strips a bare `--raw` with no following token, in case it
+# ever ends up as the last word of the prefix (it never does today, given
+# the trailing " wp" is always stripped first — this is defense against a
+# WP_CMD shape nobody has written yet, not a fix for an observed bug).
 _backup_local_exec_prefix() {
   local alias_lc="$1"
   local alias_uc; alias_uc=$(printf '%s' "$alias_lc" | tr '[:lower:]' '[:upper:]')
@@ -124,7 +137,16 @@ _backup_local_exec_prefix() {
     *\ wp) prefix="${wp_cmd% wp}" ;;
     *) prefix='' ;;
   esac
-  printf '%s' "${prefix/--raw /}"
+  prefix="${prefix//--raw /}"
+  case "$prefix" in
+    *--raw) prefix="${prefix%--raw}" ;;
+  esac
+  # Trim a possible trailing space left behind by the bare-trailing-"--raw"
+  # strip above (cosmetic: an unquoted "${prefix} tar ..." interpolation
+  # would still word-split correctly with a stray trailing space, but a
+  # clean value is cheap to guarantee and avoids relying on that).
+  prefix="${prefix% }"
+  printf '%s' "$prefix"
 }
 
 # backup_wp_content <dest_dir> — mirrors B's wp-content/ into <dest_dir>

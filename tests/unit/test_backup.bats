@@ -124,6 +124,27 @@ setup() {
   [ -z "$output" ]
 }
 
+# NIT hardening (Viktor, taken in this same PR): the previous
+# `${prefix/--raw /}` only stripped the FIRST occurrence and required a
+# trailing space. Real DDEV invocations never trigger this (see the
+# function's own comment), but the helper is meant to be general.
+
+@test "_backup_local_exec_prefix strips a REPEATED --raw token (hardening, not an observed real-world case)" {
+  SITE_B_WP_CMD="ddev exec --raw --raw -p sitegraft-test-b -- wp"
+  run _backup_local_exec_prefix b
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"--raw"* ]]
+  [ "$output" = "ddev exec -p sitegraft-test-b --" ]
+}
+
+@test "_backup_local_exec_prefix strips a TRAILING --raw with no following token (hardening)" {
+  SITE_B_WP_CMD="ddev exec -p sitegraft-test-b --raw wp"
+  run _backup_local_exec_prefix b
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"--raw"* ]]
+  [ "$output" = "ddev exec -p sitegraft-test-b" ]
+}
+
 # --- backup_verify_db_export ---
 
 @test "backup_verify_db_export fails when the dump file is missing" {
