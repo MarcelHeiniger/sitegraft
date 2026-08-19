@@ -32,6 +32,12 @@ wp_remote() {
   local wp_cmd="${!cmd_var:-wp}"
 
   if [ -n "$host" ]; then
+    require_cmd ssh || return 1
+    # TODO(Task 2.3): SITE_<ALIAS>_SSH_KEY is parsed and whitelisted by
+    # lib/profile.sh (design doc §5.2) but not consumed here yet — ssh is
+    # invoked with no -i, relying entirely on the caller's own ssh-agent/
+    # default-key setup. Wire it in as `ssh -i "$ssh_key" ...` once
+    # interactive credential handling (Task 2.3) lands.
     # Every argument that will reach the REMOTE shell must be single-quoted
     # individually via sq() — building the remote command line by hand with
     # "$wp_cmd --path='$path' $*" (the previous version) was both an
@@ -263,7 +269,7 @@ inventory_custom_code_signals() {
   fi
 
   if fn_php_raw=$(wp_remote "$alias_lc" eval 'if (file_exists($f = get_stylesheet_directory()."/functions.php")) { echo json_encode(["exists"=>true,"bytes"=>filesize($f),"lines"=>count(file($f))]); } else { echo json_encode(["exists"=>false]); }' 2>&1) \
-    && echo "$fn_php_raw" | jq -e . >/dev/null 2>&1; then
+    && echo "$fn_php_raw" | jq . >/dev/null 2>&1; then
     fn_php="$fn_php_raw"
   else
     log_warn "could not check functions.php on site ${alias_lc} — recording functions_php as unknown (fail-safe, design doc §14): ${fn_php_raw}"
@@ -271,7 +277,7 @@ inventory_custom_code_signals() {
   fi
 
   if mu_plugins_raw=$(wp_remote "$alias_lc" eval 'echo json_encode(array_map("basename", glob(WP_CONTENT_DIR."/mu-plugins/*.php") ?: []));' 2>&1) \
-    && echo "$mu_plugins_raw" | jq -e . >/dev/null 2>&1; then
+    && echo "$mu_plugins_raw" | jq . >/dev/null 2>&1; then
     mu_plugins="$mu_plugins_raw"
   else
     log_warn "could not list mu-plugins on site ${alias_lc} — recording mu_plugins as unknown (fail-safe, design doc §14): ${mu_plugins_raw}"
@@ -279,7 +285,7 @@ inventory_custom_code_signals() {
   fi
 
   if plugins_json=$(wp_remote "$alias_lc" plugin list --format=json 2>&1) \
-    && echo "$plugins_json" | jq -e . >/dev/null 2>&1; then
+    && echo "$plugins_json" | jq . >/dev/null 2>&1; then
     # status=active: an installed-but-inactive snippet plugin is not
     # injecting anything at runtime, so it is not itself a signal.
     snippet_plugins=$(echo "$plugins_json" | jq -c \

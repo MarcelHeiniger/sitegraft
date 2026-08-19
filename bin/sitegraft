@@ -6,10 +6,12 @@ SITEGRAFT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../lib/core.sh
 . "${SITEGRAFT_ROOT}/lib/core.sh"
 
-SITEGRAFT_VERSION="0.1.0"
+SITEGRAFT_VERSION="0.1.1"
 
 usage() {
-  cat <<'EOF'
+  cat <<EOF
+sitegraft ${SITEGRAFT_VERSION}
+
 Usage: sitegraft <phase> --profile <name> [flags]
 
 Phases: scan, plan, backup, graft, verify, restore
@@ -17,57 +19,85 @@ Phases: scan, plan, backup, graft, verify, restore
 EOF
 }
 
+# require_lib <name> <step> — source lib/<name>.sh, or fail with a clear
+# "not implemented yet" message instead of the raw ". : No such file or
+# directory" bash error a missing later-step lib file would otherwise
+# produce (m6 — plan/backup/graft/verify/restore aren't implemented until
+# later steps of docs/plans/2026-08-19-sitegraft-implementation.md).
+require_lib() {
+  local lib="$1" step="$2"
+  local path="${SITEGRAFT_ROOT}/lib/${lib}.sh"
+  if [ ! -f "$path" ]; then
+    log_error "phase not implemented yet — lib/${lib}.sh does not exist (see Step ${step} of docs/plans/2026-08-19-sitegraft-implementation.md)"
+    return 1
+  fi
+  # shellcheck disable=SC1090
+  . "$path"
+}
+
 main() {
   local phase="${1:-}"
   [ -n "$phase" ] || { usage; exit 1; }
   shift || true
 
-  for cmd in jq rsync ssh; do
-    require_cmd "$cmd" || exit 1
-  done
-
+  # m5: dependencies are checked per phase, not all up front — "sitegraft
+  # --help"/"-h" (and, previously, every phase) used to require rsync even
+  # though only backup/graft/restore actually invoke it.
   case "$phase" in
     scan)
-      . "${SITEGRAFT_ROOT}/lib/profile.sh"
-      . "${SITEGRAFT_ROOT}/lib/modules.sh"
-      . "${SITEGRAFT_ROOT}/lib/inventory.sh"
+      require_cmd jq || exit 1
+      require_lib profile 1 || exit 1
+      require_lib modules 1 || exit 1
+      require_lib inventory 1 || exit 1
+      modules_discover
       phase_scan "$@"
       ;;
     plan)
-      . "${SITEGRAFT_ROOT}/lib/profile.sh"
-      . "${SITEGRAFT_ROOT}/lib/modules.sh"
-      . "${SITEGRAFT_ROOT}/lib/inventory.sh"
-      . "${SITEGRAFT_ROOT}/lib/manifest.sh"
-      . "${SITEGRAFT_ROOT}/lib/plan.sh"
+      require_cmd jq || exit 1
+      require_lib profile 1 || exit 1
+      require_lib modules 1 || exit 1
+      require_lib inventory 1 || exit 1
+      require_lib manifest 2 || exit 1
+      require_lib plan 2 || exit 1
+      modules_discover
       phase_plan "$@"
       ;;
     backup)
-      . "${SITEGRAFT_ROOT}/lib/profile.sh"
-      . "${SITEGRAFT_ROOT}/lib/inventory.sh"
-      . "${SITEGRAFT_ROOT}/lib/backup.sh"
+      require_cmd jq || exit 1
+      require_cmd rsync || exit 1
+      require_lib profile 1 || exit 1
+      require_lib inventory 1 || exit 1
+      require_lib backup 3 || exit 1
       phase_backup "$@"
       ;;
     graft)
-      . "${SITEGRAFT_ROOT}/lib/profile.sh"
-      . "${SITEGRAFT_ROOT}/lib/modules.sh"
-      . "${SITEGRAFT_ROOT}/lib/inventory.sh"
-      . "${SITEGRAFT_ROOT}/lib/graft.sh"
+      require_cmd jq || exit 1
+      require_cmd rsync || exit 1
+      require_lib profile 1 || exit 1
+      require_lib modules 1 || exit 1
+      require_lib inventory 1 || exit 1
+      require_lib graft 4 || exit 1
+      modules_discover
       phase_graft "$@"
       ;;
     verify)
-      . "${SITEGRAFT_ROOT}/lib/profile.sh"
-      . "${SITEGRAFT_ROOT}/lib/inventory.sh"
-      . "${SITEGRAFT_ROOT}/lib/backup.sh"
-      . "${SITEGRAFT_ROOT}/lib/graft.sh"
-      . "${SITEGRAFT_ROOT}/lib/verify.sh"
+      require_cmd jq || exit 1
+      require_lib profile 1 || exit 1
+      require_lib inventory 1 || exit 1
+      require_lib backup 3 || exit 1
+      require_lib graft 4 || exit 1
+      require_lib verify 5 || exit 1
       phase_verify "$@"
       ;;
     restore)
-      . "${SITEGRAFT_ROOT}/lib/profile.sh"
-      . "${SITEGRAFT_ROOT}/lib/backup.sh"
+      require_cmd jq || exit 1
+      require_cmd rsync || exit 1
+      require_lib profile 1 || exit 1
+      require_lib backup 3 || exit 1
       phase_restore "$@"
       ;;
     -h|--help|help) usage ;;
+    --version) echo "sitegraft ${SITEGRAFT_VERSION}" ;;
     *) log_error "unknown phase: ${phase}"; usage; exit 1 ;;
   esac
 }

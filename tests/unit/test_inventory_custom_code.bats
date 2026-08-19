@@ -78,6 +78,33 @@ setup() {
   [ "$status" -eq 0 ]
 }
 
+@test "inventory_custom_code_signals accepts a bare 'false'/'null' result as valid JSON, not as a query failure (found via CLI smoke-testing)" {
+  # jq -e treats a top-level `false`/`null` result as failure (that is what
+  # -e is FOR — boolean filters). Using it as a generic "is this valid
+  # JSON" check was wrong: it would misclassify legitimately-valid-but-
+  # falsy wp-cli output as an unverifiable signal. None of the three real
+  # PHP snippets this guards (functions.php check, mu-plugins glob, plugin
+  # list) can normally emit a bare null/false today, but the check itself
+  # must not depend on that being true forever — fixed by dropping -e
+  # (jq '.' only fails on a genuine parse error, regardless of truthiness).
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$*" in
+      "theme list --status=active --field=name") echo "t" ;;
+      "theme get t --field=template") echo "t" ;;
+      eval*) echo 'null' ;;
+      "plugin list --format=json") echo '[]' ;;
+      *) echo '[]' ;;
+    esac
+  }
+  local result fn_status
+  result=$(inventory_custom_code_signals b 2>/dev/null)
+  fn_status=$?
+  [ "$fn_status" -eq 0 ]
+  # A genuinely-valid "null" must NOT be recorded as unknown/unverifiable.
+  echo "$result" | jq -e '.unknown_signals == []' >/dev/null
+}
+
 @test "inventory_custom_code_signals filters snippet plugins to active ones only (nit: status=active)" {
   wp_remote() {
     local alias_lc="$1"; shift

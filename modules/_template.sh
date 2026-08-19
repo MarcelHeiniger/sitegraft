@@ -14,7 +14,10 @@
 # (design doc §3.2, §12).
 # my_plugin_detect() { jq -e '.plugins[] | select(.name == "my-plugin")' "$1" >/dev/null 2>&1; }
 
-# At least one of the three below must exist.
+# At least one of post_types / option_keys / tables below must exist (a
+# module must claim at least one thing it protects — enforced at discovery
+# time, see lib/modules.sh :: module_validate_contract). option_keys_exclude
+# is an optional modifier of option_keys, not a standalone requirement.
 # my_plugin_post_types() { printf 'my_cpt\n'; }
 # my_plugin_option_keys() { printf 'my_plugin_settings\n'; }
 # my_plugin_option_keys_exclude() { printf 'my_plugin_license_*\n'; }

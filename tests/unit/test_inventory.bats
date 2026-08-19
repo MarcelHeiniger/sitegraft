@@ -6,6 +6,9 @@ setup() {
   export SITEGRAFT_MODULES_DIR="$BATS_TEST_TMPDIR/modules"
   mkdir -p "$SITEGRAFT_MODULES_DIR"
   cat > "$SITEGRAFT_MODULES_DIR/acss.sh" <<'EOF'
+acss_name() { echo "Automatic.css"; }
+acss_detect() { jq -e '.plugins[] | select(.name == "automatic-css")' "$1" >/dev/null 2>&1; }
+acss_option_keys() { printf 'automatic_css_settings\n'; }
 acss_stack_candidates() { printf 'automatic-css\nacss-legacy-slug\n'; }
 EOF
   modules_discover
