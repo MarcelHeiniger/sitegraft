@@ -810,12 +810,36 @@ subset of `migrate`, never inferred automatically).
 ### 6.7 `restore`
 
 ```sh
-sitegraft restore --profile <profile> --run <run-id> [--yes]
+sitegraft restore --profile <profile> --run <run-id> [--yes] [--dry-run]
 ```
 Runs `$STATE_DIR/restore.sh` for the designated run. Before restoring anything, it
-takes a mini-backup of B's current state ("a backup of the backup") into a
-`pre-restore/` subfolder of the same run — even a restore has to stay reversible.
-Asks for confirmation (`gum confirm`) unless `--yes` is passed.
+takes a mini-backup of B's current state ("a backup of the backup") — both
+database AND wp-content, since restore.sh's own wp-content step is exactly as
+destructive to files as the db import is to data — into a `pre-restore-<timestamp>/`
+subfolder of the same run. Asks for confirmation (`gum confirm`) unless `--yes` is
+passed.
+
+**"Even a restore has to stay reversible" is itself turnkey, not merely data-only:**
+the pre-restore snapshot gets its own generated `restore.sh` (reusing
+`backup_generate_restore_script`, pointed at the snapshot folder instead of the
+run's own `backup/`) — a `pre-restore-<timestamp>/restore.sh` an operator can run
+directly to roll B back to its state right before the restore attempt, rather than
+having to hand-reconstruct the right ssh/rsync/wp-cli commands under pressure.
+
+**Exact-state scope, amended in the Step 3 fix-pack review (Viktor/Kimi):**
+"restores B to the exact pre-graft state" is only fully guaranteed for an
+**ssh-remote or genuinely local (unwrapped)** B — both branches use `rsync
+--delete`, so a file added to `wp-content` after the backup is genuinely removed on
+restore. A **wrapped-local B** (a container-exec wrapper like DDEV — used in
+practice only by this project's own test harness, never a documented real-world
+profile shape beyond that) is **overwrite-only**: `backup_generate_restore_script`
+deliberately never attempts `rm -rf wp-content` on that path, because a
+Mutagen-style bind/sync mount can make the directory itself un-removable ("Device
+or resource busy", reproduced live) — restoring there overwrites every file the
+backup contains with its pre-graft version, but does not delete a file added since.
+This is a real, documented trade-off, not an oversight; the DDEV harness proves the
+deletion guarantee separately, directly against the bare-local (unwrapped) code
+path, rather than resting on a DDEV-only round-trip that can never exercise it.
 
 ## 7. The mapping mu-plugin — `mu-plugins/sitegraft-id-mapper.php`
 

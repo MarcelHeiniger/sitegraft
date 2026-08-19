@@ -296,10 +296,30 @@ backup_generate_restore_script() {
       # file tree rsync can safely wipe and rebuild.
       restore_wp_content_cmd="${prefix} mkdir -p '${SITE_B_WP_PATH}/wp-content' && tar czf - -C '${run_dir}/backup/b-wp-content' . | ${prefix} tar xzf - -C '${SITE_B_WP_PATH}/wp-content'"
       log_warn "B is a wrapped-local site (SITE_B_WP_CMD implies a wrapper, e.g. DDEV) — the generated restore.sh will overwrite wp-content in place but will NOT delete files added to it since this backup (no portable way to safely wipe a containerized directory that may itself be a separate mount — see the code comment in backup_generate_restore_script). Full mirror/delete semantics on restore are only guaranteed for an ssh-remote or genuinely local (unwrapped) B."
+      # MAJOR bug found by review (Viktor), confirmed live: `${SITE_B_WP_CMD}`
+      # still carries `--raw`, and `--raw` doesn't just fail to help stdin —
+      # it silently DROPS it. Reproduced on a real DDEV project: seeded an
+      # option, exported the DB, mutated the option, then piped the export
+      # back through `gunzip -c dump.sql.gz | ddev exec --raw -p X -- wp db
+      # import -` — wp-cli printed "Success: Imported from 'STDIN'." and
+      # exited 0, but the option was STILL the mutated value: the import ran
+      # against EMPTY stdin and silently did nothing. The exact same command
+      # WITHOUT --raw correctly restored the original value. A restore that
+      # reports success while actually restoring nothing is the worst
+      # possible failure mode this tool has — worse than a loud error.
+      # Fixed by using `${prefix}` (already --raw-stripped, see
+      # _backup_local_exec_prefix's own comment) plus a literal "wp", instead
+      # of `${SITE_B_WP_CMD}`, for db import specifically. Never a problem for
+      # backup_db_export's own use of `${SITE_B_WP_CMD}` with --raw intact —
+      # db EXPORT only needs stdOUT to flow (verified working across every
+      # DDEV harness run so far), and this asymmetry (stdout fine, stdin
+      # dropped) is exactly what makes this bug easy to miss without testing
+      # a real round-trip.
+      restore_db_cmd="gunzip -c '${run_dir}/backup/b-db.sql.gz' | ${prefix} wp --path='${SITE_B_WP_PATH}' db import -"
     else
       restore_wp_content_cmd="rsync -avz --delete '${run_dir}/backup/b-wp-content/' '${SITE_B_WP_PATH}/wp-content/'"
+      restore_db_cmd="gunzip -c '${run_dir}/backup/b-db.sql.gz' | ${SITE_B_WP_CMD} --path='${SITE_B_WP_PATH}' db import -"
     fi
-    restore_db_cmd="gunzip -c '${run_dir}/backup/b-db.sql.gz' | ${SITE_B_WP_CMD} --path='${SITE_B_WP_PATH}' db import -"
   fi
 
   cat > "${run_dir}/restore.sh" <<EOF
@@ -309,6 +329,20 @@ backup_generate_restore_script() {
 # invocation (wp-cli literal prefix: ${wp_cmd_b}). This script never calls a
 # sitegraft function and never sources a sitegraft lib file — it runs
 # standalone with nothing but ssh, rsync, tar, gzip/gunzip, and wc.
+#
+# Integrity check scope, tightened per review (Kimi): the checks below (gzip
+# validity, a size floor, non-empty wp-content) catch a truncated, empty, or
+# structurally-broken backup — the realistic failure modes of a partial
+# transfer or disk-full write. They do NOT catch corruption that PRESERVES
+# gzip's own structure and file size while damaging the SQL content inside
+# it (e.g. a few bytes flipped mid-dump by a storage-layer bit-rot event) —
+# that class of corruption passes gzip -t (gzip's own checksum only covers
+# the compressed stream's integrity, not whether the decompressed bytes
+# still form valid SQL) and can still land within the size floor. This is a
+# cheap sanity check, explicitly not a cryptographic guarantee — the
+# authoritative check for pre/post data integrity is Step 5's checksum
+# comparison against manifest.checksums_protected_pre_graft, not this
+# script.
 set -euo pipefail
 
 DB_DUMP="${run_dir}/backup/b-db.sql.gz"
@@ -404,13 +438,29 @@ phase_backup() {
     log_info "--dry-run: backup will print the commands it would run (read-only against B either way) and NOT write real backup files, checksums, or a completion marker"
   fi
 
+  # MAJOR bug found by review (Viktor), reproduced live: the subshell's LAST
+  # statement used to be `[ -f ... ] && chmod 600 ...`. Under a real
+  # --dry-run, backup_db_export writes nothing (run_or_echo only prints),
+  # so `[ -f ]` is false, the `&&` short-circuits chmod, and the subshell's
+  # own exit status becomes that FALSE test's status (1) — which
+  # `) || return 1` then reads as a hard failure. A dry run used to abort
+  # with a false "failed" report, and never reached
+  # backup_generate_restore_script below, so the "restore.sh was generated
+  # for inspection" log line was a lie too. `set -e` inside the subshell is
+  # a separate, additional hardening (Viktor's NIT): without it, a genuine
+  # backup_db_export failure on a REAL (non-dry-run) call wasn't guaranteed
+  # to stop the subshell early — this makes that fail fast and loud instead
+  # of relying solely on the verification step below to catch it.
   (
+    set -e
     umask 077
     mkdir -p "${run_dir}/backup"
     chmod 700 "${run_dir}/backup"
     backup_db_export "${run_dir}/backup"
     backup_wp_content "${run_dir}/backup/b-wp-content"
-    [ -f "${run_dir}/backup/b-db.sql.gz" ] && chmod 600 "${run_dir}/backup/b-db.sql.gz"
+    if [ -f "${run_dir}/backup/b-db.sql.gz" ]; then
+      chmod 600 "${run_dir}/backup/b-db.sql.gz"
+    fi
   ) || return 1
 
   local manifest
@@ -473,6 +523,9 @@ phase_restore() {
       --profile) profile="$2"; shift 2 ;;
       --run) run_dir="$2"; shift 2 ;;
       --yes) yes=1; shift ;;
+      # MINOR found by review (Viktor): the DoD lists --dry-run for every
+      # phase that writes, including restore — this was missing entirely.
+      --dry-run) SITEGRAFT_DRY_RUN=1; shift ;;
       *) log_error "unknown flag for restore: $1"; return 1 ;;
     esac
   done
@@ -482,6 +535,10 @@ phase_restore() {
   }
   profile_load "$profile" || return 1
   [ -x "${run_dir}/restore.sh" ] || { log_error "no restore.sh found for run: ${run_dir}"; return 1; }
+
+  if is_dry_run; then
+    log_info "--dry-run: restore will still take a real pre-restore snapshot of B (read-only against B, and a safety net independent of dry-run) but will print restore.sh's command instead of running it"
+  fi
 
   if [ "$yes" -ne 1 ]; then
     if command -v gum >/dev/null 2>&1; then
@@ -510,16 +567,33 @@ phase_restore() {
   # covering only half of what's about to be overwritten isn't a real safety
   # net for the other half. Taken per the nightshift mandate: prefer the
   # safer option even at extra cost (a slower pre-restore step).
+  #
+  # Nested under "<pre_restore_dir>/backup/" (matching phase_backup's own
+  # layout) SPECIFICALLY so backup_generate_restore_script can be reused
+  # unmodified below to make this snapshot itself turnkey-reversible — a
+  # MINOR review recommendation (Viktor) taken: design §6.7 says "even a
+  # restore has to stay reversible", and a data-only snapshot with no
+  # restore.sh of its own isn't actually turnkey — recovering it today would
+  # mean hand-reconstructing the right ssh/rsync/wp-cli commands under
+  # pressure, exactly the situation a generated restore.sh exists to avoid.
   local pre_restore_dir="${run_dir}/pre-restore-$(date +%Y%m%dT%H%M%S)"
   log_info "snapshotting B's current state before restoring (safety net)..."
+  # MAJOR bug found by review (Viktor), same root cause and same fix as
+  # phase_backup's own subshell above — see that comment for the full
+  # reproduction. `set -e` here too, for the same "fail fast on a real
+  # failure instead of relying on a later check" reasoning.
   (
+    set -e
     umask 077
-    mkdir -p "$pre_restore_dir"
-    chmod 700 "$pre_restore_dir"
-    backup_db_export "$pre_restore_dir"
-    backup_wp_content "${pre_restore_dir}/b-wp-content"
-    [ -f "${pre_restore_dir}/b-db.sql.gz" ] && chmod 600 "${pre_restore_dir}/b-db.sql.gz"
+    mkdir -p "${pre_restore_dir}/backup"
+    chmod 700 "${pre_restore_dir}" "${pre_restore_dir}/backup"
+    backup_db_export "${pre_restore_dir}/backup"
+    backup_wp_content "${pre_restore_dir}/backup/b-wp-content"
+    if [ -f "${pre_restore_dir}/backup/b-db.sql.gz" ]; then
+      chmod 600 "${pre_restore_dir}/backup/b-db.sql.gz"
+    fi
   ) || return 1
+  backup_generate_restore_script "$pre_restore_dir"
 
   log_info "running ${run_dir}/restore.sh ..."
   # Bug found via TDD (not present in the plan's original pseudocode): a
@@ -533,8 +607,8 @@ phase_restore() {
   # partially-applied restore would be reported as a success. Caught live by
   # a test that makes the stand-in restore.sh exit 1 after printing output.
   if ! run_or_echo "${run_dir}/restore.sh"; then
-    log_error "restore.sh failed — B may be left in a partially-restored state. Pre-restore safety snapshot is at ${pre_restore_dir}"
+    log_error "restore.sh failed — B may be left in a partially-restored state. Pre-restore safety snapshot is at ${pre_restore_dir} — run ${pre_restore_dir}/restore.sh to roll back to B's state right before this restore attempt"
     return 1
   fi
-  log_info "restore complete. Pre-restore safety snapshot kept at ${pre_restore_dir}"
+  log_info "restore complete. Pre-restore safety snapshot kept at ${pre_restore_dir} (its own restore.sh: ${pre_restore_dir}/restore.sh)"
 }

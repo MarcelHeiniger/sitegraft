@@ -34,13 +34,20 @@ echo "FAKE RESTORE RAN"
 EOF
   chmod +x "${RUN_DIR}/restore.sh"
 
+  # Bug found by review (Viktor): these stubs previously wrote their fake
+  # artifact unconditionally, even under dry-run, so a dry-run test never
+  # actually exercised phase_restore's real dry-run code path — same class
+  # of gap as test_phase_backup.bats's own stubs (see that file's comment).
+  # Honoring is_dry_run here closes it.
   backup_db_export() {
     local dest_dir="$1"
+    is_dry_run && { echo "[dry-run] would export B database to ${dest_dir}/b-db.sql.gz"; return 0; }
     mkdir -p "$dest_dir"
     printf 'fake pre-restore db snapshot' | gzip > "${dest_dir}/b-db.sql.gz"
   }
   backup_wp_content() {
     local dest_dir="$1"
+    is_dry_run && { echo "[dry-run] would archive B wp-content to ${dest_dir}"; return 0; }
     mkdir -p "${dest_dir}/themes"
     touch "${dest_dir}/themes/dummy.txt"
   }
@@ -72,9 +79,23 @@ EOF
   local snap_dir
   snap_dir=$(ls -dt "${RUN_DIR}"/pre-restore-* | head -1)
   [ -n "$snap_dir" ]
-  [ -f "${snap_dir}/b-db.sql.gz" ]
-  [ -d "${snap_dir}/b-wp-content" ]
-  [ -n "$(ls -A "${snap_dir}/b-wp-content")" ]
+  [ -f "${snap_dir}/backup/b-db.sql.gz" ]
+  [ -d "${snap_dir}/backup/b-wp-content" ]
+  [ -n "$(ls -A "${snap_dir}/backup/b-wp-content")" ]
+}
+
+# MINOR review recommendation taken (Viktor): the pre-restore snapshot is now
+# turnkey-reversible, not just data-only — design doc §6.7 ("even a restore
+# has to stay reversible") should mean an operator can actually run
+# something, not hand-reconstruct the right commands under pressure.
+@test "phase_restore's pre-restore snapshot gets its own turnkey restore.sh" {
+  run phase_restore --profile t --run "$RUN_DIR" --yes
+  [ "$status" -eq 0 ]
+  local snap_dir
+  snap_dir=$(ls -dt "${RUN_DIR}"/pre-restore-* | head -1)
+  [ -x "${snap_dir}/restore.sh" ]
+  run grep -Ei 'wp_remote|sitegraft_|backup_checksum|backup_db_export|backup_wp_content|phase_backup|phase_restore' "${snap_dir}/restore.sh"
+  [ "$status" -ne 0 ]
 }
 
 @test "phase_restore's pre-restore snapshot is owner-only" {
@@ -82,7 +103,7 @@ EOF
   local snap_dir dir_mode db_mode
   snap_dir=$(ls -dt "${RUN_DIR}"/pre-restore-* | head -1)
   dir_mode=$(stat -f '%Lp' "$snap_dir" 2>/dev/null || stat -c '%a' "$snap_dir")
-  db_mode=$(stat -f '%Lp' "${snap_dir}/b-db.sql.gz" 2>/dev/null || stat -c '%a' "${snap_dir}/b-db.sql.gz")
+  db_mode=$(stat -f '%Lp' "${snap_dir}/backup/b-db.sql.gz" 2>/dev/null || stat -c '%a' "${snap_dir}/backup/b-db.sql.gz")
   [ "$dir_mode" = "700" ]
   [ "$db_mode" = "600" ]
 }
@@ -102,5 +123,26 @@ EOF
   local snap_dir
   snap_dir=$(ls -dt "${RUN_DIR}"/pre-restore-* | head -1)
   [ -n "$snap_dir" ]
-  [ -s "${snap_dir}/b-db.sql.gz" ]
+  [ -s "${snap_dir}/backup/b-db.sql.gz" ]
+}
+
+# MINOR review recommendation taken (Viktor): --dry-run was missing from
+# phase_restore even though the DoD lists it for every phase that writes.
+@test "phase_restore accepts --dry-run as a flag" {
+  run phase_restore --profile t --run "$RUN_DIR" --yes --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"FAKE RESTORE RAN"* ]]
+}
+
+# MAJOR bug regression (Viktor), same root cause as phase_backup's own
+# subshell: under a real dry-run, backup_db_export writes nothing, so a
+# `[ -f ... ] && chmod ...` as the pre-restore snapshot subshell's LAST
+# statement used to make the whole subshell's exit status that of the false
+# test — read as a hard failure by `) || return 1`, even though nothing
+# actually went wrong. Fixed the same way as phase_backup: an `if` guard
+# instead of `&&`, so a false test never becomes the subshell's own exit
+# status.
+@test "phase_restore --dry-run does not falsely report failure (MAJOR regression, same bug as phase_backup)" {
+  SITEGRAFT_DRY_RUN=1 run phase_restore --profile t --run "$RUN_DIR" --yes
+  [ "$status" -eq 0 ]
 }

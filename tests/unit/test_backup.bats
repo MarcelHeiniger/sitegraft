@@ -194,3 +194,64 @@ _fake_dump_rows() {
   run backup_verify_wp_content "$BATS_TEST_TMPDIR/real-wp-content"
   [ "$status" -eq 0 ]
 }
+
+# --- backup_generate_restore_script ---
+# MAJOR-1 regression (Viktor's review, confirmed live on a real DDEV
+# project): the generated db-import command used to keep SITE_B_WP_CMD's
+# `--raw` flag for a wrapped-local site. `--raw` silently drops piped stdin
+# into the container — reproduced live: exported a DB with a known option
+# value, mutated the option, then `gunzip -c dump.sql.gz | ddev exec --raw
+# -p X -- wp db import -` printed "Success: Imported from 'STDIN'." (exit 0)
+# but the option was still the MUTATED value — the import ran against empty
+# stdin and silently restored nothing. The same command without --raw
+# correctly reverted it. A restore that reports success while restoring
+# nothing is the worst failure mode this tool has.
+
+@test "backup_generate_restore_script's wrapped-local db-import command drops --raw" {
+  SITE_B_SSH_HOST=""
+  SITE_B_WP_PATH="/var/www/html"
+  SITE_B_WP_CMD="ddev exec --raw -p sitegraft-test-b -- wp"
+  local run_dir="$BATS_TEST_TMPDIR/run-wrapped"
+  mkdir -p "$run_dir"
+  backup_generate_restore_script "$run_dir"
+  run grep 'db import -' "${run_dir}/restore.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"--raw"* ]]
+  [[ "$output" == *"ddev exec -p sitegraft-test-b -- wp"* ]]
+}
+
+@test "backup_generate_restore_script's wp-content restore command (already fixed) also has no --raw, for consistency" {
+  SITE_B_SSH_HOST=""
+  SITE_B_WP_PATH="/var/www/html"
+  SITE_B_WP_CMD="ddev exec --raw -p sitegraft-test-b -- wp"
+  local run_dir="$BATS_TEST_TMPDIR/run-wrapped2"
+  mkdir -p "$run_dir"
+  backup_generate_restore_script "$run_dir"
+  run grep -E 'tar (c|x)zf' "${run_dir}/restore.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"--raw"* ]]
+}
+
+@test "backup_generate_restore_script's ssh-remote db-import command uses SITE_B_WP_CMD verbatim (no wrapper stripping applies)" {
+  SITE_B_SSH_HOST="user@host-b.example.com"
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="wp"
+  local run_dir="$BATS_TEST_TMPDIR/run-ssh"
+  mkdir -p "$run_dir"
+  backup_generate_restore_script "$run_dir"
+  run grep 'db import -' "${run_dir}/restore.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ssh 'user@host-b.example.com'"* ]]
+}
+
+@test "backup_generate_restore_script's bare-local db-import command is unaffected (no wrapper to strip)" {
+  SITE_B_SSH_HOST=""
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="wp"
+  local run_dir="$BATS_TEST_TMPDIR/run-bare"
+  mkdir -p "$run_dir"
+  backup_generate_restore_script "$run_dir"
+  run grep 'db import -' "${run_dir}/restore.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"wp --path='/var/www/site-b' db import -"* ]]
+}

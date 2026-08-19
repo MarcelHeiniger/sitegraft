@@ -41,8 +41,19 @@ EOF
   # write small, deterministic fake artifacts instead. Every other function
   # under test (phase_backup's own guard clauses, verification, checksumming,
   # permissions, dry-run branching) runs for real, unstubbed.
+  #
+  # Bug found by review (Viktor): the previous version of these stubs wrote
+  # their fake artifact UNCONDITIONALLY, even under dry-run — the opposite of
+  # what the real backup_db_export/backup_wp_content do (run_or_echo prints
+  # instead of writing anything). That made the dry-run tests below
+  # vacuously pass without ever exercising the real dry-run code path in
+  # phase_backup, which is exactly how the MAJOR chmod/subshell-exit-status
+  # bug (see lib/backup.sh's phase_backup comment) went undetected by the
+  # unit suite and only surfaced on the live DDEV harness. Honoring
+  # is_dry_run here closes that gap.
   backup_db_export() {
     local dest_dir="$1"
+    is_dry_run && { echo "[dry-run] would export B database to ${dest_dir}/b-db.sql.gz"; return 0; }
     mkdir -p "$dest_dir"
     {
       printf -- '-- MySQL dump\n'
@@ -56,6 +67,7 @@ EOF
   }
   backup_wp_content() {
     local dest_dir="$1"
+    is_dry_run && { echo "[dry-run] would archive B wp-content to ${dest_dir}"; return 0; }
     mkdir -p "${dest_dir}/themes"
     touch "${dest_dir}/themes/dummy-theme.txt"
   }
