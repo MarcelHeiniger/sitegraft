@@ -710,13 +710,18 @@ git commit -m "test(integration): add DDEV harness skeleton and fixtures (grown 
 - Produces: `wp_remote <alias> <wp-cli args...>` (dispatches to SSH+wp-cli or local
   `$SITE_*_WP_CMD` depending on whether `SITE_*_SSH_HOST` is set); `inventory_scan_site
   <alias> <out_json_path>` (writes the JSON shape consumed by `module_call <mod>
-  detect <path>` and by `inventory_stack_matches` below — see design doc §6.1);
-  `inventory_stack_matches <scan_a_json> <scan_b_json>` (exit 0/1 — do A and B run
-  the same active theme and the same Etch/ACSS versions? design doc §12, review
-  finding B1); `phase_scan` (the function `bin/sitegraft` dispatches to for the
+  detect <path>` and by `inventory_stack_diff` below — see design doc §6.1);
+  `inventory_stack_diff <scan_a_json> <scan_b_json>` (pure — returns a JSON object
+  keyed by `theme`/`etch`/`acss`, one entry per component where A and B differ,
+  each `{on_a, on_b}` with `on_b: null` meaning absent on B; components already
+  matching are simply omitted — design doc §12, Marcel's revision of review finding
+  B1: this is what lets `plan` offer to *copy* a missing/mismatched component
+  instead of only ever refusing); `inventory_stack_matches <scan_a_json>
+  <scan_b_json>` (exit 0/1 — a convenience wrapper: true iff `inventory_stack_diff`
+  is empty); `phase_scan` (the function `bin/sitegraft` dispatches to for the
   `scan` phase).
 
-- [ ] **Step 1: Write the failing test for `wp_remote` dispatch and `inventory_stack_matches`**
+- [ ] **Step 1: Write the failing test for `wp_remote` dispatch and `inventory_stack_diff`**
 
 This test only checks the *dispatch decision* (SSH vs local) and the pure
 stack-comparison logic, not a real wp-cli call — that is covered by the DDEV
@@ -749,18 +754,35 @@ setup() {
   [[ "$output" == *"ddev wp"* ]]
 }
 
-@test "inventory_stack_matches passes when theme and Etch/ACSS versions are identical" {
+@test "inventory_stack_diff is empty when theme and Etch/ACSS versions are identical" {
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
   echo '{"active_theme":{"stylesheet":"etch-theme","version":"1.0"},"plugins":[{"name":"etch","version":"2.0"},{"name":"automatic-css","version":"3.0"}]}' > "$a"
   echo '{"active_theme":{"stylesheet":"etch-theme","version":"1.0"},"plugins":[{"name":"etch","version":"2.0"},{"name":"automatic-css","version":"3.0"}]}' > "$b"
-  run inventory_stack_matches "$a" "$b"
+  run inventory_stack_diff "$a" "$b"
   [ "$status" -eq 0 ]
+  [ "$(echo "$output" | jq 'length')" = "0" ]
 }
 
-@test "inventory_stack_matches fails when B's active theme differs from A's" {
+@test "inventory_stack_diff reports theme as a mismatch with both versions when they differ" {
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
-  echo '{"active_theme":{"stylesheet":"etch-theme","version":"1.0"},"plugins":[]}' > "$a"
-  echo '{"active_theme":{"stylesheet":"some-other-theme","version":"1.0"},"plugins":[]}' > "$b"
+  echo '{"active_theme":{"stylesheet":"etch-theme"},"plugins":[]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"divi"},"plugins":[]}' > "$b"
+  run inventory_stack_diff "$a" "$b"
+  echo "$output" | jq -e '.theme.on_a == "etch-theme" and .theme.on_b == "divi"' >/dev/null
+}
+
+@test "inventory_stack_diff reports on_b as null when the component is absent on B (the common case, §13)" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[{"name":"etch","version":"2.0"}]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[]}' > "$b"
+  run inventory_stack_diff "$a" "$b"
+  echo "$output" | jq -e '.etch.on_a == "2.0" and .etch.on_b == null' >/dev/null
+}
+
+@test "inventory_stack_matches wraps inventory_stack_diff (true iff it's empty)" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"active_theme":{"stylesheet":"etch-theme"},"plugins":[]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"some-other-theme"},"plugins":[]}' > "$b"
   run inventory_stack_matches "$a" "$b"
   [ "$status" -eq 1 ]
 }
@@ -835,24 +857,38 @@ inventory_scan_site() {
     > "$out_json"
 }
 
-# design doc §12 (review finding B1): does B run the same design-layer stack as A?
-# Compared: active theme stylesheet, Etch version, ACSS version. A mismatch never
-# means content is corrupted — it means the grafted content would render as
-# nothing on B, which is exactly the failure mode this check exists to catch.
-inventory_stack_matches() {
+# design doc §12 (Marcel's revision of review finding B1): per-component diff
+# between A's and B's rendering stack (active theme, Etch, ACSS). Returns only
+# the components that differ, `on_b: null` meaning "absent on B" — this is
+# deliberately NOT just a pass/fail: B running a completely different stack
+# (Divi, Elementor, a classic theme, nothing at all) is the *normal* case per
+# §13, and `plan`/`graft` need to know exactly which component to offer copying,
+# not just that "something" doesn't match.
+inventory_stack_diff() {
   local scan_a="$1" scan_b="$2"
   local theme_a theme_b etch_a etch_b acss_a acss_b
-  theme_a=$(jq -r '.active_theme.stylesheet // "unknown"' "$scan_a")
-  theme_b=$(jq -r '.active_theme.stylesheet // "unknown"' "$scan_b")
-  [ "$theme_a" = "$theme_b" ] || return 1
-
+  theme_a=$(jq -r '.active_theme.stylesheet // ""' "$scan_a")
+  theme_b=$(jq -r '.active_theme.stylesheet // ""' "$scan_b")
   etch_a=$(jq -r '.plugins[]? | select(.name=="etch") | .version // ""' "$scan_a")
   etch_b=$(jq -r '.plugins[]? | select(.name=="etch") | .version // ""' "$scan_b")
-  [ "$etch_a" = "$etch_b" ] || return 1
-
   acss_a=$(jq -r '.plugins[]? | select(.name=="automatic-css") | .version // ""' "$scan_a")
   acss_b=$(jq -r '.plugins[]? | select(.name=="automatic-css") | .version // ""' "$scan_b")
-  [ "$acss_a" = "$acss_b" ]
+
+  jq -n \
+    --arg theme_a "$theme_a" --arg theme_b "$theme_b" \
+    --arg etch_a "$etch_a" --arg etch_b "$etch_b" \
+    --arg acss_a "$acss_a" --arg acss_b "$acss_b" \
+    '{
+      theme: (if $theme_a != $theme_b then {on_a: $theme_a, on_b: ($theme_b | if length > 0 then . else null end)} else null end),
+      etch:  (if $etch_a  != $etch_b  then {on_a: $etch_a,  on_b: ($etch_b  | if length > 0 then . else null end)} else null end),
+      acss:  (if $acss_a  != $acss_b  then {on_a: $acss_a,  on_b: ($acss_b  | if length > 0 then . else null end)} else null end)
+    } | with_entries(select(.value != null))'
+}
+
+# Convenience wrapper for call sites that only need a yes/no answer.
+inventory_stack_matches() {
+  local scan_a="$1" scan_b="$2"
+  [ "$(inventory_stack_diff "$scan_a" "$scan_b" | jq 'length')" = "0" ]
 }
 
 phase_scan() {
@@ -882,7 +918,7 @@ phase_scan() {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `bats tests/unit/test_inventory.bats`
-Expected: PASS (4 tests)
+Expected: PASS (6 tests)
 
 - [ ] **Step 5: Grow the DDEV harness — add the `scan` call and its assertions**
 
@@ -930,6 +966,180 @@ Expected: `SCAN OK (SITEGRAFT_HARNESS_STOP_AFTER=scan)`.
 ```bash
 git add lib/inventory.sh tests/unit/test_inventory.bats tests/integration/ddev-harness.sh
 git commit -m "feat(scan): add site introspection (post_types, options, tables, plugins, active theme, classic menus) and wire the scan phase"
+```
+
+### Task 1.6: custom-code-on-B signals — child theme, `functions.php`, mu-plugins, snippet plugins
+
+**Files:**
+- Modify: `lib/inventory.sh` (add `inventory_custom_code_signals`,
+  `inventory_custom_code_detected`; extend `inventory_scan_site` and `phase_scan`)
+- Test: `tests/unit/test_inventory_custom_code.bats`
+
+New task, added per Marcel's third guardrail (design doc §14): before `graft`
+replaces B's design layer, `scan` collects a small set of shallow heuristic
+signals **on B only** — deliberately no code parsing, no static analysis
+(YAGNI) — so `plan` (Task 2.5) can gate on them instead of the tool silently
+discarding custom PHP nobody remembered was tied to the old theme.
+
+**Interfaces:**
+- Consumes: `wp_remote` (Task 1.5).
+- Produces: `inventory_custom_code_signals <alias>` (live wp-cli calls — child
+  theme, `functions.php` presence/size/line-count, `mu-plugins/` file listing,
+  known snippet-plugin slugs found in the existing `plugin list` dump; returns
+  the JSON shape from design doc §4/§6.1); `inventory_custom_code_detected
+  <signals_json>` (pure — exit 0/1, true iff any signal is non-empty/`true`,
+  this is the half that's actually unit-testable).
+
+- [ ] **Step 1: Write the failing test for `inventory_custom_code_detected`**
+
+```bash
+# tests/unit/test_inventory_custom_code.bats
+setup() {
+  load '../../lib/core.sh'
+  load '../../lib/inventory.sh'
+}
+
+@test "inventory_custom_code_detected is false when every signal is empty" {
+  local signals='{"child_theme":false,"functions_php":{"exists":false},"mu_plugins":[],"snippet_plugins_detected":[]}'
+  run inventory_custom_code_detected "$signals"
+  [ "$status" -eq 1 ]
+}
+
+@test "inventory_custom_code_detected is true when the active theme is a child theme" {
+  local signals='{"child_theme":true,"functions_php":{"exists":false},"mu_plugins":[],"snippet_plugins_detected":[]}'
+  run inventory_custom_code_detected "$signals"
+  [ "$status" -eq 0 ]
+}
+
+@test "inventory_custom_code_detected is true when functions.php exists" {
+  local signals='{"child_theme":false,"functions_php":{"exists":true,"bytes":100,"lines":10},"mu_plugins":[],"snippet_plugins_detected":[]}'
+  run inventory_custom_code_detected "$signals"
+  [ "$status" -eq 0 ]
+}
+
+@test "inventory_custom_code_detected is true when any mu-plugin file is present" {
+  local signals='{"child_theme":false,"functions_php":{"exists":false},"mu_plugins":["custom-redirects.php"],"snippet_plugins_detected":[]}'
+  run inventory_custom_code_detected "$signals"
+  [ "$status" -eq 0 ]
+}
+
+@test "inventory_custom_code_detected is true when a known snippet plugin is active" {
+  local signals='{"child_theme":false,"functions_php":{"exists":false},"mu_plugins":[],"snippet_plugins_detected":["code-snippets"]}'
+  run inventory_custom_code_detected "$signals"
+  [ "$status" -eq 0 ]
+}
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `bats tests/unit/test_inventory_custom_code.bats`
+Expected: FAIL — `inventory_custom_code_detected` does not exist.
+
+- [ ] **Step 3: Add the functions to `lib/inventory.sh`**
+
+```bash
+# Appended to lib/inventory.sh
+
+# design doc §6.1/§14: shallow, B-only signals — no code parsing, no static
+# analysis. The extensible slug list lives here, in one place, so adding a
+# newly-encountered snippet plugin later is a one-line change.
+inventory_custom_code_signals() {
+  local alias_lc="$1"
+  local name template child_theme fn_php mu_plugins plugins_json snippet_plugins
+
+  name=$(wp_remote "$alias_lc" theme list --status=active --field=name)
+  template=$(wp_remote "$alias_lc" theme get "$name" --field=template 2>/dev/null || echo "$name")
+  if [ "$template" != "$name" ]; then child_theme=true; else child_theme=false; fi
+
+  fn_php=$(wp_remote "$alias_lc" eval 'if (file_exists($f = get_stylesheet_directory()."/functions.php")) { echo json_encode(["exists"=>true,"bytes"=>filesize($f),"lines"=>count(file($f))]); } else { echo json_encode(["exists"=>false]); }')
+  mu_plugins=$(wp_remote "$alias_lc" eval 'echo json_encode(array_map("basename", glob(WP_CONTENT_DIR."/mu-plugins/*.php") ?: []));')
+
+  plugins_json=$(wp_remote "$alias_lc" plugin list --format=json)
+  snippet_plugins=$(echo "$plugins_json" | jq -c \
+    '[.[] | select(.name as $n | ["code-snippets","wpcode","insert-headers-and-footers"] | index($n)) | .name]')
+
+  jq -n \
+    --argjson child_theme "$child_theme" \
+    --argjson fn_php "$fn_php" \
+    --argjson mu_plugins "$mu_plugins" \
+    --argjson snippet_plugins "$snippet_plugins" \
+    '{child_theme: $child_theme, functions_php: $fn_php, mu_plugins: $mu_plugins, snippet_plugins_detected: $snippet_plugins}'
+}
+
+# Pure: given a custom_code_signals object (live or fabricated), is any signal
+# raised? This is the half of the feature that's actually unit-testable.
+inventory_custom_code_detected() {
+  local signals="$1"
+  [ "$(echo "$signals" | jq '
+    (.child_theme == true)
+    or (.functions_php.exists == true)
+    or ((.mu_plugins // []) | length > 0)
+    or ((.snippet_plugins_detected // []) | length > 0)
+  ')" = "true" ]
+}
+```
+
+- [ ] **Step 4: Extend `inventory_scan_site` and `phase_scan` to use them (both in `lib/inventory.sh`, from Task 1.5)**
+
+```bash
+# Modify inventory_scan_site (Task 1.5) to compute these on B only, and fold
+# them into scan-b.json:
+
+inventory_scan_site() {
+  local alias_lc="$1" out_json="$2"
+  log_info "scanning site '${alias_lc}' -> ${out_json}"
+  local post_types options tables plugins active_theme menus
+  post_types=$(wp_remote "$alias_lc" post-type list --format=json)
+  options=$(wp_remote "$alias_lc" option list --format=json)
+  tables=$(wp_remote "$alias_lc" db tables --format=json --all-tables-with-prefix)
+  plugins=$(wp_remote "$alias_lc" plugin list --format=json)
+  active_theme=$(wp_remote "$alias_lc" theme list --status=active --format=json | jq '.[0] // {}')
+  menus=$(wp_remote "$alias_lc" menu list --format=json 2>/dev/null || echo '[]')
+
+  local custom_code_signals='{}' custom_code_detected=false
+  if [ "$alias_lc" = "b" ]; then
+    custom_code_signals=$(inventory_custom_code_signals "$alias_lc")
+    inventory_custom_code_detected "$custom_code_signals" && custom_code_detected=true
+  fi
+
+  jq -n \
+    --argjson post_types "$post_types" \
+    --argjson options "$options" \
+    --argjson tables "$tables" \
+    --argjson plugins "$plugins" \
+    --argjson active_theme "$active_theme" \
+    --argjson menus "$menus" \
+    --argjson custom_code_signals "$custom_code_signals" \
+    --argjson custom_code_detected "$custom_code_detected" \
+    '{
+      post_types: $post_types,
+      options: $options,
+      tables: $tables,
+      plugins: $plugins,
+      active_theme: $active_theme,
+      classic_menus_detected: ($menus | length > 0),
+      classic_menu_names: [$menus[]?.name],
+      custom_code_signals: $custom_code_signals,
+      custom_code_detected: $custom_code_detected
+    }' \
+    > "$out_json"
+}
+```
+
+`phase_scan` (Task 1.5) needs no change — it already just calls
+`inventory_scan_site` for both aliases; the new fields ride along in
+`scan-b.json` for `plan` (Task 2.5) to read.
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+Run: `bats tests/unit/test_inventory_custom_code.bats`
+Expected: PASS (5 tests)
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add lib/inventory.sh tests/unit/test_inventory_custom_code.bats
+git commit -m "feat(scan): detect custom-code signals on B (child theme, functions.php, mu-plugins, snippet plugins) — design doc §14"
 ```
 
 **Step 1 done when:** `bats tests/unit/` is all green, and
@@ -1080,7 +1290,7 @@ git add lib/manifest.sh tests/unit/test_manifest.bats
 git commit -m "feat(manifest): add pure build/validate/freeze functions for the run manifest"
 ```
 
-### Task 2.2: `plan` phase logic — module dispatch, defaults, `_unclaimed` bucket, stack/classic-menu warnings
+### Task 2.2: `plan` phase logic — module dispatch, defaults, `_unclaimed` bucket, classic-menu warning
 
 **Files:**
 - Modify: `lib/manifest.sh` (add `manifest_compute_unclaimed`)
@@ -1089,16 +1299,20 @@ git commit -m "feat(manifest): add pure build/validate/freeze functions for the 
 
 **Interfaces:**
 - Consumes: `SITEGRAFT_MODULES`, `module_call` (Task 1.3); `manifest_new`,
-  `manifest_add_migrate`, `manifest_add_protect` (Task 2.1);
-  `inventory_stack_matches` (Task 1.5).
+  `manifest_add_migrate`, `manifest_add_protect` (Task 2.1).
 - Produces: `manifest_compute_unclaimed <manifest_json> <scan_b_json>` (adds a
   `protect._unclaimed` bucket per design doc §3.5, pure function); `plan_defaults
   <scan_a_json> <scan_b_json>` (builds the default migrate/protect selections by
   calling `module_call <mod> detect` against both scans — not a pure function, reads
   from disk via the scan file paths, so tested separately from the pure manifest
   functions above); `plan_warn_scope_gaps <scan_a_json> <scan_b_json>` (design doc
-  §12/§13, review findings B1/B2 — loudly warns, never blocks, since `plan` only
-  ever builds a manifest, it doesn't touch B).
+  §13, review finding B2 — the classic-menu warning, **on A only**, per Marcel's
+  clarification: B having a classic menu is normal and never warned about, see
+  §13). This task does **not** cover the rendering-stack mismatch — that warning
+  was folded into Task 2.4's interactive per-component resolution instead of being
+  a separate blanket warning here (Marcel's revision of finding B1: a generic
+  "stack doesn't match" warning would be actively misleading once `plan` can
+  offer to fix the specific mismatch on the spot).
 
 - [ ] **Step 1: Write the failing test for `manifest_compute_unclaimed` and `plan_warn_scope_gaps`**
 
@@ -1126,14 +1340,23 @@ setup() {
   echo "$output" | jq -e '.protect._unclaimed.post_types == []' >/dev/null
 }
 
-@test "plan_warn_scope_gaps warns on a stack mismatch and on classic menus, but always exits 0" {
+@test "plan_warn_scope_gaps warns about A's classic menus but never about B's, and always exits 0" {
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
-  echo '{"active_theme":{"stylesheet":"theme-a"},"plugins":[],"classic_menus_detected":true,"classic_menu_names":["Main Menu"]}' > "$a"
-  echo '{"active_theme":{"stylesheet":"theme-b"},"plugins":[]}' > "$b"
+  echo '{"classic_menus_detected":true,"classic_menu_names":["Main Menu"]}' > "$a"
+  echo '{"classic_menus_detected":true,"classic_menu_names":["Legacy Menu"]}' > "$b"
   run plan_warn_scope_gaps "$a" "$b"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"stack"* ]]
   [[ "$output" == *"Main Menu"* ]]
+  [[ "$output" != *"Legacy Menu"* ]]
+}
+
+@test "plan_warn_scope_gaps says nothing when A has no classic menus" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"classic_menus_detected":false}' > "$a"
+  echo '{"classic_menus_detected":true,"classic_menu_names":["Legacy Menu"]}' > "$b"
+  run plan_warn_scope_gaps "$a" "$b"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
 }
 ```
 
@@ -1210,13 +1433,13 @@ plan_warn_scope_gaps() {
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `bats tests/unit/test_plan.bats`
-Expected: PASS (3 tests)
+Expected: PASS (4 tests)
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add lib/manifest.sh lib/plan.sh tests/unit/test_plan.bats
-git commit -m "feat(plan): compute default migrate/protect selections, default-deny bucket, and scope-gap warnings"
+git commit -m "feat(plan): compute default migrate/protect selections, default-deny bucket, and A-only classic-menu warning"
 ```
 
 ### Task 2.3: interactive selection (`gum`/`fzf`/plain fallback) + `phase_plan`
@@ -1315,6 +1538,346 @@ reference — acceptable here since interactive UI genuinely cannot be unit test
 ```bash
 git add lib/plan.sh
 git commit -m "feat(plan): wire interactive selection (gum/fzf/plain fallback), scope-gap warnings, and freeze the manifest"
+```
+
+### Task 2.4: interactive stack resolution — offer to copy a missing/mismatched component from A
+
+**Files:**
+- Modify: `lib/plan.sh` (add `plan_resolve_stack`, `_plan_confirm`,
+  `_plan_confirm_strong`; wire into `phase_plan`)
+- Test: `tests/unit/test_plan_stack.bats`
+
+New task, added per Marcel's revision of review finding B1 (§12): the original
+resolution was refuse-or-override only. The revised behavior is that `plan` — not
+`graft` — is where the operator gets offered a fix: **copy the missing or
+mismatched component from A**, never install from anywhere else. This is
+deliberately its own task rather than folded into Task 2.2, since it is new
+scope Marcel asked for after that task was already written, not a revision of it.
+
+**Interfaces:**
+- Consumes: `inventory_stack_diff` (Task 1.5).
+- Produces: `plan_resolve_stack <manifest_json> <scan_a_json> <scan_b_json>`
+  (interactive — for every component `inventory_stack_diff` reports, prompts and
+  writes the decision into `manifest.stack.<component>` per design doc §4; prints
+  the updated manifest JSON); `_plan_confirm <prompt>` / `_plan_confirm_strong
+  <prompt>` (the two confirmation strengths §12 requires — a plain yes/no for
+  "absent on B," and a distinct, harder-to-trigger confirmation for "present on B
+  but a different version," which is a heavier decision since it overwrites
+  something that already exists).
+
+- [ ] **Step 1: Write the failing test**
+
+The interactive prompts themselves aren't unit-testable (same reasoning as Task
+2.3's `plan_select_interactive`), but the **decision-recording** half of
+`plan_resolve_stack` is — by stubbing the two confirm functions to always answer
+yes or no, the test can assert the manifest ends up with the right
+`stack.<component>.resolution` regardless of which UI path (`gum`/`fzf`/plain)
+would have asked the question.
+
+```bash
+# tests/unit/test_plan_stack.bats
+setup() {
+  load '../../lib/core.sh'
+  load '../../lib/inventory.sh'
+  load '../../lib/manifest.sh'
+  load '../../lib/plan.sh'
+}
+
+@test "plan_resolve_stack records resolution=copy for an absent component when confirmed" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[{"name":"etch","version":"2.0"}]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[]}' > "$b"
+  _plan_confirm() { return 0; }        # simulate the operator accepting
+  _plan_confirm_strong() { return 1; } # not exercised in this case
+  local manifest; manifest=$(manifest_new "https://a.example.com" "https://b.example.com")
+  run plan_resolve_stack "$manifest" "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.stack.etch.resolution == "copy" and .stack.etch.on_b == null' >/dev/null
+}
+
+@test "plan_resolve_stack records resolution=skip for an absent component when declined" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[{"name":"etch","version":"2.0"}]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[]}' > "$b"
+  _plan_confirm() { return 1; }
+  local manifest; manifest=$(manifest_new "https://a.example.com" "https://b.example.com")
+  run plan_resolve_stack "$manifest" "$a" "$b"
+  echo "$output" | jq -e '.stack.etch.resolution == "skip"' >/dev/null
+}
+
+@test "plan_resolve_stack uses the STRONG confirm (not the plain one) for a version mismatch, never auto-overwriting" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[{"name":"automatic-css","version":"3.0"}]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[{"name":"automatic-css","version":"2.5"}]}' > "$b"
+  _plan_confirm() { echo "PLAIN CONFIRM CALLED — WRONG PATH FOR A VERSION MISMATCH" >&2; return 1; }
+  _plan_confirm_strong() { return 0; } # simulate the operator explicitly accepting the overwrite
+  local manifest; manifest=$(manifest_new "https://a.example.com" "https://b.example.com")
+  run plan_resolve_stack "$manifest" "$a" "$b"
+  echo "$output" | jq -e '.stack.acss.resolution == "copy" and .stack.acss.on_b == "2.5"' >/dev/null
+  [[ "$output" != *"WRONG PATH"* ]]
+}
+
+@test "plan_resolve_stack touches nothing when the stack already matches" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[]}' > "$b"
+  local manifest; manifest=$(manifest_new "https://a.example.com" "https://b.example.com")
+  run plan_resolve_stack "$manifest" "$a" "$b"
+  echo "$output" | jq -e '.stack == null or (.stack | length) == 0' >/dev/null
+}
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `bats tests/unit/test_plan_stack.bats`
+Expected: FAIL — `plan_resolve_stack` does not exist.
+
+- [ ] **Step 3: Add the functions to `lib/plan.sh`, and wire them into `phase_plan`**
+
+```bash
+# Appended to lib/plan.sh
+
+_plan_confirm() {
+  local prompt="$1"
+  if command -v gum >/dev/null 2>&1; then
+    gum confirm "$prompt"
+  else
+    read -r -p "${prompt} [y/N] " ans
+    [ "${ans:-n}" = "y" ]
+  fi
+}
+
+# Deliberately a different, harder-to-trigger confirmation than _plan_confirm —
+# design doc §12: overwriting something already installed on B is a heavier
+# decision than filling an absence, and must never be one accidental keystroke
+# away, let alone automatic.
+_plan_confirm_strong() {
+  local prompt="$1"
+  if command -v gum >/dev/null 2>&1; then
+    gum confirm --affirmative="Overwrite" --negative="Skip" "$prompt"
+  else
+    read -r -p "${prompt} Type OVERWRITE (all caps) to confirm: " ans
+    [ "$ans" = "OVERWRITE" ]
+  fi
+}
+
+# design doc §12 (Marcel's revision of review finding B1): for each stack
+# component inventory_stack_diff reports, offer to copy it from A, using a
+# stronger confirmation when B already has something installed. Never installs
+# from anywhere but A. Declining leaves the component "skip" — graft's hard
+# precondition (Task 4.1) picks it up from there.
+plan_resolve_stack() {
+  local manifest="$1" scan_a_json="$2" scan_b_json="$3"
+  local diff; diff=$(inventory_stack_diff "$scan_a_json" "$scan_b_json")
+  local component
+  for component in $(echo "$diff" | jq -r 'keys[]'); do
+    local on_a on_b resolution
+    on_a=$(echo "$diff" | jq -r --arg c "$component" '.[$c].on_a')
+    on_b=$(echo "$diff" | jq -r --arg c "$component" '.[$c].on_b')
+    if [ "$on_b" = "null" ]; then
+      log_warn "${component} is on A (${on_a}) but not on B."
+      if _plan_confirm "Copy ${component} from A and activate it on B?"; then
+        resolution="copy"
+      else
+        resolution="skip"
+      fi
+    else
+      log_warn "B already has ${component} v${on_b} installed — A has v${on_a}. Copying A's version will REPLACE B's existing install."
+      if _plan_confirm_strong "Overwrite B's ${component} (v${on_b}) with A's version (v${on_a})?"; then
+        resolution="copy"
+      else
+        resolution="skip"
+      fi
+    fi
+    manifest=$(echo "$manifest" | jq \
+      --arg c "$component" --arg a "$on_a" --arg b "$on_b" --arg r "$resolution" \
+      '.stack[$c] = {on_a: $a, on_b: (if $b == "null" then null else $b end), resolution: $r}')
+  done
+  echo "$manifest"
+}
+```
+
+Now wire `plan_resolve_stack` into `phase_plan` (Task 2.3), skipped on the
+non-interactive `SITEGRAFT_MANIFEST_PREFILLED` path exactly like
+`plan_select_interactive` — a prefilled manifest is expected to already carry
+whatever `stack` decisions its scenario needs:
+
+```bash
+# Replace this block inside phase_plan (lib/plan.sh, from Task 2.3):
+#
+#   if [ -n "${SITEGRAFT_MANIFEST_PREFILLED:-}" ]; then
+#     manifest=$(cat "$SITEGRAFT_MANIFEST_PREFILLED")
+#   else
+#     manifest=$(plan_select_interactive "$manifest")
+#   fi
+#
+# with:
+
+  if [ -n "${SITEGRAFT_MANIFEST_PREFILLED:-}" ]; then
+    manifest=$(cat "$SITEGRAFT_MANIFEST_PREFILLED")
+  else
+    manifest=$(plan_resolve_stack "$manifest" "${run_dir}/scan-a.json" "${run_dir}/scan-b.json")
+    manifest=$(plan_select_interactive "$manifest")
+  fi
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `bats tests/unit/test_plan_stack.bats`
+Expected: PASS (4 tests)
+
+- [ ] **Step 5: Manual smoke test**
+
+Run `bin/sitegraft plan --profile ddev-test` against the DDEV harness pair
+(Task 3.2 onward) once B has neither Etch nor ACSS installed — confirm the copy
+offer appears, accepting it writes `manifest.stack.etch.resolution == "copy"`.
+Note: the DDEV fixtures (Task 1.4) don't actually install a real Etch/ACSS
+plugin on either site (they only register the CPTs sitegraft needs to see) — so
+`inventory_stack_diff` naturally finds **no** mismatch in the harness's
+default run, and this interactive path never triggers automatically inside
+`tests/integration/ddev-harness.sh`. That's an acceptable coverage gap for v1:
+the mechanics are unit-tested above; a real end-to-end exercise of the copy path
+happens on a real A/B pair, which is exactly what the pre-`1.0.0` gate in
+`docs/definition-of-done.md` already requires for other reasons (closing R2/R4).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add lib/plan.sh tests/unit/test_plan_stack.bats
+git commit -m "feat(plan): offer to copy a missing/mismatched stack component from A (design doc §12, B1 revision)"
+```
+
+### Task 2.5: custom-code-on-B blocking gate
+
+**Files:**
+- Modify: `lib/plan.sh` (add `plan_custom_code_gate`; wire into `phase_plan`,
+  ahead of everything else)
+- Test: `tests/unit/test_plan_custom_code.bats`
+
+New task, added per Marcel's third guardrail (design doc §14) alongside B1/B2.
+Unlike every other check in `plan` (which warns or offers a fix but still
+produces a manifest), this one is a genuine hard stop: if
+`scan-b.json.custom_code_detected` is `true`, `plan` **does not write a
+manifest at all** until the operator explicitly acknowledges. This is
+deliberately as heavy as `--allow-stack-mismatch`'s override, not a warning
+that scrolls past with everything else.
+
+**Interfaces:**
+- Consumes: `inventory_custom_code_detected` is not called here — the boolean
+  is already sitting in `scan-b.json` from Task 1.6; this task just reads it
+  and gates on it.
+- Produces: `plan_custom_code_gate <manifest_json> <scan_b_json>` (prints the
+  updated manifest with `custom_code_review` set on acknowledgment; **returns
+  exit 1 and prints nothing usable on decline** — `phase_plan` must treat that
+  as a hard abort, not merely skip a step).
+
+- [ ] **Step 1: Write the failing test**
+
+Like Task 2.4, the confirmation prompt itself isn't unit-testable, but the
+gating logic is, by stubbing the confirm function.
+
+```bash
+# tests/unit/test_plan_custom_code.bats
+setup() {
+  load '../../lib/core.sh'
+  load '../../lib/plan.sh'
+}
+
+@test "plan_custom_code_gate passes through untouched when no signal was raised" {
+  local manifest='{"frozen":false}'
+  local scan_b='{"custom_code_detected":false}'
+  run plan_custom_code_gate "$manifest" "$scan_b"
+  [ "$status" -eq 0 ]
+  [ "$(echo "$output" | jq -e '.custom_code_review // "absent"')" = "\"absent\"" ]
+}
+
+@test "plan_custom_code_gate records acknowledged=true and a copy of the signals when confirmed" {
+  local manifest='{"frozen":false}'
+  local scan_b='{"custom_code_detected":true,"custom_code_signals":{"child_theme":true,"functions_php":{"exists":false},"mu_plugins":[],"snippet_plugins_detected":[]}}'
+  _plan_confirm_strong() { return 0; } # simulate the operator acknowledging
+  run plan_custom_code_gate "$manifest" "$scan_b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.custom_code_review.acknowledged == true and .custom_code_review.signals.child_theme == true' >/dev/null
+}
+
+@test "plan_custom_code_gate exits 1 and writes nothing usable when declined" {
+  local manifest='{"frozen":false}'
+  local scan_b='{"custom_code_detected":true,"custom_code_signals":{"child_theme":true}}'
+  _plan_confirm_strong() { return 1; } # simulate the operator declining
+  run plan_custom_code_gate "$manifest" "$scan_b"
+  [ "$status" -eq 1 ]
+}
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `bats tests/unit/test_plan_custom_code.bats`
+Expected: FAIL — `plan_custom_code_gate` does not exist.
+
+- [ ] **Step 3: Add `plan_custom_code_gate` to `lib/plan.sh`, and wire it into `phase_plan`**
+
+```bash
+# Appended to lib/plan.sh
+
+# design doc §14 (Marcel's third guardrail): the only truly blocking gate in
+# `plan` — no manifest gets written past this point without an explicit
+# acknowledgment. Uses _plan_confirm_strong (Task 2.4) — the same weight as
+# --allow-stack-mismatch's override, never the plain confirm used elsewhere.
+plan_custom_code_gate() {
+  local manifest="$1" scan_b_json="$2"
+  if [ "$(echo "$scan_b_json" | jq -r '.custom_code_detected // false')" != "true" ]; then
+    echo "$manifest"
+    return 0
+  fi
+  log_warn "B has custom-code signal(s): $(echo "$scan_b_json" | jq -c '.custom_code_signals')"
+  if ! _plan_confirm_strong "Did you review B's theme for custom code (functions.php, code snippets, mu-plugins) before replacing the theme? Custom code living in the old theme will be LOST."; then
+    log_error "custom-code review not acknowledged — refusing to write a manifest. Re-run 'sitegraft plan' once you've reviewed B's theme."
+    return 1
+  fi
+  echo "$manifest" | jq --argjson signals "$(echo "$scan_b_json" | jq '.custom_code_signals')" \
+    '.custom_code_review = {acknowledged: true, signals: $signals}'
+}
+```
+
+Wire it into `phase_plan` (Task 2.3) right after `plan_defaults` builds the
+manifest, and **before** the stack resolution or interactive-selection branch —
+its failure aborts the whole phase immediately, no manifest ever gets written:
+
+```bash
+# Replace this block inside phase_plan (lib/plan.sh, from Task 2.3):
+#
+#   local manifest
+#   manifest=$(plan_defaults "${run_dir}/scan-a.json" "${run_dir}/scan-b.json")
+#
+#   if [ -n "${SITEGRAFT_MANIFEST_PREFILLED:-}" ]; then
+#
+# with:
+
+  local manifest
+  manifest=$(plan_defaults "${run_dir}/scan-a.json" "${run_dir}/scan-b.json")
+  manifest=$(plan_custom_code_gate "$manifest" "$(cat "${run_dir}/scan-b.json")") || return 1
+
+  if [ -n "${SITEGRAFT_MANIFEST_PREFILLED:-}" ]; then
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `bats tests/unit/test_plan_custom_code.bats`
+Expected: PASS (3 tests)
+
+- [ ] **Step 5: Manual smoke test**
+
+Run `bin/sitegraft plan --profile ddev-test` against a DDEV B fixture with a
+child theme active (temporarily activate one of WordPress's bundled child-theme
+pairs, or any theme with a non-matching `template`) — confirm `plan` refuses to
+write `manifest.json` until the strong confirmation is accepted, and that
+declining leaves no `manifest.json` in the run directory at all.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add lib/plan.sh tests/unit/test_plan_custom_code.bats
+git commit -m "feat(plan): add the custom-code-on-B blocking gate (design doc §14)"
 ```
 
 ---
@@ -1688,26 +2251,63 @@ findings A1 (missing options migration), A4 (remote-A transfers), A6 (unscoped
 search-replace), A7 (missing wordpress-importer provisioning), and B1 (the
 rendering-stack hard precondition).
 
-### Task 4.1: rendering-stack precondition + media sync (routed through the orchestrator) + mu-plugin deploy/remove
+### Task 4.1: rendering-stack sync + revised precondition + media sync (routed through the orchestrator) + mu-plugin deploy/remove
 
 **Files:**
 - Create: `lib/graft.sh`
 - Create: `mu-plugins/sitegraft-id-mapper.php`
-- Test: `tests/unit/test_graft_mediastep.bats`, `tests/unit/test_graft_precondition.bats`
+- Test: `tests/unit/test_graft_mediastep.bats`, `tests/unit/test_graft_precondition.bats`,
+  `tests/unit/test_graft_stack_sync.bats`
 
 **Interfaces:**
 - Consumes: `SITE_A_*`/`SITE_B_*` (Task 1.2), `run_or_echo` (Task 1.1),
-  `inventory_stack_matches` (Task 1.5).
-- Produces: `graft_check_stack_precondition <scan_a_json> <scan_b_json>
-  <allow_mismatch: 0|1>` (design doc §12, review finding B1 — exit 0 if the stack
-  matches, or if it doesn't but `allow_mismatch=1`; exit 1 otherwise); a two-hop
-  media sync: `graft_media_pull_cmd`/`graft_media_push_cmd` (pure functions
-  returning argv for inspection) wrapping the real `graft_media_sync`, which now
-  routes A → orchestrator (into the run directory) → B instead of assuming A is
-  directly reachable from B (design doc §6.4 step 1, review finding A4);
-  `graft_deploy_mu_plugin`, `graft_remove_mu_plugin`.
+  `inventory_stack_diff` (Task 1.5).
+- Produces: `graft_sync_stack <run_dir> <manifest_json>` (design doc §6.4 step 0a,
+  Marcel's revision of finding B1 — for every `stack.<component>` in the manifest
+  with `"resolution": "copy"`, `rsync`s that component's plugin/theme directory
+  A → orchestrator → B, then activates it; the **only** place `graft` ever writes
+  to B's `wp-content/themes/` or `wp-content/plugins/`, and it only ever copies
+  from A); `graft_check_stack_precondition <scan_a_json> <scan_b_json>
+  <manifest_json> <allow_mismatch: 0|1>` (design doc §6.4 step 0b — **revised
+  signature**: takes the manifest now, so it never re-litigates a mismatch
+  `graft_sync_stack` already resolved; exit 0 if every remaining mismatch is
+  resolved or `allow_mismatch=1`, exit 1 otherwise); a two-hop media sync:
+  `graft_media_pull_cmd`/`graft_media_push_cmd` (pure functions returning argv for
+  inspection) wrapping the real `graft_media_sync`, which routes A → orchestrator
+  (into the run directory) → B instead of assuming A is directly reachable from B
+  (design doc §6.4 step 1, review finding A4); `graft_deploy_mu_plugin`,
+  `graft_remove_mu_plugin`.
 
 - [ ] **Step 1: Write the failing tests**
+
+```bash
+# tests/unit/test_graft_stack_sync.bats
+setup() {
+  load '../../lib/core.sh'
+  load '../../lib/graft.sh'
+}
+
+@test "graft_sync_stack copies and activates every component marked resolution=copy" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"stack":{"etch":{"on_a":"2.0","on_b":null,"resolution":"copy"},"acss":{"on_a":"3.0","on_b":"2.5","resolution":"skip"}}}'
+  SITE_A_WP_PATH="/site-a"; SITE_B_WP_PATH="/site-b"; SITEGRAFT_DRY_RUN=1
+  run graft_sync_stack "$run_dir" "$manifest"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"etch"* ]]
+  [[ "$output" == *"plugin activate"* ]]
+  [[ "$output" != *"acss"* ]]  # resolution=skip must never be touched here
+}
+
+@test "graft_sync_stack does nothing when the manifest has no stack key" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  SITEGRAFT_DRY_RUN=1
+  run graft_sync_stack "$run_dir" '{}'
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+```
 
 ```bash
 # tests/unit/test_graft_precondition.bats
@@ -1721,24 +2321,35 @@ setup() {
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
   echo '{"active_theme":{"stylesheet":"t"},"plugins":[]}' > "$a"
   echo '{"active_theme":{"stylesheet":"t"},"plugins":[]}' > "$b"
-  run graft_check_stack_precondition "$a" "$b" 0
+  run graft_check_stack_precondition "$a" "$b" '{}' 0
   [ "$status" -eq 0 ]
 }
 
-@test "graft_check_stack_precondition refuses a mismatch without the override" {
+@test "graft_check_stack_precondition refuses an unresolved mismatch without the override" {
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
   echo '{"active_theme":{"stylesheet":"theme-a"},"plugins":[]}' > "$a"
   echo '{"active_theme":{"stylesheet":"theme-b"},"plugins":[]}' > "$b"
-  run graft_check_stack_precondition "$a" "$b" 0
+  local manifest='{"stack":{"theme":{"on_a":"theme-a","on_b":"theme-b","resolution":"skip"}}}'
+  run graft_check_stack_precondition "$a" "$b" "$manifest" 0
   [ "$status" -eq 1 ]
   [[ "$output" == *"--allow-stack-mismatch"* ]]
 }
 
-@test "graft_check_stack_precondition allows a mismatch with the override flag" {
+@test "graft_check_stack_precondition passes a mismatch the manifest already resolved via copy (graft_sync_stack already ran)" {
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
   echo '{"active_theme":{"stylesheet":"theme-a"},"plugins":[]}' > "$a"
   echo '{"active_theme":{"stylesheet":"theme-b"},"plugins":[]}' > "$b"
-  run graft_check_stack_precondition "$a" "$b" 1
+  local manifest='{"stack":{"theme":{"on_a":"theme-a","on_b":"theme-b","resolution":"copy"}}}'
+  run graft_check_stack_precondition "$a" "$b" "$manifest" 0
+  [ "$status" -eq 0 ]
+}
+
+@test "graft_check_stack_precondition allows a remaining mismatch with the override flag" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"active_theme":{"stylesheet":"theme-a"},"plugins":[]}' > "$a"
+  echo '{"active_theme":{"stylesheet":"theme-b"},"plugins":[]}' > "$b"
+  local manifest='{"stack":{"theme":{"on_a":"theme-a","on_b":"theme-b","resolution":"skip"}}}'
+  run graft_check_stack_precondition "$a" "$b" "$manifest" 1
   [ "$status" -eq 0 ]
 }
 ```
@@ -1771,29 +2382,72 @@ setup() {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `bats tests/unit/test_graft_mediastep.bats tests/unit/test_graft_precondition.bats`
+Run: `bats tests/unit/test_graft_mediastep.bats tests/unit/test_graft_precondition.bats tests/unit/test_graft_stack_sync.bats`
 Expected: FAIL — `lib/graft.sh` does not exist.
 
-- [ ] **Step 3: Write the precondition, media, and mu-plugin functions in `lib/graft.sh`**
+- [ ] **Step 3: Write the stack-sync, precondition, media, and mu-plugin functions in `lib/graft.sh`**
 
 ```bash
 #!/usr/bin/env bash
-# lib/graft.sh — phase: graft. Rendering-stack precondition, media sync, WXR
-# export/import, mu-plugin mapping, ID/domain remaps, options migration, optional
-# clean/idempotence pruning. See design doc §6.4, §9, §12.
+# lib/graft.sh — phase: graft. Rendering-stack sync/precondition, media sync,
+# WXR export/import, mu-plugin mapping, ID/domain remaps, options migration,
+# optional clean/idempotence pruning. See design doc §6.4, §9, §12.
 
-# design doc §12 (review finding B1): a hard precondition, not a warning like
-# plan's version — graft is the phase that actually touches B.
+# design doc §6.4 step 0a (Marcel's revision of finding B1): rsync every
+# manifest.stack.<component> marked resolution=copy from A to B, then activate
+# it. Never touches a component marked "skip" — those are graft_check_stack_
+# precondition's problem below, not this function's.
+graft_sync_stack() {
+  local run_dir="$1" manifest="$2"
+  local component
+  for component in $(echo "$manifest" | jq -r '.stack // {} | to_entries[] | select(.value.resolution == "copy") | .key'); do
+    local slug rel_dir
+    case "$component" in
+      theme)
+        slug=$(echo "$manifest" | jq -r '.stack.theme.on_a')
+        rel_dir="wp-content/themes/${slug}"
+        ;;
+      etch)
+        slug="etch" # matches the "name" field inventory_stack_diff (Task 1.5) filters plugin list on
+        rel_dir="wp-content/plugins/${slug}"
+        ;;
+      acss)
+        slug="automatic-css" # NOT "acss" — the internal component key and the plugin's real slug differ
+        rel_dir="wp-content/plugins/${slug}"
+        ;;
+    esac
+    log_info "syncing stack component '${component}' (${slug}) from A to B (design doc §12)..."
+    local staging="${run_dir}/stack-staging/${component}"
+    mkdir -p "$staging"
+    # Only this one theme/plugin's own directory is synced — never the whole
+    # wp-content/themes/ or wp-content/plugins/ tree.
+    run_or_echo rsync -avz ${SITE_A_SSH_HOST:+"${SITE_A_SSH_HOST}:"}"${SITE_A_WP_PATH}/${rel_dir}/" "${staging}/"
+    run_or_echo rsync -avz "${staging}/" ${SITE_B_SSH_HOST:+"${SITE_B_SSH_HOST}:"}"${SITE_B_WP_PATH}/${rel_dir}/"
+    if [ "$component" = "theme" ]; then
+      run_or_echo wp_remote b theme activate "$slug"
+    else
+      run_or_echo wp_remote b plugin activate "$slug"
+    fi
+  done
+}
+
+# design doc §6.4 step 0b (Marcel's revision of finding B1): a hard precondition
+# on whatever graft_sync_stack did NOT just resolve — never re-litigates a
+# component the manifest already recorded as resolution=copy.
 graft_check_stack_precondition() {
-  local scan_a="$1" scan_b="$2" allow_mismatch="$3"
-  if inventory_stack_matches "$scan_a" "$scan_b"; then
+  local scan_a="$1" scan_b="$2" manifest="$3" allow_mismatch="$4"
+  local diff unresolved
+  diff=$(inventory_stack_diff "$scan_a" "$scan_b")
+  unresolved=$(echo "$diff" | jq -r --argjson m "$manifest" \
+    '[keys[] | select(($m.stack[.].resolution // "skip") != "copy")]')
+  if [ "$(echo "$unresolved" | jq 'length')" = "0" ]; then
     return 0
   fi
   if [ "$allow_mismatch" != "1" ]; then
-    log_error "B's rendering stack (active theme / Etch / ACSS version) does not match A's — refusing to graft. Re-run with --allow-stack-mismatch to override (the grafted content may render as nothing on B until the stack is aligned — design doc §12)."
+    log_error "B's rendering stack does not match A's for: $(echo "$unresolved" | jq -r 'join(", ")') — refusing to graft. Re-run with --allow-stack-mismatch to override, or resolve it in 'sitegraft plan' first (design doc §12)."
     return 1
   fi
-  log_warn "STACK MISMATCH OVERRIDDEN (--allow-stack-mismatch) — B's rendering stack does not match A's. The grafted content may render as nothing on B until the stack is aligned by hand."
+  log_warn "STACK MISMATCH OVERRIDDEN (--allow-stack-mismatch) for: $(echo "$unresolved" | jq -r 'join(", ")') — the grafted content may render as nothing on B until the stack is aligned by hand."
   if command -v gum >/dev/null 2>&1; then
     gum confirm "Proceed anyway? This is not the usual confirmation — B's theme/Etch/ACSS genuinely does not match A's." || return 1
   else
@@ -1880,14 +2534,14 @@ add_action( 'wp_import_insert_term', function ( $term_id, $term, $original_id ) 
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `bats tests/unit/test_graft_mediastep.bats tests/unit/test_graft_precondition.bats`
-Expected: PASS (6 tests)
+Run: `bats tests/unit/test_graft_mediastep.bats tests/unit/test_graft_precondition.bats tests/unit/test_graft_stack_sync.bats`
+Expected: PASS (9 tests)
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add lib/graft.sh mu-plugins/sitegraft-id-mapper.php tests/unit/test_graft_mediastep.bats tests/unit/test_graft_precondition.bats
-git commit -m "feat(graft): add the rendering-stack hard precondition and route media sync through the orchestrator"
+git add lib/graft.sh mu-plugins/sitegraft-id-mapper.php tests/unit/test_graft_mediastep.bats tests/unit/test_graft_precondition.bats tests/unit/test_graft_stack_sync.bats
+git commit -m "feat(graft): sync approved stack components from A, then enforce the precondition on what's left (design doc §12, B1 revision); route media sync through the orchestrator"
 ```
 
 ### Task 4.2: WXR export/import (routed through the orchestrator), integrity-gate, `wordpress-importer` provisioning
@@ -2222,8 +2876,10 @@ git commit -m "feat(graft): add two-pass sentinel ID remap and orphan post_paren
   `core_wp_post_import` reads per design doc §9.3 — and pushes every key **except**
   `page_on_front`/`page_for_posts` directly onto B, leaving those two for the
   module hook to remap through `id-map.tsv`); `phase_graft` (the function
-  `bin/sitegraft` dispatches to for `graft`, now gated by
-  `graft_check_stack_precondition` before anything else runs).
+  `bin/sitegraft` dispatches to for `graft`, now gated by `graft_sync_stack`
+  (Task 4.1) followed by `graft_check_stack_precondition` before anything else
+  runs — sync whatever `plan` approved, then refuse on whatever is still
+  unresolved).
 
 - [ ] **Step 1: Write the failing test for `graft_migrate_options`**
 
@@ -2332,12 +2988,17 @@ phase_graft() {
     return 1
   }
 
-  graft_check_stack_precondition "${run_dir}/scan-a.json" "${run_dir}/scan-b.json" "$allow_mismatch" || return 1
-
   modules_discover
   local manifest; manifest=$(cat "${run_dir}/manifest.json")
   local post_types_csv; post_types_csv=$(echo "$manifest" | jq -r '[.migrate[].post_types[]?] | join(",")')
   local content_tables_csv; content_tables_csv=$(graft_content_tables_csv b)
+
+  # design doc §6.4 step 0a/0b (Marcel's revision of finding B1): sync whatever
+  # plan approved for copying, THEN enforce the hard precondition on whatever
+  # is left unresolved — never the other order, or the precondition would
+  # refuse components graft_sync_stack was about to fix anyway.
+  graft_step_done "$run_dir" stack_sync || { graft_sync_stack "$run_dir" "$manifest"; graft_mark_step "$run_dir" stack_sync; }
+  graft_check_stack_precondition "${run_dir}/scan-a.json" "${run_dir}/scan-b.json" "$manifest" "$allow_mismatch" || return 1
 
   graft_step_done "$run_dir" media_sync    || { graft_media_sync "$run_dir"; graft_mark_step "$run_dir" media_sync; }
   graft_step_done "$run_dir" mu_plugin     || { graft_deploy_mu_plugin; graft_mark_step "$run_dir" mu_plugin; }
@@ -2435,7 +3096,10 @@ every claim the tool makes, not just "protected data unchanged" (design doc §6.
   finding B3 — spot-checks each migrated option's value on B against the
   `option-<key>.value` file `graft` wrote, exit 0/1 with a diff);
   `verify_domain_absent <alias> <content_tables_csv> <domain>` (exit 0/1 — is
-  `domain` absent from B's content tables?); `phase_verify`.
+  `domain` absent from B's content tables?); `phase_verify` — its report also
+  lists every `manifest.stack.*` component copied from A as a re-licensing
+  reminder (design doc §12/§6.5), not a pass/fail check, since licensing isn't
+  something sitegraft can verify.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2608,6 +3272,14 @@ phase_verify() {
     echo "- [ ] page_on_front does not resolve — check manually" >> "$report"
   fi
 
+  # design doc §6.5/§12: not a pass/fail check — a reminder that can't be
+  # automated away. A stack component graft copied from A always comes up
+  # unlicensed on B (rsync copies code, never the wp_options a license lives in).
+  local copied; copied=$(echo "$manifest" | jq -r '.stack // {} | to_entries[] | select(.value.resolution == "copy") | .key')
+  if [ -n "$copied" ]; then
+    echo "- [ ] **REMINDER: re-license on B before going live** — copied from A and activated: $(echo "$copied" | tr '\n' ' ')" >> "$report"
+  fi
+
   log_info "verify report written: ${report}"
   return "$hard_fail"
 }
@@ -2694,7 +3366,7 @@ Expected: `ALL ASSERTIONS PASSED`. Every earlier task already met a real WordPre
 install incrementally (Tasks 1.4, 1.5, 3.2), so this run is the first time `graft`,
 `verify`, and `restore` specifically run against a live install — budget time for
 fixing integration-only bugs the unit tests couldn't catch (expected and normal,
-not a sign the plan was wrong; see design doc §0.2 R2 and R4, and §14.1's note
+not a sign the plan was wrong; see design doc §0.2 R2 and R4, and §15.1's note
 that this second pass does not close R2/R4 either — only a real dry run does, see
 `docs/definition-of-done.md`).
 
