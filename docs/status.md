@@ -1,53 +1,55 @@
 # Status — sitegraft
 
-**STATUS : idée**  <!-- idée → en construction → live/production → maintenance → archivé -->
-**Dernière mise à jour : 2026-08-19** (via « update le projet »)
+**STATUS: idea**  <!-- idea → in progress → live/production → maintenance → archived -->
+**Last updated: 2026-08-19** (via "update the project")
 
-## Résumé
+## Summary
 
-Le brainstorming avec Marcel est terminé (13 décisions actées, voir design doc §0).
-Rosalinde a livré le design doc complet, le plan d'implémentation en 6 étapes, le
-skeleton projet et la documentation de handoff. Aucune ligne de code de l'outil
-lui-même n'existe encore. Rien ne bloque le démarrage de l'étape 1 du plan, sous
-réserve de validation par Marcel des 5 décisions techniques prises seule par Rosalinde
-(voir « Décisions récentes » ci-dessous) et de la précision arrivée en cours de tâche
-sur la visibilité publique du repo (déjà intégrée dans tous les docs).
+The brainstorming session with Marcel is complete (13 decisions locked in, see
+design doc §0). Rosalinde delivered the full design doc, a 6-step implementation
+plan, the project skeleton, and the handoff documentation. No line of the tool's own
+code exists yet. Nothing blocks starting Step 1 of the plan, pending Marcel's
+validation of the 5 technical decisions Rosalinde made alone (see "Recent
+decisions" below) and the clarification received mid-task about the repo's public
+visibility (already reflected across all docs).
 
-## Fait
+## Done
 
-- [x] Brainstorming complet avec Marcel (13 décisions actées, hors scope de réouverture)
-- [x] Skeleton projet créé (`repo/` + `dist/` + `.credentials/`)
-- [x] `PROJECT.md` + `docs/{idea,infrastructure,status,todo,definition-of-done}.md` rédigés
-- [x] `CLAUDE.md` projet adapté
-- [x] Design doc complet (`docs/superpowers/specs/2026-08-19-sitegraft-design.md`)
-- [x] Plan d'implémentation en 6 étapes (`docs/plans/2026-08-19-sitegraft-implementation.md`)
-- [x] Self-review du design doc (placeholders/contradictions/ambiguïtés)
-- [x] ADR pour les décisions ouvertes (`docs/decisions/000x-*.md`)
+- [x] Full brainstorming session with Marcel (13 decisions locked in, out of scope to reopen)
+- [x] Project skeleton created (`repo/` + `dist/` + `.credentials/`)
+- [x] `PROJECT.md` + `docs/{idea,infrastructure,status,todo,definition-of-done}.md` written
+- [x] Project `CLAUDE.md` adapted
+- [x] Full design doc (`docs/superpowers/specs/2026-08-19-sitegraft-design.md`)
+- [x] 6-step implementation plan (`docs/plans/2026-08-19-sitegraft-implementation.md`)
+- [x] Design doc self-review (placeholders/contradictions/ambiguities)
+- [x] ADRs for the open decisions (`docs/decisions/000x-*.md`)
+- [x] Entire repo rewritten in US English for public release to the Etch community (2026-08-19)
 
-## En cours
+## In progress
 
-- [ ] Rien — en attente du GO de Marcel pour démarrer l'étape 1 du plan d'implémentation
+- [ ] Nothing — waiting on Marcel's go-ahead to start Step 1 of the implementation plan
 
-## Bloqué / en attente
+## Blocked / pending
 
-- Validation des 5 décisions techniques prises seule par Rosalinde (voir ci-dessous)
-- GO Marcel pour créer le repo GitHub public (Nat s'en charge, pas Rosalinde)
+- Validation of the 5 technical decisions Rosalinde made alone (see below)
+- Marcel's go-ahead to create the public GitHub repo (Nat handles that, not Rosalinde)
 
-## Décisions récentes
+## Recent decisions
 
-Décisions techniques prises seule pendant la conception, **à valider par Marcel**
-(détail et justification dans le design doc §0 et les ADR correspondants) :
-1. `jq` comme dépendance pour parser/écrire le manifest en JSON (structure imbriquée
-   par module × post_types/option_keys).
-2. Portabilité ciblée bash 3.2 (pas d'associative arrays) plutôt qu'exiger bash ≥ 4 —
-   pour tourner sans modification sur macOS système.
-3. Emplacement et rétention du state-dir de run : `~/.sitegraft/runs/<profile>-<timestamp>/`
-   sur l'orchestrateur, jamais nettoyé automatiquement (à la charge de l'opérateur).
-4. Mu-plugin de mapping livré par dépôt de fichier via `rsync` dans `wp-content/mu-plugins/`
-   (auto-chargé par WordPress, pas d'activation wp-cli nécessaire) plutôt que par un
-   mécanisme `wp plugin install`.
-5. `bats-core` comme framework de test unitaire pour les fonctions pures de `lib/`.
+Technical decisions made alone during design, **to be validated by Marcel**
+(detail and rationale in design doc §0 and the matching ADRs):
+1. `jq` as a dependency to parse/write the manifest as JSON (structure nested by
+   module × post_types/option_keys).
+2. Targeted bash 3.2 portability (no associative arrays) rather than requiring
+   bash ≥ 4 — so it runs unmodified on stock macOS.
+3. Run state-dir location and retention: `~/.sitegraft/runs/<profile>-<timestamp>/`
+   on the orchestrator, never cleaned up automatically (left to the operator).
+4. Mapping mu-plugin delivered by dropping a file via `rsync` into
+   `wp-content/mu-plugins/` (auto-loaded by WordPress, no wp-cli activation
+   needed) rather than through a `wp plugin install` mechanism.
+5. `bats-core` as the unit test framework for `lib/`'s pure functions.
 
-Précision reçue en cours de tâche (déjà intégrée) : le repo sera publié en **GitHub
-public** sous MarcelHeiniger — conséquences (zéro secret/exemple réaliste, LICENSE MIT,
-README racine en anglais) répercutées dans tous les fichiers concernés.
+Clarification received mid-task (already reflected everywhere): the repo will be
+shared with the Etch community as a **public GitHub repo** under MarcelHeiniger —
+consequences (zero secrets/realistic-looking examples, MIT LICENSE, the entire repo
+in US English including internal docs) applied across every affected file.

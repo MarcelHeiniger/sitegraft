@@ -1,86 +1,94 @@
-# sitegraft — Dossier projet
+# sitegraft — Project Folder
 
-> **POINT D'ENTRÉE.** Ce fichier + les liens ci-dessous contiennent **tout** ce qu'il faut
-> pour reprendre ce projet. Un dev externe qui dézippe ce dossier n'a **rien** à chercher
-> ailleurs (ni vault, ni API, ni Slack) : idée, infra, status, todo, definition of done.
+> **ENTRY POINT.** This file plus the links below contain **everything** needed to
+> pick this project back up. An external dev unzipping this folder has **nothing**
+> else to look up (no vault, no API, no Slack): idea, infra, status, todo, definition
+> of done.
 >
-> **STATUS : idée (design + plan livrés, implémentation pas commencée)**
-> **Dernière mise à jour : 2026-08-19** (par « update le projet »)
+> **STATUS: idea (design + plan delivered, implementation not started)**
+> **Last updated: 2026-08-19** (via "update the project")
 
 ---
 
-## 1. En une ligne
+## 1. In one line
 
-CLI bash portable qui « greffe » la couche design/contenu d'un site WordPress Etch/ACSS
-fraîchement construit (site A) sur un site cible vivant (site B), sans jamais toucher
-aux plugins/données métier de B — pour toute future migration Etch, projet-agnostique.
+A portable bash CLI that "grafts" the design/content layer of a freshly built
+WordPress Etch/ACSS site (site A) onto a live target site (site B), without ever
+touching B's business plugins or their data — for any future Etch migration,
+project-agnostic.
 
-## 2. Idée & vision
+## 2. Idea & vision
 
-Marcel construit régulièrement des refontes de sites WordPress en Etch/ACSS pour des
-clients dont le site en production tourne déjà avec un plugin métier chargé de données
-réelles (ex. réservations, e-commerce). Le remplacement manuel du thème/contenu sans
-toucher aux données du plugin est répétitif, risqué et non outillé. sitegraft encapsule
-ce geste dans un outil testé, rejouable, et extensible par simple ajout de fichier.
-→ Détail : [`docs/idea.md`](docs/idea.md)
+Marcel regularly builds WordPress redesigns in Etch/ACSS for clients whose
+production site already runs a business plugin loaded with real data (e.g.
+bookings, e-commerce). Manually replacing the theme/content without touching the
+plugin's data is repetitive, risky, and unsupported by any tooling. sitegraft wraps
+that move in a tested, replayable tool that's extensible by simply adding a file.
+→ Detail: [`docs/idea.md`](docs/idea.md)
 
 ## 3. Infrastructure
 
-Outil 100% local/portable : bash + wp-cli + ssh/rsync. Pas de service hébergé, pas de
-base de données propre à l'outil. État de run stocké sur la machine qui exécute
-l'outil (l'« orchestrateur »), jamais sur A ni B de façon permanente. **SANS secrets.**
-→ Détail : [`docs/infrastructure.md`](docs/infrastructure.md)
-→ Accès/creds : **jamais ici** — pointeurs dans `../.credentials/` (break-glass `~/.SuperUser/`).
+A 100% local/portable tool: bash + wp-cli + ssh/rsync. No hosted service, no
+database of its own. Run state is stored on the machine running the tool (the
+"orchestrator"), never permanently on A or B. **No secrets.**
+→ Detail: [`docs/infrastructure.md`](docs/infrastructure.md)
+→ Access/creds: **never here** — pointers live in `../.credentials/` (break-glass
+`~/.SuperUser/`).
 
-## 4. Où en est le projet (status)
+## 4. Where the project stands (status)
 
-Design doc et plan d'implémentation livrés le 2026-08-19 (Rosalinde). Aucune ligne de
-code de l'outil n'existe encore — seuls le skeleton projet et la documentation sont en
-place. Aucun run pilote prévu : validation exclusivement par le harnais de test DDEV
-(2 sites WP jetables) décrit dans le design doc.
-→ Détail : [`docs/status.md`](docs/status.md)
+Design doc and implementation plan delivered 2026-08-19 (Rosalinde). No tool code
+exists yet — only the project skeleton and documentation are in place. No pilot run
+is planned: validation happens exclusively through the DDEV test harness (2
+disposable WP sites) described in the design doc.
+→ Detail: [`docs/status.md`](docs/status.md)
 
-## 5. Ce qui reste à faire (todo)
+## 5. What's left to do (todo)
 
-- [ ] Valider le design doc et les 5 décisions ouvertes avec Marcel (voir `docs/status.md` → Décisions récentes)
-- [ ] Étape 1 du plan : core + profils/credentials + scan (voir `docs/plans/2026-08-19-sitegraft-implementation.md`)
-- [ ] Étape 2 : manifest + sélection interactive
-- [ ] Étape 3 : backup + restore
-- [ ] Étape 4 : graft (médias + WXR + mu-plugin mapping + remaps)
-- [ ] Étape 5 : verify + harnais d'intégration DDEV
-- [ ] Étape 6 : polish (dry-run partout, docs usage, LICENSE, README public)
-→ Détail : [`docs/todo.md`](docs/todo.md)
+- [ ] Validate the design doc and the 5 open decisions with Marcel (see
+      `docs/status.md` → Recent decisions)
+- [ ] Plan step 1: core + profiles/credentials + scan (see
+      `docs/plans/2026-08-19-sitegraft-implementation.md`)
+- [ ] Step 2: manifest + interactive selection
+- [ ] Step 3: backup + restore
+- [ ] Step 4: graft (media + WXR + mu-plugin mapping + remaps)
+- [ ] Step 5: verify + DDEV integration harness
+- [ ] Step 6: polish (dry-run everywhere, usage docs, LICENSE, public README)
+→ Detail: [`docs/todo.md`](docs/todo.md)
 
 ## 6. Definition of Done
 
-Un run complet `scan → plan → backup → graft → verify` réussit sur le harnais DDEV
-(site A avec contenu Etch simulé, site B avec un faux plugin protégé) sans altérer un
-seul octet des données du faux plugin de B, avec `restore.sh` fonctionnel et testé.
-→ Détail : [`docs/definition-of-done.md`](docs/definition-of-done.md)
+A full `scan → plan → backup → graft → verify` run succeeds on the DDEV harness
+(site A with simulated Etch content, site B with a fake protected plugin) without
+altering a single byte of B's fake plugin data, with a working, tested `restore.sh`.
+→ Detail: [`docs/definition-of-done.md`](docs/definition-of-done.md)
 
-## 7. Démarrer (dev)
+## 7. Getting started (dev)
 
-Voir [`README.md`](README.md) — install / build / test / lancer en local.
+See [`README.md`](README.md) — install / build / test / run locally.
 
-## 8. Historique des décisions
+## 8. Decision history
 
-[`docs/decisions/`](docs/decisions/) — une décision = un fichier (ADR « pourquoi X »).
-Plans d'implémentation : [`docs/plans/`](docs/plans/).
-Design doc complet : [`docs/superpowers/specs/2026-08-19-sitegraft-design.md`](docs/superpowers/specs/2026-08-19-sitegraft-design.md).
+[`docs/decisions/`](docs/decisions/) — one decision = one file (an ADR: "why X").
+Implementation plans: [`docs/plans/`](docs/plans/).
+Full design doc:
+[`docs/superpowers/specs/2026-08-19-sitegraft-design.md`](docs/superpowers/specs/2026-08-19-sitegraft-design.md).
 
 ---
 
-### Convention de mise à jour
+### Update convention
 
-Ce dossier est **la source de vérité** du projet. Quand Marcel dit **« update le projet »** :
-Nat pull l'état live (API tâches + travail de la session), réconcilie, et réécrit
-les sections 4-5-6 + la date ci-dessus. Le dossier est **toujours zip-ready** ensuite.
+This folder is the project's **source of truth**. When Marcel says **"update the
+project"**: Nat pulls the live state (task API + session work), reconciles it, and
+rewrites sections 4-5-6 plus the date above. The folder stays **always zip-ready**
+afterward.
 
-### Note visibilité repo
+### Note on repo visibility
 
-`repo/` est destiné à être publié en **repo GitHub public** (compte MarcelHeiniger,
-exception à la convention « tous les repos privés »). Conséquence stricte : **zéro
-secret, zéro host/IP réel, zéro nom de client, pas même d'exemple « réaliste »** —
-uniquement des placeholders génériques (`example.com`, `user@host`, `<profile>`).
-Le README.md à la racine de `repo/` est en anglais et public-facing ; les docs projet
-internes (ce fichier, `docs/`) restent en français.
+`repo/` is intended to be published as a **public GitHub repo** (MarcelHeiniger
+account, an exception to the "all repos private" convention) — it will be shared
+with the Etch community. Strict consequence: **zero secrets, zero real hosts/IPs,
+zero client names, not even as "realistic-looking" examples** — only generic
+placeholders (`example.com`, `user@host`, `<profile>`). **The entire `repo/`,
+including every internal doc, is US English** — there is no French content anywhere
+in the published repo.

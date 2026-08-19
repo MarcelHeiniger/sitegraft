@@ -1,57 +1,57 @@
 # CLAUDE.md — sitegraft (repo)
 
-**Lis d'abord `PROJECT.md`** (point d'entrée : idée, infra, status, todo, DoD),
-puis `docs/plans/` et `docs/status.md` avant toute action sur ce projet.
+**Read `PROJECT.md` first** (entry point: idea, infra, status, todo, DoD), then
+`docs/plans/` and `docs/status.md` before doing anything on this project.
 
-## Quoi
+## What
 
-CLI bash portable qui greffe la couche design/contenu d'un site WordPress Etch/ACSS
-(site A) sur un site cible vivant (site B) sans toucher aux plugins/données de B.
+A portable bash CLI that grafts the design/content layer of a WordPress Etch/ACSS
+site (site A) onto a live target site (site B) without touching B's plugins/data.
 
-## Langue
+## Language
 
-- **Docs projet** (`PROJECT.md`, `docs/*.md` sauf `README.md` racine) : **français**.
-- **README.md racine** (public-facing, repo GitHub public) : **anglais**.
-- **Code et commentaires de code** (`bin/`, `lib/`, `modules/`, `tests/`) : **anglais**,
-  y compris une fois l'implémentation commencée — convention à respecter dès le
-  premier commit de code.
+**Everything in this repo is US English** — docs, code, and comments alike. This
+repo is shared publicly with the Etch community; there is no French content
+anywhere in it (project docs outside `repo/`, e.g. the container-level README, may
+stay French — that's outside what gets published).
 
 ## Dev / build
 
-Pas encore implémenté — voir `docs/plans/2026-08-19-sitegraft-implementation.md` pour
-la marche à suivre. Une fois l'outil amorcé :
+Not implemented yet — see `docs/plans/2026-08-19-sitegraft-implementation.md` for
+the build sequence. Once the tool exists:
 ```sh
-# tests unitaires (fonctions pures de lib/)
+# unit tests (pure functions in lib/)
 bats tests/unit/
 
-# tests d'intégration (harnais DDEV à 2 sites jetables)
+# integration tests (DDEV harness, 2 disposable sites)
 tests/integration/ddev-harness.sh
 ```
 
-## Déploiement
+## Deployment
 
-Sans objet — sitegraft ne se déploie pas, c'est un CLI cloné/installé sur la machine
-qui l'exécute (voir `docs/infrastructure.md`).
+N/A — sitegraft doesn't deploy anywhere; it's a CLI cloned/installed on the machine
+that runs it (see `docs/infrastructure.md`).
 
 ## Conventions
 
-- **Versioning** : bump de version dans `bin/sitegraft` (variable `SITEGRAFT_VERSION`)
-  à chaque changement de comportement utilisateur visible.
-- **Jamais de SQL brut filtré à la main pour du contenu.** Contenu = WXR (`wp export`/
-  `wp import`). Options = `wp option get/update --format=json` un par un. Tables
-  propres à un plugin = `wp db export --tables=X,Y` ciblé.
-- **Jamais de `sed`/regex brute sur des données WordPress.** Toujours `wp search-replace`
-  (safe sur le PHP sérialisé).
-- **Jamais `scp`.** Toujours `rsync` pour tout transfert de fichier.
-- **Système de modules = le point d'extensibilité.** Un nouveau plugin métier à
-  protéger = un nouveau fichier `modules/<plugin>.sh`, zéro modification de `lib/` ou
-  `bin/`. Voir le design doc §3 pour le contrat exact.
-- **Défaut sûr (default-deny).** Tout ce qui est détecté sur B mais non couvert par un
-  module connu est protégé par défaut, jamais migré/écrasé sans sélection explicite.
-- **Zéro secret dans le repo — repo public GitHub.** Aucun host réel, IP, mot de passe,
-  token, nom de client, même pas en exemple « réaliste ». Uniquement des placeholders
-  génériques (`example.com`, `user@host`, `<profile>`). Les credentials réels vivent en
-  dehors du repo (`~/.config/sitegraft/<profile>.creds`, gitignored) ou sont saisis à
-  la volée.
-- **Portabilité bash 3.2** (pas d'associative arrays) — voir
+- **Versioning**: bump the version in `bin/sitegraft` (the `SITEGRAFT_VERSION`
+  variable) on every user-visible behavior change.
+- **Never raw SQL filtered by hand for content.** Content = WXR (`wp export`/
+  `wp import`). Options = `wp option get/update --format=json`, one at a time.
+  Plugin-owned tables = targeted `wp db export --tables=X,Y`.
+- **Never `sed`/raw regex on WordPress data.** Always `wp search-replace` (safe on
+  serialized PHP).
+- **Never `scp`.** Always `rsync` for any file transfer.
+- **The module system is the extensibility point.** A new business plugin to
+  protect = a new `modules/<plugin>.sh` file, zero changes to `lib/` or `bin/`. See
+  the design doc §3 for the exact contract.
+- **Safe default (default-deny).** Anything detected on B but not covered by a
+  known module is protected by default, never migrated/overwritten without an
+  explicit manifest selection.
+- **Zero secrets in the repo — public GitHub repo.** No real host, IP, password,
+  token, or client name, not even as a "realistic-looking" example. Only generic
+  placeholders (`example.com`, `user@host`, `<profile>`). Real credentials live
+  outside the repo (`~/.config/sitegraft/<profile>.creds`, gitignored) or are
+  entered interactively.
+- **Bash 3.2 portability** (no associative arrays) — see
   `docs/decisions/0003-bash-compatibility.md`.

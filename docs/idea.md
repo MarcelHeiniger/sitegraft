@@ -1,64 +1,64 @@
-# Idée & vision — sitegraft
+# Idea & Vision — sitegraft
 
-## Problème
+## Problem
 
-Marcel refond régulièrement des sites WordPress existants en Etch/ACSS. Le site cible
-(« B ») est souvent déjà en production avec un plugin métier chargé de données réelles
-non-négociables (ex. un plugin de réservation avec des réservations clients live). La
-refonte ne doit remplacer QUE la couche design/contenu (thème, pages, templates,
-navigation, styles) — jamais toucher aux données ni à la configuration du plugin
-métier de B. Aujourd'hui ce geste se fait à la main, site par site, sans outillage :
-lent, non reproductible, et risqué (une erreur de search-replace ou d'export SQL brut
-peut corrompre les données de production d'un client).
+Marcel regularly rebuilds existing WordPress sites in Etch/ACSS. The target site
+("B") is often already in production with a business plugin loaded with real,
+non-negotiable data (e.g. a booking plugin with live customer reservations). The
+redesign must replace ONLY the design/content layer (theme, pages, templates,
+navigation, styles) — never touch B's business plugin's data or configuration.
+Today this is done by hand, site by site, with no tooling: slow, non-reproducible,
+and risky (a bad search-replace or a hand-filtered raw SQL export can corrupt a
+client's production data).
 
-## Solution / proposition de valeur
+## Solution / value proposition
 
-sitegraft est un CLI bash qui encapsule ce geste en phases séparées, inspectables et
-rejouables : scanner les deux sites, décider précisément quoi migrer et quoi protéger,
-sauvegarder B avant toute modification, exécuter le transfert via les mécanismes
-natifs de WordPress (WXR + wp-cli, jamais de SQL brut filtré à la main pour le
-contenu), vérifier le résultat, et permettre un retour arrière en un clic. Le système
-de modules enfichables rend chaque nouveau plugin métier (MotoPress aujourd'hui,
-autre chose demain) une simple déclaration de fichier, sans toucher au cœur de
-l'outil — donc directement réutilisable sur toutes les futures migrations Etch de
-Marcel, quel que soit le plugin protégé côté B.
+sitegraft is a bash CLI that wraps this move into separate, inspectable, replayable
+phases: scan both sites, decide precisely what to migrate and what to protect, back
+up B before any change, run the transfer through WordPress's own native mechanisms
+(WXR + wp-cli, never raw SQL filtered by hand for content), verify the result, and
+allow a one-command rollback. The pluggable module system turns every new business
+plugin (MotoPress today, something else tomorrow) into a simple file declaration,
+with no changes to the tool's core — making it directly reusable across all of
+Marcel's future Etch migrations, whatever plugin B needs protected.
 
-## Cible / utilisateurs
+## Target / users
 
-- **Utilisateur unique actuel : Marcel**, en tant qu'opérateur de migrations Etch pour
-  ses propres projets et ceux de ses clients (agences, sites vitrine, sites métier).
-- Pas de multi-utilisateur, pas de SaaS, pas d'UI web : un outil personnel outillé
-  comme un vrai produit interne, publié en open-source pour la visibilité (repo public)
-  mais sans ambition commerciale à ce stade.
+- **Sole current user: Marcel**, as the operator running Etch migrations for his
+  own projects and his clients' (agencies, brochure sites, business sites).
+- No multi-user, no SaaS, no web UI: a personal tool built to the standard of a
+  real internal product, published open-source for visibility (public repo) but
+  with no commercial ambition at this stage.
 
 ## Scope
 
-**Dans le périmètre :**
-- Migration site A (Etch/ACSS fraîchement construit) → site B (existant, vivant),
-  un run à la fois, une paire de sites à la fois.
-- Modules de protection/migration pour WordPress core content + Etch + ACSS dès v1 ;
-  extensible par fichier pour tout futur plugin métier.
-- Backup complet de B avant toute écriture, restore en un script.
-- Exécution locale (Mac/Linux/WSL) pilotant A et B à distance via SSH/wp-cli, ou en
-  local via DDEV.
-- Validation par harnais de test DDEV (2 sites jetables), pas de run pilote en
-  production planifié pendant la construction de l'outil.
+**In scope:**
+- Migrating site A (a freshly built Etch/ACSS site) → site B (an existing, live
+  site), one run at a time, one site pair at a time.
+- Protection/migration modules for WordPress core content + Etch + ACSS from v1;
+  extensible by file for any future business plugin.
+- A full backup of B before any write, restore via a single script.
+- Local execution (Mac/Linux/WSL) driving A and B remotely via SSH/wp-cli, or
+  locally via DDEV.
+- Validation through a DDEV test harness (2 disposable sites); no production pilot
+  run planned while the tool is being built.
 
-**Hors périmètre (explicitement) :**
-- Pas de MCP, pas de web-UI, pas de plugin WordPress installé sur A ou B.
-- Pas de support multi-site batch (une paire A→B par run).
-- Pas de support Windows natif (WSL oui, cmd/PowerShell natif non).
-- Pas de migration de plugins tiers eux-mêmes (seulement protection de leurs données) —
-  sitegraft ne installe/configure jamais un plugin métier sur B.
-- Pas de synchronisation continue / bidirectionnelle : sitegraft fait un transfert
-  ponctuel A→B, pas une réplication.
+**Explicitly out of scope:**
+- No MCP, no web UI, no WordPress plugin installed on A or B.
+- No multi-site batch support (one A→B pair per run).
+- No native Windows support (WSL yes, native cmd/PowerShell no).
+- No migration of third-party plugins themselves (only protecting their data) —
+  sitegraft never installs/configures a business plugin on B.
+- No continuous / bidirectional sync: sitegraft does a one-time A→B transfer, not
+  replication.
 
-## Contexte & historique
+## Context & history
 
-Né d'un brainstorming avec Marcel le 2026-08-19, motivé par le cas concret d'un site B
-tournant MotoPress Hotel Booking en production avec des réservations live. Toutes les
-décisions d'architecture (nom, approche CLI bash modulaire, base WXR/wp-cli, système
-de modules, phases séparées, sélection interactive, stratégie de backup, mapping
-d'ID via mu-plugin temporaire, portabilité) ont été actées avant la rédaction du
-design doc — voir `docs/superpowers/specs/2026-08-19-sitegraft-design.md` pour le détail
-et le raisonnement complet.
+Born from a brainstorming session with Marcel on 2026-08-19, motivated by the
+concrete case of a site B running MotoPress Hotel Booking in production with live
+reservations. Every architecture decision (name, modular bash CLI approach,
+WXR/wp-cli base, module system, separate phases, interactive selection, backup
+strategy, ID mapping via a temporary mu-plugin, portability) was locked in before
+the design doc was written — see
+`docs/superpowers/specs/2026-08-19-sitegraft-design.md` for the full detail and
+reasoning.

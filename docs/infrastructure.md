@@ -1,68 +1,69 @@
 # Infrastructure — sitegraft
 
-> ⚠️ **SANITIZED — aucun secret ici.** Ce fichier part dans le zip remis à un externe
-> ET dans un repo GitHub **public**. Pas de mot de passe, token, clé privée, host réel
-> ni IP — même pas d'exemple « réaliste ». Uniquement `example.com`, `user@host`,
-> `<profile>`. Les accès réels sont des **pointeurs** dans `../.credentials/` →
-> break-glass `~/.SuperUser/<serveur>.md` (local, jamais commité, jamais dans ce repo).
+> ⚠️ **SANITIZED — no secrets here.** This file ships in the handoff zip AND in a
+> **public** GitHub repo. No password, token, private key, real host, or IP — not
+> even a "realistic-looking" example. Only `example.com`, `user@host`, `<profile>`.
+> Real access lives as **pointers** in `../.credentials/` → break-glass
+> `~/.SuperUser/<server>.md` (local, never committed, never in this repo).
 
-## Stack technique
+## Tech stack
 
-- **Langage :** bash pur, compatible bash 3.2 (macOS système) — voir
-  `docs/decisions/0003-bash-compatibility.md`. Pas de Python, pas de Node, pas de plugin WP.
-- **Dépendances runtime :** `ssh`, `rsync` (jamais `scp`), `wp-cli` (sur A, sur B, ou
-  via wrapper `ddev wp`), `jq` (parsing du manifest JSON), `gum` (UI interactive,
-  fallback `fzf`, fallback prompt texte brut).
-- **Dépendances de test uniquement :** `bats-core` (tests unitaires des fonctions
-  pures de `lib/`), `ddev` (harnais d'intégration à 2 sites jetables).
-- **Aucune base de données propre à l'outil.** Toutes les données transitent par les
-  bases WordPress de A et B eux-mêmes (via wp-cli).
+- **Language:** plain bash, bash 3.2 compatible (stock macOS) — see
+  `docs/decisions/0003-bash-compatibility.md`. No Python, no Node, no WP plugin.
+- **Runtime dependencies:** `ssh`, `rsync` (never `scp`), `wp-cli` (on A, on B, or
+  via the `ddev wp` wrapper), `jq` (manifest JSON parsing), `gum` (interactive UI,
+  fallback `fzf`, fallback plain text prompts).
+- **Test-only dependencies:** `bats-core` (unit tests for `lib/`'s pure functions),
+  `ddev` (2-disposable-site integration harness).
+- **No database of its own.** All data flows through A and B's own WordPress
+  databases (via wp-cli).
 
-## Où ça tourne
+## Where it runs
 
-sitegraft n'est **pas hébergé** — c'est un outil qu'on exécute depuis n'importe quelle
-machine (« l'orchestrateur ») disposant des dépendances runtime ci-dessus.
+sitegraft is **not hosted** — it's a tool you run from any machine (the
+"orchestrator") that has the runtime dependencies above.
 
-| Rôle | Description | Notes |
+| Role | Description | Notes |
 |------|-------------|-------|
-| Orchestrateur | Machine (Mac/Linux/WSL) où `sitegraft` est lancé | État de run (`~/.sitegraft/runs/<id>/`) local à cette machine |
-| Site A | Site WordPress Etch/ACSS source, joignable en SSH+wp-cli ou DDEV local | Read-only pour sitegraft (jamais modifié) |
-| Site B | Site WordPress cible vivant, joignable en SSH+wp-cli ou DDEV local | Écrit uniquement pendant la phase `graft`, après backup |
+| Orchestrator | Machine (Mac/Linux/WSL) where `sitegraft` is launched | Run state (`~/.sitegraft/runs/<id>/`) is local to this machine |
+| Site A | Source WordPress Etch/ACSS site, reachable via SSH+wp-cli or local DDEV | Read-only for sitegraft (never modified) |
+| Site B | Live target WordPress site, reachable via SSH+wp-cli or local DDEV | Written only during the `graft` phase, after backup |
 
-Chaque paire A↔B réelle (hosts, chemins, alias SSH) est déclarée dans un fichier de
-profil `profiles/<nom>.conf` — commitable, sans secret (uniquement des noms de
-variables). Les credentials (clé SSH, mot de passe éventuel) vivent soit dans
-`~/.config/sitegraft/<profile>.creds` (chmod 600, gitignored), soit sont saisis à la
-volée. Voir le design doc §5 pour le détail exact des deux formats.
+Each real A↔B pair (hosts, paths, SSH aliases) is declared in a profile file
+`profiles/<name>.conf` — committable, no secrets (variable names only).
+Credentials (SSH key, an optional password) live either in
+`~/.config/sitegraft/<profile>.creds` (chmod 600, gitignored) or are entered
+interactively. See design doc §5 for the exact format of both.
 
-## Déploiement
+## Deployment
 
-sitegraft ne se « déploie » pas : c'est un CLI qu'on clone/installe (`git clone` +
-`PATH`, ou copie de `bin/sitegraft` + `lib/` + `modules/`) sur la machine
-orchestratrice. Pas de CI/CD de déploiement applicable.
+sitegraft doesn't "deploy": it's a CLI you clone/install (`git clone` + `PATH`, or
+copy `bin/sitegraft` + `lib/` + `modules/`) onto the orchestrating machine. No
+deployment CI/CD applies.
 
-## DNS / domaines
+## DNS / domains
 
-Sans objet — sitegraft ne gère ni ne modifie de DNS. Le domaine de B reste celui déjà
-en place ; sitegraft fait uniquement un `wp search-replace` du domaine de A vers celui
-de B **à l'intérieur du contenu importé** (voir design doc, remapping post-import).
+N/A — sitegraft doesn't manage or change DNS. B's domain stays whatever it already
+is; sitegraft only runs a `wp search-replace` from A's domain to B's **inside the
+imported content** (see design doc, post-import remapping).
 
 ## CI / tests
 
-- **Tests unitaires** (`tests/unit/*.bats`) : fonctions pures de `lib/*.sh`, exécutables
-  sans aucune dépendance externe autre que bats-core. Doivent être verts avant tout
-  commit touchant `lib/`.
-- **Tests d'intégration** (`tests/integration/`) : harnais DDEV à 2 sites jetables
-  (A = contenu Etch simulé, B = faux plugin protégé + son CPT + sa table SQL).
-  Assertion centrale : les données du faux plugin de B sont byte-identiques avant/après
-  un run `graft` complet. Doivent être verts avant tout merge touchant `graft`/`backup`.
-- Pas de CI hébergée planifiée pour ce projet à ce stade (outil personnel, pas de repo
-  d'entreprise avec pipeline obligatoire) — `bats` + harnais DDEV se lancent en local
-  avant commit/merge. À revoir si le repo public attire des contributions externes.
+- **Unit tests** (`tests/unit/*.bats`): pure functions in `lib/*.sh`, runnable with
+  no external dependency other than bats-core. Must be green before any commit
+  touching `lib/`.
+- **Integration tests** (`tests/integration/`): a DDEV harness with 2 disposable
+  sites (A = simulated Etch content, B = a fake protected plugin + its own CPT +
+  its own SQL table). Central assertion: B's fake plugin data is byte-identical
+  before/after a full `graft` run. Must be green before any merge touching
+  `graft`/`backup`.
+- No hosted CI planned for this project at this stage (a personal tool, not a
+  company repo with a mandatory pipeline) — `bats` + the DDEV harness run locally
+  before commit/merge. Revisit if the public repo attracts outside contributions.
 
-## Sauvegardes / restauration
+## Backups / restore
 
-C'est une fonctionnalité de l'outil lui-même (phase `backup`), pas une infra externe :
-`wp db export` complet de B + `tar` de `wp-content`, rapatriés sur l'orchestrateur via
-`rsync`, accompagnés d'un `restore.sh` généré et prêt à l'emploi. Détail complet dans
-le design doc §7 (phase backup) et §8 (phase restore).
+This is a feature of the tool itself (the `backup` phase), not external infra: a
+full `wp db export` of B + a `tar` of `wp-content`, pulled to the orchestrator via
+`rsync`, along with a generated, ready-to-run `restore.sh`. Full detail in design
+doc §6.3 (backup phase) and §6.7 (restore phase).

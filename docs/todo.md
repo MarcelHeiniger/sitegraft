@@ -1,34 +1,37 @@
 # Todo — sitegraft
 
-> Backlog courant. Priorisé. Reflète l'état live (API tâches) après chaque « update le projet ».
-> **Dernière sync : 2026-08-19**
+> Current backlog. Prioritized. Reflects the live state (task API) after each
+> "update the project".
+> **Last sync: 2026-08-19**
 
-## Prochaines étapes (prioritaires)
+## Next steps (priority)
 
-- [ ] GO Marcel sur les 5 décisions techniques ouvertes (`docs/status.md` → Décisions récentes)
-- [ ] Démarrer étape 1 du plan : core + profils/credentials + scan
+- [ ] Marcel's go-ahead on the 5 open technical decisions (`docs/status.md` →
+      Recent decisions)
+- [ ] Start plan Step 1: core + profiles/credentials + scan
       (`docs/plans/2026-08-19-sitegraft-implementation.md`)
-- [ ] Étape 2 : manifest + sélection interactive (`gum choose`, fallback `fzf`)
-- [ ] Étape 3 : backup + restore
-- [ ] Étape 4 : graft (médias → WXR import → mu-plugin mapping → remaps)
-- [ ] Étape 5 : verify + harnais d'intégration DDEV
-- [ ] Étape 6 : polish (dry-run partout, `docs/usage.md`, LICENSE, README public anglais)
+- [ ] Step 2: manifest + interactive selection (`gum choose`, fallback `fzf`)
+- [ ] Step 3: backup + restore
+- [ ] Step 4: graft (media → WXR import → mu-plugin mapping → remaps)
+- [ ] Step 5: verify + DDEV integration harness
+- [ ] Step 6: polish (dry-run everywhere, `docs/usage.md`, LICENSE, public README)
 
 ## Backlog
 
-- [ ] Module hypothétique `motopress.sh` — écrit comme exemple pédagogique dans le
-      design doc, pas encore implémenté ni testé contre un vrai MotoPress
-- [ ] `docs/usage.md` détaillé (au-delà du README) si le README devient trop long
-- [ ] Script d'installation (`install.sh` ou instructions Homebrew/apt pour les
-      dépendances : `jq`, `gum`, `rsync`, `bats-core`)
+- [ ] The hypothetical `motopress.sh` module — written as a worked example in the
+      design doc, not yet implemented or tested against a real MotoPress install
+- [ ] A detailed `docs/usage.md` (beyond the README) if the README grows too long
+- [ ] An install script (`install.sh` or Homebrew/apt instructions for the
+      dependencies: `jq`, `gum`, `rsync`, `bats-core`)
 
-## Idées / plus tard
+## Ideas / later
 
-- Support d'un mode "diff report" en sortie de `verify` (HTML ou markdown) — YAGNI pour
-  la v1, à réévaluer une fois l'outil utilisé sur un vrai run
-- Publication éventuelle sur Homebrew (`brew install sitegraft`) si l'outil sert au-delà
-  de Marcel — hors scope v1
+- Support a "diff report" output mode for `verify` (HTML or markdown) — YAGNI for
+  v1, revisit once the tool has been used on a real run
+- Possible Homebrew publication (`brew install sitegraft`) if the tool sees use
+  beyond Marcel — out of scope for v1
 
-## Fait récemment
+## Recently done
 
-- [x] Design doc + plan d'implémentation + skeleton livrés (2026-08-19, Rosalinde)
+- [x] Design doc + implementation plan + skeleton delivered (2026-08-19, Rosalinde)
+- [x] Full repo rewritten in US English for public release (2026-08-19, Rosalinde)
