@@ -80,3 +80,29 @@ manifest_freeze() {
   manifest_validate "$manifest" || return 1
   echo "$manifest" | jq '.frozen = true'
 }
+
+# manifest_compute_unclaimed <manifest_json> <scan_b_json> — default-deny
+# (design doc §3.6): every post_type present on B that isn't claimed by ANY
+# module, migrate or protect, is added to protect._unclaimed. Pure and
+# idempotent — safe to call more than once, and deliberately called exactly
+# once by phase_plan, after the manifest's migrate/protect buckets have
+# reached their FINAL state for the run (module defaults, the custom-code
+# gate, stack resolution, and any interactive adjustment all happen first) —
+# not from inside plan_defaults, where it would only ever see the module
+# defaults and go stale the moment the operator adjusts a selection.
+manifest_compute_unclaimed() {
+  local manifest="$1" scan_b="$2"
+  local claimed_pt all_pt unclaimed_pt
+  claimed_pt=$(echo "$manifest" | jq -c '[.migrate[]?.post_types[]?, .protect[]?.post_types[]?] | unique')
+  all_pt=$(echo "$scan_b" | jq -c '[.post_types[].name]')
+  # Bug found via TDD against the plan's literal spec: `select(($claimed |
+  # index(.)) | not)` looks right but isn't — the `|` into `index(.)` rebinds
+  # `.` to $claimed itself before `index` ever sees it, so it always searches
+  # $claimed for $claimed, never for the outer $all[] element. `$x` binds the
+  # element explicitly so `index($x)` searches for the right thing.
+  unclaimed_pt=$(jq -n --argjson all "$all_pt" --argjson claimed "$claimed_pt" \
+    '[$all[] as $x | select(($claimed | index($x)) | not) | $x]')
+  echo "$manifest" | jq --argjson u "$unclaimed_pt" \
+    '.protect._unclaimed = {post_types: $u, tables: [], option_keys: [],
+      note: "found on B, unclaimed by any module — protected by default-deny"}'
+}
