@@ -113,7 +113,16 @@ inventory_scan_site() {
   tables=$(wp_remote "$alias_lc" db tables --format=list --all-tables-with-prefix \
     | jq -R -s -c 'split("\n") | map(select(length > 0))')
   plugins=$(wp_remote "$alias_lc" plugin list --format=json)
-  active_theme=$(wp_remote "$alias_lc" theme list --status=active --format=json | jq '.[0] // {}')
+  # `wp theme list --format=json`'s real field for the theme slug is "name"
+  # (verified live against a real install) — design doc §6.1/§12 documents
+  # the scan schema as active_theme.stylesheet, and inventory_stack_diff
+  # (below) reads that field, so it is added here as an alias alongside the
+  # original "name" (kept, not overwritten — no information lost). Without
+  # this, inventory_stack_diff always compared "" == "" and never detected
+  # an actual theme mismatch — undetected until this was checked directly
+  # against a real DDEV scan rather than only fabricated test JSON.
+  active_theme=$(wp_remote "$alias_lc" theme list --status=active --format=json \
+    | jq '(.[0] // {}) | if has("name") then . + {stylesheet: .name} else . end')
   menus=$(wp_remote "$alias_lc" menu list --format=json 2>/dev/null || echo '[]')
 
   local custom_code_signals='{}' custom_code_detected=false

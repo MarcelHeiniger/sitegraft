@@ -153,3 +153,29 @@ EOF
   run inventory_stack_matches "$a" "$b"
   [ "$status" -eq 1 ]
 }
+
+@test "inventory_scan_site aliases wp-cli's real 'name' field to 'stylesheet' for active_theme (found via live DDEV harness run)" {
+  # wp-cli's real `theme list --format=json` field is "name", never
+  # "stylesheet" (verified against a real install) — but the design doc's
+  # documented scan schema (§6.1/§12) and inventory_stack_diff both read
+  # active_theme.stylesheet. Without this alias, inventory_stack_diff always
+  # compared "" == "" and never actually detected a real theme mismatch —
+  # this stayed undetected through every unit test (which only ever
+  # fabricated scan-*.json directly) until checked against a real scan.
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$*" in
+      "post-type list --format=json") echo '[]' ;;
+      "option list --format=json") echo '[]' ;;
+      "db tables --format=list --all-tables-with-prefix") echo 'wp_options' ;;
+      "plugin list --format=json") echo '[]' ;;
+      "theme list --status=active --format=json") echo '[{"name":"twentytwentyfive","status":"active","version":"1.5"}]' ;;
+      "menu list --format=json") echo '[]' ;;
+      *) echo '[]' ;;
+    esac
+  }
+  local out="$BATS_TEST_TMPDIR/scan-a.json"
+  inventory_scan_site a "$out"
+  run jq -e '.active_theme.name == "twentytwentyfive" and .active_theme.stylesheet == "twentytwentyfive"' "$out"
+  [ "$status" -eq 0 ]
+}

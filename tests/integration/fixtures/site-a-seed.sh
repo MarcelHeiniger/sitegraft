@@ -20,3 +20,7 @@ ddev exec --raw -p "$DDEV_PROJECT" -- wp option update page_on_front "$HOME_ID"
 ddev exec --raw -p "$DDEV_PROJECT" -- wp option update etch_settings '{"theme_mode":"dark"}' --format=json
 ddev exec --raw -p "$DDEV_PROJECT" -- wp option update etch_styles '{"primary_color":"#111"}' --format=json
 ddev exec --raw -p "$DDEV_PROJECT" -- wp option update automatic_css_settings '{"spacing_scale":"1.25"}' --format=json
+# M5 fixture: a wp_navigation post using the dynamic wp:page-list block (no
+# hardcoded post IDs) — the harness asserts inventory_nav_uses_dynamic_page_list
+# picks this up as true (design doc §0 point 11 / §6.1).
+ddev exec --raw -p "$DDEV_PROJECT" -- wp post create --post_type=wp_navigation --post_title="Main" --post_status=publish --post_content='<!-- wp:page-list /-->'

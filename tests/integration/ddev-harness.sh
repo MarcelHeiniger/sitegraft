@@ -11,6 +11,10 @@ PROJECT_B="sitegraft-test-b"
 cleanup() {
   ddev delete -Oy "$PROJECT_A" >/dev/null 2>&1 || true
   ddev delete -Oy "$PROJECT_B" >/dev/null 2>&1 || true
+  # m7: this harness-generated profile (real project names, gitignored) was
+  # never removed — left behind after every run instead of being test-only
+  # scratch state.
+  rm -f "${ROOT}/profiles/ddev-test.conf"
 }
 trap cleanup EXIT
 
@@ -25,6 +29,17 @@ cp "${ROOT}/tests/integration/fixtures/site-a-fake-etch/fake-etch-cpts.php" "/tm
 mkdir -p "/tmp/${PROJECT_B}/wp-content/mu-plugins"
 cp "${ROOT}/tests/integration/fixtures/site-b-fake-plugin/fake-plugin.php" "/tmp/${PROJECT_B}/wp-content/mu-plugins/fake-plugin.php"
 ddev exec --raw -p "$PROJECT_B" -- wp eval 'do_action("activate_fake-plugin.php");' # dbDelta + seed via activation hook logic, invoked directly since it's an mu-plugin (no real activation event)
+
+echo "==> asserting the site-b-fake-plugin fixture actually created its table+row"
+# m8: without this, later "protected data untouched" assertions (Task
+# 3.2/5.2) would be vacuously true if the fixture's activation hook ever
+# silently failed to run — checked directly against B's DB, independent of
+# sitegraft's own scan.
+FAKE_ROW_COUNT=$(ddev exec --raw -p "$PROJECT_B" -- wp eval 'global $wpdb; echo (int) $wpdb->get_var("SELECT COUNT(*) FROM ".$wpdb->prefix."fakebooking_reservations");')
+if [ "$FAKE_ROW_COUNT" -lt 1 ]; then
+  echo "fake-plugin fixture did not create its row (harness bug, not a sitegraft bug) — aborting"
+  exit 1
+fi
 
 if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "seed" ]; then
   echo "SEED OK (SITEGRAFT_HARNESS_STOP_AFTER=seed)"
@@ -68,6 +83,20 @@ echo "==> asserting fixtures are visible in the scan output"
 jq -e '.post_types[] | select(.name=="etch_cfs")' "${RUN_DIR}/scan-a.json" >/dev/null
 jq -e '.post_types[] | select(.name=="fake_reservation")' "${RUN_DIR}/scan-b.json" >/dev/null
 jq -e '.classic_menus_detected == false' "${RUN_DIR}/scan-a.json" >/dev/null
+
+echo "==> asserting m8's extra one-line coverage"
+# nav_uses_dynamic_page_list (M5): the wp:page-list post seeded on A above.
+jq -e '.nav_uses_dynamic_page_list == true' "${RUN_DIR}/scan-a.json" >/dev/null
+# tables (design doc §12/§6.1): B's fake plugin's real table, prefix and all.
+jq -e '.tables[] | select(endswith("fakebooking_reservations"))' "${RUN_DIR}/scan-b.json" >/dev/null
+# custom_code_detected (§14): B's mu-plugin alone is a signal — must fire.
+jq -e '.custom_code_detected == true' "${RUN_DIR}/scan-b.json" >/dev/null
+# options (site-a-seed.sh): the Etch/ACSS-shaped options actually landed.
+jq -e '.options[] | select(.option_name=="etch_settings")' "${RUN_DIR}/scan-a.json" >/dev/null
+jq -e '.options[] | select(.option_name=="automatic_css_settings")' "${RUN_DIR}/scan-a.json" >/dev/null
+# active_theme.stylesheet: both sites resolved a real active theme.
+jq -e '.active_theme.stylesheet | length > 0' "${RUN_DIR}/scan-a.json" >/dev/null
+jq -e '.active_theme.stylesheet | length > 0' "${RUN_DIR}/scan-b.json" >/dev/null
 
 if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "scan" ]; then
   echo "SCAN OK (SITEGRAFT_HARNESS_STOP_AFTER=scan)"
