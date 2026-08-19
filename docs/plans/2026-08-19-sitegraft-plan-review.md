@@ -274,3 +274,58 @@ by more DDEV-only testing — it is the moment R2 and R4 (design doc §0.2) actu
 get closed, not merely re-flagged. The 5 open technical decisions remain
 unrevisited here, as instructed — they're a separate approval track from this
 plan-review pass.
+
+---
+
+## E. Amendments after this review (Marcel, 2026-08-19)
+
+Marcel sent two follow-up amendments to B1/B2 above, plus a third new guardrail,
+before Step 1 started. These aren't Kimi's original findings — recorded here so
+the resolution trail for this review file stays complete rather than scattered
+across commit messages.
+
+### E1. B1 revised — offer to copy the missing/mismatched component, not just refuse
+
+The original B1 resolution (refuse `graft` + `--allow-stack-mismatch` override)
+was correct as a fallback but incomplete as the primary behavior: it implicitly
+treated "B already runs A's exact stack" as the normal case, when the actual
+common case (per B2) is B running something else entirely, with none of
+Etch/ACSS installed. **Resolution:** `plan` now offers to copy a missing or
+version-mismatched stack component from A — `rsync` A → orchestrator → B, then
+activate — recorded in the manifest's new `stack` key; declining still falls
+back to the original refuse/override behavior in `graft`. Guardrails: license
+keys are never copied (structural — `rsync` of a plugin directory never touches
+`wp_options`, where license keys live); a version already present on B needs a
+separate, stronger confirmation than an absent one, never an automatic
+overwrite; `verify`'s report lists every component copied as a re-licensing
+reminder. Design doc §12 rewritten; plan Task 2.4 (new) + Task 1.5's
+`inventory_stack_diff` + Task 4.1's revised precondition. "sitegraft never
+installs from an external source — it only replicates what already exists on
+A" is now §12's core sentence, verbatim as Marcel phrased it.
+
+### E2. B2 clarified — block-themes-only applies to site A only, never B
+
+No behavior changed — the code was already A-only (`phase_scan` never warned
+about B's classic menus). The wording wasn't unambiguous enough for a reader
+unfamiliar with the codebase to be sure of that. **Resolution:** design doc §13
+and §6.1 rewritten so a reader from the Etch community cannot come away
+thinking B must be a block theme — B running Divi, Elementor, Bricks, or a
+classic theme is stated as the normal, expected, primary case, explicitly tied
+to why E1's copy-from-A behavior exists at all.
+
+### E3. New guardrail — custom code living in B's theme
+
+Not a revision of an existing finding — a third, new guardrail Marcel asked
+for in the same round. `graft` replacing B's design layer can silently stop
+custom PHP from running (a child theme's `functions.php`, mu-plugins, snippet
+plugins) with no warning. **Resolution:** `scan` collects shallow heuristic
+signals on B only (child theme, `functions.php` presence/size/lines, mu-plugins
+listing, a short extensible list of known snippet-plugin slugs — no code
+parsing, YAGNI); if any signal is raised, `plan` blocks — refuses to write a
+manifest at all — until an explicit, `--allow-stack-mismatch`-weight
+acknowledgment is given. Design doc gained new §14 (self-review renumbered
+§14→§15 to make room, subsections shifted accordingly); plan Task 1.6 (scan
+signals) + Task 2.5 (the gate). Explicitly distinguished from data already
+protected by default-deny (a snippet plugin's own DB rows) and reassured
+against being mistaken for a data-loss risk (`backup` already archives all of
+`wp-content` per finding A3 — the gate prevents surprise, not loss).
