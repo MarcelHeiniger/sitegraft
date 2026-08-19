@@ -368,6 +368,32 @@ marked protected. **Nothing is ever migrated or wiped by default.** An operator 
 wants to migrate something not yet covered has to write a module for it (even a
 minimal one) — that's deliberate friction, not an oversight.
 
+**Tracked implementation gap, `_unclaimed.tables` (as of Step 2, `plan`):**
+`manifest_compute_unclaimed` (`lib/manifest.sh`) currently enumerates unclaimed
+`post_types` and `option_keys` against B's scan, but leaves `_unclaimed.tables`
+`[]` — not a silent oversight, a deliberately deferred extension, for two
+stacked reasons. First, module-declared tables are suffixes only
+(`fakebooking_reservations`), while `scan-b.json`'s `.tables` holds the live,
+prefixed names (`wp_fakebooking_reservations`) — matching them needs either a
+live table-prefix lookup (a wp-cli round trip `plan` has never made; every
+`plan_*` function works only from already-scanned JSON on disk, and this
+section's own "writes only locally" has always implicitly meant reads too) or
+an `endswith($suffix)` heuristic, which is resolvable without a live call.
+Second, and the harder half endswith-matching doesn't solve: no `core-wp`
+module exists yet (Step 4, Task 4.1) to claim WordPress's own tables
+(`wp_posts`, `wp_options`, `wp_users`, ...) as core-handled — so naively
+enumerating unclaimed tables today would flood the bucket with every core WP
+table on B, mislabeled as "protected by default-deny" when graft's
+content-migration path (WXR + `wp option`) touches several of them regardless
+via a different mechanism entirely. That's not a bigger protected set, it's a
+misleading one. **The safety property does not depend on this enumeration**:
+`graft` (Step 4) must build its DB-table-copy step exclusively from
+`protect.<module>.tables`/`migrate.<module>.tables` — an explicit allowlist
+read from the manifest, never a live "whatever's on B" scan. `_unclaimed` is a
+reporting/audit bucket, not itself the enforcement point; an incomplete
+`tables` enumeration is a visibility gap, not a protection gap. Revisit once a
+`core-wp` module exists and can exempt its own tables from the bucket.
+
 ## 4. Manifest format
 
 Produced by `plan`, frozen, consumed as-is by `graft`. JSON, parsed via `jq`.

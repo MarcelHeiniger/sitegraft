@@ -20,7 +20,32 @@ setup() {
   echo "$output" | jq -e '.protect == {}' >/dev/null
   echo "$output" | jq -e '.clean.enabled == false' >/dev/null
   echo "$output" | jq -e '.clean.post_types == []' >/dev/null
-  echo "$output" | jq -e '.options == {}' >/dev/null
+  echo "$output" | jq -e '.options.search_replace == {"from":"https://a.example.com","to":"https://b.example.com"}' >/dev/null
+}
+
+# --- MINOR fixes (Viktor's review of PR #2): design doc §4's manifest shows
+# `profile`, `site_a.alias`/`site_b.alias`, and `options.search_replace`,
+# none of which the original 2-arg manifest_new actually produced.
+@test "manifest_new defaults profile to empty and aliases to a/b when only URLs are given (2-arg call sites keep working unchanged)" {
+  run manifest_new "https://a.example.com" "https://b.example.com"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.profile == ""' >/dev/null
+  echo "$output" | jq -e '.site_a.alias == "a"' >/dev/null
+  echo "$output" | jq -e '.site_b.alias == "b"' >/dev/null
+}
+
+@test "manifest_new records the profile name and real aliases when given" {
+  run manifest_new "https://a.example.com" "https://b.example.com" "my-profile" "site-a" "site-b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.profile == "my-profile"' >/dev/null
+  echo "$output" | jq -e '.site_a.alias == "site-a"' >/dev/null
+  echo "$output" | jq -e '.site_b.alias == "site-b"' >/dev/null
+}
+
+@test "manifest_new populates options.search_replace from the two site URLs — the A-to-B domain remap graft §9.4 needs" {
+  run manifest_new "https://a.example.com" "https://b.example.com"
+  echo "$output" | jq -e '.options.search_replace.from == "https://a.example.com"' >/dev/null
+  echo "$output" | jq -e '.options.search_replace.to == "https://b.example.com"' >/dev/null
 }
 
 @test "manifest_add_migrate adds a module entry with post_types and option_keys" {

@@ -4,21 +4,29 @@
 # (§14), drives interactive stack resolution and adjustment, freezes the
 # manifest.
 
-# plan_defaults <scan_a_json_path> <scan_b_json_path> — dispatches every
-# discovered module against both scans (design doc §6.2 step 2-3): a module
-# detected on A goes to migrate (with whatever post_types/option_keys/tables
-# it declares); a module detected on B and NOT on A goes to protect instead.
-# A module detected on both sites is only ever migrated — its content on B
-# is expected to be replaced/merged by the graft, not separately protected.
-# Not pure (reads scan files from disk and calls into the module registry),
-# so tested directly with fabricated modules rather than as a jq one-liner —
-# see tests/unit/test_plan.bats.
+# plan_defaults <scan_a_json_path> <scan_b_json_path> [profile] — dispatches
+# every discovered module against both scans (design doc §6.2 step 2-3): a
+# module detected on A goes to migrate (with whatever
+# post_types/option_keys/tables it declares); a module detected on B and NOT
+# on A goes to protect instead. A module detected on both sites is only ever
+# migrated — its content on B is expected to be replaced/merged by the
+# graft, not separately protected. Not pure (reads scan files from disk and
+# calls into the module registry), so tested directly with fabricated
+# modules rather than as a jq one-liner — see tests/unit/test_plan.bats.
+#
+# `profile` (optional, new in this fix-pack) is passed straight through to
+# manifest_new to populate the manifest's `profile` field (design doc §4).
+# SITE_A_ALIAS/SITE_B_ALIAS are read directly from the environment, not
+# passed as parameters — by the time phase_plan calls this, profile_load has
+# already exported them (same pattern every other SITE_*_* consumer in this
+# codebase uses, e.g. wp_remote in lib/inventory.sh).
 plan_defaults() {
-  local scan_a_json="$1" scan_b_json="$2"
+  local scan_a_json="$1" scan_b_json="$2" profile="${3:-}"
   local manifest
   manifest=$(manifest_new \
     "$(jq -r '.site_url // "unknown"' "$scan_a_json" 2>/dev/null || echo unknown)" \
-    "$(jq -r '.site_url // "unknown"' "$scan_b_json" 2>/dev/null || echo unknown)")
+    "$(jq -r '.site_url // "unknown"' "$scan_b_json" 2>/dev/null || echo unknown)" \
+    "$profile" "${SITE_A_ALIAS:-a}" "${SITE_B_ALIAS:-b}")
 
   local mod
   for mod in $SITEGRAFT_MODULES; do
@@ -87,25 +95,51 @@ _plan_confirm_strong() {
 # Presents a flat list of "module: item" toggles built from the manifest's
 # migrate bucket and returns the subset the operator kept, one per line.
 # gum first, fzf fallback, plain numbered-prompt fallback last.
+#
+# MINOR bug found live (Viktor's review of PR #2), fixed: `gum choose
+# --selected.all` is not a real flag — confirmed against a real `gum choose
+# --help` (installed 0.17.0 via `brew install gum` to check): it errors
+# "unknown flag --selected.all", exit 80, on the PRIMARY interactive path,
+# before the operator ever sees a prompt. The real flag (`--help`: "Options
+# that should start as selected (selects all if given *)") is
+# `--selected='*'`. Minimum gum version for THAT specific wildcard: 0.15.0 —
+# checked against the real release history (`gh api
+# repos/charmbracelet/gum/releases`), not asserted from memory: `--selected`
+# on `choose` shipped earlier, in v0.7.0, but the `*` "select all" shorthand
+# used here landed in v0.15.0 (PR #769). Verified live against 0.17.0 that
+# the corrected flag clears parsing and reaches the TTY-open step — the
+# furthest any environment without a real controlling terminal can verify.
 _plan_prompt_items() {
   local items="$1" # newline-separated "module: item" strings
   if [ -z "$items" ]; then
     return 0
   fi
   if command -v gum >/dev/null 2>&1; then
-    printf '%s\n' "$items" | gum choose --no-limit --selected.all
+    printf '%s\n' "$items" | gum choose --no-limit --selected='*'
   elif command -v fzf >/dev/null 2>&1; then
     printf '%s\n' "$items" | fzf -m --bind 'ctrl-a:select-all'
   else
     log_warn "neither gum nor fzf found — falling back to a plain yes/no prompt per item"
+    # MAJOR bug fixed here (found live, reproduced before this fix): `done <<<
+    # "$items"` redirects fd0 for the WHOLE while loop, so the inner `read -r
+    # -p "Keep...` ans` — which also defaults to reading fd0 — consumed the
+    # NEXT item line as its own answer instead of prompting the operator.
+    # Reproduced with 3 items and answers y/n/y: every item came out kept
+    # regardless of the typed answers, a silent, wrong selection with no
+    # error. Fix: the outer loop reads items from fd3 (bound only to this
+    # while loop, via `done 3<<< "$items"`), leaving fd0 entirely free for
+    # the inner interactive prompt — the same plain `read -r -p` used
+    # (unmodified, on purpose, for consistency) by _plan_confirm/
+    # _plan_confirm_strong above, which read fd0 without incident because
+    # nothing else in those functions ever contends for it.
     local line ans
-    while IFS= read -r line; do
+    while IFS= read -r line <&3; do
       [ -n "$line" ] || continue
       read -r -p "Keep '${line}'? [Y/n] " ans
       case "${ans:-y}" in
         y|Y|'') printf '%s\n' "$line" ;;
       esac
-    done <<< "$items"
+    done 3<<< "$items"
   fi
 }
 
@@ -133,9 +167,24 @@ _plan_apply_selection() {
   local manifest="$1" kept="$2"
   local mod
   for mod in $(echo "$manifest" | jq -r '.migrate | keys[]'); do
-    local mod_pt_list mod_kept_raw kept_pt kept_ok
+    local mod_pt_list mod_re mod_kept_raw kept_pt kept_ok
     mod_pt_list=$(echo "$manifest" | jq -c --arg m "$mod" '.migrate[$m].post_types')
-    mod_kept_raw=$(printf '%s\n' "$kept" | grep "^${mod}: " | sed "s/^${mod}: //")
+    # $mod is filename-derived (lib/modules.sh: hyphens -> underscores from
+    # modules/<name>.sh), never attacker-controlled remote input — but it's
+    # still interpolated into a grep/sed REGEX below, and an operator could
+    # in principle name a module file something regex-special. Escaped
+    # anyway (cheap, and turns a "low risk, note it" nit into a closed one)
+    # rather than trusting every future module filename to stay
+    # regex-innocuous.
+    mod_re=$(printf '%s' "$mod" | sed 's/[.[\*^$()+?{|]/\\&/g')
+    # `|| true`: found live, reproduced under `set -euo pipefail` (the mode
+    # bin/sitegraft runs under) — with pipefail, a `grep` that matches
+    # nothing makes the WHOLE pipeline's exit status non-zero even though
+    # the trailing `sed` exits 0, and `set -e` then aborts the function at
+    # this assignment. This fires on every real run where a module's kept
+    # list is empty (fully deselected in the prompt above) — not a
+    # theoretical case.
+    mod_kept_raw=$(printf '%s\n' "$kept" | { grep "^${mod_re}: " || true; } | sed "s/^${mod_re}: //")
     kept_pt=$(printf '%s\n' "$mod_kept_raw" | jq -R -s --argjson pt "$mod_pt_list" -c \
       'split("\n") | map(select(length > 0)) | map(select(. as $x | ($pt | index($x))))')
     kept_ok=$(printf '%s\n' "$mod_kept_raw" | jq -R -s --argjson pt "$mod_pt_list" -c \
@@ -256,6 +305,40 @@ plan_custom_code_gate_check_prefilled() {
   return 1
 }
 
+# _plan_freeze_summary <manifest_json> — prints what "Freeze this manifest?"
+# is actually about to freeze, on stdout (phase_plan redirects it to stderr,
+# same as every other operator-facing message in this file). Recommended
+# addition beyond the plan's literal spec (Viktor's review of PR #2): the
+# original summary printed only migrate/protect MODULE KEYS ("migrate: etch,
+# acss"), not the actual post_types/option_keys/tables an operator selected
+# — so a broken selection (like the MAJOR fd-collision bug fixed alongside
+# this) would sail through the freeze confirmation unnoticed, since the
+# summary never showed enough to catch it. Now lists every item per module,
+# for both buckets, including `protect._unclaimed` — an operator should see
+# exactly what leaves A and what's protected on B before committing.
+#
+# Long lists are truncated to the first 15 items + a count of the rest —
+# `_unclaimed.option_keys` (extended in this same fix-pack, lib/manifest.sh)
+# can easily run into the hundreds on a real WordPress install (autoloaded
+# core options, transients, plugin settings), and an unreadable wall of text
+# defeats the whole point of this summary existing. Truncation is display-
+# only: the full, untruncated list is still what's written to manifest.json
+# and what graft consumes — nothing is actually dropped, only how much of it
+# is echoed to the terminal before freezing.
+_plan_freeze_summary() {
+  local manifest="$1"
+  echo "$manifest" | jq -r '
+    def fmt_items($arr):
+      if ($arr | length) == 0 then "(nothing selected)"
+      elif ($arr | length) > 15 then (($arr[0:15] | join(", ")) + " ... and \(($arr | length) - 15) more")
+      else ($arr | join(", ")) end;
+    "migrate:",
+    (.migrate | to_entries[] | "  " + .key + ": " + fmt_items((.value.post_types // []) + (.value.option_keys // []))),
+    "protect:",
+    (.protect | to_entries[] | "  " + .key + ": " + fmt_items((.value.post_types // []) + (.value.tables // []) + (.value.option_keys // [])))
+  '
+}
+
 phase_plan() {
   local profile="" run_dir=""
   while [ $# -gt 0 ]; do
@@ -278,7 +361,7 @@ phase_plan() {
   plan_warn_scope_gaps "${run_dir}/scan-a.json" "${run_dir}/scan-b.json"
 
   local manifest
-  manifest=$(plan_defaults "${run_dir}/scan-a.json" "${run_dir}/scan-b.json")
+  manifest=$(plan_defaults "${run_dir}/scan-a.json" "${run_dir}/scan-b.json" "$profile")
 
   # design doc §14: runs before any step below — none of them should matter
   # until this is settled. Deviation from the plan's literal Task 2.5 wiring
@@ -310,10 +393,7 @@ phase_plan() {
   manifest=$(manifest_compute_unclaimed "$manifest" "$(cat "${run_dir}/scan-b.json")")
 
   if [ -z "${SITEGRAFT_MANIFEST_PREFILLED:-}" ]; then
-    echo "$manifest" | jq -r '
-      "migrate: " + ([.migrate | keys[]] | join(", ")),
-      "protect: " + ([.protect | keys[]] | join(", "))
-    ' >&2
+    _plan_freeze_summary "$manifest" >&2
     _plan_confirm "Freeze this manifest? Nothing outside migrate/protect above will ever be touched by graft." || {
       log_error "manifest not frozen — re-run 'sitegraft plan' when ready"
       return 1

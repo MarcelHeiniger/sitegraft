@@ -29,6 +29,33 @@ setup() {
   echo "$output" | jq -e '.protect._unclaimed.post_types == ["mystery_cpt"]' >/dev/null
 }
 
+# --- option_keys coverage: MINOR fix (Viktor's review of PR #2) — design doc
+# §3.6 says default-deny covers "post_type, table, OR option key", and
+# option_keys is now extended the same way post_types always has been (no
+# prefix-resolution issue for options, unlike tables — see the tracked
+# comment above manifest_compute_unclaimed for why tables stays [] for now).
+@test "manifest_compute_unclaimed protects an option_key present on B but claimed nowhere" {
+  local manifest='{"migrate":{},"protect":{"known":{"option_keys":["known_plugin_settings"]}}}'
+  local scan_b='{"post_types":[],"options":[{"option_name":"known_plugin_settings"},{"option_name":"mystery_option"}]}'
+  run manifest_compute_unclaimed "$manifest" "$scan_b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.protect._unclaimed.option_keys == ["mystery_option"]' >/dev/null
+}
+
+@test "manifest_compute_unclaimed adds no option_keys when everything on B is already claimed" {
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_settings"]}},"protect":{}}'
+  local scan_b='{"post_types":[],"options":[{"option_name":"etch_settings"}]}'
+  run manifest_compute_unclaimed "$manifest" "$scan_b"
+  echo "$output" | jq -e '.protect._unclaimed.option_keys == []' >/dev/null
+}
+
+@test "manifest_compute_unclaimed still leaves tables as [] (tracked, not a silent gap — see design doc §3.6)" {
+  local manifest='{"migrate":{},"protect":{}}'
+  local scan_b='{"post_types":[],"options":[]}'
+  run manifest_compute_unclaimed "$manifest" "$scan_b"
+  echo "$output" | jq -e '.protect._unclaimed.tables == []' >/dev/null
+}
+
 @test "plan_warn_scope_gaps warns about A's classic menus but never about B's, and always exits 0" {
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
   echo '{"classic_menus_detected":true,"classic_menu_names":["Main Menu"]}' > "$a"
