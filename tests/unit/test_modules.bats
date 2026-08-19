@@ -12,18 +12,40 @@ EOF
   cat > "$SITEGRAFT_MODULES_DIR/_template.sh" <<'EOF'
 template_name() { echo "should not be loaded"; }
 EOF
-  # Mirrors the real, documented example the design doc ships
-  # (modules/motopress.sh.example, §3.5/§2) — not a synthetic filename.
-  cat > "$SITEGRAFT_MODULES_DIR/motopress.sh.example" <<'EOF'
-motopress_name() { echo "should not be loaded either"; }
-EOF
+  # N1: the actual shipped file (modules/motopress.sh.example, design doc
+  # §2/§3.5), copied in — not a re-typed synthetic stand-in. This is a
+  # real, complete worked-example module (name/detect/post_types/
+  # option_keys/tables/post_import, all matching the §3.2 contract); the
+  # only thing under test here is that its .example suffix keeps it from
+  # ever being sourced/registered by default.
+  cp "${BATS_TEST_DIRNAME}/../../modules/motopress.sh.example" "$SITEGRAFT_MODULES_DIR/motopress.sh.example"
 }
 
-@test "modules_discover finds demo-mod but skips _template.sh and .sh.example files" {
+@test "modules_discover finds demo-mod but skips _template.sh and the real motopress.sh.example (N1)" {
   modules_discover
   [[ " $SITEGRAFT_MODULES " == *" demo_mod "* ]]
   [[ " $SITEGRAFT_MODULES " != *" template "* ]]
   [[ " $SITEGRAFT_MODULES " != *" motopress "* ]]
+}
+
+@test "modules/motopress.sh.example is itself a valid, complete module once activated (N1)" {
+  # Simulates exactly what §3.5 documents as the expected move: copy it to
+  # modules/motopress.sh, dropping the .example suffix, to activate it for
+  # real. Confirms the shipped worked example genuinely satisfies the
+  # module contract (module_validate_contract) rather than merely looking
+  # plausible in the design doc's prose.
+  cp "${BATS_TEST_DIRNAME}/../../modules/motopress.sh.example" "$SITEGRAFT_MODULES_DIR/motopress.sh"
+  modules_discover
+  [[ " $SITEGRAFT_MODULES " == *" motopress "* ]]
+  run module_call motopress name
+  [ "$status" -eq 0 ]
+  [ "$output" = "MotoPress Hotel Booking" ]
+  run module_call motopress post_types
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"mphb_booking"* ]]
+  run module_call motopress tables
+  [ "$status" -eq 0 ]
+  [ "$output" = "mphb_room_type_meta" ]
 }
 
 @test "module_has_fn detects an existing function and rejects a missing one" {

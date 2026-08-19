@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# modules/motopress.sh.example — worked example: a hypothetical future module.
+# Copy to modules/motopress.sh (drop the .example suffix) to activate it for real.
+# MotoPress Hotel Booking is NOT implemented in v1 — this file exists purely to show
+# the contract end-to-end, including a table and a post_import remap hook.
+
+motopress_name() { echo "MotoPress Hotel Booking"; }
+
+motopress_detect() {
+  jq -e '.plugins[] | select(.slug == "motopress-hotel-booking")' "$1" >/dev/null 2>&1
+}
+
+motopress_post_types() {
+  cat <<'EOF'
+mphb_booking
+mphb_room_type
+mphb_rate
+mphb_room
+EOF
+}
+
+motopress_option_keys() {
+  cat <<'EOF'
+mphb_settings
+EOF
+}
+
+motopress_tables() {
+  # Suffixes only — sitegraft prefixes with the live $table_prefix of the site.
+  cat <<'EOF'
+mphb_room_type_meta
+EOF
+}
+
+# Example post-import hook: not used for migration in v1 (MotoPress data always
+# lands in the "protect" bucket, never in "migrate", for the case Marcel described —
+# a live B with real bookings). Shown here purely to document the hook signature for
+# a future module that DOES migrate a plugin's content.
+motopress_post_import() {
+  state_dir="$1"
+  id_map_tsv="$2"
+  wp_cmd_b="$3"
+  # Example: if mphb_room_type posts had been migrated, remap a hypothetical
+  # "related_room_id" postmeta pointing at another migrated post.
+  while IFS=$'\t' read -r old_id new_id post_type; do
+    [ "$post_type" = "mphb_room_type" ] || continue
+    $wp_cmd_b post list --post_type=mphb_booking --meta_key=related_room_id \
+      --meta_value="$old_id" --field=ID | while read -r booking_id; do
+        $wp_cmd_b post meta update "$booking_id" related_room_id "$new_id"
+    done
+  done < "$id_map_tsv"
+}

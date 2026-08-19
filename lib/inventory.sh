@@ -163,9 +163,16 @@ inventory_scan_site() {
   # `... 2>/dev/null || echo '[]'` turned any query error into "no classic
   # menus" — silently suppressing the §13 warning exactly when it is least
   # trustworthy (the query didn't actually run).
+  # N2: stderr is kept OUT of the value that gets parsed as JSON below (via
+  # --argjson) — a wp-cli deprecation notice or warning on stderr, even on
+  # an otherwise-successful call (exit 0), would have silently corrupted
+  # $menus with non-JSON text mixed in. Only re-captured, separately, on
+  # the failure path below, purely for the diagnostic message.
   local menus_unknown=false
-  if ! menus=$(wp_remote "$alias_lc" menu list --format=json 2>&1); then
-    log_warn "could not list nav menus on site ${alias_lc} — classic-menu detection recorded as unknown, not clean (fail-safe, design doc §13): ${menus}"
+  if ! menus=$(wp_remote "$alias_lc" menu list --format=json 2>/dev/null); then
+    local menus_err
+    menus_err=$(wp_remote "$alias_lc" menu list --format=json 2>&1 >/dev/null)
+    log_warn "could not list nav menus on site ${alias_lc} — classic-menu detection recorded as unknown, not clean (fail-safe, design doc §13): ${menus_err}"
     menus='[]'
     menus_unknown=true
   fi
@@ -180,10 +187,13 @@ inventory_scan_site() {
   # itself fails (never silently assumed false).
   local nav_dynamic='null'
   if [ "$alias_lc" = "a" ]; then
-    nav_dynamic=$(inventory_nav_uses_dynamic_page_list "$alias_lc" 2>&1) || {
-      log_warn "could not determine whether site A's navigation uses a dynamic page-list block — recording nav_uses_dynamic_page_list as unknown (null): ${nav_dynamic}"
+    # N2: same stderr-out-of-the-parsed-value treatment as $menus above.
+    if ! nav_dynamic=$(inventory_nav_uses_dynamic_page_list "$alias_lc" 2>/dev/null); then
+      local nav_err
+      nav_err=$(inventory_nav_uses_dynamic_page_list "$alias_lc" 2>&1 >/dev/null)
+      log_warn "could not determine whether site A's navigation uses a dynamic page-list block — recording nav_uses_dynamic_page_list as unknown (null): ${nav_err}"
       nav_dynamic='null'
-    }
+    fi
     # Guard against a non-boolean/garbled result being embedded as JSON.
     case "$nav_dynamic" in
       true|false) : ;;
@@ -324,23 +334,35 @@ inventory_custom_code_signals() {
     unknown=$(echo "$unknown" | jq -c '. + ["child_theme"]')
   fi
 
-  if fn_php_raw=$(wp_remote "$alias_lc" eval 'if (file_exists($f = get_stylesheet_directory()."/functions.php")) { echo json_encode(["exists"=>true,"bytes"=>filesize($f),"lines"=>count(file($f))]); } else { echo json_encode(["exists"=>false]); }' 2>&1) \
+  # N2 applies to the three blocks below too: stderr is kept out of the
+  # value read as JSON on the success path (2>/dev/null), even though the
+  # `jq .` validity check right after already fails closed on corrupted
+  # content — cleaner to avoid the corruption in the first place than to
+  # rely on catching it downstream. Re-captured, separately, only on the
+  # failure path, for the diagnostic message.
+  local fn_php_eval='if (file_exists($f = get_stylesheet_directory()."/functions.php")) { echo json_encode(["exists"=>true,"bytes"=>filesize($f),"lines"=>count(file($f))]); } else { echo json_encode(["exists"=>false]); }'
+  if fn_php_raw=$(wp_remote "$alias_lc" eval "$fn_php_eval" 2>/dev/null) \
     && echo "$fn_php_raw" | jq . >/dev/null 2>&1; then
     fn_php="$fn_php_raw"
   else
-    log_warn "could not check functions.php on site ${alias_lc} — recording functions_php as unknown (fail-safe, design doc §14): ${fn_php_raw}"
+    local fn_php_err
+    fn_php_err=$(wp_remote "$alias_lc" eval "$fn_php_eval" 2>&1 >/dev/null)
+    log_warn "could not check functions.php on site ${alias_lc} — recording functions_php as unknown (fail-safe, design doc §14): ${fn_php_err}"
     unknown=$(echo "$unknown" | jq -c '. + ["functions_php"]')
   fi
 
-  if mu_plugins_raw=$(wp_remote "$alias_lc" eval 'echo json_encode(array_map("basename", glob(WP_CONTENT_DIR."/mu-plugins/*.php") ?: []));' 2>&1) \
+  local mu_plugins_eval='echo json_encode(array_map("basename", glob(WP_CONTENT_DIR."/mu-plugins/*.php") ?: []));'
+  if mu_plugins_raw=$(wp_remote "$alias_lc" eval "$mu_plugins_eval" 2>/dev/null) \
     && echo "$mu_plugins_raw" | jq . >/dev/null 2>&1; then
     mu_plugins="$mu_plugins_raw"
   else
-    log_warn "could not list mu-plugins on site ${alias_lc} — recording mu_plugins as unknown (fail-safe, design doc §14): ${mu_plugins_raw}"
+    local mu_plugins_err
+    mu_plugins_err=$(wp_remote "$alias_lc" eval "$mu_plugins_eval" 2>&1 >/dev/null)
+    log_warn "could not list mu-plugins on site ${alias_lc} — recording mu_plugins as unknown (fail-safe, design doc §14): ${mu_plugins_err}"
     unknown=$(echo "$unknown" | jq -c '. + ["mu_plugins"]')
   fi
 
-  if plugins_json=$(wp_remote "$alias_lc" plugin list --format=json 2>&1) \
+  if plugins_json=$(wp_remote "$alias_lc" plugin list --format=json 2>/dev/null) \
     && echo "$plugins_json" | jq . >/dev/null 2>&1; then
     # status=active: an installed-but-inactive snippet plugin is not
     # injecting anything at runtime, so it is not itself a signal.
@@ -348,7 +370,9 @@ inventory_custom_code_signals() {
       --argjson names "$SITEGRAFT_SNIPPET_PLUGIN_SLUGS" \
       '[.[] | select(.status == "active") | select(.name as $n | $names | index($n)) | .name]')
   else
-    log_warn "could not list plugins on site ${alias_lc} — recording snippet_plugins as unknown (fail-safe, design doc §14): ${plugins_json}"
+    local plugins_err
+    plugins_err=$(wp_remote "$alias_lc" plugin list --format=json 2>&1 >/dev/null)
+    log_warn "could not list plugins on site ${alias_lc} — recording snippet_plugins as unknown (fail-safe, design doc §14): ${plugins_err}"
     unknown=$(echo "$unknown" | jq -c '. + ["snippet_plugins"]')
   fi
 

@@ -98,15 +98,29 @@ sitegraft_register_tmp_dir() {
 # reference in the first place (explicit arity/existence checks before
 # dereferencing — see phase_scan's --profile and SITEGRAFT_STATE_DIR
 # guards) rather than to try to recover it here.
+#
+# Also found via a genuinely discriminating mutation test (second review
+# round, after the first M1 test was shown not to distinguish the fix
+# from its absence — see tests/unit/test_core.bats): `local rc=$?; ...;
+# return $rc` alone is not sufficient. bin/sitegraft runs under
+# `set -euo pipefail`, which is inherited into this trap's execution
+# context — if `rm -rf`/`rm -f` below ever fails for real (permissions,
+# a read-only parent dir, anything), set -e aborts sitegraft_cleanup
+# *at that point*, before `return $rc` is ever reached, and the failing
+# cleanup command's own status becomes the reported exit code instead —
+# discarding a genuinely successful run's real status 0 same as the bug
+# this function exists to fix in the first place. `|| true` on each
+# cleanup operation means a failure to remove something never aborts the
+# function early, so `return $rc` is always reached.
 sitegraft_cleanup() {
   local rc=$?
   local dir
   if [ -n "$SITEGRAFT_TMP_REGISTRY" ] && [ -f "$SITEGRAFT_TMP_REGISTRY" ]; then
     while IFS= read -r dir; do
       [ -n "$dir" ] || continue
-      [ -d "$dir" ] && rm -rf "$dir"
+      [ -d "$dir" ] && rm -rf "$dir" 2>/dev/null || true
     done < "$SITEGRAFT_TMP_REGISTRY"
-    rm -f "$SITEGRAFT_TMP_REGISTRY"
+    rm -f "$SITEGRAFT_TMP_REGISTRY" 2>/dev/null || true
   fi
   return $rc
 }

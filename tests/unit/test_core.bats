@@ -23,35 +23,54 @@ setup() {
   [ "$status" -eq 1 ]
 }
 
-@test "the EXIT trap does not flip a successful run into a failure over a stale registered temp dir (M1, verified live)" {
-  # This is the REAL bug (corrected from an earlier, wrong description of
-  # it — see the note in lib/core.sh): a *stale* registered dir (one that
-  # no longer exists on disk for any reason) makes the cleanup loop's last
-  # evaluated command, `[ -d "$dir" ] && rm -rf "$dir"`, end on the FALSE
-  # branch — exit 1, since `&&` short-circuits before rm -rf ever runs.
-  # Without capturing $? before that loop runs, that stray 1 silently
-  # replaced the exit status of an otherwise completely successful script.
-  # Verified two ways before writing this test: (a) reproduced against a
-  # minimal reimplementation of the pre-fix cleanup — a genuinely
-  # successful script with a stale dir registered came out exit 1; (b)
-  # confirmed the *opposite* claim an earlier draft of this test/comment
-  # made — that normal failures (return 1/exit N/a failing command) were
-  # being masked to exit 0 — is FALSE: those propagated correctly both
-  # before and after this fix (see the baseline test below).
+@test "the EXIT trap preserves a genuinely successful run even when cleanup's own internal rm fails (M1, discriminating mutation test)" {
+  # This is the test that actually discriminates the fix from its absence
+  # (a second review round showed the previous version of this test did
+  # not: mutating away BOTH `local rc=$?` and `return $rc` still left the
+  # whole suite, including that test, green — because the previous
+  # scenario's "stale dir" only affected an internal loop iteration, not
+  # sitegraft_cleanup's own actual LAST executed command, which was
+  # already an unconditional `rm -f "$SITEGRAFT_TMP_REGISTRY"` that
+  # (almost) always succeeds on its own regardless of rc-capture).
   #
-  # A plain bats "run" cannot observe this (bats' own trap handling
-  # interferes), so this writes a tiny script that installs the trap
-  # itself — exactly as bin/sitegraft now does, not lib/core.sh — and
-  # launches a real bash subprocess to inspect its actual exit code.
+  # This scenario instead makes the registry directory read-only right
+  # before the trap fires, so `rm -f "$SITEGRAFT_TMP_REGISTRY"` genuinely
+  # fails with EACCES — verified directly (see the mutation proof below)
+  # that this is real, not synthetic.
+  #
+  # Systematic empirical finding this test is built on (a full truth
+  # table, not guesswork): on this bash version, when an EXIT trap's own
+  # last executed command fails, that failure code REPLACES the script's
+  # true original exit status — even discarding a distinguishable one
+  # (e.g. `exit 2` becomes 1, the trap's own generic failure code), and
+  # even flipping a genuine success (0) into a failure. When the trap's
+  # own last command succeeds, the true original status survives
+  # untouched. Two things follow from that, both present in
+  # sitegraft_cleanup: (1) `rm -rf`/`rm -f` need `|| true` so a failure to
+  # remove something never becomes the trap's own last (failing) status —
+  # proven load-bearing by this test; (2) `local rc=$?; ...; return $rc`
+  # is additionally kept as portable, low-cost defense in depth — on this
+  # specific bash version, with the `|| true` guards already in place,
+  # every code path through sitegraft_cleanup ends in a command that
+  # succeeds on its own, which independently preserves the true original
+  # status per the rule above, so no black-box scenario was found where
+  # rc-capture is *independently* discriminable given (1) already holds.
+  # Removing it was considered and rejected: relying solely on an
+  # unwritten, version-specific bash trap behavior for correctness here
+  # would be more fragile than keeping the explicit, portable pattern.
+  local regdir="$BATS_TEST_TMPDIR/regdir"
+  mkdir -p "$regdir"
   local probe="$BATS_TEST_TMPDIR/probe.sh"
   {
     echo 'set -euo pipefail'
+    echo "TMPDIR=\"${regdir}\""
     echo ". \"${BATS_TEST_DIRNAME}/../../lib/core.sh\""
     echo 'trap sitegraft_cleanup EXIT'
-    echo 'sitegraft_register_tmp_dir "/tmp/this-dir-does-not-exist-sitegraft-m1-test"'
+    echo "chmod 555 \"${regdir}\""
     echo 'echo "script succeeding normally now"'
   } > "$probe"
   run bash "$probe"
+  chmod 755 "$regdir"
   [ "$status" -eq 0 ]
 }
 

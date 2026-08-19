@@ -153,6 +153,39 @@ EOF
   [ "$status" -eq 0 ]
 }
 
+@test "a wp-cli deprecation notice on stderr during an otherwise-successful menu list call does not corrupt scan-a.json (N2)" {
+  # Simulates exactly what N2 warned about: a notice/warning on stderr
+  # from a call that still exits 0 and prints valid JSON on stdout. With
+  # the old "2>&1" capture, that notice text would have been merged into
+  # the value later parsed via --argjson, breaking jq. Here "menu list"
+  # succeeds (exit 0, valid JSON on stdout) but also writes to stderr.
+  wp_remote() {
+    local alias_lc="$1"; shift
+    local args="$*"
+    case "$args" in
+      "post-type list --format=json") echo '[]' ;;
+      "option list --format=json") echo '[]' ;;
+      "db tables --format=list --all-tables-with-prefix") echo 'wp_options' ;;
+      "plugin list --format=json") echo '[]' ;;
+      "theme list --status=active --format=json") echo '[{"stylesheet":"t","version":"1"}]' ;;
+      "theme list --status=active --field=name") echo "t" ;;
+      "theme get t --field=template") echo "t" ;;
+      "menu list --format=json")
+        echo "PHP Deprecated: some notice in wp-content/plugins/whatever.php on line 42" >&2
+        echo '[{"name":"Main","count":2}]'
+        ;;
+      eval*) echo 'null' ;;
+      *) echo '[]' ;;
+    esac
+  }
+  run phase_scan --profile demo
+  [ "$status" -eq 0 ]
+  local run_dir
+  run_dir=$(ls -dt "$BATS_TEST_TMPDIR"/runs/demo-* | head -1)
+  run jq -e '.classic_menus_detected == true and .classic_menus_unknown == false and (.classic_menu_names == ["Main"])' "${run_dir}/scan-a.json"
+  [ "$status" -eq 0 ]
+}
+
 @test "phase_scan's own belt-and-suspenders guard rejects a missing SITEGRAFT_STATE_DIR even if profile_load's check were ever bypassed (BLOCKER)" {
   # profile_load's required-key check is the primary defense (see
   # test_profile.bats) — this exercises phase_scan's independent second
