@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# bin/sitegraft — entrypoint. Dispatches to a phase implemented in lib/<phase>.sh.
+set -euo pipefail
+
+SITEGRAFT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/core.sh
+. "${SITEGRAFT_ROOT}/lib/core.sh"
+
+SITEGRAFT_VERSION="0.1.0"
+
+usage() {
+  cat <<'EOF'
+Usage: sitegraft <phase> --profile <name> [flags]
+
+Phases: scan, plan, backup, graft, verify, restore
+
+EOF
+}
+
+main() {
+  local phase="${1:-}"
+  [ -n "$phase" ] || { usage; exit 1; }
+  shift || true
+
+  for cmd in jq rsync ssh; do
+    require_cmd "$cmd" || exit 1
+  done
+
+  case "$phase" in
+    scan)
+      . "${SITEGRAFT_ROOT}/lib/profile.sh"
+      . "${SITEGRAFT_ROOT}/lib/modules.sh"
+      . "${SITEGRAFT_ROOT}/lib/inventory.sh"
+      phase_scan "$@"
+      ;;
+    plan)
+      . "${SITEGRAFT_ROOT}/lib/profile.sh"
+      . "${SITEGRAFT_ROOT}/lib/modules.sh"
+      . "${SITEGRAFT_ROOT}/lib/inventory.sh"
+      . "${SITEGRAFT_ROOT}/lib/manifest.sh"
+      . "${SITEGRAFT_ROOT}/lib/plan.sh"
+      phase_plan "$@"
+      ;;
+    backup)
+      . "${SITEGRAFT_ROOT}/lib/profile.sh"
+      . "${SITEGRAFT_ROOT}/lib/inventory.sh"
+      . "${SITEGRAFT_ROOT}/lib/backup.sh"
+      phase_backup "$@"
+      ;;
+    graft)
+      . "${SITEGRAFT_ROOT}/lib/profile.sh"
+      . "${SITEGRAFT_ROOT}/lib/modules.sh"
+      . "${SITEGRAFT_ROOT}/lib/inventory.sh"
+      . "${SITEGRAFT_ROOT}/lib/graft.sh"
+      phase_graft "$@"
+      ;;
+    verify)
+      . "${SITEGRAFT_ROOT}/lib/profile.sh"
+      . "${SITEGRAFT_ROOT}/lib/inventory.sh"
+      . "${SITEGRAFT_ROOT}/lib/backup.sh"
+      . "${SITEGRAFT_ROOT}/lib/graft.sh"
+      . "${SITEGRAFT_ROOT}/lib/verify.sh"
+      phase_verify "$@"
+      ;;
+    restore)
+      . "${SITEGRAFT_ROOT}/lib/profile.sh"
+      . "${SITEGRAFT_ROOT}/lib/backup.sh"
+      phase_restore "$@"
+      ;;
+    -h|--help|help) usage ;;
+    *) log_error "unknown phase: ${phase}"; usage; exit 1 ;;
+  esac
+}
+
+main "$@"
