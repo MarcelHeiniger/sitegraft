@@ -44,10 +44,21 @@ scan → plan → backup → graft → verify → (restore if needed)
 - **restore** — one command, rolls B back to its pre-graft state.
 
 Every phase is independently re-runnable and inspectable. Nothing is destructive
-until `backup` has completed successfully. `graft` also refuses to run if B's
-active theme, Etch, or ACSS version doesn't match A's — grafted content with
-nothing to render it is a failure mode, not a success — unless you explicitly
-pass `--allow-stack-mismatch` and confirm you mean it.
+until `backup` has completed successfully.
+
+**Safety gates.** If B's active theme, Etch, or ACSS is missing or a different
+version than A's, `plan` offers to copy the component from A and activate it on
+B (never installed from anywhere else — sitegraft only ever replicates what's
+already on A); a version already on B is never silently overwritten, that
+needs its own explicit confirmation. Anything left unresolved makes `graft`
+refuse outright unless you pass `--allow-stack-mismatch` and confirm you mean
+it. Separately, if `scan` finds signs of custom code tied to B's current theme
+(a child theme, a populated `functions.php`, mu-plugins, known snippet-manager
+plugins), `plan` won't write a manifest at all until you explicitly confirm
+you've reviewed it — replacing the theme would otherwise silently stop that
+code from running. (`backup` already archives all of `wp-content`, so nothing
+is truly lost either way — the gate is there to prevent a surprise, not to
+prevent data loss that's already covered.)
 
 ## The module system
 
