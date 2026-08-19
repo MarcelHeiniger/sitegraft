@@ -407,6 +407,10 @@ wp --path="$WP_PATH" option list --format=json          # full dump — filtered
 wp --path="$WP_PATH" db tables --format=json --all-tables-with-prefix
 wp --path="$WP_PATH" plugin list --format=json           # helps with module detection
 ```
+```sh
+wp --path="$WP_PATH" theme list --status=active --format=json
+wp --path="$WP_PATH" menu list --format=json             # classic nav menus, see §14
+```
 Writes `scan-a.json` and `scan-b.json` to the state directory. Strictly read-only —
 no writes to A or B. Freely re-runnable.
 
@@ -415,6 +419,16 @@ each site's navigation is a dynamic `wp:page-list` block (no hardcoded IDs) by
 inspecting the content of the `wp_navigation` posts it finds — never assumed, always
 verified per site, result recorded in `scan-*.json`
 (`"nav_uses_dynamic_page_list": true/false`).
+
+**Rendering stack (see §13):** `scan` also records each site's active theme
+(`active_theme.stylesheet`/`.version`) and, via the existing `plugin list` dump,
+every plugin's version — this is what `plan` and `graft` use to detect a stack
+mismatch between A and B before any content is transferred.
+
+**Classic menus (see §14):** `scan` records whether A has any classic nav menus
+with items (`wp menu list` / `wp menu item list` non-empty) as
+`"classic_menus_detected": true/false` plus the menu names, so `plan` can warn —
+v1 has no module that migrates classic menu assignments.
 
 ### 6.2 `plan` (interactive, writes only locally)
 
@@ -440,16 +454,38 @@ ssh "$SITE_B_SSH_HOST" "tar czf - -C $(dirname "$SITE_B_WP_PATH") wp-content" \
 ```
 Then generates `$STATE_DIR/restore.sh` — a self-contained script that hardcodes
 (inside the run, not the repo) the backup path and the same wp-cli/rsync commands in
-reverse, ready to run with no other context needed. Also computes
-`checksums_protected_pre_graft` (sha256 of the protected tables/options exports) and
-writes them into `manifest.json`. Marks `$STATE_DIR/backup.complete` — `graft`
-refuses to start without this marker.
+reverse, ready to run with no other context needed. **Self-contained means literal:**
+`restore.sh` bakes in the resolved ssh/rsync/wp-cli command lines at generation time
+and never calls back into a sitegraft bash function — a script that shells out to
+`wp_remote` (or any other sitegraft helper) would fail the moment it's copied
+anywhere without a sitegraft checkout, which defeats the point of a standalone
+rollback script. Also computes `checksums_protected_pre_graft` (sha256 of the
+protected tables/options exports) and writes them into `manifest.json`. Marks
+`$STATE_DIR/backup.complete` — `graft` refuses to start without this marker.
+
+**Checksum normalization (applies everywhere a protected-data checksum is taken —
+`backup`, `verify`, and the DDEV harness use the exact same normalization):**
+`wp db export` shells out to `mysqldump`, whose output embeds a
+`-- Dump completed on …` timestamp comment (and similar `-- ` comment lines). Two
+exports of byte-identical data taken seconds apart will hash differently if the raw
+dump is hashed directly. Every checksum in this tool is therefore computed over the
+dump with all lines starting with `-- ` stripped first — a single shared function,
+never three different implementations, so the three call sites can never drift.
 
 ### 6.4 `graft`
 
+0. **Precondition — rendering stack (see §13):** refuses to start unless A's and
+   B's active theme and Etch/ACSS versions match, per `scan`'s recorded data —
+   unless launched with the explicit `--allow-stack-mismatch` override, which still
+   requires a loud, hard-to-miss confirmation before continuing. This check runs
+   before step 1, so a mismatch is caught before anything is touched.
 1. **Media**: `rsync -avz --ignore-existing` of `wp-content/uploads/` A → B (never
    overwriting a file already present on B — protects media already used by the
-   protected plugin in case of a filename collision).
+   protected plugin in case of a filename collision). **Routed through the
+   orchestrator, not A→B directly** — exactly like the WXR transfer in step 5: A is
+   never assumed to be reachable from B (or vice versa), only from the
+   orchestrator. Media is pulled A → orchestrator (into the run directory) and then
+   pushed orchestrator → B.
 2. **Mu-plugin**: drop `mu-plugins/sitegraft-id-mapper.php` onto B via `rsync`.
 3. **WXR export on A**, filtered to the manifest's post_types:
    ```sh
@@ -487,9 +523,17 @@ Each sub-step drops a marker `$STATE_DIR/graft.step<N>.done` — an interrupted
 ### 6.5 `verify` (read-only on B)
 
 - Recounts migrated post_types (A before vs. B after, expecting consistency).
-- Recomputes checksums of protected data, compares against
-  `manifest.checksums_protected_pre_graft` — **any mismatch is a hard failure**.
-- Verifies that B's `show_on_front`/`page_on_front` resolves to an existing page.
+- Recomputes checksums of protected data (same normalization as `backup`, see §6.3),
+  compares against `manifest.checksums_protected_pre_graft` — **any mismatch is a
+  hard failure**.
+- Spot-checks that migrated options carry the exact values fetched from A (e.g. the
+  option file written during `graft`'s options step vs. B's live value) — catches a
+  silently-skipped or partially-applied options migration.
+- Verifies that B's `show_on_front`/`page_on_front` resolves to an existing page
+  (and, when `page_on_front` was remapped, that it resolves to the **correct**
+  remapped page, not merely *some* existing page).
+- Verifies A's domain string is **absent** from B's imported content (posts,
+  postmeta, options) — catches an incomplete or broken domain search-replace.
 - Verifies the expected navigation is present.
 - Verifies (best-effort, `curl -sS -o /dev/null -w '%{http_code}'`) that B's root
   URL returns 200.
@@ -559,25 +603,32 @@ domain is handled separately (§9.4). The ID must be remapped precisely, with no
 collisions.
 
 **Two-pass sentinel technique** — to eliminate any risk that a new ID already
-substituted gets re-matched by an old ID processed later in the same batch:
+substituted gets re-matched by an old ID processed later in the same batch. **Both
+passes are scoped with `--tables=` to the content tables only**
+(`{$prefix}posts,{$prefix}postmeta,{$prefix}options` — computed once from B's live
+`$wpdb->prefix`) — this is deliberate and non-negotiable: `wp search-replace`
+without `--tables=` scans every table sharing the site's prefix, which would include
+any protected plugin's tables and directly violate the tool's core promise:
 
 ```sh
+CONTENT_TABLES="${B_PREFIX}posts,${B_PREFIX}postmeta,${B_PREFIX}options"
+
 # Pass 1: old_id -> unique sentinel token
 while IFS=$'\t' read -r old_id new_id post_type; do
   [ "$post_type" = "attachment" ] || continue
   wp --path="$SITE_B_WP_PATH" search-replace \
     "\"id\":${old_id}(?!\d)" "\"id\":__SITEGRAFT_${old_id}__" \
-    --regex --precise --skip-columns=guid
+    --tables="$CONTENT_TABLES" --regex --precise --skip-columns=guid
   wp --path="$SITE_B_WP_PATH" search-replace \
     "wp-image-${old_id}(?!\d)" "wp-image-__SITEGRAFT_${old_id}__" \
-    --regex --precise --skip-columns=guid
+    --tables="$CONTENT_TABLES" --regex --precise --skip-columns=guid
 done < "$STATE_DIR/id-map.tsv"
 
 # Pass 2: sentinel token -> real new_id
 while IFS=$'\t' read -r old_id new_id post_type; do
   [ "$post_type" = "attachment" ] || continue
   wp --path="$SITE_B_WP_PATH" search-replace \
-    "__SITEGRAFT_${old_id}__" "${new_id}" --precise --skip-columns=guid
+    "__SITEGRAFT_${old_id}__" "${new_id}" --tables="$CONTENT_TABLES" --precise --skip-columns=guid
 done < "$STATE_DIR/id-map.tsv"
 ```
 
@@ -614,13 +665,15 @@ core_wp_post_import() {
 ### 9.4 Domain search-replace, A→B
 
 Two mandatory passes (a plain variant and a JSON-escaped variant, since Etch stores
-some data as JSON blobs in certain options/postmeta):
+some data as JSON blobs in certain options/postmeta), **scoped with the same
+`--tables=$CONTENT_TABLES` as §9.1** for the same non-negotiable reason — a
+protected plugin's own tables never get anywhere near a `search-replace` call:
 
 ```sh
 wp --path="$SITE_B_WP_PATH" search-replace 'https://a.example.com' 'https://b.example.com' \
-  --skip-columns=guid --precise
+  --tables="$CONTENT_TABLES" --skip-columns=guid --precise
 wp --path="$SITE_B_WP_PATH" search-replace 'https:\/\/a.example.com' 'https:\/\/b.example.com' \
-  --skip-columns=guid --precise
+  --tables="$CONTENT_TABLES" --skip-columns=guid --precise
 ```
 
 `--skip-columns=guid`: WordPress's `guid` isn't supposed to change after creation —
@@ -628,7 +681,22 @@ let wp-cli/the import handle its value natively instead of rewriting it by hand.
 
 ## 10. DDEV test harness
 
-`tests/integration/ddev-harness.sh` orchestrates:
+`tests/integration/ddev-harness.sh` is **built incrementally, not as a single
+monolithic script written at the end.** A minimal skeleton (spin up two disposable
+sites, seed the fixtures below, tear down) ships with the plan's very first step,
+so every later phase gets real integration feedback the moment it's implemented
+instead of meeting a real WordPress install for the first time at the very end.
+The harness's assertions grow phase by phase:
+
+- After `scan` lands: the fixtures seeded on A and B are visible in the resulting
+  `scan-*.json` (post_types, options, active theme, and — see §14 — no false
+  positive on classic menus for these fixtures).
+- After `backup` lands: the backup files exist (`b-db.sql.gz`, the `b-wp-content/`
+  tree) and re-hashing them immediately produces the same checksum (normalization
+  in §6.3 is stable, not merely "usually the same").
+- After `graft` lands: the full set of assertions below.
+
+Orchestration:
 
 1. `ddev config` + `ddev start` for two disposable projects (site "A" and site "B"),
    WP core installed via `wp core install`.
@@ -648,7 +716,15 @@ let wp-cli/the import handle its value natively instead of rewriting it by hand.
    manifest passed as an argument, to automate the test).
 6. **Central assertion**: recompute checksums of B's protected data, compare
    byte-for-byte against step 4's snapshot.
-7. Secondary assertion: A's migrated content is present and rendered on B.
+7. **Positive assertions** — a passing run must also prove the migration actually
+   did its job, not merely that it left protected data alone:
+   - A's migrated content (e.g. the seeded `etch_cfs` post) is present and
+     rendered on B.
+   - A's migrated options are present on B with the **exact values** seeded on A
+     (e.g. `etch_settings`), not merely "some value."
+   - `page_on_front` on B, if remapped, resolves to the correct migrated page (not
+     just *any* existing page).
+   - A's domain string is **absent** from B's imported content.
 8. `sitegraft restore`, then another comparison: B returns exactly to its
    pre-graft state (both the design layer and the protected data).
 9. Teardown `trap`: `ddev delete -O` on both projects, whether the run succeeded or
@@ -664,7 +740,59 @@ let wp-cli/the import handle its value natively instead of rewriting it by hand.
 | Deep page hierarchies | `plan` **validates** that if a hierarchical post_type (`page`) is selected, ALL of its potential ancestors are selected too (same post_type, all-or-nothing migration) — a partial hierarchy import isn't a supported case in v1 (YAGNI: sitegraft migrates whole post_types, not subtrees). |
 | Idempotent reimport | Every post imported by sitegraft carries `_sitegraft_source_id` (set by the mu-plugin, §7). Before any import, `graft` lists and deletes (`wp post delete --force`) any post of the selected post_types carrying this meta from a previous run — a rerun never duplicates content. Distinct from the `clean` step (which removes B's **original pre-existing** content, not content sitegraft placed itself). |
 
-## 12. Self-review (2026-08-19)
+## 12. Design-layer stack precondition (product decision)
+
+sitegraft migrates *content, options, and media* — it never installs or configures
+the *rendering stack* those things depend on (the active theme, Etch, ACSS). If B
+doesn't run the same stack as A, the grafted content has nothing to render it: the
+run would "succeed" by every content-level measure while producing a visually
+broken site.
+
+**Decision:** sitegraft never installs the stack on B. That step is Marcel's
+(or whoever operates the tool) responsibility, done however a theme/plugin
+normally gets onto a site — outside sitegraft's scope, deliberately. What
+sitegraft *does* do is refuse to proceed blindly:
+
+- `scan` records each site's active theme (`stylesheet`/`version`) and every
+  plugin's version (already dumped via `plugin list`) — see §6.1.
+- `plan` warns loudly (not a hard failure — `plan` only ever builds a manifest,
+  it doesn't touch B) if A's and B's active theme or Etch/ACSS versions differ.
+- `graft` treats the same mismatch as a **hard precondition failure** — see §6.4
+  step 0 — refusing to run at all unless launched with an explicit
+  `--allow-stack-mismatch` flag, and even then only after a loud, unmissable
+  confirmation prompt (not the same quiet `gum confirm` used elsewhere — this one
+  states plainly that the grafted content may render as nothing on B).
+
+This is a scope boundary, not an oversight: automatically installing themes/plugins
+on a live client site is a materially different (and riskier) kind of automation
+than migrating content sitegraft already owns end-to-end. If a future version ever
+takes this on, it should be its own deliberately-scoped module, not a silent
+addition to `graft`.
+
+## 13. Navigation scope: block themes only in v1
+
+§0 point 11 and §6.1 cover block-theme navigation exclusively — dynamic
+`wp:page-list` blocks and `wp_navigation` posts. **Classic menus
+(`nav_menu`/`nav_menu_item`, the `wp_nav_menu()` theme-location system) are
+explicitly out of scope for v1.** This is a deliberate assumption, not a gap that
+slipped through:
+
+- Etch is a block-theme/FSE-first builder — the primary use case (Etch site A →
+  live site B) is block-theme territory already.
+- Classic menus carry theme-location assignments (`register_nav_menu` slugs) that
+  are meaningless without knowing B's theme's registered locations — migrating
+  them correctly needs its own module, not a generic core feature.
+
+`scan` still **detects** classic menus on A (`wp menu list`, see §6.1) and records
+whether any exist with items assigned, purely so `plan` can surface a warning
+("A has N classic menu(s) with items — sitegraft v1 does not migrate classic menu
+assignments, migrate them by hand or write a module") rather than silently
+dropping something the operator might expect to be handled. A `modules/classic-
+menus.sh` is a plausible future module (own post_type is `nav_menu_item`, own
+taxonomy is `nav_menu`) — not attempted in v1 (YAGNI): no current sitegraft use
+case runs against a classic-menu theme.
+
+## 14. Self-review (2026-08-19)
 
 Review pass done by Rosalinde after the full write-up:
 - **Placeholders/TBD**: none found — every wp-cli command, file format, and code
@@ -678,3 +806,24 @@ Review pass done by Rosalinde after the full write-up:
   §6.6 and §11 to avoid any confusion in the implementation plan.
 - **Risks**: recorded explicitly in §0.2 (R1-R4) rather than buried in the prose, so
   Nat can have Marcel rule on them without having to extract them herself.
+
+### 14.1 Second pass (2026-08-19) — resolving the independent plan review
+
+An independent review of the plan against this design doc (`docs/plans/2026-08-19-
+sitegraft-plan-review.md`, done by Kimi before Step 1 started) found 7 concrete
+plan-code defects (A1-A7 — missing options-migration step, a non-self-contained
+`restore.sh`, a missing wp-content backup, unhandled remote-A transfers, unstable
+mysqldump-timestamp checksums, unscoped search-replace calls, missing
+wordpress-importer provisioning) and 3 scope gaps this design doc hadn't addressed
+at all (B1 — no rendering-stack precondition, now §12; B2 — no classic-menu
+handling or documented assumption, now §13; B3 — the DDEV harness's positive
+assertions were too weak to catch A1 or a broken remap). All were resolved: the
+plan's code was fixed, and this design doc gained §12-§13 plus the clarifications
+folded into §6.1, §6.3, §6.4, §6.5, §9.1, and §9.4 above. C1's sequencing
+recommendation (build the DDEV harness incrementally from the plan's first step,
+not as a big-bang integration effort at the end) reshaped §10 and the plan's step
+structure. Every finding's resolution is recorded, one line each, directly in the
+review file — nothing here duplicates that log. R1-R4 (§0.2) and the two open items
+they left (a real Etch-content dry run, a real MotoPress-shaped module) remain
+unresolved by design: closing R2/R4 with a first real dry run against a genuine A/B
+pair is now an explicit pre-v1.0.0 checklist item (`docs/definition-of-done.md`).
