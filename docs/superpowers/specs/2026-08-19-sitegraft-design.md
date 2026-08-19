@@ -338,11 +338,39 @@ Produced by `plan`, frozen, consumed as-is by `graft`. JSON, parsed via `jq`.
   "options": {
     "search_replace": { "from": "https://a.example.com", "to": "https://b.example.com" }
   },
+  "stack": {
+    "theme": { "on_a": "etch-theme", "on_b": null, "resolution": "copy" },
+    "etch": { "on_a": "2.0", "on_b": null, "resolution": "copy" },
+    "acss": { "on_a": "3.0", "on_b": "2.5", "resolution": "skip" }
+  },
+  "custom_code_review": {
+    "acknowledged": true,
+    "signals": {
+      "child_theme": true,
+      "functions_php": { "exists": true, "bytes": 4213, "lines": 187 },
+      "mu_plugins": ["custom-redirects.php"],
+      "snippet_plugins_detected": ["code-snippets"]
+    }
+  },
   "checksums_protected_pre_graft": {
     "example-plugin": "sha256:…"
   }
 }
 ```
+
+`stack` (§12) records `plan`'s resolution for each of the three tracked stack
+components (theme, `etch`, `acss`) whenever A's and B's versions differ.
+`on_b: null` means the component was entirely absent on B; a version string means
+present but different. `resolution` is `"copy"` (operator confirmed — `graft`
+will `rsync` the component from A to B and activate it) or `"skip"` (operator
+declined, or the mismatch hasn't been resolved yet — `graft`'s hard precondition
+applies, see §6.4 step 0b). A component absent from `stack` entirely means A and
+B already matched at `plan` time — nothing to resolve.
+
+`custom_code_review` (§14) is present only when `scan-b.json.custom_code_detected`
+was `true` — its `acknowledged: true` is the only way `plan` ever freezes a
+manifest for a B with any custom-code signal raised; `signals` is a frozen copy
+of what `scan` found, kept for the record rather than re-read live at `graft` time.
 
 Validation rules (`lib/manifest.sh :: manifest_validate`):
 - `frozen` must be `true` for `graft` to accept the manifest.
@@ -409,26 +437,65 @@ wp --path="$WP_PATH" plugin list --format=json           # helps with module det
 ```
 ```sh
 wp --path="$WP_PATH" theme list --status=active --format=json
-wp --path="$WP_PATH" menu list --format=json             # classic nav menus, see §14
+wp --path="$WP_PATH" menu list --format=json             # classic nav menus, see §13 — checked on both sites, only meaningful as a warning on A
 ```
 Writes `scan-a.json` and `scan-b.json` to the state directory. Strictly read-only —
 no writes to A or B. Freely re-runnable.
 
-The Etch-specific check Marcel asked for (§0, point 11): `scan` also checks whether
-each site's navigation is a dynamic `wp:page-list` block (no hardcoded IDs) by
+The Etch-specific check Marcel asked for (§0, point 11): `scan` checks whether
+**A's** navigation is a dynamic `wp:page-list` block (no hardcoded IDs) by
 inspecting the content of the `wp_navigation` posts it finds — never assumed, always
-verified per site, result recorded in `scan-*.json`
-(`"nav_uses_dynamic_page_list": true/false`).
+verified, result recorded in `scan-a.json` (`"nav_uses_dynamic_page_list":
+true/false`). This is an A-only check by nature — B's navigation, whatever form it
+takes, is either being replaced or is none of sitegraft's business (§13).
 
-**Rendering stack (see §13):** `scan` also records each site's active theme
+**Rendering stack (see §12):** `scan` also records each site's active theme
 (`active_theme.stylesheet`/`.version`) and, via the existing `plugin list` dump,
 every plugin's version — this is what `plan` and `graft` use to detect a stack
-mismatch between A and B before any content is transferred.
+mismatch between A and B, and (§12) to offer copying a missing component from A
+to B, before any content is transferred. **This is not a check that B must
+already resemble A** — quite the opposite; see §12 and §13 for why B running
+something entirely different (Divi, Elementor, a classic theme) is the normal
+case this check exists to handle gracefully, not to reject.
 
-**Classic menus (see §14):** `scan` records whether A has any classic nav menus
-with items (`wp menu list` / `wp menu item list` non-empty) as
-`"classic_menus_detected": true/false` plus the menu names, so `plan` can warn —
-v1 has no module that migrates classic menu assignments.
+**Classic menus (see §13):** `scan` records, **for both sites**, whether any
+classic nav menus exist with items assigned
+(`"classic_menus_detected": true/false` plus the menu names) — but `plan` only
+ever turns this into a warning **for A** ("A has N classic menu(s) with items —
+sitegraft v1 does not migrate classic menu assignments"). B having classic menus
+triggers no warning: it is B's own, pre-existing navigation, not a defect.
+
+**Custom code on B (see §14):** `scan` also collects a small set of heuristic
+signals — **on B only**, deliberately shallow (no code parsing, no static
+analysis — YAGNI):
+
+```sh
+wp --path="$SITE_B_WP_PATH" theme get --field=template "$(wp theme list --status=active --field=name)"
+wp --path="$SITE_B_WP_PATH" eval 'if (file_exists($f = get_stylesheet_directory()."/functions.php")) { echo json_encode(["exists"=>true,"bytes"=>filesize($f),"lines"=>count(file($f))]); } else { echo json_encode(["exists"=>false]); }'
+wp --path="$SITE_B_WP_PATH" eval 'echo json_encode(array_map("basename", glob(WP_CONTENT_DIR."/mu-plugins/*.php") ?: []));'
+```
+
+recorded in `scan-b.json` as:
+
+```jsonc
+"custom_code_signals": {
+  "child_theme": true,
+  "functions_php": { "exists": true, "bytes": 4213, "lines": 187 },
+  "mu_plugins": ["custom-redirects.php"],
+  "snippet_plugins_detected": ["code-snippets"]
+},
+"custom_code_detected": true
+```
+
+`child_theme` is `true` when the active theme's `template` differs from its own
+`name` (WordPress's own definition of a child theme). `snippet_plugins_detected`
+cross-references the existing `plugin list` dump against a short, deliberately
+extensible list of known snippet-manager slugs (`code-snippets`, `wpcode`,
+`insert-headers-and-footers`, …) — add to the list as new ones come up, don't
+build a general plugin classifier. `custom_code_detected` is `true` iff any of
+the four signals is non-empty/`true` — the single boolean `plan`'s gate (§14)
+checks. None of this is checked on A — A is a fresh Etch build; this signal set
+exists specifically to catch what B might be quietly running.
 
 ### 6.2 `plan` (interactive, writes only locally)
 
@@ -437,11 +504,38 @@ v1 has no module that migrates classic menu assignments.
 3. Builds the defaults: modules detected on A with Etch/ACSS content → pre-checked
    on the migration side; modules detected on B and absent from the migration
    selection → pre-checked on the protection side.
-4. `gum choose --no-limit` (fallback `fzf`, fallback a numbered list + text prompt)
-   to fine-tune the selection (individual post_types and option_keys).
-5. Validates (no migrate/protect conflict, see §4), computes the `_unclaimed` bucket
+4. **Custom-code awareness gate (§14) — blocking, not a warning:** if
+   `scan-b.json.custom_code_detected` is `true`, `plan` stops here and requires
+   an explicit typed/`gum confirm` acknowledgment — the exact same weight as
+   `--allow-stack-mismatch`'s override, not a message that scrolls past:
+   *"Did you review B's theme for custom code (functions.php, code snippets,
+   mu-plugins) before replacing the theme? Custom code living in the old theme
+   will be LOST."* Declining means `plan` **exits without writing a manifest at
+   all** — nothing built in steps 1-3 above is kept; there is nothing to resume
+   until the operator re-runs `plan` ready to acknowledge. Accepting records
+   `manifest.custom_code_review = {"acknowledged": true, "signals": {...}}` (a
+   copy of `scan-b.json.custom_code_signals`, for the record). No signals
+   raised → this step is invisible, nothing to acknowledge. Runs before any
+   further step below, since none of them should matter until this is settled.
+5. **Stack resolution (§12) — for each of `theme`/`etch`/`acss` where A and B
+   differ:**
+   - **Absent on B:** "`etch` is on A (v2.0) but not on B — copy it from A and
+     activate it on B? [y/N]" (`gum confirm`, plain wording, defaults to the
+     common case). Accepted → `stack.<component> = {..., "resolution": "copy"}`.
+   - **Present on B, different version:** a **louder** warning first ("B already
+     has `acss` v2.5 installed — A has v3.0. Copying A's version will **replace**
+     B's existing install."), then a **separate** confirm before the same copy
+     is offered — never the same single keystroke as the absent case. Declined
+     or accepted, same as above, into `stack.<component>.resolution`.
+   - **Declined (either case):** `stack.<component> = {..., "resolution": "skip"}`
+     — `graft`'s hard precondition (§6.4 step 0b) will apply to it.
+   - Matching components are simply omitted from `stack` — nothing to resolve.
+6. `gum choose --no-limit` (fallback `fzf`, fallback a numbered list + text prompt)
+   to fine-tune the migrate/protect selection (individual post_types and
+   option_keys).
+7. Validates (no migrate/protect conflict, see §4), computes the `_unclaimed` bucket
    automatically, writes `manifest.json` with `"frozen": false`.
-6. Explicit confirmation (`gum confirm "Freeze this manifest?"`) → `"frozen": true`.
+8. Explicit confirmation (`gum confirm "Freeze this manifest?"`) → `"frozen": true`.
 
 ### 6.3 `backup` (writes only to the orchestrator's state dir — B not deeply touched yet)
 
@@ -474,11 +568,21 @@ never three different implementations, so the three call sites can never drift.
 
 ### 6.4 `graft`
 
-0. **Precondition — rendering stack (see §13):** refuses to start unless A's and
-   B's active theme and Etch/ACSS versions match, per `scan`'s recorded data —
-   unless launched with the explicit `--allow-stack-mismatch` override, which still
-   requires a loud, hard-to-miss confirmation before continuing. This check runs
-   before step 1, so a mismatch is caught before anything is touched.
+0a. **Stack sync (see §12):** for every `stack.<component>` in the manifest with
+    `"resolution": "copy"`, `rsync` that component's plugin/theme directory
+    A → orchestrator (into the run dir) → B — the same two-hop routing as every
+    other transfer, never `scp`, never a direct A↔B connection — then
+    `wp plugin activate <slug>` or `wp theme activate <stylesheet>` on B. Marker-
+    gated like every other step. This is the **only** place `graft` ever writes
+    to B's `wp-content/themes/` or `wp-content/plugins/`, and it only ever
+    copies from A — never downloads from wp.org or any other external source.
+0b. **Precondition — remaining stack mismatches (see §12):** after 0a, refuses to
+    continue if A's and B's active theme or Etch/ACSS versions still differ (i.e.
+    components the manifest recorded as `"resolution": "skip"`, or a new
+    mismatch `plan` never saw because B changed since) — unless launched with the
+    explicit `--allow-stack-mismatch` override, which still requires a loud,
+    hard-to-miss confirmation before continuing. This runs before step 1, so a
+    mismatch is caught before anything is touched.
 1. **Media**: `rsync -avz --ignore-existing` of `wp-content/uploads/` A → B (never
    overwriting a file already present on B — protects media already used by the
    protected plugin in case of a filename collision). **Routed through the
@@ -537,6 +641,12 @@ Each sub-step drops a marker `$STATE_DIR/graft.step<N>.done` — an interrupted
 - Verifies the expected navigation is present.
 - Verifies (best-effort, `curl -sS -o /dev/null -w '%{http_code}'`) that B's root
   URL returns 200.
+- **Lists every stack component `graft` copied from A** (§12, from
+  `manifest.stack.*.resolution == "copy"`) as an explicit reminder: *"Etch was
+  copied from A and activated on B — it is unlicensed. Re-license it on B before
+  going live."* Not a check that can pass or fail (licensing isn't something
+  sitegraft can verify), just a reminder that would otherwise be easy to forget
+  once the run reports success.
 - Writes `$STATE_DIR/verify-report.md`, exits non-zero on a hard failure.
 
 ### 6.6 `clean` (an optional sub-step of `graft`, never run on its own)
@@ -689,8 +799,8 @@ instead of meeting a real WordPress install for the first time at the very end.
 The harness's assertions grow phase by phase:
 
 - After `scan` lands: the fixtures seeded on A and B are visible in the resulting
-  `scan-*.json` (post_types, options, active theme, and — see §14 — no false
-  positive on classic menus for these fixtures).
+  `scan-*.json` (post_types, options, active theme, and — see §13 — no false
+  positive on classic menus for A's fixture).
 - After `backup` lands: the backup files exist (`b-db.sql.gz`, the `b-wp-content/`
   tree) and re-hashing them immediately produces the same checksum (normalization
   in §6.3 is stable, not merely "usually the same").
@@ -742,57 +852,170 @@ Orchestration:
 
 ## 12. Design-layer stack precondition (product decision)
 
-sitegraft migrates *content, options, and media* — it never installs or configures
-the *rendering stack* those things depend on (the active theme, Etch, ACSS). If B
-doesn't run the same stack as A, the grafted content has nothing to render it: the
-run would "succeed" by every content-level measure while producing a visually
-broken site.
+sitegraft migrates *content, options, and media*. The *rendering stack* those
+things depend on (the active theme, Etch, ACSS) is a different kind of thing —
+code, not content — and B needing it is not an edge case: **the single most common
+real invocation of sitegraft is a B that runs an entirely different stack from A**
+(a legacy Divi, Elementor, or Bricks site, or a classic theme with none of Etch/
+ACSS installed at all — see §13, this is the normal case B2 describes, not a
+failure mode). If B doesn't end up running the same stack as A, the grafted
+content has nothing to render it: the run would "succeed" by every content-level
+measure while producing a visually broken site.
 
-**Decision:** sitegraft never installs the stack on B. That step is Marcel's
-(or whoever operates the tool) responsibility, done however a theme/plugin
-normally gets onto a site — outside sitegraft's scope, deliberately. What
-sitegraft *does* do is refuse to proceed blindly:
+**Decision: sitegraft never installs anything from an external source — it only
+replicates what already exists on A.** There is a real difference between those
+two things. "Installing a stack" could mean downloading a theme from wp.org or a
+plugin marketplace, activating a license, resolving a version sitegraft has never
+seen — real, riskier automation that has no place quietly happening inside
+`graft`. "Replicating from A" means copying files sitegraft can already read,
+onto a site it already has write access to, because the operator explicitly asked
+for exactly that pairing (A → B) in the profile. sitegraft does the second thing,
+opt-in, never the first.
+
+Concretely:
 
 - `scan` records each site's active theme (`stylesheet`/`version`) and every
   plugin's version (already dumped via `plugin list`) — see §6.1.
-- `plan` warns loudly (not a hard failure — `plan` only ever builds a manifest,
-  it doesn't touch B) if A's and B's active theme or Etch/ACSS versions differ.
-- `graft` treats the same mismatch as a **hard precondition failure** — see §6.4
-  step 0 — refusing to run at all unless launched with an explicit
-  `--allow-stack-mismatch` flag, and even then only after a loud, unmissable
-  confirmation prompt (not the same quiet `gum confirm` used elsewhere — this one
-  states plainly that the grafted content may render as nothing on B).
+- For each stack component (active theme, Etch, ACSS) where A and B differ,
+  `plan` resolves it interactively into the manifest's new `stack` key (§4) — see
+  §6.2 for the exact flow:
+  - **Absent on B:** offers to copy it — `rsync` the plugin/theme directory
+    A → orchestrator → B (never `scp`, never A↔B directly — the same two-hop
+    routing as every other transfer in this tool), then `wp plugin activate` /
+    `wp theme activate` on B. A plain confirm; this is the common case (§13).
+  - **Present on B but a different version than A's:** **warns loudly** and
+    requires an **explicit, separate confirmation** before offering the same
+    copy — this overwrites something that already exists on B, which is a
+    heavier decision than filling an absence, and is never done automatically or
+    by the same quick keystroke as the absent case.
+  - **Declined either way:** the component stays an unresolved mismatch — see
+    below, unchanged from the original decision.
+  - Whatever the operator decides is recorded in the manifest, not re-asked at
+    `graft` time.
+- `graft`'s stack-sync step (§6.4 step 0a) executes every `stack.<component>`
+  decision recorded as `copy` — this is the only place sitegraft ever writes to
+  B's `wp-content/themes/` or `wp-content/plugins/`.
+- Any component **left unresolved** (declined, or newly detected at `graft` time
+  because `scan`/`plan` are re-runnable and B may have changed) is still a **hard
+  precondition failure** (§6.4 step 0b) — `graft` refuses to run unless launched
+  with `--allow-stack-mismatch`, and even then only after a loud, unmissable
+  confirmation distinct from the quiet `gum confirm` used elsewhere.
 
-This is a scope boundary, not an oversight: automatically installing themes/plugins
-on a live client site is a materially different (and riskier) kind of automation
-than migrating content sitegraft already owns end-to-end. If a future version ever
-takes this on, it should be its own deliberately-scoped module, not a silent
-addition to `graft`.
+**Guardrail — licensing is never touched, and this is a structural fact, not a
+policy choice sitegraft has to remember to honor.** The copy step `rsync`s a
+plugin or theme's *code directory* only. It never touches `wp_options` (that's a
+database table, categorically outside the scope of an `rsync` of a filesystem
+directory), and license keys for premium plugins are stored as options, not as
+files inside the plugin folder, in every case this tool has to deal with (Etch,
+ACSS). Combined with the pre-existing module-level exclusions (`etch_license_*`,
+`*_db_version`, etc. — §3.3 — never in any module's migrated `option_keys` to
+begin with), **a copied Etch/ACSS on B always comes up unlicensed.** This is not
+a gap to fix: re-licensing B is a deliberate manual step, done by a human, after
+the graft — `verify`'s report explicitly lists every stack component sitegraft
+copied, as a reminder that this step is still outstanding.
 
-## 13. Navigation scope: block themes only in v1
+This remains a scope boundary on the *installation* half of the problem, not an
+oversight: sitegraft will never reach out to wp.org, a marketplace, or any URL
+that isn't A itself. If a future version ever wants that, it should be its own
+deliberately-scoped module, not a silent addition to `graft`.
 
-§0 point 11 and §6.1 cover block-theme navigation exclusively — dynamic
-`wp:page-list` blocks and `wp_navigation` posts. **Classic menus
-(`nav_menu`/`nav_menu_item`, the `wp_nav_menu()` theme-location system) are
-explicitly out of scope for v1.** This is a deliberate assumption, not a gap that
-slipped through:
+## 13. Navigation scope: block themes only on A (source) in v1
 
-- Etch is a block-theme/FSE-first builder — the primary use case (Etch site A →
-  live site B) is block-theme territory already.
+**Read this section carefully if you're evaluating sitegraft from the Etch
+community: this is a statement about site A only. It says nothing about what B
+has to be.**
+
+§0 point 11 and §6.1's navigation check cover block-theme navigation exclusively —
+dynamic `wp:page-list` blocks and `wp_navigation` posts — **and this applies only
+to A, the Etch build being migrated from.** sitegraft's whole premise requires A
+to be a block-theme/FSE Etch site; that part was never in question.
+
+**B is a completely different story, and this is the important part: B running a
+legacy stack — Divi, Elementor, Bricks, a classic (non-block) theme, classic nav
+menus, whatever it is — is not merely tolerated, it is the *primary, expected*
+case sitegraft exists for.** B's entire design layer being something other than
+Etch is precisely the situation being replaced or protected around (see §12: the
+common case is B having none of Etch/ACSS installed at all, which `plan`/`graft`
+now handle by offering to copy the stack from A, not by requiring B to already
+match). Nothing in sitegraft ever inspects B's theme type as a gate on whether the
+tool can run — the stack check in §12 is about whether A's *specific* stack
+(Etch/ACSS/its theme) ends up present on B by the end of the run, never about
+what B's *original* stack was.
+
+**Classic menus (`nav_menu`/`nav_menu_item`, the `wp_nav_menu()` theme-location
+system) are explicitly out of scope for v1 — on A only.** This is a deliberate
+assumption, not a gap that slipped through:
+
+- Etch is a block-theme/FSE-first builder — A is block-theme territory by
+  construction, so a classic menu found on A would be unusual and worth a warning.
+- A classic menu found on **B** is completely unremarkable (B likely isn't a
+  block theme to begin with, per the point above) and triggers **no warning at
+  all** — there is nothing to warn about; it's B's existing navigation, doing
+  exactly what it's supposed to do until the graft replaces or coexists with it.
 - Classic menus carry theme-location assignments (`register_nav_menu` slugs) that
-  are meaningless without knowing B's theme's registered locations — migrating
-  them correctly needs its own module, not a generic core feature.
+  are meaningless without knowing the target theme's registered locations —
+  migrating them correctly (from A, if A ever had one) needs its own module, not
+  a generic core feature.
 
-`scan` still **detects** classic menus on A (`wp menu list`, see §6.1) and records
+`scan` **detects** classic menus on **A** (`wp menu list`, see §6.1) and records
 whether any exist with items assigned, purely so `plan` can surface a warning
 ("A has N classic menu(s) with items — sitegraft v1 does not migrate classic menu
 assignments, migrate them by hand or write a module") rather than silently
-dropping something the operator might expect to be handled. A `modules/classic-
+dropping something the operator might expect to be handled. `scan` collects the
+same data for B too (harmless, and occasionally useful context), but `plan` never
+warns about it — B having classic menus is not a problem, and framing it as one
+would be exactly the misreading this section exists to prevent. A `modules/classic-
 menus.sh` is a plausible future module (own post_type is `nav_menu_item`, own
-taxonomy is `nav_menu`) — not attempted in v1 (YAGNI): no current sitegraft use
-case runs against a classic-menu theme.
+taxonomy is `nav_menu`) for migrating a classic menu **from A** — not attempted in
+v1 (YAGNI): no current sitegraft use case runs against a classic-menu A.
 
-## 14. Self-review (2026-08-19)
+## 14. Custom code in B's theme (pre-graft awareness gate)
+
+`graft` replaces B's design layer. If B's *current* theme carries custom PHP —
+a child theme's `functions.php`, snippets, mu-plugins — that code stops running
+the moment the theme is no longer active, whether or not anyone remembered it
+was there. This is a distinct risk from §12's stack precondition: §12 is about
+whether the *new* stack renders; this section is about not losing track of
+something useful living in the *old* one.
+
+**What `scan` looks for on B (§6.1), shallow by design (no code parsing, YAGNI):**
+child theme (`template` ≠ `name`), presence/size/line-count of the active
+theme's `functions.php`, the `wp-content/mu-plugins/` file listing, and a short
+list of known snippet-manager plugin slugs. Any one of these being non-empty
+sets `custom_code_detected: true`.
+
+**The gate:** if `custom_code_detected` is `true`, `plan` (§6.2 step 4) blocks —
+it will not write a frozen manifest — until the operator explicitly
+acknowledges, with the exact same weight as `--allow-stack-mismatch`'s override
+(a distinct, hard-to-miss confirmation, never a warning that scrolls by):
+
+> *"Did you review B's theme for custom code (functions.php, code snippets,
+> mu-plugins) before replacing the theme? Custom code living in the old theme
+> will be LOST."*
+
+The acknowledgment (or its absence — `plan` simply doesn't produce a manifest
+until it's given) is recorded in `manifest.custom_code_review` (§4), alongside a
+frozen copy of the signals that triggered it, for the record.
+
+**What this gate is not:** snippets a snippet-manager *plugin* stores in its own
+database tables or options are already **plugin data** — covered by the
+default-deny module system (§3.5) like any other plugin, protected unless
+explicitly selected for migration, with no special-casing needed here. The risk
+this section exists for is narrower and different in kind: **code living in
+theme *files*** (`functions.php`, anything a child theme or an mu-plugin loads)
+that has no module, no database row, and no protection mechanism at all — it
+simply stops executing when the theme is swapped. That's not a class of thing
+`migrate`/`protect` selections can express; a confirmation gate is the right
+tool for a risk this shaped, not a manifest key.
+
+**And this is not data loss, even when it happens:** `backup` (§6.3, review
+finding A3) archives B's entire `wp-content/` — the old theme's files included —
+before `graft` touches anything. The gate exists to prevent a *surprise*, not to
+prevent *loss*; the safety net for loss is the backup, already mandatory before
+`graft` can run at all. An operator who declines to acknowledge, thinks better
+of it, and re-runs `plan` ready to proceed has lost nothing by having been asked.
+
+## 15. Self-review
 
 Review pass done by Rosalinde after the full write-up:
 - **Placeholders/TBD**: none found — every wp-cli command, file format, and code
@@ -807,7 +1030,7 @@ Review pass done by Rosalinde after the full write-up:
 - **Risks**: recorded explicitly in §0.2 (R1-R4) rather than buried in the prose, so
   Nat can have Marcel rule on them without having to extract them herself.
 
-### 14.1 Second pass (2026-08-19) — resolving the independent plan review
+### 15.1 Second pass (2026-08-19) — resolving the independent plan review
 
 An independent review of the plan against this design doc (`docs/plans/2026-08-19-
 sitegraft-plan-review.md`, done by Kimi before Step 1 started) found 7 concrete
@@ -827,3 +1050,47 @@ review file — nothing here duplicates that log. R1-R4 (§0.2) and the two open
 they left (a real Etch-content dry run, a real MotoPress-shaped module) remain
 unresolved by design: closing R2/R4 with a first real dry run against a genuine A/B
 pair is now an explicit pre-v1.0.0 checklist item (`docs/definition-of-done.md`).
+
+### 15.2 Third pass (2026-08-19) — Marcel's amendments to B1/B2
+
+Marcel amended the resolutions to B1 and B2 above before Step 1 started:
+
+- **B1 amended:** the original resolution (refuse + `--allow-stack-mismatch`
+  override, §15.1) was correct as a fallback but incomplete as the primary
+  behavior — it made "B already has A's exact stack" an implicit precondition,
+  when the actual common case is B running something else entirely (§13). §12
+  now describes `plan` offering to **copy** a missing or mismatched component
+  from A, with the refuse/override path kept only for whatever the operator
+  declines or never resolves. §4's manifest schema gained the `stack` key to
+  record the decision. Reworded the core sentence of §12 to the exact
+  distinction Marcel drew: *"sitegraft never installs anything from an external
+  source — it only replicates what already exists on A."*
+- **B2 clarified (no behavior change, wording only):** §13 and §6.1 were
+  rewritten so the block-themes-only assumption reads unambiguously as **A-only**
+  — B running Divi, Elementor, Bricks, or a classic theme is the normal,
+  supported, expected case (indeed the primary one), not a precondition failure.
+  The classic-menu warning was already A-only in the code (`phase_scan` never
+  checked B's `classic_menus_detected`); §13 previously didn't say so clearly
+  enough for a reader to be sure. It does now.
+
+This pass also caught two stale cross-references from §15.1's edits (§6.1 said
+"see §13" for the stack precondition, which is actually §12, and "see §14" for
+classic menus, which is §13) — fixed alongside the amendment.
+
+### 15.3 Fourth pass (2026-08-19) — custom-code-in-B's-theme awareness gate
+
+Marcel added a third guardrail in the same round as B1/B2: `graft` replacing B's
+design layer can silently discard custom PHP that only ran because B's old
+theme was active (`functions.php`, mu-plugins, snippet-manager content). New
+§14 documents the decision: `scan` collects shallow heuristic signals on B only
+(child theme, `functions.php` presence/size, mu-plugins listing, known
+snippet-plugin slugs — §6.1), and `plan` gates on them exactly as hard as the
+stack-mismatch override (§6.2 step 4) — not a scrollable warning, an explicit
+acknowledgment, or no manifest gets written. §4 gained `custom_code_review`
+to record it. Distinguished explicitly from data already protected by
+default-deny (a snippet plugin's own DB rows) versus the actual gap this closes
+(code living in theme files, which no module or protection mechanism covers) —
+and from data loss, since `backup`'s full `wp-content` archive (§6.3, finding
+A3) already makes the old theme's files recoverable regardless; this gate is
+about not being surprised, not about preventing loss that `backup` already
+prevents.
