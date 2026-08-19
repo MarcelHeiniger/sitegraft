@@ -1,28 +1,28 @@
-# ADR 0002 — Manifest en JSON, parsé via `jq`
+# ADR 0002 — Manifest as JSON, parsed via `jq`
 
-**Date :** 2026-08-19 · **Statut :** proposé (décision Rosalinde, à valider Marcel)
+**Date:** 2026-08-19 · **Status:** proposed (Rosalinde's decision, pending Marcel's validation)
 
-## Contexte
+## Context
 
-Le manifest produit par `plan` et consommé par `graft` doit représenter une
-structure imbriquée : par module, une liste de post_types, une liste d'option_keys,
-une liste de tables, plus un bucket `_unclaimed` de défaut-deny et des checksums
-calculés après coup par `backup`. Un format KEY=VALUE plat (à la manière des profils)
-ne représente pas proprement cette imbrication sans conventions de nommage fragiles
-(`MIGRATE_ETCH_POST_TYPES="a b c"`, etc.).
+The manifest produced by `plan` and consumed by `graft` needs to represent a nested
+structure: per module, a list of post_types, a list of option_keys, a list of
+tables, plus a default-deny `_unclaimed` bucket and checksums computed later by
+`backup`. A flat KEY=VALUE format (like the profiles) can't cleanly represent that
+nesting without fragile naming conventions (`MIGRATE_ETCH_POST_TYPES="a b c"`, etc.).
 
-## Décision
+## Decision
 
-Le manifest est un fichier JSON, lu et écrit exclusivement via `jq` dans `lib/manifest.sh`.
+The manifest is a JSON file, read and written exclusively via `jq` inside
+`lib/manifest.sh`.
 
-## Conséquences
+## Consequences
 
-- (+) Structure imbriquée native, lisible, versionnable, diffable proprement en git
-  (utile si un manifest de référence est un jour commité pour un test).
-- (+) `jq` est quasi-universel (`brew install jq`, `apt install jq`, déjà présent sur
-  beaucoup de machines de dev).
-- (−) Nouvelle dépendance runtime obligatoire (pas seulement de test) — à ajouter à la
-  liste de préflight (`sitegraft` doit vérifier sa présence et échouer proprement avec
-  un message d'installation sinon).
-- (−) Manipuler du JSON en bash reste plus verbeux que des variables shell — accepté
-  comme coût raisonnable vu la structure du problème.
+- (+) Native nested structure, readable, versionable, diffs cleanly in git (useful
+  if a reference manifest ever gets committed for a test).
+- (+) `jq` is nearly universal (`brew install jq`, `apt install jq`, already present
+  on many dev machines).
+- (−) A new mandatory runtime dependency (not just a test one) — added to the
+  preflight check list (`sitegraft` must verify its presence and fail cleanly with
+  an install hint otherwise).
+- (−) Handling JSON in bash is more verbose than plain shell variables — accepted
+  as a reasonable cost given the shape of the problem.

@@ -1,31 +1,32 @@
-# ADR 0001 — CLI bash modulaire à phases séparées
+# ADR 0001 — Modular bash CLI with separate phases
 
-**Date :** 2026-08-19 · **Statut :** accepté
+**Date:** 2026-08-19 · **Status:** accepted
 
-## Contexte
+## Context
 
-Marcel refond régulièrement des sites WordPress Etch/ACSS et doit répéter, à la main,
-le remplacement de la couche design/contenu d'un site cible vivant sans toucher aux
-données de ses plugins métier. Plusieurs architectures étaient possibles : un plugin
-WordPress installé sur le site cible, une application web (MCP/UI), ou un CLI
-autonome piloté depuis une machine tierce.
+Marcel regularly rebuilds WordPress Etch/ACSS sites and has to repeat, by hand, the
+job of replacing a live target site's design/content layer without touching its
+business plugins' data. Several architectures were possible: a WordPress plugin
+installed on the target site, a web application (MCP/UI), or a standalone CLI
+driven from a third machine.
 
-## Décision
+## Decision
 
-sitegraft est un CLI bash pur (pas de Python/Node, pas de plugin WordPress, pas de
-web-UI, pas de MCP), organisé en phases indépendantes et re-exécutables
-(`scan → plan → backup → graft → verify → restore`), avec un système de modules
-enfichables par fichier pour déclarer ce qui doit être migré vs protégé selon le
-plugin métier présent sur le site cible.
+sitegraft is a plain bash CLI (no Python/Node, no WordPress plugin, no web UI, no
+MCP), organized into independent, re-runnable phases
+(`scan → plan → backup → graft → verify → restore`), with a file-based pluggable
+module system to declare what should be migrated vs. protected depending on which
+business plugin is present on the target site.
 
-## Conséquences
+## Consequences
 
-- (+) Aucune installation persistante sur A ou B — l'outil ne laisse aucune trace une
-  fois le run terminé (hors le mu-plugin temporaire, retiré en fin de `graft`).
-- (+) Chaque phase est inspectable et rejouable indépendamment — un `graft` interrompu
-  ne force pas à recommencer un `scan`/`plan`/`backup` déjà faits.
-- (+) Le système de modules rend l'outil réutilisable sur toute future migration Etch,
-  quel que soit le plugin métier du site cible, sans toucher au cœur.
-- (−) Pas d'interface graphique — toute interaction reste en ligne de commande
-  (`gum`/`fzf` pour l'aspect interactif), acceptable pour un usage opérateur unique.
-- (−) La portabilité bash impose des contraintes de style de code (voir ADR 0003).
+- (+) No persistent installation on A or B — the tool leaves no trace once a run
+  finishes (aside from the temporary mu-plugin, removed at the end of `graft`).
+- (+) Each phase is independently inspectable and re-runnable — an interrupted
+  `graft` doesn't force redoing an already-completed `scan`/`plan`/`backup`.
+- (+) The module system makes the tool reusable across every future Etch
+  migration, whatever business plugin the target site runs, with no changes to
+  the core.
+- (−) No graphical interface — all interaction stays on the command line
+  (`gum`/`fzf` for the interactive parts), acceptable for a single-operator tool.
+- (−) Bash portability imposes code style constraints (see ADR 0003).

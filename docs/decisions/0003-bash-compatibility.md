@@ -1,29 +1,29 @@
-# ADR 0003 — Portabilité ciblée bash 3.2 (pas de tableaux associatifs)
+# ADR 0003 — Target bash 3.2 compatibility (no associative arrays)
 
-**Date :** 2026-08-19 · **Statut :** proposé (décision Rosalinde, à valider Marcel)
+**Date:** 2026-08-19 · **Status:** proposed (Rosalinde's decision, pending Marcel's validation)
 
-## Contexte
+## Context
 
-Le mandat demande une portabilité « n'importe quel Mac ou PC, macOS + Linux/WSL »
-avec des dépendances minimales, et demande explicitement de « décider et documenter »
-la version de bash ciblée. macOS embarque bash 3.2 par défaut (dernière version sous
-licence GPLv2, Apple n'a jamais mis à jour vers bash 4+ sous GPLv3). Le système de
-registre de modules (§3 du design doc) aurait naturellement utilisé un tableau
-associatif (`declare -A`) — disponible seulement depuis bash 4.
+The mandate calls for portability across "any Mac or PC, macOS + Linux/WSL" with
+minimal dependencies, and explicitly asks to "decide and document" the targeted
+bash version. macOS ships bash 3.2 by default (the last version under the GPLv2
+license — Apple never updated to GPLv3-licensed bash 4+). The module registry
+system (design doc §3) would naturally have used an associative array
+(`declare -A`) — available only from bash 4 onward.
 
-## Décision
+## Decision
 
-sitegraft cible la compatibilité bash 3.2. Aucune associative array, aucun `mapfile`,
-aucun `${var,,}` (lowercase natif bash 4+). Le registre de modules est une simple
-chaîne de noms séparés par espace, parcourue avec un `for` classique ; la présence
-d'une fonction de module optionnelle est testée avec `type -t`.
+sitegraft targets bash 3.2 compatibility. No associative arrays, no `mapfile`, no
+`${var,,}` (native lowercase, bash 4+ only). The module registry is a plain
+space-separated string of names, walked with a classic `for` loop; an optional
+module function's presence is checked with `type -t`.
 
-## Conséquences
+## Consequences
 
-- (+) Tourne sans rien installer de plus sur un Mac fraîchement sorti de la boîte.
-- (+) Cohérent avec l'esprit « dépendances minimales » du mandat.
-- (−) Style de code légèrement plus verbeux par endroits (pas de sucre syntaxique
-  bash 4+) — accepté, documenté dans `CLAUDE.md` du projet comme convention de code.
-- (−) Si l'outil grossit beaucoup (dizaines de modules), l'absence de tableau
-  associatif pourrait devenir gênante — non applicable en v1 (3 modules), à réévaluer
-  si le nombre de modules dépasse ce que des listes plates gèrent confortablement.
+- (+) Runs with nothing extra to install on a Mac straight out of the box.
+- (+) Consistent with the mandate's "minimal dependencies" spirit.
+- (−) Slightly more verbose code style in places (no bash 4+ syntactic sugar) —
+  accepted, documented in the project's `CLAUDE.md` as a code convention.
+- (−) If the tool grows a lot (dozens of modules), the lack of an associative
+  array could become awkward — not applicable in v1 (3 modules), to be revisited
+  if the module count outgrows what flat lists handle comfortably.
