@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # lib/inventory.sh — read-only site introspection (phase: scan).
 
+# Known "snippet" plugins whose mere active presence is itself a custom-code
+# signal on B (§14) — a named constant rather than an array literal inline
+# inside a jq program string, which is fragile to quote from the shell side
+# (Kimi's review note) and harder to extend (adding one is a one-line change
+# here instead of hunting for the jq filter that embeds it).
+SITEGRAFT_SNIPPET_PLUGIN_SLUGS='["code-snippets","wpcode","insert-headers-and-footers"]'
+
 # sq <string> — single-quote a string safely for embedding in a shell command
 # line that will be re-parsed by another shell (e.g. the far end of an ssh
 # connection). Replaces each ' with '\'' and wraps the whole thing in outer
@@ -68,6 +75,26 @@ inventory_table_prefix() {
   wp_remote "$alias_lc" eval 'global $wpdb; echo $wpdb->prefix;'
 }
 
+# design doc §0 point 11 / §6.1: is A's navigation a dynamic wp:page-list
+# block (no hardcoded post IDs)? Never assumed — always verified by
+# inspecting the actual content of every wp_navigation post found. A-only by
+# nature (§6.1: B's navigation, whatever form it takes, is either being
+# replaced or is none of sitegraft's business — §13). Returns the literal
+# text "true"/"false" (valid JSON on its own) so callers can --argjson it
+# directly; on a query failure, callers treat that as null/unknown rather
+# than silently assuming false.
+inventory_nav_uses_dynamic_page_list() {
+  local alias_lc="$1"
+  wp_remote "$alias_lc" eval '
+$navs = get_posts(array("post_type" => "wp_navigation", "numberposts" => -1, "post_status" => "any"));
+$dynamic = false;
+foreach ($navs as $n) {
+  if (strpos($n->post_content, "wp:page-list") !== false) { $dynamic = true; break; }
+}
+echo json_encode($dynamic);
+'
+}
+
 inventory_scan_site() {
   local alias_lc="$1" out_json="$2"
   log_info "scanning site '${alias_lc}' -> ${out_json}"
@@ -89,6 +116,21 @@ inventory_scan_site() {
     inventory_custom_code_detected "$custom_code_signals" && custom_code_detected=true
   fi
 
+  # A-only (§0 point 11) — null/unknown on B, and null on A if the query
+  # itself fails (never silently assumed false).
+  local nav_dynamic='null'
+  if [ "$alias_lc" = "a" ]; then
+    nav_dynamic=$(inventory_nav_uses_dynamic_page_list "$alias_lc" 2>&1) || {
+      log_warn "could not determine whether site A's navigation uses a dynamic page-list block — recording nav_uses_dynamic_page_list as unknown (null): ${nav_dynamic}"
+      nav_dynamic='null'
+    }
+    # Guard against a non-boolean/garbled result being embedded as JSON.
+    case "$nav_dynamic" in
+      true|false) : ;;
+      *) nav_dynamic='null' ;;
+    esac
+  fi
+
   jq -n \
     --argjson post_types "$post_types" \
     --argjson options "$options" \
@@ -98,16 +140,18 @@ inventory_scan_site() {
     --argjson menus "$menus" \
     --argjson custom_code_signals "$custom_code_signals" \
     --argjson custom_code_detected "$custom_code_detected" \
+    --argjson nav_uses_dynamic_page_list "$nav_dynamic" \
     '{
       post_types: $post_types,
       options: $options,
       tables: $tables,
       plugins: $plugins,
       active_theme: $active_theme,
-      classic_menus_detected: ($menus | length > 0),
-      classic_menu_names: [$menus[]?.name],
+      classic_menus_detected: ([$menus[]? | select((.count // 0) > 0)] | length > 0),
+      classic_menu_names: [$menus[]? | select((.count // 0) > 0) | .name],
       custom_code_signals: $custom_code_signals,
-      custom_code_detected: $custom_code_detected
+      custom_code_detected: $custom_code_detected,
+      nav_uses_dynamic_page_list: $nav_uses_dynamic_page_list
     }' \
     > "$out_json"
 }
@@ -188,33 +232,77 @@ inventory_stack_matches() {
 }
 
 # design doc §6.1/§14: shallow, B-only signals — no code parsing, no static
-# analysis. The extensible slug list lives here, in one place, so adding a
-# newly-encountered snippet plugin later is a one-line change.
+# analysis. The extensible slug list lives in SITEGRAFT_SNIPPET_PLUGIN_SLUGS.
+#
+# M3, fail-CLOSED on error: §14 gates a blocking confirmation before `plan`
+# writes a manifest — a wp-cli query that errors must never be silently read
+# as "signal absent" (the previous version did exactly that: e.g.
+# `wp_remote ... 2>/dev/null || echo "$name"` turned any error into "not a
+# child theme"). Every query below is checked individually; a failure adds
+# that signal's name to unknown_signals instead of guessing a default, and
+# inventory_custom_code_detected treats any unknown signal as detected —
+# the gate fires rather than silently passing through on a query it could
+# not actually verify.
 inventory_custom_code_signals() {
   local alias_lc="$1"
-  local name template child_theme fn_php mu_plugins plugins_json snippet_plugins
+  local name template fn_php_raw mu_plugins_raw plugins_json
+  local child_theme=false fn_php='{"exists":false}' mu_plugins='[]' snippet_plugins='[]'
+  local unknown='[]'
 
-  name=$(wp_remote "$alias_lc" theme list --status=active --field=name)
-  template=$(wp_remote "$alias_lc" theme get "$name" --field=template 2>/dev/null || echo "$name")
-  if [ "$template" != "$name" ]; then child_theme=true; else child_theme=false; fi
+  if ! name=$(wp_remote "$alias_lc" theme list --status=active --field=name 2>&1); then
+    log_warn "could not determine the active theme on site ${alias_lc} — all custom-code signals recorded as unknown (fail-safe, design doc §14): ${name}"
+    jq -n '{child_theme:false,functions_php:{exists:false},mu_plugins:[],snippet_plugins_detected:[],unknown_signals:["active_theme"]}'
+    return 0
+  fi
 
-  fn_php=$(wp_remote "$alias_lc" eval 'if (file_exists($f = get_stylesheet_directory()."/functions.php")) { echo json_encode(["exists"=>true,"bytes"=>filesize($f),"lines"=>count(file($f))]); } else { echo json_encode(["exists"=>false]); }')
-  mu_plugins=$(wp_remote "$alias_lc" eval 'echo json_encode(array_map("basename", glob(WP_CONTENT_DIR."/mu-plugins/*.php") ?: []));')
+  if template=$(wp_remote "$alias_lc" theme get "$name" --field=template 2>&1); then
+    [ "$template" != "$name" ] && child_theme=true
+  else
+    log_warn "could not read the theme/template relationship for '${name}' on site ${alias_lc} — recording child_theme as unknown (fail-safe, design doc §14): ${template}"
+    unknown=$(echo "$unknown" | jq -c '. + ["child_theme"]')
+  fi
 
-  plugins_json=$(wp_remote "$alias_lc" plugin list --format=json)
-  snippet_plugins=$(echo "$plugins_json" | jq -c \
-    '[.[] | select(.name as $n | ["code-snippets","wpcode","insert-headers-and-footers"] | index($n)) | .name]')
+  if fn_php_raw=$(wp_remote "$alias_lc" eval 'if (file_exists($f = get_stylesheet_directory()."/functions.php")) { echo json_encode(["exists"=>true,"bytes"=>filesize($f),"lines"=>count(file($f))]); } else { echo json_encode(["exists"=>false]); }' 2>&1) \
+    && echo "$fn_php_raw" | jq -e . >/dev/null 2>&1; then
+    fn_php="$fn_php_raw"
+  else
+    log_warn "could not check functions.php on site ${alias_lc} — recording functions_php as unknown (fail-safe, design doc §14): ${fn_php_raw}"
+    unknown=$(echo "$unknown" | jq -c '. + ["functions_php"]')
+  fi
+
+  if mu_plugins_raw=$(wp_remote "$alias_lc" eval 'echo json_encode(array_map("basename", glob(WP_CONTENT_DIR."/mu-plugins/*.php") ?: []));' 2>&1) \
+    && echo "$mu_plugins_raw" | jq -e . >/dev/null 2>&1; then
+    mu_plugins="$mu_plugins_raw"
+  else
+    log_warn "could not list mu-plugins on site ${alias_lc} — recording mu_plugins as unknown (fail-safe, design doc §14): ${mu_plugins_raw}"
+    unknown=$(echo "$unknown" | jq -c '. + ["mu_plugins"]')
+  fi
+
+  if plugins_json=$(wp_remote "$alias_lc" plugin list --format=json 2>&1) \
+    && echo "$plugins_json" | jq -e . >/dev/null 2>&1; then
+    # status=active: an installed-but-inactive snippet plugin is not
+    # injecting anything at runtime, so it is not itself a signal.
+    snippet_plugins=$(echo "$plugins_json" | jq -c \
+      --argjson names "$SITEGRAFT_SNIPPET_PLUGIN_SLUGS" \
+      '[.[] | select(.status == "active") | select(.name as $n | $names | index($n)) | .name]')
+  else
+    log_warn "could not list plugins on site ${alias_lc} — recording snippet_plugins as unknown (fail-safe, design doc §14): ${plugins_json}"
+    unknown=$(echo "$unknown" | jq -c '. + ["snippet_plugins"]')
+  fi
 
   jq -n \
     --argjson child_theme "$child_theme" \
     --argjson fn_php "$fn_php" \
     --argjson mu_plugins "$mu_plugins" \
     --argjson snippet_plugins "$snippet_plugins" \
-    '{child_theme: $child_theme, functions_php: $fn_php, mu_plugins: $mu_plugins, snippet_plugins_detected: $snippet_plugins}'
+    --argjson unknown_signals "$unknown" \
+    '{child_theme: $child_theme, functions_php: $fn_php, mu_plugins: $mu_plugins, snippet_plugins_detected: $snippet_plugins, unknown_signals: $unknown_signals}'
 }
 
 # Pure: given a custom_code_signals object (live or fabricated), is any signal
 # raised? This is the half of the feature that's actually unit-testable.
+# Any unknown_signals entry counts as raised (M3: fail closed, never silently
+# treat "we could not check" as "nothing was found").
 inventory_custom_code_detected() {
   local signals="$1"
   [ "$(echo "$signals" | jq '
@@ -222,6 +310,7 @@ inventory_custom_code_detected() {
     or (.functions_php.exists == true)
     or ((.mu_plugins // []) | length > 0)
     or ((.snippet_plugins_detected // []) | length > 0)
+    or ((.unknown_signals // []) | length > 0)
   ')" = "true" ]
 }
 
@@ -229,17 +318,62 @@ phase_scan() {
   local profile=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --profile) profile="$2"; shift 2 ;;
+      --profile)
+        # M2: without this arity check, "--profile" as the LAST argument
+        # dereferences a missing $2 — under bin/sitegraft's `set -u` this is
+        # a fatal "unbound variable" error (verified live), and that
+        # specific bash 3.2 error class reports $?=0 to any EXIT trap
+        # regardless of what it does (see the note in lib/core.sh), so the
+        # process used to exit 0 despite never running. An explicit arity
+        # check turns it into a normal, fully-propagated `return 1` instead.
+        if [ $# -lt 2 ]; then
+          log_error "--profile requires a value"
+          return 1
+        fi
+        profile="$2"; shift 2 ;;
+      --dry-run)
+        # M2: the plan requires --dry-run to work as a flag everywhere, not
+        # only via the SITEGRAFT_DRY_RUN env var.
+        SITEGRAFT_DRY_RUN=1
+        shift ;;
       *) log_error "unknown flag for scan: $1"; return 1 ;;
     esac
   done
   [ -n "$profile" ] || { log_error "scan requires --profile <name>"; return 1; }
 
-  profile_load "$profile"
+  if is_dry_run; then
+    # M6: run_or_echo prints "[dry-run] ..." text instead of running the
+    # command, which jq --argjson then fails to parse as JSON (verified
+    # live: exit 5, "Invalid JSON text passed to --argjson"). scan is
+    # strictly read-only (design doc §6.1: no writes to A or B, freely
+    # re-runnable) — there is nothing on A or B for --dry-run to protect
+    # here. Chosen fix: scan ignores --dry-run entirely and always runs its
+    # real (harmless) read-only queries, rather than half-printing planned
+    # commands and half-crashing on the jq step.
+    log_info "scan is strictly read-only (design doc §6.1) — --dry-run has no writes to skip on A or B; running the real read-only queries as usual"
+    SITEGRAFT_DRY_RUN=0
+  fi
+
+  profile_load "$profile" || return 1
+
+  # M4: scan-*.json holds a full `wp option list` dump — this can include
+  # license keys, SMTP tokens, or anything else a plugin stores as an
+  # option. Neither the run directory nor the files in it may be
+  # group/world-readable. umask first (belt) so mkdir/redirection default
+  # to owner-only, then explicit chmod (suspenders) so this holds
+  # regardless of the caller's ambient umask.
+  local prev_umask
+  prev_umask=$(umask)
+  umask 077
+
   local run_dir="${SITEGRAFT_STATE_DIR}/${profile}-$(date +%Y%m%dT%H%M%S)"
   mkdir -p "$run_dir"
+  chmod 700 "$run_dir"
   inventory_scan_site a "${run_dir}/scan-a.json"
   inventory_scan_site b "${run_dir}/scan-b.json"
+  chmod 600 "${run_dir}/scan-a.json" "${run_dir}/scan-b.json"
+
+  umask "$prev_umask"
 
   if jq -e '.classic_menus_detected == true' "${run_dir}/scan-a.json" >/dev/null 2>&1; then
     log_warn "site A has classic nav menu(s) with items: $(jq -r '.classic_menu_names | join(", ")' "${run_dir}/scan-a.json") — sitegraft v1 does not migrate classic menu assignments (design doc §13)"
