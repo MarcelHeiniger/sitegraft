@@ -50,6 +50,51 @@ main() {
   [ -n "$phase" ] || { usage; exit 1; }
   shift || true
 
+  # Task 6.1 Step 1: global --dry-run handling, applied to every phase's
+  # argv uniformly, before dispatch. This is deliberately NOT the only place
+  # --dry-run gets parsed — every phase function below (phase_scan,
+  # phase_backup, phase_graft, phase_verify, phase_restore) also parses its
+  # own --dry-run flag independently (see each lib/*.sh's own case
+  # statement), because every one of them is also called DIRECTLY by the
+  # bats unit tests, bypassing bin/sitegraft entirely — removing the
+  # per-phase parsing would break that. What this adds is CLI-level
+  # consistency for the actual `sitegraft` command: without it, `plan`
+  # (which never writes to B, so never needed its own --dry-run case) would
+  # reject `--dry-run` as an "unknown flag" while every writing phase
+  # accepts it silently — an operator adopting the habit "always pass
+  # --dry-run first" would hit a confusing, inconsistent error on exactly
+  # one phase. With this, `--dry-run` is uniformly a safe, accepted no-op on
+  # phases that don't need it (scan/plan/verify), same as it already was via
+  # each phase's own env-var-or-flag handling. A plain indexed bash array is
+  # fine here despite the bash 3.2 target (ADR 0003, docs/decisions/
+  # 0003-bash-compatibility.md) — that decision rules out ASSOCIATIVE arrays
+  # only (`declare -A`, bash 4+); ordinary indexed arrays like this one have
+  # always worked on bash 3.2.
+  # BUG found live (reproduced with a plain `sitegraft --help` call --
+  # nothing to do with --dry-run at all): "${args[@]}" on a bash 3.2 array
+  # that ends up with ZERO elements is an "unbound variable" error under
+  # this script's own `set -u` (line 3) -- fixed in bash 4.4, still broken
+  # on 3.2, the exact version this tool targets. Every invocation with no
+  # remaining args after --dry-run stripping (e.g. --help/-h/--version take
+  # no args at all, so the loop below never appends anything) hit this
+  # immediately: `./bin/sitegraft --help` failed with a raw
+  # "args[@]: unbound variable" instead of printing usage. The length check
+  # around the re-splat avoids ever evaluating "${args[@]}" on an empty
+  # array, sidestepping the bug entirely rather than relying on one of the
+  # more obscure ${args[@]+...} parameter-expansion workarounds -- this
+  # codebase avoided arrays altogether before this function for reasons
+  # never written down; this bug is presumably exactly why.
+  local args=() dry_run=0 arg
+  for arg in "$@"; do
+    if [ "$arg" = "--dry-run" ]; then dry_run=1; else args+=("$arg"); fi
+  done
+  if [ "${#args[@]}" -gt 0 ]; then
+    set -- "${args[@]}"
+  else
+    set --
+  fi
+  [ "$dry_run" -eq 1 ] && export SITEGRAFT_DRY_RUN=1
+
   # m5: dependencies are checked per phase, not all up front — "sitegraft
   # --help"/"-h" (and, previously, every phase) used to require rsync even
   # though only backup/graft/restore actually invoke it.
