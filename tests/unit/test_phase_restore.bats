@@ -74,8 +74,8 @@ EOF
 @test "phase_restore --yes runs restore.sh and takes a pre-restore snapshot of B's db AND wp-content" {
   run phase_restore --profile t --run "$RUN_DIR" --yes
   [ "$status" -eq 0 ]
-  [[ "$output" == *"FAKE RESTORE RAN"* ]]
-  [[ "$output" == *"restore complete"* ]] || [[ "$output" == *"Restore complete"* ]] || [[ "$output" == *"restore complete."* ]]
+  [[ "$output" == *"FAKE RESTORE RAN"* ]] || false
+  [[ "$output" == *"restore complete"* ]] || [[ "$output" == *"Restore complete"* ]] || [[ "$output" == *"restore complete."* ]] || false
   local snap_dir
   snap_dir=$(ls -dt "${RUN_DIR}"/pre-restore-* | head -1)
   [ -n "$snap_dir" ]

@@ -62,7 +62,7 @@ setup() {
   echo '{"classic_menus_detected":true,"classic_menu_names":["Legacy Menu"]}' > "$b"
   run plan_warn_scope_gaps "$a" "$b"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Main Menu"* ]]
+  [[ "$output" == *"Main Menu"* ]] || false
   [[ "$output" != *"Legacy Menu"* ]]
 }
 

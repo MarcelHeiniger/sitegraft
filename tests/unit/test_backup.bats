@@ -62,8 +62,8 @@ setup() {
   SITE_B_WP_PATH="/var/www/site-b"
   SITE_B_WP_CMD="wp"
   run backup_wp_cmd_literal b
-  [[ "$output" == *"ssh"* ]]
-  [[ "$output" == *"user@host-b.example.com"* ]]
+  [[ "$output" == *"ssh"* ]] || false
+  [[ "$output" == *"user@host-b.example.com"* ]] || false
   [[ "$output" != *"wp_remote"* ]]
 }
 
@@ -74,7 +74,7 @@ setup() {
   # SITE_*_WP_CMD, same shape wp_remote itself has to handle (lib/inventory.sh).
   SITE_B_WP_CMD="ddev exec --raw -p test-b -- wp"
   run backup_wp_cmd_literal b
-  [[ "$output" != *"ssh"* ]]
+  [[ "$output" != *"ssh"* ]] || false
   [[ "$output" == *"ddev exec"* ]]
 }
 
@@ -133,7 +133,7 @@ setup() {
   SITE_B_WP_CMD="ddev exec --raw --raw -p sitegraft-test-b -- wp"
   run _backup_local_exec_prefix b
   [ "$status" -eq 0 ]
-  [[ "$output" != *"--raw"* ]]
+  [[ "$output" != *"--raw"* ]] || false
   [ "$output" = "ddev exec -p sitegraft-test-b --" ]
 }
 
@@ -141,7 +141,7 @@ setup() {
   SITE_B_WP_CMD="ddev exec -p sitegraft-test-b --raw wp"
   run _backup_local_exec_prefix b
   [ "$status" -eq 0 ]
-  [[ "$output" != *"--raw"* ]]
+  [[ "$output" != *"--raw"* ]] || false
   [ "$output" = "ddev exec -p sitegraft-test-b" ]
 }
 
@@ -237,7 +237,7 @@ _fake_dump_rows() {
   backup_generate_restore_script "$run_dir"
   run grep 'db import -' "${run_dir}/restore.sh"
   [ "$status" -eq 0 ]
-  [[ "$output" != *"--raw"* ]]
+  [[ "$output" != *"--raw"* ]] || false
   [[ "$output" == *"ddev exec -p sitegraft-test-b -- wp"* ]]
 }
 
@@ -331,7 +331,7 @@ _fake_dump_rows() {
   wp_remote() { echo "SHOULD NOT BE CALLED"; }
   run backup_compute_protected_checksums b "$manifest"
   [ "$status" -eq 0 ]
-  [[ "$output" != *"SHOULD NOT BE CALLED"* ]]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
   run jq -e 'has("_unclaimed") | not' <<< "$output"
   [ "$status" -eq 0 ]
 }
