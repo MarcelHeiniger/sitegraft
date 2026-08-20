@@ -233,7 +233,7 @@ setup() {
   # never inspect what PHP was actually sent), so this is the one test that
   # actually looks at the eval body itself.
   [[ "$(echo "$output" | grep -c 'sitegraft_domain_present(')" -ge 3 ]] || false
-  [[ "$output" != *"strpos( \$post->post_content"* ]] # the old inline duplication must be gone, not just supplemented
+  [[ "$output" != *"strpos( \$post->post_content"* ]] || false # the old inline duplication must be gone, not just supplemented
 }
 
 # Security-review fix-pack (Kimi, BLOCKER, root cause): fails CLOSED, not
