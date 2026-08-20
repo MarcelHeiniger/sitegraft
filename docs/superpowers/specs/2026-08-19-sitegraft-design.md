@@ -312,6 +312,19 @@ EOF
 }
 ```
 
+> **v1 status (Step 6 self-review, 2026-08-20): `modules/acss.sh` does NOT
+> exist in the repo.** Only `modules/core-wp.sh` and `modules/etch.sh`
+> (added in Step 6 — see that file's own header comment) are real, shipped
+> v1 modules; `modules/motopress.sh.example` is the intentional
+> never-loaded worked example (§3.5). Correctly so, not an oversight:
+> `TODO_VERIFY_LEGACY_ACSS_SLUG` above is exactly the blocker this comment
+> already names, and it's still open — nobody has checked a real pre-4.0
+> Automatic.css install to confirm its actual legacy folder name. Shipping
+> `modules/acss.sh` with a guessed value would violate this section's own
+> instruction not to. `docs/definition-of-done.md`'s "3 v1 modules
+> (core-wp, etch, acss)" line is corrected accordingly — see that file and
+> `docs/todo.md` → Backlog for the up-to-date scope.
+
 ### 3.5 Example of a future module — `modules/motopress.sh.example`
 
 Shipped as a full worked example (not a real v1 module — MotoPress support isn't
@@ -567,13 +580,26 @@ if the credentials file referenced by the profile doesn't exist — with an expl
 offer to save it ("save to `~/.config/sitegraft/example.creds` so you don't have to
 re-enter it? [y/N]"), never automatic.
 
+> **v1 status (Step 6 self-review, 2026-08-20): (b) is NOT implemented.**
+> `profile_load` (a) parses the `.creds` file when present, exactly as
+> documented, but when it's absent it only logs a warning and proceeds
+> without `SITE_*_SSH_KEY` — never prompts. Deliberately left as a
+> documented gap rather than added late in the polish pass (see
+> `docs/status.md`/`docs/todo.md` → Backlog): not a broken state in
+> practice, since a missing key just falls back to ssh's own default
+> identity resolution (ssh-agent / `~/.ssh/config`), the common case working
+> fine either way. An operator who needs a specific per-site key today
+> creates `~/.config/sitegraft/<profile>.creds` by hand (chmod 600) — path
+> (a), fully working.
+
 `lib/profile.sh :: profile_load` **parses** the `.conf` file itself, line by line
 (never `source`s/`.`s it — corrected during the post-review fix-pack: a
 source-after-shape-check design was verified live to let both trailing shell
 code and an embedded command substitution execute). Only an anchored
 `KEY="value"` / `KEY='value'` line is accepted, and only for a key on a fixed
 SITE_*/SITEGRAFT_* whitelist — no arbitrary code, ever. Then loads the matching
-`.creds` file the same way if it exists, otherwise triggers (b).
+`.creds` file the same way if it exists — otherwise it warns and proceeds
+without it, per the v1 status note above, rather than triggering (b).
 
 ## 6. Exact phase walkthrough
 

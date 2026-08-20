@@ -160,6 +160,17 @@ profile_load() {
     profile_check_creds_permissions "$creds_file" || return 1
     profile_parse_file "$creds_file" || return 1
   else
-    log_warn "no credentials file at ${creds_file} — interactive prompt not wired until Task 2.3"
+    # Step 6 self-review (design doc §5.2 vs. code): §5.2 documents a real
+    # "(b) interactive prompt" fallback here (gum input --password, with an
+    # offer to save what was entered) — never implemented in v1, and the old
+    # message's "not wired until Task 2.3" was itself stale (that task
+    # finished steps ago without landing this). Deliberately left as a
+    # documented v1 gap rather than rushed in during this polish pass — see
+    # docs/status.md and docs/todo.md. Not a broken state in practice: no
+    # SSH_KEY set just means wp_remote falls back to ssh's own default
+    # identity resolution (ssh-agent / ~/.ssh/config), which works fine for
+    # the common case — this is a missing convenience, not a missing
+    # capability.
+    log_warn "no credentials file at ${creds_file} — proceeding without SITE_*_SSH_KEY (falls back to ssh's own default identity resolution). Interactive credential prompting (design doc §5.2's option (b)) is not implemented in v1 — create ${creds_file} by hand (chmod 600) if you need a specific SSH key per site."
   fi
 }
