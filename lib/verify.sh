@@ -233,18 +233,12 @@ phase_verify() {
     echo
   } > "$report"
 
-  # --- protected-data checksums (finding A5's normalization, reused verbatim
-  # from backup_checksum — never a second implementation) -------------------
-  local recomputed='{}' mod
-  for mod in $(echo "$manifest" | jq -r '.protect | keys[]'); do
-    local tables_csv
-    tables_csv=$(echo "$manifest" | jq -r --arg m "$mod" '.protect[$m].tables // [] | join(",")')
-    [ -n "$tables_csv" ] || continue
-    local tables_content sum
-    tables_content=$(wp_remote b db export - --tables="$tables_csv" 2>/dev/null || echo "")
-    sum=$(backup_checksum "$tables_content")
-    recomputed=$(echo "$recomputed" | jq --arg m "$mod" --arg s "sha256:${sum}" '.[$m] = $s')
-  done
+  # --- protected-data checksums (finding A5's normalization AND the
+  # table-suffix-to-live-prefix resolution, both reused verbatim from
+  # backup_compute_protected_checksums, lib/backup.sh — never a second,
+  # independently-drifting implementation) ----------------------------------
+  local recomputed
+  recomputed=$(backup_compute_protected_checksums b "$manifest" 2>>"$report") || recomputed='{}'
   local checksum_diff
   if checksum_diff=$(verify_compare_checksums "$manifest" "$recomputed" 2>>"$report"); then
     echo "- [x] protected data unchanged" >> "$report"

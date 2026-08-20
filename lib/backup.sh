@@ -416,6 +416,69 @@ EOF
   chmod 700 "${run_dir}/restore.sh"
 }
 
+# backup_prefix_tables_csv <prefix> <tables_csv> — pure string function, no
+# I/O. lib/manifest.sh's own documented convention (see its comment above
+# manifest_compute_unclaimed): a module's declared `tables` are bare
+# SUFFIXES ("fakebooking_reservations"), never the live-prefixed name a real
+# install actually uses ("wp_fakebooking_reservations") — wp-cli's own
+# `--tables=`/`db query` need the real, prefixed name. One shared
+# implementation (same "never three different implementations" reasoning as
+# backup_checksum's own normalization above) so backup and verify resolve a
+# manifest's table suffixes to real table names IDENTICALLY — a mismatch
+# here would make backup's PRE-graft checksum and verify's POST-graft
+# checksum silently stop being comparable.
+backup_prefix_tables_csv() {
+  local prefix="$1" tables_csv="$2"
+  [ -n "$tables_csv" ] || return 0
+  local IFS=','
+  local out="" t
+  for t in $tables_csv; do
+    [ -n "$t" ] || continue
+    out="${out}${out:+,}${prefix}${t}"
+  done
+  printf '%s' "$out"
+}
+
+# backup_compute_protected_checksums <alias> <manifest_json> — the exact
+# checksum computation phase_backup uses to populate
+# manifest.checksums_protected_pre_graft, extracted into its own function
+# (review/nightshift follow-up, design doc §6.3/§6.5) specifically so
+# phase_verify (Step 5) can recompute the IDENTICAL thing post-graft — never
+# a second, subtly different implementation that could silently drift from
+# this one. Real bug found live via the Step 5 DDEV harness (not caught by
+# any earlier unit test, since every unit test's wp_remote/
+# inventory_table_prefix stubs return canned content regardless of the
+# --tables= value passed in): without backup_prefix_tables_csv's
+# resolution, this loop's `--tables=` argument never matched any real table
+# on a live install (a bare suffix, not B's actual live-prefixed table
+# name) — silently checksumming empty content instead of the real protected
+# data. Not a smaller bug than it sounds: an empty-vs-empty checksum still
+# "matches" before/after graft, so the tool's central non-contamination
+# promise would have reported success without ever actually having checked
+# anything.
+#
+# A module with no `tables` at all (e.g. `_unclaimed`, always `tables: []`,
+# or any post_type/option_key-only module) is skipped, not sent as an empty
+# --tables= (not a meaningful export request) — plan bug fix already present
+# before this extraction, kept as-is.
+backup_compute_protected_checksums() {
+  local alias_lc="$1" manifest="$2"
+  local prefix
+  prefix=$(inventory_table_prefix "$alias_lc") || return 1
+  local checksums='{}' mod
+  for mod in $(echo "$manifest" | jq -r '.protect | keys[]'); do
+    local tables_csv
+    tables_csv=$(echo "$manifest" | jq -r --arg m "$mod" '.protect[$m].tables // [] | join(",")')
+    [ -n "$tables_csv" ] || continue
+    local prefixed_tables_csv tables_content sum
+    prefixed_tables_csv=$(backup_prefix_tables_csv "$prefix" "$tables_csv")
+    tables_content=$(wp_remote "$alias_lc" db export - --tables="$prefixed_tables_csv" 2>/dev/null || echo "")
+    sum=$(backup_checksum "$tables_content")
+    checksums=$(echo "$checksums" | jq --arg m "$mod" --arg s "sha256:${sum}" '.[$m] = $s')
+  done
+  printf '%s' "$checksums"
+}
+
 # phase_backup --profile <name> [--run <run-dir>] [--dry-run] — design doc
 # §6.3: full DB + wp-content backup of B, pulled to the orchestrator, BEFORE
 # graft ever writes anything to B. Requires a frozen manifest (`sitegraft
@@ -496,27 +559,13 @@ phase_backup() {
     log_info "backup artifacts verified: valid gzip, core tables present, wp-content non-empty"
 
     # design doc §6.3: checksums of the protected tables/options exports,
-    # using the exact same normalization backup_checksum defines above.
-    # Plan bug found and fixed here: the plan's original pseudocode ran this
-    # unconditionally for every `protect` module, including ones with no
-    # `tables` at all (e.g. `_unclaimed`, which manifest_compute_unclaimed
-    # always sets to `tables: []`, and any post_type/option_key-only
-    # module) — `--tables=` with an empty value is not a meaningful export
-    # request and shouldn't be sent. Skipping a module with no tables here
-    # only skips a DB-table checksum for it; it doesn't weaken protection —
-    # graft's table-copy step (Step 4) is required to build itself from the
-    # manifest's explicit tables allowlist regardless (design doc §3.6),
-    # never from this checksum loop.
-    local checksums='{}' mod
-    for mod in $(echo "$manifest" | jq -r '.protect | keys[]'); do
-      local tables_csv
-      tables_csv=$(echo "$manifest" | jq -r --arg m "$mod" '.protect[$m].tables // [] | join(",")')
-      [ -n "$tables_csv" ] || continue
-      local tables_content sum
-      tables_content=$(wp_remote b db export - --tables="$tables_csv" 2>/dev/null || echo "")
-      sum=$(backup_checksum "$tables_content")
-      checksums=$(echo "$checksums" | jq --arg m "$mod" --arg s "sha256:${sum}" '.[$m] = $s')
-    done
+    # using the exact same normalization backup_checksum defines above, and
+    # the exact same table-suffix-to-live-prefix resolution phase_verify
+    # (Step 5) will later reuse via backup_compute_protected_checksums —
+    # see that function's own comment for why this must never be a second,
+    # independent implementation.
+    local checksums
+    checksums=$(backup_compute_protected_checksums b "$manifest") || { log_error "could not compute protected-data checksums — aborting before declaring the backup good"; return 1; }
     manifest=$(echo "$manifest" | jq --argjson c "$checksums" '.checksums_protected_pre_graft = $c')
     echo "$manifest" > "${run_dir}/manifest.json"
     chmod 600 "${run_dir}/manifest.json" 2>/dev/null || true

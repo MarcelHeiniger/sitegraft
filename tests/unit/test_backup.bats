@@ -276,3 +276,69 @@ _fake_dump_rows() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"wp --path='/var/www/site-b' db import -"* ]]
 }
+
+# --- backup_prefix_tables_csv / backup_compute_protected_checksums ---------
+# Real bug found live via the Step 5 DDEV harness, NOT caught by any earlier
+# unit test (every existing wp_remote/inventory_table_prefix stub in this
+# suite returns canned content regardless of the --tables= value it's
+# handed): lib/manifest.sh documents that a module's declared `tables` are
+# bare SUFFIXES ("fakebooking_reservations"), never a live-prefixed name
+# ("wp_fakebooking_reservations") — the checksum loop needs to resolve that
+# suffix to B's REAL live table name before calling `wp db export
+# --tables=`, or it silently checksums empty content (a nonexistent table)
+# instead of the actual protected data.
+
+@test "backup_prefix_tables_csv joins each bare suffix with the given prefix" {
+  run backup_prefix_tables_csv "wp_" "fakebooking_reservations,fakebooking_log"
+  [ "$status" -eq 0 ]
+  [ "$output" = "wp_fakebooking_reservations,wp_fakebooking_log" ]
+}
+
+@test "backup_prefix_tables_csv is a no-op (empty output) for an empty tables_csv" {
+  run backup_prefix_tables_csv "wp_" ""
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "backup_prefix_tables_csv skips an empty element between two commas rather than emitting a bare prefix" {
+  run backup_prefix_tables_csv "wp_" "a,,b"
+  [ "$output" = "wp_a,wp_b" ]
+}
+
+@test "backup_compute_protected_checksums resolves table suffixes to B's live prefix before exporting" {
+  local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
+  local captured="$BATS_TEST_TMPDIR/captured-tables-arg"
+  inventory_table_prefix() { echo "wp_"; }
+  wp_remote() {
+    local alias_lc="$1"; shift
+    for a in "$@"; do
+      case "$a" in
+        --tables=*) printf '%s' "${a#--tables=}" > "$captured" ;;
+      esac
+    done
+    echo "INSERT INTO t VALUES (1);"
+  }
+  run backup_compute_protected_checksums b "$manifest"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$captured")" = "wp_fakebooking_reservations" ]
+  run jq -e '.fakebooking | startswith("sha256:")' <<< "$output"
+  [ "$status" -eq 0 ]
+}
+
+@test "backup_compute_protected_checksums skips a module with no tables (empty --tables= is not a meaningful export)" {
+  local manifest='{"protect":{"_unclaimed":{"tables":[]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  run backup_compute_protected_checksums b "$manifest"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]]
+  run jq -e 'has("_unclaimed") | not' <<< "$output"
+  [ "$status" -eq 0 ]
+}
+
+@test "backup_compute_protected_checksums fails when B's live table prefix cannot be determined (fail closed, not open)" {
+  local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
+  inventory_table_prefix() { return 1; }
+  run backup_compute_protected_checksums b "$manifest"
+  [ "$status" -eq 1 ]
+}
