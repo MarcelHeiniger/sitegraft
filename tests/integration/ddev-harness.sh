@@ -421,7 +421,11 @@ jq -n --arg da "$DOMAIN_A" --arg db "$DOMAIN_B" '{
   sitegraft_manifest_version: 1,
   frozen: true,
   migrate: {
-    "core-wp": {post_types: ["page","post"], option_keys: ["show_on_front","page_on_front","page_for_posts"]},
+    # wp_navigation included here (beyond page/post) specifically so Step 5
+    # verify_nav_present gets exercised against a REAL migrated navigation
+    # post, not merely its own no-op skip path (site-a-seed.sh already seeds
+    # a wp_navigation post on A using the dynamic wp:page-list block).
+    "core-wp": {post_types: ["page","post","wp_navigation"], option_keys: ["show_on_front","page_on_front","page_for_posts"]},
     media: {post_types: ["attachment"], option_keys: []},
     etch: {post_types: ["etch_cfs"], option_keys: ["etch_settings","etch_styles"]}
   },
@@ -450,6 +454,26 @@ ddev exec --raw -p "$PROJECT_B" -- wp post update "$FAKEBOOKING_POST_ID" \
 # this script) predates it and would make this comparison vacuous.
 PRE_GRAFT_CHECKSUM=$(b_protected_checksum)
 
+# Step 5 addition, found live (a real bug the earlier graft-only harness
+# pass never surfaced, since (b)/(h) above compare against this script's OWN
+# b_protected_checksum, never against manifest.checksums_protected_pre_graft
+# at all): re-running `sitegraft backup` here, against the REAL migrate/
+# protect manifest just written above (not the empty-protect placeholder
+# manifest.json used earlier for the plan/custom-code-gate demo), is what
+# actually POPULATES manifest.checksums_protected_pre_graft for the
+# "fakebooking" protect module — verify's own checksum comparison (Step 5)
+# reads that key, and without this, it stays entirely absent (jq sees
+# `null`), which crashed verify_compare_checksums outright the first time
+# this harness reached it. This mirrors the REAL production flow (scan ->
+# plan -> backup -> graft -> verify) exactly: backup always runs against the
+# manifest that's about to be grafted, not a stale earlier one — the
+# harness's own two-manifest test structure (an empty one to demo the
+# custom-code gate, then this real one for graft) was the thing papering
+# over the gap, not sitegraft itself.
+echo "==> re-running backup against the REAL graft manifest, so checksums_protected_pre_graft reflects the actual protect selection (and the injected MAJOR-2 collision payload) verify will check against"
+"${ROOT}/bin/sitegraft" backup --profile ddev-test --run "$RUN_DIR"
+jq -e '.checksums_protected_pre_graft.fakebooking | startswith("sha256:")' "${RUN_DIR}/manifest.json" >/dev/null
+
 echo "==> running graft"
 # --allow-stack-mismatch: both A/B get a fresh default WP theme from
 # `ddev wp core install`, normally identical — passed defensively anyway so
@@ -465,6 +489,10 @@ ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=etch_cfs --field=pos
 ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=etch_cfs --field=post_title | grep -q 'Image Block CFS'
 B_ATTACH_COUNT=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=attachment --format=count)
 [ "$B_ATTACH_COUNT" -ge 1 ]
+# Step 5 fixture addition: wp_navigation was added to core-wp's migrate
+# post_types above specifically to exercise verify_nav_present against real
+# migrated data (site-a-seed.sh's "Main" wp_navigation post).
+ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=wp_navigation --field=post_title | grep -q '^Main$'
 
 echo "==> (b) asserting B's protected fake-plugin data is BYTE-IDENTICAL before/after graft (the central non-contamination proof)"
 POST_GRAFT_CHECKSUM=$(b_protected_checksum)
@@ -586,4 +614,83 @@ if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "graft" ]; then
   exit 0
 fi
 
-echo "no later phase wired yet — see Step 5 (verify)"
+# --------------------------------------------------------------------------
+# Step 5: verify + the full graft/verify/restore assertion set (review
+# finding B3). verify is read-only against B — nothing below it mutates B
+# except the deliberate negative-case injection/revert, which exists to
+# prove verify actually detects a real regression rather than always
+# reporting PASS.
+
+echo "==> updating the harness profile with B's real, live-resolved URL (needed for verify's HTTP smoke check) — same DDEV_PRIMARY_URL override reasoning as the DOMAIN_A/DOMAIN_B comment above; the earlier SITE_B_URL='https://b.example.com' was never the URL DDEV actually serves"
+cat > "${ROOT}/profiles/ddev-test.conf" <<EOF
+SITE_A_ALIAS="a"
+SITE_A_WP_PATH="/var/www/html"
+SITE_A_WP_CMD="ddev exec --raw -p ${PROJECT_A} -- wp"
+SITE_A_URL="${DOMAIN_A}"
+SITE_B_ALIAS="b"
+SITE_B_WP_PATH="/var/www/html"
+SITE_B_WP_CMD="ddev exec --raw -p ${PROJECT_B} -- wp"
+SITE_B_URL="${DOMAIN_B}"
+SITEGRAFT_STATE_DIR="/tmp/sitegraft-ddev-test-runs"
+EOF
+
+echo "==> running verify"
+"${ROOT}/bin/sitegraft" verify --profile ddev-test --run "$RUN_DIR"
+
+VERIFY_REPORT="${RUN_DIR}/verify-report.md"
+echo "==> asserting the verify report exists and every check passed cleanly (no HARD FAIL) on a graft that should be entirely correct"
+[ -f "$VERIFY_REPORT" ]
+if grep -q "HARD FAIL" "$VERIFY_REPORT"; then
+  echo "FAIL: verify-report.md contains a HARD FAIL line on a graft run that completed cleanly:" >&2
+  cat "$VERIFY_REPORT" >&2
+  exit 1
+fi
+grep -q "protected data unchanged" "$VERIFY_REPORT"
+grep -q "migrated options match A's values on B" "$VERIFY_REPORT"
+grep -q "page_on_front resolves to the correctly remapped page" "$VERIFY_REPORT"
+grep -q "A's domain string is absent from B's content" "$VERIFY_REPORT"
+grep -q "no orphan post_parent references" "$VERIFY_REPORT"
+grep -q "expected navigation is present" "$VERIFY_REPORT"
+grep -q "Result: PASS" "$VERIFY_REPORT"
+echo "==> confirmed: verify report shows every positive check passed, on real migrated WordPress data (not stubs)"
+
+echo "==> NEGATIVE CASE: mutating a migrated option's value on B after graft, to prove verify actually detects a real B3-class regression rather than always reporting PASS (finding B3's whole reason to exist)"
+ddev exec --raw -p "$PROJECT_B" -- wp option update etch_settings '{"theme_mode":"CORRUPTED_BY_HARNESS_NEGATIVE_CASE"}' --format=json
+if "${ROOT}/bin/sitegraft" verify --profile ddev-test --run "$RUN_DIR"; then
+  echo "FAIL: verify reported success even though etch_settings on B no longer matches the value graft migrated from A — verify is not actually checking what it claims to check (finding B3 regression)" >&2
+  exit 1
+fi
+grep -q "HARD FAIL" "$VERIFY_REPORT"
+grep -q "etch_settings" "$VERIFY_REPORT"
+grep -q "Result: HARD FAIL" "$VERIFY_REPORT"
+echo "==> confirmed: verify correctly HARD FAILS (non-zero exit, report says so explicitly) when a migrated option's value on B has drifted from what graft wrote — never an optimistic pass"
+
+echo "==> reverting the injected corruption and re-confirming verify passes clean again"
+ddev exec --raw -p "$PROJECT_B" -- wp option update etch_settings '{"theme_mode":"dark"}' --format=json
+"${ROOT}/bin/sitegraft" verify --profile ddev-test --run "$RUN_DIR"
+grep -q "Result: PASS" "$VERIFY_REPORT"
+
+echo "ALL VERIFY ASSERTIONS PASSED"
+
+if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "verify" ]; then
+  echo "VERIFY OK (SITEGRAFT_HARNESS_STOP_AFTER=verify)"
+  exit 0
+fi
+
+echo "==> running restore (--yes, non-interactive) and re-checking protected state after the full graft->verify->restore round-trip"
+"${ROOT}/bin/sitegraft" restore --profile ddev-test --run "$RUN_DIR" --yes
+
+echo "==> asserting B's protected fake-plugin data is byte-identical to its pre-graft state after restore (same PRE_GRAFT_CHECKSUM baseline as the marker-gated-resumability check above)"
+RESTORE_CHECKSUM=$(b_protected_checksum)
+if [ "$PRE_GRAFT_CHECKSUM" != "$RESTORE_CHECKSUM" ]; then
+  echo "FAIL: protected fake-plugin data differs after restore (Step 5 graft->verify->restore round-trip)" >&2
+  exit 1
+fi
+
+echo "==> asserting the mapping mu-plugin is still absent from B after restore (it was already removed by graft itself, and restore never re-adds it)"
+if ddev exec --raw -p "$PROJECT_B" -- test -f /var/www/html/wp-content/mu-plugins/sitegraft-id-mapper.php 2>/dev/null; then
+  echo "FAIL: sitegraft-id-mapper.php is present on B after restore" >&2
+  exit 1
+fi
+
+echo "ALL VERIFY+RESTORE ASSERTIONS PASSED (Step 5 — full graft/verify/restore pipeline proven end-to-end)"
