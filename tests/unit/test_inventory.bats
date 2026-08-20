@@ -20,8 +20,8 @@ EOF
   SITE_A_WP_CMD="wp"
   SITEGRAFT_DRY_RUN=1
   run wp_remote a post-type list --format=json
-  [[ "$output" == *"ssh"* ]]
-  [[ "$output" == *"user@host-a.example.com"* ]]
+  [[ "$output" == *"ssh"* ]] || false
+  [[ "$output" == *"user@host-a.example.com"* ]] || false
 }
 
 @test "sq single-quotes a plain string" {
@@ -85,8 +85,8 @@ EOF
   # The whole payload must appear as ONE single-quoted argv element to the
   # remote wp — never as an unquoted "; touch ..." that a remote shell
   # would execute as a second command.
-  [[ "$output" == *"'1; touch /tmp/PWNED'"* ]]
-  [[ "$output" != *"'1'; touch /tmp/PWNED"* ]]
+  [[ "$output" == *"'1; touch /tmp/PWNED'"* ]] || false
+  [[ "$output" != *"'1'; touch /tmp/PWNED"* ]] || false
 }
 
 @test "wp_remote passes -i <SSH_KEY> before -- when SITE_<ALIAS>_SSH_KEY is set (Step 6 self-review: design doc §5.2 vs. code drift, was parsed but never consumed)" {
@@ -106,7 +106,7 @@ EOF
   unset SITE_A_SSH_KEY
   SITEGRAFT_DRY_RUN=1
   run wp_remote a option get siteurl
-  [[ "$output" != *"-i "* ]]
+  [[ "$output" != *"-i "* ]] || false
 }
 
 @test "wp_remote's -i value is a plain positional argument to -i, so a hostile-looking SITE_*_SSH_KEY can't be read as a SEPARATE ssh option" {
@@ -121,7 +121,7 @@ EOF
   SITE_A_SSH_KEY="-oProxyCommand=touch /tmp/PWNED"
   SITEGRAFT_DRY_RUN=1
   run wp_remote a option get siteurl
-  [[ "$output" == "[dry-run] ssh -i -oProxyCommand=touch /tmp/PWNED -- user@host-a.example.com "* ]]
+  [[ "$output" == "[dry-run] ssh -i -oProxyCommand=touch /tmp/PWNED -- user@host-a.example.com "* ]] || false
 }
 
 @test "wp_remote passes -- before the host to ssh so a hostile-looking SITE_*_SSH_HOST can't be read as an option (MINOR-4)" {
@@ -135,7 +135,7 @@ EOF
   SITE_A_WP_CMD="wp"
   SITEGRAFT_DRY_RUN=1
   run wp_remote a option get siteurl
-  [[ "$output" == "[dry-run] ssh -- "* ]]
+  [[ "$output" == "[dry-run] ssh -- "* ]] || false
 }
 
 @test "wp_remote runs the local wp command when no SSH host is set" {
@@ -144,8 +144,8 @@ EOF
   SITE_B_WP_CMD="ddev wp"
   SITEGRAFT_DRY_RUN=1
   run wp_remote b post-type list --format=json
-  [[ "$output" != *"ssh"* ]]
-  [[ "$output" == *"ddev wp"* ]]
+  [[ "$output" != *"ssh"* ]] || false
+  [[ "$output" == *"ddev wp"* ]] || false
 }
 
 @test "wp_remote actually splits a multi-word local WP_CMD into separate argv words on real execution (not just dry-run echo)" {

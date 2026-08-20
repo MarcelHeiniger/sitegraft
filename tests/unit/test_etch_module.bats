@@ -31,23 +31,23 @@ setup() {
 
 @test "etch_post_types declares etch_cfs, etch_cpts, and etch_loops" {
   run etch_post_types
-  [[ "$output" == *"etch_cfs"* ]]
-  [[ "$output" == *"etch_cpts"* ]]
-  [[ "$output" == *"etch_loops"* ]]
+  [[ "$output" == *"etch_cfs"* ]] || false
+  [[ "$output" == *"etch_cpts"* ]] || false
+  [[ "$output" == *"etch_loops"* ]] || false
 }
 
 @test "etch_option_keys declares the settings/styles/toolbar/stylesheet keys" {
   run etch_option_keys
-  [[ "$output" == *"etch_settings"* ]]
-  [[ "$output" == *"etch_styles"* ]]
-  [[ "$output" == *"etch_css_toolbar_values"* ]]
-  [[ "$output" == *"etch_global_stylesheets"* ]]
+  [[ "$output" == *"etch_settings"* ]] || false
+  [[ "$output" == *"etch_styles"* ]] || false
+  [[ "$output" == *"etch_css_toolbar_values"* ]] || false
+  [[ "$output" == *"etch_global_stylesheets"* ]] || false
 }
 
 @test "etch_option_keys_exclude excludes license and db_version globs" {
   run etch_option_keys_exclude
-  [[ "$output" == *"etch_license_*"* ]]
-  [[ "$output" == *"etch_db_version"* ]]
+  [[ "$output" == *"etch_license_*"* ]] || false
+  [[ "$output" == *"etch_db_version"* ]] || false
 }
 
 # --- etch_stack_candidates: the one addition beyond the design doc's §3.3
@@ -69,5 +69,5 @@ setup() {
   mkdir -p "$SITEGRAFT_MODULES_DIR"
   cp "${BATS_TEST_DIRNAME}/../../modules/etch.sh" "$SITEGRAFT_MODULES_DIR/etch.sh"
   modules_discover
-  [[ " ${SITEGRAFT_MODULES} " == *" etch "* ]]
+  [[ " ${SITEGRAFT_MODULES} " == *" etch "* ]] || false
 }
