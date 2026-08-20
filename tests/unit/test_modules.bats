@@ -23,8 +23,8 @@ EOF
 
 @test "modules_discover finds demo-mod but skips _template.sh and the real motopress.sh.example (N1)" {
   modules_discover
-  [[ " $SITEGRAFT_MODULES " == *" demo_mod "* ]]
-  [[ " $SITEGRAFT_MODULES " != *" template "* ]]
+  [[ " $SITEGRAFT_MODULES " == *" demo_mod "* ]] || false
+  [[ " $SITEGRAFT_MODULES " != *" template "* ]] || false
   [[ " $SITEGRAFT_MODULES " != *" motopress "* ]]
 }
 
@@ -36,13 +36,13 @@ EOF
   # plausible in the design doc's prose.
   cp "${BATS_TEST_DIRNAME}/../../modules/motopress.sh.example" "$SITEGRAFT_MODULES_DIR/motopress.sh"
   modules_discover
-  [[ " $SITEGRAFT_MODULES " == *" motopress "* ]]
+  [[ " $SITEGRAFT_MODULES " == *" motopress "* ]] || false
   run module_call motopress name
   [ "$status" -eq 0 ]
   [ "$output" = "MotoPress Hotel Booking" ]
   run module_call motopress post_types
   [ "$status" -eq 0 ]
-  [[ "$output" == *"mphb_booking"* ]]
+  [[ "$output" == *"mphb_booking"* ]] || false
   run module_call motopress tables
   [ "$status" -eq 0 ]
   [ "$output" = "mphb_room_type_meta" ]
@@ -71,7 +71,7 @@ EOF
   # the side effect this test inspects (SITEGRAFT_MODULES) would never make
   # it back to this shell regardless of correctness.
   modules_discover >/dev/null 2>&1
-  [[ " $SITEGRAFT_MODULES " != *" broken "* ]]
+  [[ " $SITEGRAFT_MODULES " != *" broken "* ]] || false
   # The good module in the same directory must still load fine.
   [[ " $SITEGRAFT_MODULES " == *" demo_mod "* ]]
 }

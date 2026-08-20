@@ -216,7 +216,7 @@ EOF
   }
   run phase_scan --profile demo
   [ "$status" -eq 0 ]
-  [[ "$output" == *"could not verify whether site A has classic nav menu"* ]]
+  [[ "$output" == *"could not verify whether site A has classic nav menu"* ]] || false
   local run_dir
   run_dir=$(ls -dt "$BATS_TEST_TMPDIR"/runs/demo-* | head -1)
   run jq -e '.classic_menus_unknown == true and .classic_menus_detected == true' "${run_dir}/scan-a.json"
