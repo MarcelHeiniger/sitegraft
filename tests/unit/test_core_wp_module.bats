@@ -5,6 +5,8 @@
 # comment). Loaded directly (not via modules_discover) so the module
 # contract functions are exercised in isolation, same convention as
 # tests/unit/test_modules.bats uses for its own fabricated modules.
+bats_require_minimum_version 1.5.0
+
 setup() {
   load '../../lib/core.sh'
   # shellcheck disable=SC1091
@@ -33,15 +35,15 @@ setup() {
 
 @test "core_wp_post_types declares page and post" {
   run core_wp_post_types
-  [[ "$output" == *"page"* ]]
-  [[ "$output" == *"post"* ]]
+  [[ "$output" == *"page"* ]] || false
+  [[ "$output" == *"post"* ]] || false
 }
 
 @test "core_wp_option_keys declares the front-page trio plus site identity" {
   run core_wp_option_keys
-  [[ "$output" == *"page_on_front"* ]]
-  [[ "$output" == *"page_for_posts"* ]]
-  [[ "$output" == *"show_on_front"* ]]
+  [[ "$output" == *"page_on_front"* ]] || false
+  [[ "$output" == *"page_for_posts"* ]] || false
+  [[ "$output" == *"show_on_front"* ]] || false
 }
 
 @test "core_wp_post_import remaps page_on_front through id-map.tsv" {
@@ -53,7 +55,7 @@ setup() {
   wp_cmd_b_stub() { echo "wp_cmd_b_stub $*" >> "$BATS_TEST_TMPDIR/calls.log"; }
   core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
   run cat "$BATS_TEST_TMPDIR/calls.log"
-  [[ "$output" == *"option update page_on_front 105"* ]]
+  [[ "$output" == *"option update page_on_front 105"* ]] || false
 }
 
 @test "core_wp_post_import is a no-op when A never had a front page set" {
@@ -75,6 +77,45 @@ setup() {
   : > "$tsv" # page 5 was never actually imported
   wp_cmd_b_stub() { echo "SHOULD NOT BE CALLED" >> "$BATS_TEST_TMPDIR/calls.log"; }
   run core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
+  [ ! -f "$BATS_TEST_TMPDIR/calls.log" ]
+}
+
+# Fix-pack bug found live (DDEV harness, MAJOR-B's new graft --dry-run
+# assertion, running end to end for the first time against a genuinely
+# fresh run directory — same root cause and same fix as
+# graft_remap_featured_images in lib/graft.sh): graft_fetch_id_map never
+# creates id_map_tsv under --dry-run, so on a first-time dry run the file
+# doesn't exist at all, not merely empty. `awk` on a genuinely missing file
+# exits non-zero (2), and the bare `new_id=$(awk ...)` assignment aborted
+# the whole graft under this codebase's `set -e` — reproduced live as a
+# bare, unlogged "exit 2" from the DDEV harness, no error message anywhere
+# (the awk call's own stderr is intentionally discarded via 2>/dev/null).
+#
+# Run via a real `bash -c 'set -euo pipefail; ...'` subprocess, not a plain
+# bats function call — same convention test_plan_select.bats' own
+# set-euo-pipefail regression test already established, for the identical
+# reason: a bats @test body does NOT itself run under set -e, so calling
+# core_wp_post_import directly here would never reproduce this bug at all
+# (verified while writing this test: a plain `run core_wp_post_import ...`
+# without set -e active masked the crash completely, awk's failure just
+# left new_id empty and the function returned 0 either way — the exact
+# opposite of what actually happens under bin/sitegraft's real `set -euo
+# pipefail`, which is what the DDEV harness run — and a real operator —
+# actually hits).
+@test "core_wp_post_import is a no-op (not a crash) under set -euo pipefail when id-map.tsv does not exist at all yet — first-time --dry-run case" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '"5"' > "${run_dir}/option-page_on_front.value"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  [ ! -e "$tsv" ]
+  run --separate-stderr bash -c '
+    set -euo pipefail
+    source lib/core.sh
+    source modules/core-wp.sh
+    wp_cmd_b_stub() { echo "SHOULD NOT BE CALLED" >> "$3"; }
+    core_wp_post_import "$1" "$2" wp_cmd_b_stub
+  ' _ "$run_dir" "$tsv" "$BATS_TEST_TMPDIR/calls.log"
   [ "$status" -eq 0 ]
   [ ! -f "$BATS_TEST_TMPDIR/calls.log" ]
 }
@@ -108,5 +149,5 @@ setup() {
   wp_cmd_b_stub() { echo "SHOULD NOT BE CALLED FOR REAL UNDER DRY-RUN"; }
   SITEGRAFT_DRY_RUN=1 run core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"[dry-run] wp_cmd_b_stub option update page_on_front 105"* ]]
+  [[ "$output" == *"[dry-run] wp_cmd_b_stub option update page_on_front 105"* ]] || false
 }

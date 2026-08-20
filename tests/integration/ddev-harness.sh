@@ -474,12 +474,36 @@ echo "==> re-running backup against the REAL graft manifest, so checksums_protec
 "${ROOT}/bin/sitegraft" backup --profile ddev-test --run "$RUN_DIR"
 jq -e '.checksums_protected_pre_graft.fakebooking | startswith("sha256:")' "${RUN_DIR}/manifest.json" >/dev/null
 
+echo "==> MAJOR-B (review fix-pack, reproduced live by Viktor): running graft --dry-run FIRST against this exact run directory, then asserting the REAL graft right after still does the work rather than silently skipping it"
+# graft_mark_step (lib/graft.sh) used to `touch` its graft.<step>.done
+# marker unconditionally, dry-run or not — a --dry-run graft against a run
+# directory wrote every marker for real, so a REAL graft against that SAME
+# run directory afterward saw every step as already done and skipped the
+# entire pipeline, silently. This is the realistic sequence that triggers
+# it: scan -> plan -> backup -> graft --dry-run -> graft, exactly what a
+# cautious operator previewing before the real run would do. Fixed by
+# guarding graft_mark_step itself so no marker is ever written under
+# SITEGRAFT_DRY_RUN=1 — asserted here first (no marker files exist right
+# after the dry run), then proven for real by every assertion (a)-(h) below,
+# which only pass if the REAL graft that follows actually migrated content
+# rather than a no-op skip.
+"${ROOT}/bin/sitegraft" graft --profile ddev-test --run "$RUN_DIR" --allow-stack-mismatch --dry-run
+DONE_MARKERS_AFTER_DRY_RUN=$(find "$RUN_DIR" -maxdepth 1 -name 'graft.*.done' 2>/dev/null)
+if [ -n "$DONE_MARKERS_AFTER_DRY_RUN" ]; then
+  echo "FAIL: graft --dry-run left marker file(s) behind — a real graft against this run directory would silently skip these steps (MAJOR-B regression):" >&2
+  echo "$DONE_MARKERS_AFTER_DRY_RUN" >&2
+  exit 1
+fi
+echo "==> confirmed: graft --dry-run left no graft.*.done marker in the run directory"
+
 echo "==> running graft"
 # --allow-stack-mismatch: both A/B get a fresh default WP theme from
 # `ddev wp core install`, normally identical — passed defensively anyway so
 # a real-world theme-version drift between the two disposable installs can
 # never turn into unrelated harness flakiness; no other stack component
-# (etch/acss) is registered as a module in this repo yet, so
+# (acss) is registered as a module in this repo yet (etch now is — see
+# modules/etch.sh — but never matches this harness's fixtures, which
+# simulate Etch via a mu-plugin, not a real "etch" plugin list entry), so
 # graft_check_stack_precondition has nothing else to resolve either way.
 "${ROOT}/bin/sitegraft" graft --profile ddev-test --run "$RUN_DIR" --allow-stack-mismatch
 

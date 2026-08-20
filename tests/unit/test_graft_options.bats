@@ -36,7 +36,7 @@ setup() {
     fi
   }
   run graft_migrate_options "$run_dir" "$manifest"
-  [[ "$output" == *"option update show_on_front"* ]]
+  [[ "$output" == *"option update show_on_front"* ]] || false
 }
 
 @test "graft_migrate_options never pushes page_on_front/page_for_posts directly (remapped by core_wp_post_import instead)" {
@@ -53,8 +53,8 @@ setup() {
     fi
   }
   run graft_migrate_options "$run_dir" "$manifest"
-  [[ "$output" != *"option update page_on_front"* ]]
-  [[ "$output" != *"option update page_for_posts"* ]]
+  [[ "$output" != *"option update page_on_front"* ]] || false
+  [[ "$output" != *"option update page_for_posts"* ]] || false
   [ "$(cat "${run_dir}/option-page_on_front.value")" = '"5"' ]
 }
 
@@ -73,12 +73,12 @@ setup() {
   graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
   run graft_search_replace_domain "" "https://b.example.com" "$tsv" "$run_dir"
   [ "$status" -eq 0 ]
-  [[ "$output" != *"SHOULD NOT BE CALLED"* ]]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 
   : > "$tsv"
   run graft_search_replace_domain "https://a.example.com" "https://b.example.com" "$tsv" "$run_dir"
   [ "$status" -eq 0 ]
-  [[ "$output" != *"SHOULD NOT BE CALLED"* ]]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }
 
 @test "graft_search_replace_domain's payload carries from/to and every migrated post id, never a table name" {
@@ -96,7 +96,7 @@ setup() {
   [ "$status" -eq 0 ]
   run jq -e '.post_ids == ["42","105"]' "$captured"
   [ "$status" -eq 0 ]
-  [[ "$output" != *"--tables"* ]]
+  [[ "$output" != *"--tables"* ]] || false
 }
 
 @test "graft_search_replace_domain's wp eval call requires the shared content-remap library and calls its function, never a table-wide search-replace" {
@@ -108,13 +108,14 @@ setup() {
   graft_remove_file() { :; }
   SITEGRAFT_DRY_RUN=1
   run graft_search_replace_domain "https://a.example.com" "https://b.example.com" "$tsv" "$run_dir"
-  [[ "$output" == *"wp_remote b eval"* ]]
-  [[ "$output" == *"require_once"* ]]
-  [[ "$output" == *"sitegraft-content-remap-functions.php"* ]]
-  [[ "$output" == *"sitegraft_remap_domain("* ]]
-  [[ "$output" == *"wp_update_post"* ]]
-  [[ "$output" != *'str_replace( "/", "\\/", $from )'* ]]  # the substitution itself must live in the required file, not inline here
-  [[ "$output" != *"search-replace"* ]]
+  [[ "$output" == *"wp_remote b eval"* ]] || false
+  [[ "$output" == *"require_once"* ]] || false
+  [[ "$output" == *"sitegraft-content-remap-functions.php"* ]] || false
+  [[ "$output" == *"sitegraft_remap_domain("* ]] || false
+  [[ "$output" == *"wp_update_post"* ]] || false
+  # the substitution itself must live in the required file, not inline here
+  [[ "$output" != *'str_replace( "/", "\\/", $from )'* ]] || false
+  [[ "$output" != *"search-replace"* ]] || false
 }
 
 @test "graft_migrate_options also rewrites the domain string inside a migrated option's own value, scoped only to that explicitly-listed key" {
@@ -133,9 +134,68 @@ setup() {
   run graft_migrate_options "$run_dir" "$manifest" "https://a.example.com" "https://b.example.com"
   [ "$status" -eq 0 ]
   local stored; stored=$(cat "${run_dir}/option-etch_styles.value")
-  [[ "$stored" == *"https://b.example.com/logo.png"* ]]
-  [[ "$stored" == *'https:\/\/b.example.com\/x'* ]]
-  [[ "$stored" != *"a.example.com"* ]]
+  [[ "$stored" == *"https://b.example.com/logo.png"* ]] || false
+  # Test-quality fix-pack bug found live (this assertion was silently never
+  # enforced before the fix-pack's `[[ ]] || false` pass — see the file's
+  # own note on the bash 3.2 [[ ]]-under-set-e quirk): the ORIGINAL
+  # assertion here checked for the literal escaped-slash text
+  # 'https:\/\/b.example.com\/x' — but graft_migrate_options' domain rewrite
+  # always re-serializes via jq (`jq -c ... walk(replace_domain)`), and jq
+  # does NOT escape "/" on output by default (same documented fact
+  # verify_options_match's own tests rely on) — REGARDLESS of whether the
+  # INPUT JSON had it escaped. The stored value was always going to come
+  # out with a plain, unescaped slash; asserting otherwise was asserting an
+  # implementation detail that can never be true, not a real requirement.
+  # What actually matters (and is what a downstream `wp option update
+  # --format=json` correctly parses either way, since escaping "/" is
+  # OPTIONAL in JSON, not required) is that the DECODED value is right —
+  # checked here via jq, the same "compare decoded, not raw text"
+  # discipline verify_options_match's own tests already established.
+  run jq -e '.escaped == "https://b.example.com/x"' <<< "$stored"
+  [ "$status" -eq 0 ]
+  [[ "$stored" != *"a.example.com"* ]] || false
+}
+
+# Fix-pack bug found live (DDEV harness, MAJOR-B's new graft --dry-run
+# assertion, running end to end for the first time): every other test in
+# this file stubs wp_remote WITHOUT checking is_dry_run at all, so it
+# always returns real canned data for "a" reads regardless of dry-run mode
+# — which meant none of them ever actually exercised what the REAL
+# wp_remote (lib/inventory.sh) does under --dry-run: wrap EVERY call,
+# reads included, in run_or_echo, returning "[dry-run] wp_remote a option
+# get ..." text instead of a real value. That garbage then hit `jq` in the
+# domain-rewrite pass a few lines below graft_migrate_options' own read —
+# jq errored (not valid JSON), and under this codebase's `set -euo
+# pipefail`, that aborted the WHOLE graft with a bare, unlogged exit 5.
+# This test's stub is deliberately is_dry_run-AWARE (mimicking exactly the
+# real wp_remote/run_or_echo relationship, same technique as
+# test_verify.bats' MAJOR-A regression tests) so it actually reproduces the
+# failure before the fix and proves the fix after it: the read from A must
+# return real data even under --dry-run (SITEGRAFT_DRY_RUN=0 is prefixed
+# onto just that one call), while the write to B stays correctly simulated.
+@test "graft_migrate_options reads A's real value even under --dry-run, so the domain-rewrite jq pass never chokes on dry-run-echo text (fix-pack regression)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_styles"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if is_dry_run; then
+      echo "[dry-run] wp_remote ${alias_lc} $*"
+      return 0
+    fi
+    if [ "$alias_lc" = "a" ]; then
+      echo '{"logo_url":"https://a.example.com/logo.png"}'
+    else
+      echo "SHOULD NOT BE CALLED FOR REAL — the write to B must stay simulated under --dry-run"
+    fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest" "https://a.example.com" "https://b.example.com"
+  [ "$status" -eq 0 ]
+  local stored; stored=$(cat "${run_dir}/option-etch_styles.value")
+  [[ "$stored" == *"https://b.example.com/logo.png"* ]] || false
+  [[ "$output" == *"[dry-run] wp_remote b"* ]] || false
+  [[ "$output" != *"SHOULD NOT BE CALLED FOR REAL"* ]] || false
 }
 
 @test "graft_prune_previous_run deletes every post carrying _sitegraft_source_id from a prior run" {
@@ -149,8 +209,8 @@ setup() {
     fi
   }
   run graft_prune_previous_run "page,post"
-  [[ "$output" == *"post delete 5"* ]]
-  [[ "$output" == *"post delete 7"* ]]
+  [[ "$output" == *"post delete 5"* ]] || false
+  [[ "$output" == *"post delete 7"* ]] || false
 }
 
 @test "graft_prune_previous_run is a no-op when the post_types list is empty" {
