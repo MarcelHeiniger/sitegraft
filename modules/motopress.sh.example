@@ -36,6 +36,14 @@ EOF
 # lands in the "protect" bucket, never in "migrate", for the case Marcel described —
 # a live B with real bookings). Shown here purely to document the hook signature for
 # a future module that DOES migrate a plugin's content.
+#
+# `run_or_echo` wraps every write below — required, not decorative (design
+# doc §3.2): graft_run_module_post_import (lib/graft.sh) calls every module's
+# post_import hook unconditionally, including under `--dry-run` — a hook
+# that calls `$wp_cmd_b` directly instead of through `run_or_echo` would
+# write to B for real even on a dry run. lib/core.sh's run_or_echo is
+# already sourced by the time any module hook runs; a future module never
+# needs its own dry-run check.
 motopress_post_import() {
   state_dir="$1"
   id_map_tsv="$2"
@@ -46,7 +54,7 @@ motopress_post_import() {
     [ "$post_type" = "mphb_room_type" ] || continue
     $wp_cmd_b post list --post_type=mphb_booking --meta_key=related_room_id \
       --meta_value="$old_id" --field=ID | while read -r booking_id; do
-        $wp_cmd_b post meta update "$booking_id" related_room_id "$new_id"
+        run_or_echo $wp_cmd_b post meta update "$booking_id" related_room_id "$new_id"
     done
   done < "$id_map_tsv"
 }

@@ -67,7 +67,19 @@ core_wp_post_import() {
     esac
     new_id=$(awk -F'\t' -v old="$old_id" '$1==old{print $2}' "$id_map_tsv" 2>/dev/null)
     if [ -n "$new_id" ]; then
-      $wp_cmd_b option update "$key" "$new_id"
+      # Step 6 dry-run audit: this was a raw, unwrapped write — the ONE real
+      # gap the audit found (design doc §3.2's module contract never said a
+      # post_import hook must respect --dry-run, and graft_run_module_
+      # post_import, lib/graft.sh, calls every module's hook unconditionally,
+      # not only when NOT is_dry_run). Concretely reachable, not theoretical:
+      # graft's step-idempotency markers (graft.*.done files) mean a
+      # `--dry-run` re-run of `graft` against a run directory whose
+      # id-map.tsv was already populated by an earlier REAL run would have
+      # actually written to B's live page_on_front/page_for_posts option —
+      # while the run overall was believed dry. run_or_echo is already this
+      # codebase's one standard for exactly this (see lib/core.sh) — used
+      # here instead of a second, module-local dry-run check.
+      run_or_echo $wp_cmd_b option update "$key" "$new_id"
     else
       log_warn "core-wp post_import: A's ${key} (page ${old_id}) has no corresponding entry in id-map.tsv — leaving B's ${key} unchanged (the page was likely not included in this run's migrate selection)"
     fi

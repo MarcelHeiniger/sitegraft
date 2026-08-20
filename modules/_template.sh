@@ -24,6 +24,11 @@
 # my_plugin_tables() { printf 'my_plugin_data\n'; }
 
 # Optional: run after WXR import + generic remaps, for module-specific fixups.
+# Called unconditionally, including under `--dry-run` (design doc §3.2) — wrap
+# every write through $wp_cmd_b in lib/core.sh's run_or_echo (already sourced
+# by the time this runs), never call $wp_cmd_b directly for a mutating
+# subcommand. See modules/motopress.sh.example's post_import for a full
+# worked example.
 # my_plugin_post_import() { local state_dir="$1" id_map_tsv="$2" wp_cmd_b="$3"; }
 
 # Optional: this module's plugin is also a §12 stack-sync component (like etch

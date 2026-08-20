@@ -181,6 +181,20 @@ For a module with prefix `<mod>` (e.g. `core_wp`, `etch`, `acss`, `motopress`):
 \* At least ONE of the three functions `_post_types` / `_option_keys` / `_tables`
 must exist — a module that declares nothing has no reason to exist.
 
+**`<mod>_post_import` and `--dry-run` (added in Step 6's dry-run audit, which
+found and fixed a real violation of this in `modules/core-wp.sh`):**
+`graft_run_module_post_import` (lib/graft.sh) calls every module's
+`post_import` hook unconditionally, whether or not `--dry-run` was passed —
+there is no separate "skip module hooks in dry-run" branch. A hook that
+mutates B (via the `wp_cmd_b` prefix it's handed) MUST wrap every such call in
+`lib/core.sh`'s `run_or_echo` — never invoke `$wp_cmd_b` directly for a
+write. `run_or_echo` is already sourced by the time any module hook runs, so
+this is zero extra work: `run_or_echo $wp_cmd_b option update key value`
+instead of `$wp_cmd_b option update key value`. Read-only `$wp_cmd_b` calls
+(e.g. `post list` to look something up) don't need wrapping. See
+`modules/motopress.sh.example`'s `motopress_post_import` for a worked
+example, and `modules/core-wp.sh`'s `core_wp_post_import` for the real fix.
+
 `lib/modules.sh` discovers modules via the glob `modules/*.sh` (the `.example`
 suffix is explicitly excluded, as is `_template.sh`), sources each file, and builds
 `SITEGRAFT_MODULES` — a space-separated string of names (no associative array,
