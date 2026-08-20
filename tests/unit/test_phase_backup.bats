@@ -31,7 +31,7 @@ EOF
   "frozen": true,
   "migrate": {},
   "protect": {
-    "fakebooking": {"post_types": [], "tables": ["wp_fakebooking_reservations"], "option_keys": []},
+    "fakebooking": {"post_types": [], "tables": ["fakebooking_reservations"], "option_keys": []},
     "_unclaimed": {"post_types": [], "tables": [], "option_keys": []}
   }
 }
