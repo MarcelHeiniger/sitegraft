@@ -40,6 +40,7 @@ wp_remote() {
   local host_var="SITE_${alias_uc}_SSH_HOST"
   local path_var="SITE_${alias_uc}_WP_PATH"
   local cmd_var="SITE_${alias_uc}_WP_CMD"
+  local key_var="SITE_${alias_uc}_SSH_KEY"
   local host="${!host_var:-}"
   # `${!path_var:?msg}` looks like a safe guard but is NOT one on this bash
   # version (verified live, second review round): that fatal parameter-
@@ -60,11 +61,21 @@ wp_remote() {
 
   if [ -n "$host" ]; then
     require_cmd ssh || return 1
-    # TODO(Task 2.3): SITE_<ALIAS>_SSH_KEY is parsed and whitelisted by
-    # lib/profile.sh (design doc §5.2) but not consumed here yet — ssh is
-    # invoked with no -i, relying entirely on the caller's own ssh-agent/
-    # default-key setup. Wire it in as `ssh -i "$ssh_key" ...` once
-    # interactive credential handling (Task 2.3) lands.
+    local ssh_key="${!key_var:-}"
+    # Step 6 self-review (design doc §5.2 vs. code): SITE_<ALIAS>_SSH_KEY was
+    # parsed and whitelisted by lib/profile.sh, and documented in §5.2 as a
+    # real credential an operator can set — but this function silently
+    # ignored it, always relying on the caller's own ssh-agent/default-key
+    # setup regardless. Not a cosmetic gap: an operator who deliberately set
+    # SITE_A_SSH_KEY (e.g. a per-host deploy key, distinct from their normal
+    # default identity) would have that choice silently discarded, with
+    # `ssh` falling back to whatever key it picks by default instead —
+    # wrong, or simply failing to authenticate, with no indication why.
+    # Fixed here rather than left for the still-undone interactive-prompt
+    # half of §5.2 (part (b), file-based-only for now — see docs/status.md
+    # for that documented, deliberately deferred gap): this is the file-path
+    # (a) case, already fully wired everywhere else, just never reaching
+    # ssh's own argv.
     # Every argument that will reach the REMOTE shell must be single-quoted
     # individually via sq() — building the remote command line by hand with
     # "$wp_cmd --path='$path' $*" (the previous version) was both an
@@ -95,7 +106,19 @@ wp_remote() {
     # hostile-looking host string is parsed as a (rejected) literal
     # hostname instead of as an option, while legitimate hosts are
     # completely unaffected.
-    run_or_echo ssh -- "$host" "$remote_cmd"
+    #
+    # `-i "$ssh_key"` BEFORE `--` (an option, not a positional) only when
+    # SITE_<ALIAS>_SSH_KEY was actually set — an empty/unset key means "use
+    # ssh's own default identity resolution", not "pass -i with an empty
+    # argument" (ssh would reject that outright). No array needed for this
+    # one optional flag (this codebase avoids bash arrays entirely so far,
+    # bash 3.2 target or not) — a plain if/else with the flag inlined is
+    # just as clear here.
+    if [ -n "$ssh_key" ]; then
+      run_or_echo ssh -i "$ssh_key" -- "$host" "$remote_cmd"
+    else
+      run_or_echo ssh -- "$host" "$remote_cmd"
+    fi
   else
     # $wp_cmd is deliberately unquoted here so it word-splits into separate
     # argv elements (e.g. "ddev exec -p my-site -- wp" -> 6 words). A quoted

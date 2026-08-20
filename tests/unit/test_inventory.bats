@@ -89,6 +89,41 @@ EOF
   [[ "$output" != *"'1'; touch /tmp/PWNED"* ]]
 }
 
+@test "wp_remote passes -i <SSH_KEY> before -- when SITE_<ALIAS>_SSH_KEY is set (Step 6 self-review: design doc §5.2 vs. code drift, was parsed but never consumed)" {
+  SITE_A_SSH_HOST="user@host-a.example.com"
+  SITE_A_WP_PATH="/var/www/html"
+  SITE_A_WP_CMD="wp"
+  SITE_A_SSH_KEY="/home/marcel/.ssh/id_ed25519_site_a"
+  SITEGRAFT_DRY_RUN=1
+  run wp_remote a option get siteurl
+  [ "$output" = "[dry-run] ssh -i /home/marcel/.ssh/id_ed25519_site_a -- user@host-a.example.com wp --path='/var/www/html' 'option' 'get' 'siteurl'" ]
+}
+
+@test "wp_remote never passes -i when SITE_<ALIAS>_SSH_KEY is unset — falls back to ssh's own default identity resolution" {
+  SITE_A_SSH_HOST="user@host-a.example.com"
+  SITE_A_WP_PATH="/var/www/html"
+  SITE_A_WP_CMD="wp"
+  unset SITE_A_SSH_KEY
+  SITEGRAFT_DRY_RUN=1
+  run wp_remote a option get siteurl
+  [[ "$output" != *"-i "* ]]
+}
+
+@test "wp_remote's -i value is a plain positional argument to -i, so a hostile-looking SITE_*_SSH_KEY can't be read as a SEPARATE ssh option" {
+  # "-i" consumes exactly the next argv element as its own value (ssh's own
+  # option-parsing contract, same reasoning as the SSH_HOST MINOR-4 test
+  # below for "--"/positionals) — a key value that itself looks like an
+  # option (e.g. starting with "-") lands as -i's argument, never as a
+  # second, independent flag ssh would parse on its own.
+  SITE_A_SSH_HOST="user@host-a.example.com"
+  SITE_A_WP_PATH="/var/www/html"
+  SITE_A_WP_CMD="wp"
+  SITE_A_SSH_KEY="-oProxyCommand=touch /tmp/PWNED"
+  SITEGRAFT_DRY_RUN=1
+  run wp_remote a option get siteurl
+  [[ "$output" == "[dry-run] ssh -i -oProxyCommand=touch /tmp/PWNED -- user@host-a.example.com "* ]]
+}
+
 @test "wp_remote passes -- before the host to ssh so a hostile-looking SITE_*_SSH_HOST can't be read as an option (MINOR-4)" {
   # Verified live: "ssh -oProxyCommand=..." is only rejected today because
   # profile-sourced hosts happen to contain characters ssh's own option
