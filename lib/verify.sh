@@ -5,9 +5,13 @@
 # claimed to run, but silently did the wrong thing (a skipped options update,
 # a broken domain search-replace, a page_on_front pointing at the wrong page).
 # Nothing in this file ever writes to B — every wp_remote call here is a
-# read (option get, post get/list, db query, eval SELECT), never an update/
-# import/delete. That is the whole point of a *verify* phase: prove the graft
-# worked without being able to change what it proved.
+# read (option get, post get/list, db export, eval that only inspects and
+# echoes), never an update/import/delete/search-replace. That is the whole
+# point of a *verify* phase: prove the graft worked without being able to
+# change what it proved. (The one write-shaped-looking call, pushing a
+# small JSON payload file for verify_domain_absent's `wp eval` to read, is
+# to a throwaway file under wp-content — never a database write — and is
+# removed again immediately after; see that function's own comment.)
 
 # verify_compare_checksums <manifest_json> <recomputed_checksums_json> — pure
 # function, no I/O. Same normalization as backup_checksum (design doc §6.3,
@@ -49,6 +53,28 @@ verify_compare_checksums() {
 # not a failure: any key graft never actually reached (an interrupted run
 # resumed past this step) is not this function's job to invent an opinion
 # about.
+#
+# Security-review fix-pack (Kimi, MAJOR, missed by the first review pass —
+# CRITICAL for any DACH/FR site, which is this tool's primary use case):
+# comparing the two sides as raw TEXT is wrong whenever the value contains a
+# `/` or a non-ASCII character. The file on disk can be written two
+# different ways depending on whether graft_migrate_options' domain-rewrite
+# ran (lib/graft.sh): untouched, it's A's own `wp option get --format=json`
+# text (PHP json_encode — escapes `/` to `\/` and non-ASCII to `\uXXXX` by
+# default); rewritten for a domain search-replace (true for virtually every
+# REAL graft, since almost none skip a domain remap), it's jq's own
+# re-serialization (jq does NOT escape `/` or non-ASCII by default). B's
+# live re-fetch below is ALWAYS PHP json_encode (via `wp option get
+# --format=json`). So a migrated option holding a URL or an accented
+# character (ü, é — the everyday case for a German/French site, not an edge
+# case) would compare two texts that decode to the IDENTICAL value but are
+# spelled differently — a false HARD FAIL on every such graft. Piping BOTH
+# sides through `jq -c .` before comparing decodes and re-serializes each
+# with jq's own single, consistent convention, so the comparison is over
+# the decoded value, not over which of two different serializers happened
+# to write the text last. Falls back to the raw text if a side isn't valid
+# JSON at all (shouldn't happen for a `--format=json` value, but comparing
+# something is still better than aborting the whole check on one bad key).
 verify_options_match() {
   local run_dir="$1" manifest="$2"
   local key mismatched=""
@@ -57,10 +83,12 @@ verify_options_match() {
       page_on_front|page_for_posts) continue ;;
     esac
     [ -f "${run_dir}/option-${key}.value" ] || continue
-    local expected actual
+    local expected actual expected_canon actual_canon
     expected=$(cat "${run_dir}/option-${key}.value")
     actual=$(wp_remote b option get "$key" --format=json 2>/dev/null || echo 'null')
-    [ "$expected" = "$actual" ] || mismatched="${mismatched}${key} "
+    expected_canon=$(printf '%s' "$expected" | jq -c . 2>/dev/null) || expected_canon="$expected"
+    actual_canon=$(printf '%s' "$actual" | jq -c . 2>/dev/null) || actual_canon="$actual"
+    [ "$expected_canon" = "$actual_canon" ] || mismatched="${mismatched}${key} "
   done
   if [ -n "$mismatched" ]; then
     log_error "migrated option value(s) do not match A's on B: ${mismatched}"
@@ -68,33 +96,134 @@ verify_options_match() {
   fi
 }
 
-# verify_domain_absent <alias> <domain> <table_prefix> — design doc §9.4/§6.5:
-# is A's domain string absent from B's content (posts, postmeta, options)?
-# Checks BOTH forms graft's own remap targets (design doc §9.4) — plain
-# ("https://a.example.com") and JSON-escaped ("https:\/\/a.example.com"),
-# since Etch stores some data as JSON blobs in certain options/postmeta.
+# verify_domain_absent <run_dir> <id_map_tsv> <manifest_json> <domain> —
+# design doc §9.4/§6.5. Rewritten in a security-review fix-pack (Viktor +
+# Kimi, independently converging on the same root cause) after Marcel
+# confirmed, reading a REAL verify-report.md, that the original SQL-based
+# version was a DEAD check: it always reported "absent" (PASS) regardless
+# of B's actual content.
 #
-# Deliberately NOT scoped to only the posts THIS run imported (unlike
-# graft_search_replace_domain's own scoping, lib/graft.sh MAJOR-2) — that
-# scoping exists there to keep a WRITE away from a protected plugin's rows;
-# a read-only LIKE query carries none of that risk, and scanning B's whole
-# content tables is the more thorough check: it would also catch a leftover
-# reference in a row graft's scoped remap never touched for some other
-# reason (a bug this check exists specifically to surface, not paper over).
+# What was wrong with the original implementation, and why a PHP-side
+# rewrite (not a smaller patch) was the only fix that closes all of it:
+#  1. FATAL (Kimi, root cause): a `UNION ... LIMIT` per branch is invalid
+#     MySQL/MariaDB syntax (error 1064) — EVERY invocation of the old query
+#     errored. That error was swallowed by `2>/dev/null || echo ""`, so
+#     `hit` was always empty and the function always returned 0 — a check
+#     that structurally could never fail, because its query never once
+#     executed successfully. This is a fail-OPEN bug, not a false-negative
+#     edge case: the check was decorative from the day it shipped.
+#  2. Even with valid SQL, the JSON-escaped-form branch (`LIKE
+#     '%https:\/\/%'`) could never match real escaped bytes either — SQL
+#     string-literal escaping mangles a literal backslash inside a LIKE
+#     pattern, so the exact case this branch exists for (Etch's JSON blobs,
+#     design doc §9.4) was unreachable even in a syntactically-valid
+#     version.
+#  3. Scanning B's WHOLE posts/postmeta/options tables conflates two
+#     different questions: "did graft fully rewrite the content it
+#     imported" (what verify should ask) vs. "does A's domain string exist
+#     ANYWHERE on B" (not a graft defect when it doesn't — B legitimately
+#     carrying a reference to A's domain, e.g. B is a clone of A, or a
+#     protected plugin's own settings happen to mention it, is not
+#     something graft's own search-replace was ever scoped to fix, exactly
+#     the reasoning graft_search_replace_domain's own comment gives for
+#     scoping ITS write the same way). A table-wide read wrongly hard-fails
+#     on that, real for the harness's own MAJOR-2 protected-data injection
+#     fixture and for any real B that predates the graft.
+#
+# The fix: a single `wp eval`, scoped IDENTICALLY to graft's own write
+# surface (graft_search_replace_domain, lib/graft.sh) — the posts THIS run
+# imported (id-map.tsv's new-ID column, via graft_migrated_post_ids_json)
+# plus the migrated option_keys — never a table-wide scan. Uses PHP's own
+# strpos() directly on the raw fetched bytes, not SQL LIKE and not a JSON
+# round-trip:
+#  - post_content/post_excerpt (plain TEXT columns, never PHP-serialized —
+#    same reasoning as graft_search_replace_domain's own comment) are
+#    searched for BOTH the plain domain string and its JSON-escaped form (a
+#    real backslash-slash byte sequence, not a SQL escape of one) — strpos()
+#    on raw bytes has no escaping-layer ambiguity at all.
+#  - a migrated option's LIVE value is run through maybe_serialize() before
+#    strpos(): PHP's serialize() format never escapes `/` or any other byte
+#    (unlike JSON), so a single plain-domain strpos against the serialized
+#    form reliably finds the domain inside ANY nested array/object without
+#    needing a second escaped-form check for options.
+# The domain travels to B inside a pushed JSON payload file (the same
+# graft_push_remap_payload/graft_remove_file pattern every other B-bound
+# transfer in this codebase already uses), decoded server-side by PHP's own
+# json_decode — never interpolated into a SQL or shell string, which also
+# closes the SQL-quote-injection surface the old implementation had.
+#
+# Fails CLOSED, not open: a `wp eval` that errors, or produces no
+# recognizable result, is reported as UNKNOWN and treated as a failure by
+# the caller — never silently folded into "absent". This is the single
+# property the previous implementation most needed and didn't have.
+#
+# Known, documented scope limit (MINOR, review fix-pack): this checks for
+# the domain string exactly as `manifest.options.search_replace.from`
+# recorded it (mirroring graft's own scope) — a DIFFERENT scheme variant of
+# the same host (e.g. A's content using `http://` when the manifest recorded
+# `https://`, or a protocol-relative `//a.example.com`) is not detected,
+# because graft's own search-replace never targeted it either. Not a gap
+# this check introduces; it inherits graft's own documented scope exactly.
 verify_domain_absent() {
-  local alias_lc="$1" domain="$2" prefix="$3"
+  local run_dir="$1" id_map_tsv="$2" manifest="$3" domain="$4"
   [ -n "$domain" ] || return 0
-  local escaped hit
-  escaped=$(printf '%s' "$domain" | sed 's#/#\\/#g')
-  hit=$(wp_remote "$alias_lc" db query \
-    "SELECT 1 FROM ${prefix}posts WHERE post_content LIKE '%${domain}%' OR post_content LIKE '%${escaped}%' OR post_excerpt LIKE '%${domain}%' OR post_excerpt LIKE '%${escaped}%' LIMIT 1
-     UNION SELECT 1 FROM ${prefix}postmeta WHERE meta_value LIKE '%${domain}%' OR meta_value LIKE '%${escaped}%' LIMIT 1
-     UNION SELECT 1 FROM ${prefix}options WHERE option_value LIKE '%${domain}%' OR option_value LIKE '%${escaped}%' LIMIT 1" \
-    --skip-column-names 2>/dev/null || echo "")
-  if [ -n "$hit" ]; then
-    log_error "A's domain string ('${domain}') is still present in B's content (posts/postmeta/options) — the domain search-replace did not fully rewrite it"
+
+  local post_ids_json option_keys_json payload_json remote_path
+  post_ids_json='[]'
+  [ -s "$id_map_tsv" ] && post_ids_json=$(graft_migrated_post_ids_json "$id_map_tsv")
+  option_keys_json=$(echo "$manifest" | jq -c '[.migrate[]?.option_keys[]?] | unique')
+  payload_json=$(jq -n --argjson post_ids "$post_ids_json" --argjson option_keys "$option_keys_json" --arg domain "$domain" \
+    '{post_ids: $post_ids, option_keys: $option_keys, domain: $domain}')
+  remote_path=$(graft_push_remap_payload "$run_dir" "$payload_json" "sitegraft-verify-domain-payload.json")
+
+  # `&&`/`||` (not a bare assignment) so a failing wp_remote call is exempt
+  # from bin/sitegraft's `set -e` (the same class of pitfall lib/core.sh's
+  # own sitegraft_cleanup comment documents at length) and `rc` genuinely
+  # reflects the call's real exit status instead of aborting the process
+  # before `rc=$?` is ever reached.
+  local result rc
+  result=$(wp_remote b eval '
+    $payload_path = WP_CONTENT_DIR . "/sitegraft-verify-domain-payload.json";
+    $payload = json_decode( file_get_contents( $payload_path ), true );
+    if ( ! $payload ) { echo "ERROR:unreadable-payload"; return; }
+    $domain = $payload["domain"];
+    $escaped = str_replace( "/", "\\/", $domain );
+    $hits = array();
+    foreach ( $payload["post_ids"] as $post_id ) {
+      $post_id = (int) $post_id;
+      $post = get_post( $post_id );
+      if ( ! $post ) { continue; }
+      if ( strpos( $post->post_content, $domain ) !== false || strpos( $post->post_content, $escaped ) !== false
+        || strpos( $post->post_excerpt, $domain ) !== false || strpos( $post->post_excerpt, $escaped ) !== false ) {
+        $hits[] = "post:{$post_id}";
+      }
+    }
+    foreach ( $payload["option_keys"] as $key ) {
+      $value = get_option( $key );
+      if ( $value === false ) { continue; }
+      if ( strpos( maybe_serialize( $value ), $domain ) !== false ) {
+        $hits[] = "option:{$key}";
+      }
+    }
+    echo empty( $hits ) ? "OK" : ( "HIT:" . implode( ",", $hits ) );
+  ' 2>/dev/null) && rc=0 || rc=$?
+  graft_remove_file b "$remote_path" 2>/dev/null || true
+
+  if [ "$rc" -ne 0 ] || [ -z "$result" ]; then
+    log_error "domain-absence check could not run (wp eval failed or returned nothing) — treated as UNKNOWN, never as a silent pass"
     return 1
   fi
+  case "$result" in
+    OK) return 0 ;;
+    HIT:*)
+      log_error "A's domain string ('${domain}') is still present in content graft imported: ${result#HIT:}"
+      return 1
+      ;;
+    *)
+      log_error "domain-absence check returned an unrecognized result ('${result}') — treated as UNKNOWN, never as a silent pass"
+      return 1
+      ;;
+  esac
 }
 
 # verify_page_on_front <run_dir> <id_map_tsv> — design doc §9.3/§6.5/review
@@ -255,17 +384,16 @@ phase_verify() {
     hard_fail=1
   fi
 
-  # --- A's domain absent from B's content (finding B3) ----------------------
+  # --- A's domain absent from the content graft imported (finding B3,
+  # rescoped and rebuilt in the security-review fix-pack — see
+  # verify_domain_absent's own comment for why) ------------------------------
   local domain; domain=$(echo "$manifest" | jq -r '.options.search_replace.from // ""')
   [ "$domain" = "null" ] && domain=""
   if [ -n "$domain" ]; then
-    local prefix; prefix=$(inventory_table_prefix b 2>/dev/null || echo "")
-    if [ -z "$prefix" ]; then
-      echo "- [ ] domain-absence check skipped — could not determine B's live table prefix" >> "$report"
-    elif verify_domain_absent b "$domain" "$prefix" 2>>"$report"; then
-      echo "- [x] A's domain string is absent from B's content" >> "$report"
+    if verify_domain_absent "$run_dir" "$id_map_tsv" "$manifest" "$domain" 2>>"$report"; then
+      echo "- [x] A's domain string is absent from the content graft imported (migrated posts + migrated options)" >> "$report"
     else
-      echo "- [ ] **HARD FAIL: A's domain string is still present in B's content** — see above" >> "$report"
+      echo "- [ ] **HARD FAIL: A's domain string is still present in content graft imported, or the check could not be verified** — see above" >> "$report"
       hard_fail=1
     fi
   fi
@@ -280,11 +408,24 @@ phase_verify() {
     hard_fail=1
   fi
 
-  # --- orphan post_parent references (design doc §9.2/§11 — a warning, not
-  # a hard failure: signals a manifest selection mistake, fixed by hand via
-  # id-map.tsv, not something verify can safely auto-correct) ---------------
-  local orphans; orphans=$(graft_check_orphan_parents 2>/dev/null || echo "")
-  if [ -z "$orphans" ]; then
+  # --- orphan post_parent references (design doc §9.2/§11 — orphans FOUND
+  # is a warning, not a hard failure: signals a manifest selection mistake,
+  # fixed by hand via id-map.tsv, not something verify can safely
+  # auto-correct). Security-review fix-pack (Kimi, same fail-open class as
+  # verify_domain_absent above): the previous `2>/dev/null || echo ""`
+  # treated a QUERY ERROR (wp-cli failure, connectivity issue) identically
+  # to "confirmed zero orphans" — a check that can never actually fail is as
+  # dangerous as one with broken syntax. A query that errors is now reported
+  # as UNKNOWN and IS a hard failure (an unverified check must never pass
+  # silently); only a query that ran and genuinely found nothing prints the
+  # pass line, and only a query that ran and found real orphans prints the
+  # (non-blocking) warning. -------------------------------------------------
+  local orphans orphan_rc
+  orphans=$(graft_check_orphan_parents 2>>"$report") && orphan_rc=0 || orphan_rc=$?
+  if [ "$orphan_rc" -ne 0 ]; then
+    echo "- [ ] **HARD FAIL: the orphan post_parent check could not run (query error) — treated as UNKNOWN, never as a silent pass** — see above" >> "$report"
+    hard_fail=1
+  elif [ -z "$orphans" ]; then
     echo "- [x] no orphan post_parent references" >> "$report"
   else
     echo "- [ ] orphan post_parent references found (post ID(s), design doc §9.2 — check manually / remap via id-map.tsv): $(echo "$orphans" | tr '\n' ' ')" >> "$report"

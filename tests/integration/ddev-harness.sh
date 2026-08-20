@@ -648,7 +648,7 @@ fi
 grep -q "protected data unchanged" "$VERIFY_REPORT"
 grep -q "migrated options match A's values on B" "$VERIFY_REPORT"
 grep -q "page_on_front resolves to the correctly remapped page" "$VERIFY_REPORT"
-grep -q "A's domain string is absent from B's content" "$VERIFY_REPORT"
+grep -q "A's domain string is absent from the content graft imported" "$VERIFY_REPORT"
 grep -q "no orphan post_parent references" "$VERIFY_REPORT"
 grep -q "expected navigation is present" "$VERIFY_REPORT"
 grep -q "Result: PASS" "$VERIFY_REPORT"
@@ -667,6 +667,83 @@ echo "==> confirmed: verify correctly HARD FAILS (non-zero exit, report says so 
 
 echo "==> reverting the injected corruption and re-confirming verify passes clean again"
 ddev exec --raw -p "$PROJECT_B" -- wp option update etch_settings '{"theme_mode":"dark"}' --format=json
+"${ROOT}/bin/sitegraft" verify --profile ddev-test --run "$RUN_DIR"
+grep -q "Result: PASS" "$VERIFY_REPORT"
+
+# Security-review fix-pack (post-merge-review by Marcel + Kimi, converging
+# with Viktor's own independent finding): the FIRST version of this harness
+# pass never actually exercised a domain leak, so it never caught that
+# verify_domain_absent's original SQL-based implementation was structurally
+# DEAD — a `UNION ... LIMIT` per branch is invalid MySQL/MariaDB syntax, so
+# every real invocation errored, and that error was silently swallowed
+# (`2>/dev/null || echo ""`) into an always-"absent" result. Marcel found
+# this by reading a real verify-report.md that said "domain absent: PASS"
+# against a B that still, provably, carried A's domain. This negative case
+# is the fix's own proof: it did not exist before, and its whole point is
+# proving the rewritten check (a) genuinely fires on a real leak in content
+# graft imported, something the dead check could never do regardless of
+# what was actually on B, and (b) stays correctly scoped to graft's own
+# write surface (migrated posts + migrated option_keys) rather than
+# hard-failing on B's own protected, out-of-scope data — B's fakebooking
+# fixture has carried A's domain in its OWN settings since the MAJOR-2
+# injection far above, and must NOT be reported here.
+echo "==> NEGATIVE CASE 2 (the primary regression this fix-pack repairs): injecting A's domain string into a post graft ACTUALLY imported (in scope), while B's protected fakebooking_settings STILL carries A's domain from the earlier MAJOR-2 injection (out of scope) — proves verify_domain_absent both fires for real and stays correctly scoped"
+HERO_ID=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=etch_cfs --title="Hero CFS" --field=ID)
+[ -n "$HERO_ID" ]
+HERO_CONTENT_BEFORE=$(ddev exec --raw -p "$PROJECT_B" -- wp post get "$HERO_ID" --field=post_content)
+ddev exec --raw -p "$PROJECT_B" -- wp post update "$HERO_ID" --post_content="${HERO_CONTENT_BEFORE} <!-- leaked reference to ${DOMAIN_A} -->"
+if "${ROOT}/bin/sitegraft" verify --profile ddev-test --run "$RUN_DIR"; then
+  echo "FAIL: verify reported success even though A's domain string was injected into a post graft actually imported — verify_domain_absent is not checking real content (the exact dead-check regression this fix-pack repairs)" >&2
+  exit 1
+fi
+grep -q "HARD FAIL" "$VERIFY_REPORT"
+# The actual log line interpolates the domain BETWEEN "domain string" and
+# "is still present" (`A's domain string ('https://...') is still present in
+# content graft imported: post:N`) — matching on the stable suffix only,
+# never the interpolated domain text itself.
+DOMAIN_HARD_FAIL_LINE=$(grep "is still present in content graft imported" "$VERIFY_REPORT")
+[ -n "$DOMAIN_HARD_FAIL_LINE" ]
+case "$DOMAIN_HARD_FAIL_LINE" in
+  *"post:${HERO_ID}"*) : ;;
+  *) echo "FAIL: the domain-absence hard fail did not name the actual leaking post (post:${HERO_ID})" >&2; exit 1 ;;
+esac
+case "$DOMAIN_HARD_FAIL_LINE" in
+  *"fakebooking"*)
+    echo "FAIL: verify_domain_absent flagged B's PROTECTED fakebooking_settings (out of graft's write scope) — the scoping fix regressed to a table-wide scan" >&2
+    exit 1
+    ;;
+esac
+echo "==> confirmed: verify_domain_absent fires on a real domain leak in imported content (post:${HERO_ID}) and correctly ignores B's protected fakebooking_settings, which has carried A's domain since the MAJOR-2 injection — proves both the fix and the scoping"
+
+echo "==> reverting the injected domain leak and re-confirming verify passes clean again"
+ddev exec --raw -p "$PROJECT_B" -- wp post update "$HERO_ID" --post_content="$HERO_CONTENT_BEFORE"
+"${ROOT}/bin/sitegraft" verify --profile ddev-test --run "$RUN_DIR"
+grep -q "Result: PASS" "$VERIFY_REPORT"
+
+# Security-review fix-pack (Kimi): same fail-open class as the domain check
+# above — a query ERROR was previously indistinguishable from "confirmed
+# zero orphans". This proves the check can genuinely detect a real orphan
+# (a non-blocking WARNING per design doc §9.2/§11 — a found orphan signals a
+# manifest selection mistake to fix by hand, not something verify
+# auto-corrects or hard-fails on), not merely that it can fail closed on an
+# error (already covered by tests/unit/test_verify.bats).
+echo "==> NEGATIVE CASE 3 (orphan post_parent check): setting a migrated page's post_parent to an ID that does not exist on B"
+ddev exec --raw -p "$PROJECT_B" -- wp post update "$FEATURED_PAGE_ID_B" --post_parent=999999
+"${ROOT}/bin/sitegraft" verify --profile ddev-test --run "$RUN_DIR"
+ORPHAN_LINE=$(grep "orphan post_parent references found" "$VERIFY_REPORT")
+[ -n "$ORPHAN_LINE" ]
+case "$ORPHAN_LINE" in
+  *"${FEATURED_PAGE_ID_B}"*) : ;;
+  *) echo "FAIL: the orphan-found line did not name the actual orphaned page (${FEATURED_PAGE_ID_B})" >&2; exit 1 ;;
+esac
+if grep -q "Result: HARD FAIL" "$VERIFY_REPORT"; then
+  echo "FAIL: a found orphan must be a non-blocking WARNING (design doc §9.2/§11), not a HARD FAIL" >&2
+  exit 1
+fi
+echo "==> confirmed: the orphan post_parent check genuinely detects a real orphan (post ${FEATURED_PAGE_ID_B}) as a non-blocking warning"
+
+echo "==> reverting the injected orphan and re-confirming verify passes clean again"
+ddev exec --raw -p "$PROJECT_B" -- wp post update "$FEATURED_PAGE_ID_B" --post_parent=0
 "${ROOT}/bin/sitegraft" verify --profile ddev-test --run "$RUN_DIR"
 grep -q "Result: PASS" "$VERIFY_REPORT"
 
