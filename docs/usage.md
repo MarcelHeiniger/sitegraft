@@ -212,6 +212,14 @@ page, A's domain string is absent from B's migrated content, and (if configured)
 HTTP smoke check that B's front page actually renders with an expected marker.
 Writes a report into the run directory and exits non-zero on any hard failure.
 
+`--dry-run` is accepted here too, but `verify` is already read-only against B by
+construction — there is nothing for it to simulate, so it just runs the real checks
+either way. This is deliberate, not an oversight: an earlier version of this phase
+set the dry-run flag and never reset it, which made every check below read the
+literal text `[dry-run] ...` instead of B's actual data and report a false failure
+on a graft that had actually succeeded — fixed, and `--dry-run` on `verify` is now
+exactly as safe (and exactly as unnecessary) as passing it to `scan`.
+
 ### 4.6 `restore` — roll B back
 
 ```sh
@@ -236,7 +244,7 @@ checkout on hand.
 |---|---|---|
 | `--profile <name>` | all | Required. Which `profiles/<name>.conf` to use. |
 | `--run <run-dir>` | plan, backup, graft, verify, restore | Which run directory to operate on. Defaults to the most recent one for the profile (required for `restore`). |
-| `--dry-run` | all (no-op on scan/plan/verify) | Print what would happen instead of doing it. Accepted uniformly on every phase for CLI consistency, even where a phase has nothing to simulate. |
+| `--dry-run` | all | Print what would happen instead of doing it. `scan`/`plan`/`verify` accept it too for CLI consistency, but each is read-only (or writes only locally) already, so it's a safe no-op there — the real reads/checks always run. |
 | `--allow-stack-mismatch` | graft only | Override the rendering-stack hard precondition. Triggers a second, louder confirmation. |
 | `--yes` | restore only | Skip the confirmation prompt. |
 | `-h`, `--help` | — | Print usage. |

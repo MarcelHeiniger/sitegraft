@@ -343,10 +343,23 @@ verify_http_smoke() {
 # option update/post update/db import/search-replace anywhere in this file).
 #
 # --dry-run is accepted for CLI-contract consistency with every other phase
-# (bin/sitegraft's global --dry-run parsing, Step 6) but has no real effect
-# here beyond that: verify performs no writes to B to simulate in the first
-# place, and its only local write (the report file) is exactly what an
-# operator running verify wants to see either way.
+# (bin/sitegraft's global --dry-run parsing, Step 6) but MUST be neutralized
+# immediately below, the same way phase_scan's own M6 fix (lib/inventory.sh)
+# already does — this comment used to claim dry-run "has no real effect
+# here beyond that", which was wrong and a real bug (MAJOR-A, review
+# fix-pack): every check in this file reads B through wp_remote, and
+# wp_remote's own real command is wrapped in run_or_echo (lib/core.sh) —
+# under SITEGRAFT_DRY_RUN=1 that means EVERY read below returns the literal
+# text "[dry-run] wp_remote b option get ..." instead of B's actual value.
+# verify_options_match/verify_page_on_front/verify_nav_present/
+# verify_domain_absent and the checksum recompute would all parse that
+# garbage as real data and — being written fail-closed on purpose — report a
+# false HARD FAIL on a graft that actually succeeded. Reachable for real via
+# the plain `sitegraft verify --profile X --dry-run` CLI invocation now that
+# bin/sitegraft strips --dry-run globally. verify is read-only against B
+# already (see this function's own header comment above) — there is nothing
+# for --dry-run to protect here, so the fix is identical in shape to scan's:
+# accept the flag, then immediately run the real reads anyway.
 phase_verify() {
   local profile="" run_dir=""
   while [ $# -gt 0 ]; do
@@ -358,6 +371,12 @@ phase_verify() {
     esac
   done
   [ -n "$profile" ] || { log_error "verify requires --profile <name>"; return 1; }
+
+  if is_dry_run; then
+    log_info "verify is read-only against B (design doc §6.5) — --dry-run has nothing to simulate; running the real checks as usual"
+    SITEGRAFT_DRY_RUN=0
+  fi
+
   profile_load "$profile" || return 1
 
   [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1)
