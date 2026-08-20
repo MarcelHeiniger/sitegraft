@@ -16,12 +16,17 @@
 
 # At least one of post_types / option_keys / tables below must exist (a
 # module must claim at least one thing it protects — enforced at discovery
-# time, see lib/modules.sh :: module_validate_contract). option_keys_exclude
-# is an optional modifier of option_keys, not a standalone requirement.
+# time, see lib/modules.sh :: module_validate_contract).
 # my_plugin_post_types() { printf 'my_cpt\n'; }
 # my_plugin_option_keys() { printf 'my_plugin_settings\n'; }
-# my_plugin_option_keys_exclude() { printf 'my_plugin_license_*\n'; }
 # my_plugin_tables() { printf 'my_plugin_data\n'; }
+
+# option_keys_exclude is declared in the contract (design doc §3.2) but NOT
+# WIRED in v1 — nothing in lib/ or bin/ ever reads it. Do NOT rely on it to
+# keep a license/secret key out of migration: my_plugin_option_keys above
+# MUST already be a complete, explicit allowlist on its own (never a broad
+# prefix you expect this function to narrow down), or that key WILL migrate.
+# my_plugin_option_keys_exclude() { printf 'my_plugin_license_*\n'; }
 
 # Optional: run after WXR import + generic remaps, for module-specific fixups.
 # Called unconditionally, including under `--dry-run` (design doc §3.2) — wrap

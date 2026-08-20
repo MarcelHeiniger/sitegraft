@@ -47,6 +47,17 @@ etch_styles
 EOF
 }
 
+# MINOR-C (review fix-pack): declared for contract completeness (design doc
+# §3.2/§3.3), but NOT WIRED — grepped, nothing in lib/ or bin/ ever calls
+# `module_has_fn "$mod" option_keys_exclude` or reads this function's output
+# at all. Harmless for etch specifically: `etch_option_keys` above is
+# already a complete, explicit allowlist that never includes a license or
+# DB-version key in the first place, so there is nothing for this function
+# to actually exclude here. NOT SAFE to rely on for a future module: if a
+# module ever returns a BROAD prefix from `_option_keys` (e.g. "my_plugin_*"
+# instead of an explicit list) expecting `_option_keys_exclude` to carve
+# license/secret keys back out, those keys would migrate anyway — this
+# function's return value is inert. See §3.2 for the full contract note.
 etch_option_keys_exclude() {
   cat <<'EOF'
 etch_license_*
