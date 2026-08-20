@@ -1,0 +1,1132 @@
+#!/usr/bin/env bash
+# lib/graft.sh — phase: graft. Rendering-stack sync/precondition, media sync,
+# WXR export/import, mu-plugin mapping, ID/domain remaps, options migration,
+# optional clean/idempotence pruning. See design doc §6.4, §9, §12.
+#
+# Requires lib/backup.sh to already be sourced (bin/sitegraft's "graft" case
+# does this) — graft.sh reuses _backup_local_exec_prefix (lib/backup.sh,
+# Task 3.1) for every local (non-ssh) file transfer that touches a
+# container-wrapped site (e.g. DDEV), rather than re-deriving it. That
+# function's own comment predicted this exact need: "Step 4's media sync
+# will face this identical problem — reuse _backup_local_exec_prefix there
+# rather than rediscovering this the hard way a second time." The same
+# problem turned out to apply well beyond media: stack-component sync, WXR
+# export/import staging, the mapping mu-plugin, and id-map.log retrieval all
+# hit the identical "SITE_*_WP_PATH is a container-internal path, invisible
+# to the orchestrator's own filesystem" issue backup_wp_content solved once
+# already — see the local-transfer helpers immediately below.
+
+# --- Local-transfer helpers (wrapped-local / bare-local / ssh-remote) ------
+#
+# Every real (non-pure) transfer function below routes through exactly one
+# of: an ssh+rsync branch (handled directly by the caller, unchanged from
+# the plan's literal two-hop design), or one of the helpers here for the
+# non-ssh case, which itself splits into wrapped-local (DDEV-style — needs
+# to stream through the wrapper, since the container filesystem isn't the
+# orchestrator's) and bare-local (a real path on the orchestrator's own
+# filesystem — plain rsync/cp suffices, same as backup_wp_content's own
+# "else" branch).
+
+graft_local_prefix() { _backup_local_exec_prefix "$1"; }
+
+# graft_pull_dir <alias> <src_dir_on_alias> <host_dest_dir> — pull a whole
+# directory FROM <alias> (A or B) TO the orchestrator. Mirrors
+# backup_wp_content's tar-through-the-wrapper technique for a wrapped-local
+# site; a source directory that doesn't exist yet (e.g. A has never had any
+# media uploaded) is treated as "nothing to pull", not an error.
+graft_pull_dir() {
+  local alias_lc="$1" src_dir="$2" host_dest_dir="$3"
+  mkdir -p "$host_dest_dir"
+  local prefix; prefix=$(graft_local_prefix "$alias_lc")
+  if [ -n "$prefix" ]; then
+    if ! is_dry_run && ! $prefix test -d "$src_dir" >/dev/null 2>&1; then
+      log_info "source directory does not exist on ${alias_lc} yet (nothing to pull): ${src_dir}"
+      return 0
+    fi
+    run_or_echo bash -c "${prefix} tar -c -z -f - -C '${src_dir}' . | tar -x -z -f - -C '${host_dest_dir}'"
+  else
+    if ! is_dry_run && [ ! -d "$src_dir" ]; then
+      log_info "source directory does not exist on ${alias_lc} yet (nothing to pull): ${src_dir}"
+      return 0
+    fi
+    run_or_echo rsync -avz "${src_dir%/}/" "${host_dest_dir%/}/"
+  fi
+}
+
+# graft_push_dir <alias> <host_src_dir> <dest_dir_on_alias> [--keep-existing]
+# — push a whole directory FROM the orchestrator TO <alias>. --keep-existing
+# mirrors rsync --ignore-existing (design doc §6.4 step 1: never overwrite a
+# file already on B) for the wrapped-local tar path, using tar's own
+# -k/--keep-old-files — supported by both GNU tar and macOS/BSD tar
+# (bsdtar), so this is portable without an extra dependency.
+graft_push_dir() {
+  local alias_lc="$1" host_src_dir="$2" dest_dir="$3" mode="${4:-}"
+  local prefix; prefix=$(graft_local_prefix "$alias_lc")
+  if [ -n "$prefix" ]; then
+    local untar_opts="-x -z -f -"
+    [ "$mode" = "--keep-existing" ] && untar_opts="-x -z -k -f -"
+    run_or_echo bash -c "${prefix} mkdir -p '${dest_dir}' && tar -c -z -f - -C '${host_src_dir}' . | ${prefix} tar ${untar_opts} -C '${dest_dir}'"
+  else
+    run_or_echo mkdir -p "$dest_dir"
+    if [ "$mode" = "--keep-existing" ]; then
+      run_or_echo rsync -avz --ignore-existing "${host_src_dir%/}/" "${dest_dir%/}/"
+    else
+      run_or_echo rsync -avz "${host_src_dir%/}/" "${dest_dir%/}/"
+    fi
+  fi
+}
+
+# graft_push_file <alias> <host_file> <dest_dir_on_alias> <dest_name> — push
+# a single file (the mapping mu-plugin is the only caller today).
+graft_push_file() {
+  local alias_lc="$1" host_file="$2" dest_dir="$3" dest_name="$4"
+  local prefix; prefix=$(graft_local_prefix "$alias_lc")
+  if [ -n "$prefix" ]; then
+    run_or_echo bash -c "${prefix} mkdir -p '${dest_dir}' && cat '${host_file}' | ${prefix} tee '${dest_dir}/${dest_name}' >/dev/null"
+  else
+    run_or_echo mkdir -p "$dest_dir"
+    run_or_echo rsync -avz "$host_file" "${dest_dir}/${dest_name}"
+  fi
+}
+
+# graft_remove_file <alias> <path_on_alias> — remove a single file on A/B
+# (the mapping mu-plugin's own removal is the only caller today).
+graft_remove_file() {
+  local alias_lc="$1" path="$2"
+  local prefix; prefix=$(graft_local_prefix "$alias_lc")
+  if [ -n "$prefix" ]; then
+    run_or_echo bash -c "${prefix} rm -f '${path}'"
+  else
+    run_or_echo rm -f "$path"
+  fi
+}
+
+# graft_remove_dir <alias> <path_on_alias> — remove a whole directory on A/B
+# (used to clean up the temporary export/import staging dir inside a
+# wrapped-local container after each transfer).
+graft_remove_dir() {
+  local alias_lc="$1" path="$2"
+  local prefix; prefix=$(graft_local_prefix "$alias_lc")
+  if [ -n "$prefix" ]; then
+    run_or_echo bash -c "${prefix} rm -rf '${path}'"
+  else
+    run_or_echo rm -rf "$path"
+  fi
+}
+
+# --- Task 4.1: stack sync, precondition, media, mu-plugin ------------------
+
+# design doc §6.4 step 0a (Marcel's revision of finding B1, amended for the
+# ACSS v4 plugin-folder-rename case, §3.4): rsync every manifest.stack.
+# <component> marked resolution=copy from A to B, then activate it.
+#
+# CORRECTION (caught by Marcel, not by review or self-review): an earlier
+# draft of this function hardcoded slug="etch" / slug="automatic-css" per
+# component via a case statement. That's exactly the bug design doc §3.2's
+# rule exists to prevent: ACSS's plugin folder changed with the v4 release, so
+# a hardcoded "automatic-css" would silently do nothing (or worse, sync the
+# wrong path) against any pre-4.0 install. The ONLY source of truth for a
+# slug, here, is manifest.stack.<component>.slug_a — resolved once by `scan`
+# (via inventory_resolve_slug, Task 1.5) and frozen into the manifest by
+# `plan` (Task 2.4). This function never re-derives, guesses, or hardcodes a
+# slug for any component, theme included.
+#
+# Never touches a component marked "skip" — those are graft_check_stack_
+# precondition's problem below, not this function's.
+#
+# Routes both hops (A -> orchestrator staging, staging -> B) through
+# graft_pull_dir/graft_push_dir for the non-ssh case, so this works
+# identically whether A/B are ssh-remote, wrapped-local (DDEV), or bare-local
+# — see the helpers block above. Falls back to plain rsync for the bare-local
+# case, matching the exact command shape the plan's own unit tests assert.
+graft_sync_stack() {
+  local run_dir="$1" manifest="$2"
+  local component
+  for component in $(echo "$manifest" | jq -r '.stack // {} | to_entries[] | select(.value.resolution == "copy") | .key'); do
+    local slug rel_dir
+    slug=$(echo "$manifest" | jq -r --arg c "$component" '.stack[$c].slug_a')
+    if [ "$component" = "theme" ]; then
+      rel_dir="wp-content/themes/${slug}"
+    else
+      rel_dir="wp-content/plugins/${slug}"
+    fi
+    log_info "syncing stack component '${component}' (resolved slug: ${slug}) from A to B (design doc §12)..."
+    local staging="${run_dir}/stack-staging/${component}"
+    mkdir -p "$staging"
+
+    if [ -n "${SITE_A_SSH_HOST:-}" ]; then
+      run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${SITE_A_WP_PATH}/${rel_dir}/" "${staging}/"
+    elif [ -n "$(graft_local_prefix a)" ]; then
+      graft_pull_dir a "${SITE_A_WP_PATH}/${rel_dir}" "$staging"
+    else
+      run_or_echo rsync -avz "${SITE_A_WP_PATH}/${rel_dir}/" "${staging}/"
+    fi
+
+    if [ -n "${SITE_B_SSH_HOST:-}" ]; then
+      run_or_echo rsync -avz "${staging}/" "${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/${rel_dir}/"
+    elif [ -n "$(graft_local_prefix b)" ]; then
+      graft_push_dir b "$staging" "${SITE_B_WP_PATH}/${rel_dir}"
+    else
+      run_or_echo rsync -avz "${staging}/" "${SITE_B_WP_PATH}/${rel_dir}/"
+    fi
+
+    if [ "$component" = "theme" ]; then
+      run_or_echo wp_remote b theme activate "$slug"
+    else
+      run_or_echo wp_remote b plugin activate "$slug"
+    fi
+  done
+}
+
+# design doc §6.4 step 0b (Marcel's revision of finding B1): a hard precondition
+# on whatever graft_sync_stack did NOT just resolve — never re-litigates a
+# component the manifest already recorded as resolution=copy.
+graft_check_stack_precondition() {
+  local scan_a="$1" scan_b="$2" manifest="$3" allow_mismatch="$4"
+  local diff unresolved
+  diff=$(inventory_stack_diff "$scan_a" "$scan_b")
+  unresolved=$(echo "$diff" | jq -r --argjson m "$manifest" \
+    '[keys[] | select(($m.stack[.].resolution // "skip") != "copy")]')
+  if [ "$(echo "$unresolved" | jq 'length')" = "0" ]; then
+    return 0
+  fi
+  if [ "$allow_mismatch" != "1" ]; then
+    log_error "B's rendering stack does not match A's for: $(echo "$unresolved" | jq -r 'join(", ")') — refusing to graft. Re-run with --allow-stack-mismatch to override, or resolve it in 'sitegraft plan' first (design doc §12)."
+    return 1
+  fi
+  log_warn "STACK MISMATCH OVERRIDDEN (--allow-stack-mismatch) for: $(echo "$unresolved" | jq -r 'join(", ")') — the grafted content may render as nothing on B until the stack is aligned by hand."
+  # DEVIATION from the plan's literal Task 4.1 pseudocode, found via TDD (the
+  # plan's own given test for this exact path — "allows a remaining mismatch
+  # with the override flag" — fails against the literal pseudocode: no bats
+  # test can answer an interactive gum/read prompt, and every OTHER
+  # confirmation helper in this codebase (lib/plan.sh's _plan_confirm) is
+  # documented as "genuinely not unit-testable ... covered by the DDEV
+  # harness instead", never asserted to return 0 from a bare bats `run`).
+  # --allow-stack-mismatch is itself already an explicit, hard-to-mistype
+  # flag an operator must deliberately pass — design doc §12's "loud,
+  # unmissable confirmation" is the SECOND layer of that, meant for a human
+  # sitting at an interactive terminal, not a barrier a scripted/CI run
+  # (already carrying its own explicit override) can never get past. Gated
+  # on stdin being a real TTY, the same signal `read`'s own behavior already
+  # depends on: an interactive run still gets the loud prompt exactly as
+  # designed; a non-interactive run (bats, the DDEV harness, any scripted
+  # invocation) proceeds on the flag alone, with the warning above already
+  # on the record.
+  if [ -t 0 ]; then
+    if command -v gum >/dev/null 2>&1; then
+      gum confirm "Proceed anyway? This is not the usual confirmation — B's theme/Etch/ACSS genuinely does not match A's." || return 1
+    else
+      local ans
+      read -r -p "Type EXACTLY 'proceed anyway' to continue despite the stack mismatch: " ans
+      [ "$ans" = "proceed anyway" ] || return 1
+    fi
+  else
+    log_warn "no interactive terminal detected — proceeding on --allow-stack-mismatch alone (the loud confirmation above is skipped only for non-interactive/scripted runs)"
+  fi
+}
+
+# Pure argv-inspection helpers (design doc §6.4 step 1) — NOT what
+# graft_media_sync itself calls for the wrapped-local case (it needs the
+# tar-through-the-wrapper technique above, which isn't expressible as a
+# single rsync argv); these exist so the two-hop shape (ssh vs. no-ssh,
+# never scp, never --ignore-existing missing on the push side) is directly
+# unit-testable without a live site.
+graft_media_pull_cmd() {
+  local site_a_ssh_host="$1" src="$2" dst="$3"
+  if [ -n "$site_a_ssh_host" ]; then
+    printf 'rsync\n-avz\n%s:%s\n%s\n' "$site_a_ssh_host" "$src" "$dst"
+  else
+    printf 'rsync\n-avz\n%s\n%s\n' "$src" "$dst"
+  fi
+}
+
+graft_media_push_cmd() {
+  local site_b_ssh_host="$1" src="$2" dst="$3"
+  if [ -n "$site_b_ssh_host" ]; then
+    printf 'rsync\n-avz\n--ignore-existing\n%s\n%s:%s\n' "$src" "$site_b_ssh_host" "$dst"
+  else
+    printf 'rsync\n-avz\n--ignore-existing\n%s\n%s\n' "$src" "$dst"
+  fi
+}
+
+# design doc §6.4 step 1 / review finding A4: A's uploads are pulled to the
+# orchestrator's run directory first, then pushed to B — A is never assumed
+# reachable from B directly, exactly like the WXR transfer in step 5.
+#
+# DEVIATION from the plan's literal pseudocode: that version always used a
+# plain rsync for the non-ssh case, which breaks for a wrapped-local site
+# (SITE_*_WP_PATH is a container-internal path — see the helpers block
+# above). Routes through graft_pull_dir/graft_push_dir instead, which fall
+# back to the exact same plain rsync for a genuinely bare-local site.
+graft_media_sync() {
+  local run_dir="$1"
+  local staging="${run_dir}/media-staging"
+  mkdir -p "$staging"
+  log_info "pulling A's media to the orchestrator..."
+  if [ -n "${SITE_A_SSH_HOST:-}" ]; then
+    run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${SITE_A_WP_PATH}/wp-content/uploads/" "${staging}/"
+  else
+    graft_pull_dir a "${SITE_A_WP_PATH}/wp-content/uploads" "$staging"
+  fi
+  log_info "pushing media to B (never overwriting existing files)..."
+  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
+    run_or_echo rsync -avz --ignore-existing "${staging}/" "${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/wp-content/uploads/"
+  else
+    graft_push_dir b "$staging" "${SITE_B_WP_PATH}/wp-content/uploads" --keep-existing
+  fi
+}
+
+graft_deploy_mu_plugin() {
+  local mu_dir="${SITE_B_WP_PATH}/wp-content/mu-plugins"
+  local src="${SITEGRAFT_ROOT}/mu-plugins/sitegraft-id-mapper.php"
+  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
+    run_or_echo ssh -- "$SITE_B_SSH_HOST" "mkdir -p $(sq "$mu_dir")"
+    run_or_echo rsync -avz "$src" "${SITE_B_SSH_HOST}:${mu_dir}/sitegraft-id-mapper.php"
+  else
+    graft_push_file b "$src" "$mu_dir" "sitegraft-id-mapper.php"
+  fi
+}
+
+# Recommended (Marcel's nightshift mandate): callers wrap this in a trap so
+# the mu-plugin is removed even when graft fails partway through — see
+# phase_graft's own trap below. Leaving a temporary logging mu-plugin behind
+# on a failed run would be a silent, ongoing side effect on B.
+graft_remove_mu_plugin() {
+  local target="${SITE_B_WP_PATH}/wp-content/mu-plugins/sitegraft-id-mapper.php"
+  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
+    run_or_echo ssh -- "$SITE_B_SSH_HOST" "rm -f $(sq "$target")"
+  else
+    graft_remove_file b "$target"
+  fi
+}
+
+# --- Task 4.2: WXR export/import, integrity gate, importer provisioning ---
+
+graft_integrity_gate() {
+  local file="$1" allowed_json="$2"
+  [ -s "$file" ] || { log_error "WXR file is empty: ${file}"; return 1; }
+  grep -q '<wp:wxr_version>' "$file" || { log_error "no <wp:wxr_version> marker in: ${file}"; return 1; }
+  local item_count; item_count=$(grep -c '<item>' "$file" || true)
+  [ "$item_count" -ge 1 ] || { log_error "no <item> found in: ${file}"; return 1; }
+
+  # CDATA-tolerant on purpose, even though it's NOT what triggers against a
+  # real `wp export`: verified live (a real WP 7.1 / wp-cli export, both by
+  # direct output inspection and by reading wp-cli's own
+  # WP_Export_WXR_Formatter.php source — the `wp:post_type` line uses the
+  # plain ->tag() form, not ->contains->cdata(), unlike title/content/meta_value,
+  # which DO get CDATA-wrapped) that `<wp:post_type>` is emitted as plain
+  # text, not `<wp:post_type><![CDATA[...]]></wp:post_type>` — so `[^<]*`
+  # matches it today without any changes. Widened to `.*` plus a CDATA-marker
+  # strip anyway, purely as defense-in-depth against a wp-cli version, a
+  # different export path (e.g. wp-admin's own native exporter, which does
+  # CDATA-wrap this field), or a hand-edited WXR ever changing that shape —
+  # cheap to add, and this is a security control, not a place to bet on one
+  # observed version's behavior never changing.
+  local found_types leaked
+  found_types=$(grep -o '<wp:post_type>.*</wp:post_type>' "$file" \
+    | sed -E 's#</?wp:post_type>##g; s#<!\[CDATA\[##g; s#\]\]>##g' \
+    | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+  # Fail CLOSED, not open: an `<item>` count >=1 (checked above) with ZERO
+  # post_type actually extracted means the regex above didn't recognize
+  # this file's shape at all — exactly the silent "leaked is always []"
+  # failure mode commit 770e4c1's jq fix (below) exists to prevent, just
+  # one layer up (a parsing gap instead of a comparison-logic gap). Refusing
+  # here means a future export-format change this regex doesn't understand
+  # aborts loudly instead of the gate quietly rubber-stamping everything.
+  if [ "$(echo "$found_types" | jq 'length')" = "0" ]; then
+    log_error "no <wp:post_type> could be parsed out of a WXR file that has ${item_count} <item>(s): ${file} — refusing to trust an integrity gate that found nothing to check"
+    return 1
+  fi
+
+  # `$allowed | index(.)` rebinds `.` to $allowed before index runs, so it
+  # always searches $allowed for $allowed and `leaked` is always [] — silently
+  # defeating this integrity gate (fixed in commit 770e4c1, per the design
+  # doc/plan errata — verified here by a dedicated test asserting the gate
+  # actually catches a leaked post_type, not merely that it "runs"). Binding
+  # the element with `as $x` so index searches for the right thing. Same trap
+  # as manifest_compute_unclaimed's own fix (lib/manifest.sh).
+  leaked=$(jq -n --argjson found "$found_types" --argjson allowed "$allowed_json" \
+    '[$found[] as $x | select(($allowed | index($x)) | not) | $x]')
+  if [ "$(echo "$leaked" | jq 'length')" != "0" ]; then
+    log_error "WXR contains post_type(s) outside the manifest allowlist: $(echo "$leaked" | jq -r 'join(", ")')"
+    return 1
+  fi
+}
+
+# design doc §8 does not hold against the currently-shipped wordpress-importer
+# (0.9.5, the version wp-cli installs from wp.org): verified live, its
+# process_attachment() unconditionally requires fetch_attachments=true, and
+# even then does a REAL wp_safe_remote_get() of A's own attachment URL —
+# there is no "assume the file already exists locally, just create the
+# post" code path at all. Passing --skip=attachment (as graft_import_wxr
+# now does) makes it hard-error per attachment instead ("Fetching
+# attachments is not enabled"); the alternative, fetch_attachments=true,
+# means an ACTUAL live HTTP fetch of A from B for every attachment — which
+# wp_safe_remote_get's own SSRF protection can reject outright depending on
+# network topology (reproduced live via the DDEV harness: "A valid URL was
+# not provided" against a *.ddev.site hostname) and, more fundamentally,
+# directly contradicts this tool's own non-negotiable "never assume A is
+# reachable from B" principle (design doc §6.4 step 1, review finding A4).
+#
+# Attachments are migrated OURSELVES instead, entirely independent of
+# wp-cli's `import` command. graft_media_sync (Task 4.1) has already
+# rsync'd/tar-streamed the real files onto B by the time this runs, at the
+# exact same relative wp-content/uploads/<path> A used — so this only ever
+# needs `wp media import --skip-copy` (register the already-placed local
+# file in place, per wp-cli's own docs: "media files ... are imported to
+# the library but not moved on disk") against a file already on B's own
+# filesystem. No network fetch, no dependency on A being reachable from B —
+# closer to sitegraft's own stated architecture than a WXR-based attachment
+# import could ever be.
+#
+# Writes id-map.tsv rows in the exact same format the mapping mu-plugin
+# produces (old_id<TAB>new_id<TAB>post_type, §7) by APPENDING — graft_fetch_id_map
+# (below) appends B's own post/term log to the same file afterward, so by
+# the time graft_remap_attachment_ids (Task 4.3) runs, id-map.tsv already
+# has a complete picture regardless of which mechanism produced which row.
+graft_import_attachments() {
+  local run_dir="$1"
+  local id_map_tsv="${run_dir}/id-map.tsv"
+  local ids
+  ids=$(wp_remote a post list --post_type=attachment --format=csv --fields=ID 2>/dev/null | tail -n +2)
+  [ -n "$ids" ] || return 0
+  local old_id
+  for old_id in $ids; do
+    [ -n "$old_id" ] || continue
+    local rel_path title new_id
+    # Same set -e fragility class as graft_remap_featured_images' own fix
+    # (this file, MAJOR-1 fix-pack) — `post meta get` on a missing key
+    # exits non-zero, which would silently kill the whole graft under
+    # bin/sitegraft's `set -e` the first time an attachment genuinely has
+    # no _wp_attached_file (an external/offloaded media entry, say). Never
+    # actually reproduced for THIS call (the harness fixture's one
+    # attachment always has it), but fixed proactively rather than waiting
+    # to hit it live a second time.
+    rel_path=$(wp_remote a post meta get "$old_id" _wp_attached_file 2>/dev/null || true)
+    if [ -z "$rel_path" ]; then
+      log_warn "attachment ${old_id} on A has no _wp_attached_file meta — skipping (not a locally-stored file, e.g. an external/offloaded media library entry)"
+      continue
+    fi
+    title=$(wp_remote a post get "$old_id" --field=post_title 2>/dev/null)
+    if is_dry_run; then
+      printf '[dry-run] wp_remote b media import %s/wp-content/uploads/%s --skip-copy --title=%s --porcelain\n' "$SITE_B_WP_PATH" "$rel_path" "$title"
+      continue
+    fi
+    # Same set -e fragility class fixed elsewhere in this function/file
+    # (MAJOR-1 fix-pack) — `wp media import` failing (a corrupt file, an
+    # unsupported type) exits non-zero, which would otherwise abort the
+    # whole graft right here instead of reaching the graceful
+    # skip-and-warn handling immediately below.
+    new_id=$(wp_remote b media import "${SITE_B_WP_PATH}/wp-content/uploads/${rel_path}" --skip-copy --title="$title" --porcelain 2>/dev/null || true)
+    if [ -z "$new_id" ]; then
+      log_warn "failed to import attachment (A id ${old_id}, file ${rel_path}) onto B — was it actually placed by graft_media_sync? skipping"
+      continue
+    fi
+    # Same idempotent-reimport marker the mapping mu-plugin sets on every
+    # other imported post (§7/§11) — attachments bypass the mu-plugin
+    # entirely (see this function's own header comment), so this is set by
+    # hand here instead, to keep graft_prune_previous_run's coverage
+    # consistent across every migrated post_type, attachments included.
+    wp_remote b post meta update "$new_id" _sitegraft_source_id "$old_id" >/dev/null 2>&1
+    printf '%s\t%s\tattachment\n' "$old_id" "$new_id" >> "$id_map_tsv"
+  done
+}
+
+# design doc §6.4 step 3/5 / review finding A4: export lands in the run directory
+# on the orchestrator, pulled from A first if A is remote — never assumed
+# directly visible to B.
+#
+# DEVIATION from the plan's literal pseudocode: the non-ssh branch there
+# passed --dir="$staging" (an orchestrator path) straight to `wp export`,
+# which breaks identically to graft_media_sync's original bug for a
+# wrapped-local A — wp-cli actually runs INSIDE the container, so --dir must
+# be a container-internal path there too, pulled out afterward via
+# graft_pull_dir (same tar-through-the-wrapper technique).
+graft_export_wxr() {
+  local post_types_csv="$1" run_dir="$2"
+  local staging="${run_dir}/export"
+  mkdir -p "$staging"
+  if [ -n "${SITE_A_SSH_HOST:-}" ]; then
+    local remote_dir="/tmp/sitegraft-export-$$"
+    run_or_echo ssh -- "$SITE_A_SSH_HOST" "mkdir -p $(sq "$remote_dir")"
+    run_or_echo wp_remote a export --post_type="$post_types_csv" --dir="$remote_dir"
+    run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${remote_dir}/" "${staging}/"
+    run_or_echo ssh -- "$SITE_A_SSH_HOST" "rm -rf $(sq "$remote_dir")"
+  else
+    local prefix; prefix=$(graft_local_prefix a)
+    if [ -n "$prefix" ]; then
+      local container_dir="/tmp/sitegraft-export-$$"
+      run_or_echo $prefix mkdir -p "$container_dir"
+      run_or_echo wp_remote a export --post_type="$post_types_csv" --dir="$container_dir"
+      graft_pull_dir a "$container_dir" "$staging"
+      graft_remove_dir a "$container_dir"
+    else
+      run_or_echo wp_remote a export --post_type="$post_types_csv" --dir="$staging"
+    fi
+  fi
+}
+
+# DEVIATION from the plan's literal pseudocode: that version passed a glob
+# ("${remote_dir}/*.xml") as a single quoted argument straight to `wp_remote
+# b import`. Two independent bugs make that unsafe:
+#  1. wp_remote's ssh branch single-quotes every argument individually via
+#     sq() before joining them into the remote command line (lib/inventory.sh)
+#     — a glob inside a single-quoted string is never expanded by the remote
+#     shell, so wp-cli would receive the literal string "*.xml" and fail to
+#     find any file.
+#  2. The non-ssh branch has the same container-path problem as
+#     graft_export_wxr above for a wrapped-local B.
+# Fixed by expanding the glob HERE, on the orchestrator's own staging dir
+# (always a real host directory, already populated by graft_export_wxr's
+# pull step), and importing each file by its exact basename — this also
+# correctly handles `wp export` splitting a large site across multiple WXR
+# files, which a single glob argument would have silently mishandled anyway.
+graft_import_wxr() {
+  local run_dir="$1"
+  local staging="${run_dir}/export"
+  local f base
+  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
+    local remote_dir="/tmp/sitegraft-import-$$"
+    run_or_echo ssh -- "$SITE_B_SSH_HOST" "mkdir -p $(sq "$remote_dir")"
+    run_or_echo rsync -avz "${staging}/" "${SITE_B_SSH_HOST}:${remote_dir}/"
+    for f in "${staging}"/*.xml; do
+      [ -e "$f" ] || continue
+      base=$(basename "$f")
+      run_or_echo wp_remote b import "${remote_dir}/${base}" --authors=skip --skip=attachment
+    done
+    run_or_echo ssh -- "$SITE_B_SSH_HOST" "rm -rf $(sq "$remote_dir")"
+  else
+    local prefix; prefix=$(graft_local_prefix b)
+    if [ -n "$prefix" ]; then
+      local container_dir="/tmp/sitegraft-import-$$"
+      graft_push_dir b "$staging" "$container_dir"
+      for f in "${staging}"/*.xml; do
+        [ -e "$f" ] || continue
+        base=$(basename "$f")
+        run_or_echo wp_remote b import "${container_dir}/${base}" --authors=skip --skip=attachment
+      done
+      graft_remove_dir b "$container_dir"
+    else
+      for f in "${staging}"/*.xml; do
+        [ -e "$f" ] || continue
+        run_or_echo wp_remote b import "$f" --authors=skip --skip=attachment
+      done
+    fi
+  fi
+}
+
+# design doc §6.4 step 6 / review finding A7: install+activate on B if absent,
+# recording exactly what B had before so graft can put it back afterward.
+graft_ensure_importer() {
+  local run_dir="$1"
+  local state_file="${run_dir}/.wordpress-importer-pre-state"
+  if wp_remote b plugin is-installed wordpress-importer >/dev/null 2>&1; then
+    printf 'installed\n' > "$state_file"
+    if wp_remote b plugin is-active wordpress-importer >/dev/null 2>&1; then
+      printf 'active\n' >> "$state_file"
+    else
+      printf 'inactive\n' >> "$state_file"
+      run_or_echo wp_remote b plugin activate wordpress-importer
+    fi
+  else
+    printf 'absent\n' > "$state_file"
+    run_or_echo wp_remote b plugin install wordpress-importer --activate
+  fi
+}
+
+graft_restore_importer_state() {
+  local run_dir="$1"
+  local state_file="${run_dir}/.wordpress-importer-pre-state"
+  [ -f "$state_file" ] || return 0
+  local pre_installed pre_active
+  pre_installed=$(sed -n '1p' "$state_file")
+  pre_active=$(sed -n '2p' "$state_file")
+  if [ "$pre_installed" = "absent" ]; then
+    run_or_echo wp_remote b plugin uninstall wordpress-importer --deactivate
+  elif [ "$pre_active" = "inactive" ]; then
+    run_or_echo wp_remote b plugin deactivate wordpress-importer
+  fi
+}
+
+# graft_fetch_id_map <run_dir> — pull B's mapping log (design doc §6.4 step 9)
+# and APPEND it to ${run_dir}/id-map.tsv, wrapper-aware (see the helpers
+# block above). Deliberately APPENDS, never overwrites: graft_import_attachments
+# (above) already wrote its own rows to this same file earlier in the run
+# (attachments never go through the mu-plugin/WXR-import log at all, see its
+# own comment) — this function must never truncate those. A missing log (no
+# post/term was actually imported by the mu-plugin — should not happen once
+# the integrity gate requires >=1 <item>, but fails safe rather than
+# aborting the whole run on a `cat`/rsync error) is a no-op: whatever
+# id-map.tsv already had (possibly just attachment rows, possibly nothing)
+# is left exactly as-is.
+graft_fetch_id_map() {
+  local run_dir="$1"
+  local src="${SITE_B_WP_PATH}/wp-content/sitegraft-id-map.log"
+  local dest="${run_dir}/id-map.tsv"
+  local tmp="${run_dir}/.id-map-fetch.tmp"
+  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
+    run_or_echo rsync -avz "${SITE_B_SSH_HOST}:${src}" "$tmp"
+  else
+    local prefix; prefix=$(graft_local_prefix b)
+    if [ -n "$prefix" ]; then
+      if ! is_dry_run && ! $prefix test -f "$src" >/dev/null 2>&1; then
+        log_warn "no id-map.log found on B (no posts/terms were imported via WXR?) — id-map.tsv left as-is"
+        return 0
+      fi
+      run_or_echo bash -c "${prefix} cat '${src}' > '${tmp}'"
+    else
+      if ! is_dry_run && [ ! -f "$src" ]; then
+        log_warn "no id-map.log found on B (no posts/terms were imported via WXR?) — id-map.tsv left as-is"
+        return 0
+      fi
+      run_or_echo rsync -avz "$src" "$tmp"
+    fi
+  fi
+  if ! is_dry_run && [ -f "$tmp" ]; then
+    cat "$tmp" >> "$dest"
+    rm -f "$tmp"
+  fi
+}
+
+# --- Task 4.3: ID-map remap (two-pass sentinel technique) ------------------
+
+# graft_content_tables_csv and graft_build_sentinel_commands used to live
+# here — REMOVED (review, Viktor, NIT-1). Both went orphaned the moment
+# graft_remap_attachment_ids/graft_search_replace_domain were rebuilt for
+# MAJOR-2 (this same fix-pack) to stop scanning whole tables and instead
+# rewrite only the specific posts this run imported: the two-pass sentinel
+# logic moved into lib/php/content-remap-functions.php, run via a single
+# `wp eval` per remap step, and neither bash function had any remaining
+# caller. Their own unit tests stayed green regardless — a real, if
+# accidental, false-coverage signal on exactly the logic (the remap that
+# must never contaminate protected data) where a coverage gap matters most.
+# See lib/php/content-remap-functions.php and its own bats-driven `php`
+# tests (tests/unit/test_content_remap_functions.bats) for where this logic
+# and its test coverage live now.
+
+# graft_push_remap_lib <run_dir> — pushes lib/php/content-remap-functions.php
+# onto B (wrapper-aware, same graft_push_file every other B-bound transfer
+# in this file uses) so the `wp eval` snippets below can `require_once` it
+# instead of re-embedding the substitution logic inline. Caller removes it
+# afterward via graft_remove_file, same lifecycle as the JSON payload.
+graft_push_remap_lib() {
+  local run_dir="$1"
+  graft_push_file b "${SITEGRAFT_ROOT}/lib/php/content-remap-functions.php" "${SITE_B_WP_PATH}/wp-content" "sitegraft-content-remap-functions.php"
+  printf '%s/wp-content/sitegraft-content-remap-functions.php' "$SITE_B_WP_PATH"
+}
+
+# graft_migrated_post_ids_json <id_map_tsv> — every NEW post ID this run
+# imported, as a JSON array of strings, in id-map.tsv's own row order.
+# Shared by graft_remap_attachment_ids/graft_search_replace_domain below —
+# both need exactly this same "which posts did THIS run actually touch"
+# scope, so it's computed once instead of twice.
+graft_migrated_post_ids_json() {
+  local id_map_tsv="$1"
+  awk -F'\t' '{print $2}' "$id_map_tsv" | jq -R -s -c 'split("\n") | map(select(length > 0))'
+}
+
+# graft_push_remap_payload <run_dir> <json> <remote_filename> — writes
+# <json> to a local temp file and pushes it onto B via graft_push_file
+# (wrapper-aware, same helper every other B-bound file transfer in this
+# file uses), returning the CONTAINER-side path the PHP payload below reads
+# from. Caller is responsible for removing it afterward via graft_remove_file.
+graft_push_remap_payload() {
+  local run_dir="$1" json="$2" remote_filename="$3"
+  local local_payload="${run_dir}/.${remote_filename}"
+  printf '%s' "$json" > "$local_payload"
+  chmod 600 "$local_payload" 2>/dev/null || true
+  graft_push_file b "$local_payload" "${SITE_B_WP_PATH}/wp-content" "$remote_filename"
+  rm -f "$local_payload"
+  printf '%s/wp-content/%s' "$SITE_B_WP_PATH" "$remote_filename"
+}
+
+# MAJOR-2 (review, Viktor — this is the important fix in this file):
+# `wp search-replace` has no row-level scoping at all — the previous
+# implementation ran it against the WHOLE content tables
+# (wp_posts/wp_postmeta/wp_options), which means ANY row there, including a
+# protected plugin's own settings in wp_options or its own postmeta, was in
+# scope for this regex substitution. Reproduced live: a protected option
+# carrying a colliding `"id":<N>` payload (N = an old attachment ID this run
+# also happened to migrate) got silently rewritten — a real corruption of
+# data this tool's core promise says it will never touch.
+#
+# Rebuilt to touch ONLY what this run actually imported, never a table
+# scan: pushes a small JSON payload (the attachment old->new map, and the
+# full list of migrated post IDs) onto B, then a SINGLE `wp eval` fetches
+# post_content/post_excerpt for exactly those post IDs — never anything
+# else — applies the identical two-pass sentinel technique (pass 1: every
+# `"id":X`/`wp-image-X` -> a unique sentinel, ALL attachments, before pass
+# 2 resolves any sentinel to its real new ID — same ordering guarantee as
+# before, per design doc §9.1), and writes back only the posts that
+# actually changed. A protected plugin's row anywhere else is never read,
+# matched, or written — not filtered out after the fact, structurally
+# unreachable by this function.
+#
+# PHP's own preg_replace (full PCRE, including the negative-lookahead the
+# sentinel patterns need) does the substitution — not sed/grep -E, neither
+# of which supports `(?!\d)` — and not a naive bash string replace either,
+# which would be unsafe generically (this codebase's own CLAUDE.md: "never
+# sed/raw regex on WordPress data") — post_content/post_excerpt specifically
+# are plain TEXT columns, never PHP-serialized, so a direct fetch/modify/
+# `wp_update_post()` write-back is safe for exactly these two fields. This
+# is why the scope is content-field-only: wp_postmeta values CAN be
+# serialized PHP, and safely rewriting an arbitrary serialized structure
+# needs WordPress's own maybe_unserialize()/maybe_serialize() round-trip —
+# out of scope here, same as design doc §11's existing position that a
+# CPT-specific meta reference is the relevant module's post_import hook's
+# job, not a generic core remap's.
+#
+# The payload is pushed to a real file rather than embedded via bash string
+# interpolation into the PHP source: keeps the PHP body 100% static (no
+# bash-side escaping of PHP's own quotes/`$`/backslashes to get wrong), and
+# reuses the exact same wrapper-aware transfer helper every other B-bound
+# file in this codebase already goes through.
+graft_remap_attachment_ids() {
+  local id_map_tsv="$1" run_dir="$2"
+  [ -s "$id_map_tsv" ] || return 0
+
+  local attach_map_json post_ids_json payload_json remote_path lib_path
+  attach_map_json=$(awk -F'\t' '$3=="attachment"{printf "%s\t%s\n", $1, $2}' "$id_map_tsv" \
+    | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {old: .[0], new: .[1]})')
+  [ "$(echo "$attach_map_json" | jq 'length')" != "0" ] || return 0
+  post_ids_json=$(graft_migrated_post_ids_json "$id_map_tsv")
+  payload_json=$(jq -n --argjson attachments "$attach_map_json" --argjson post_ids "$post_ids_json" \
+    '{attachments: $attachments, post_ids: $post_ids}')
+  remote_path=$(graft_push_remap_payload "$run_dir" "$payload_json" "sitegraft-id-remap-payload.json")
+  lib_path=$(graft_push_remap_lib "$run_dir")
+
+  # The actual substitution (sitegraft_remap_attachment_refs) lives in
+  # lib/php/content-remap-functions.php — required here, never re-embedded
+  # inline (review, Viktor, NIT-1: keeps production and
+  # tests/unit/test_content_remap_functions.bats running the literal same
+  # code, and the substitution logic itself independently unit-testable).
+  run_or_echo wp_remote b eval '
+    require_once WP_CONTENT_DIR . "/sitegraft-content-remap-functions.php";
+    $payload_path = WP_CONTENT_DIR . "/sitegraft-id-remap-payload.json";
+    $payload = json_decode( file_get_contents( $payload_path ), true );
+    if ( ! $payload ) { echo "sitegraft: no id-remap payload found or unreadable\n"; return; }
+    $count = 0;
+    foreach ( $payload["post_ids"] as $post_id ) {
+      $post_id = (int) $post_id;
+      $post = get_post( $post_id );
+      if ( ! $post ) { continue; }
+      $content = sitegraft_remap_attachment_refs( $payload["attachments"], $post->post_content );
+      $excerpt = sitegraft_remap_attachment_refs( $payload["attachments"], $post->post_excerpt );
+      if ( $content !== $post->post_content || $excerpt !== $post->post_excerpt ) {
+        wp_update_post( array( "ID" => $post_id, "post_content" => $content, "post_excerpt" => $excerpt ) );
+        $count++;
+      }
+    }
+    echo "sitegraft: id-remap rewrote {$count} post(s)\n";
+  '
+  graft_remove_file b "$remote_path"
+  graft_remove_file b "$lib_path"
+}
+
+# MAJOR-1 (found by review, Viktor): design doc §9.2 counts on
+# wordpress-importer to natively remap featured-image (_thumbnail_id) and
+# post_parent references during import — but that native remap only fires
+# for a reference INSIDE the same WXR import, via wordpress-importer's own
+# correspondence table. graft_import_attachments (this file, Task 4.1/4.2
+# fix-pack) deliberately migrates attachments OUTSIDE the WXR/`wp import`
+# path entirely (see its own header comment for why) — attachments are
+# never in the WXR wordpress-importer processes, so its native
+# _thumbnail_id remap never runs for them. Left unfixed, every migrated
+# post that had a featured image on A keeps A's OWN attachment ID in its
+# `_thumbnail_id` postmeta after import — pointing at nothing (or, worse,
+# at an unrelated existing attachment on B whose ID happens to collide).
+# The sentinel remap (graft_remap_attachment_ids, above) does not cover
+# this either: `_thumbnail_id` is stored as a bare integer in meta_value,
+# not inside a `"id":X` or `wp-image-X` string pattern.
+#
+# Scoped to exactly the posts THIS run imported (every row of id_map_tsv,
+# read directly — never a table-wide scan or search-replace): for each
+# imported post, if its current `_thumbnail_id` matches an OLD attachment
+# ID this same run also migrated, rewrite it to that attachment's NEW ID.
+# A post whose _thumbnail_id doesn't match anything in id-map.tsv (already
+# correct, unset, or pointing at content outside this run's selection) is
+# left untouched — this is a targeted fix, not a blind sweep.
+#
+# Reads directly from the id-map.tsv FILE on fd 3 (not a process
+# substitution) — no fd0-collision risk (see graft_remap_attachment_ids'
+# own comment on that bug class), but the same fd-3 convention is used here
+# too for consistency and because the loop body execs wp_remote either way.
+#
+# Other CPT-specific attachment-referencing meta keys (a "related_image_id"
+# a business plugin might use, say) are explicitly out of scope here, same
+# as any other module-specific internal reference (design doc §11's edge
+# case table: "outside the core's generic remap — that's the job of the
+# relevant module's post_import hook"). _thumbnail_id is the one universal,
+# WordPress-core-defined key every post_type can carry, which is why it
+# gets a generic, non-module-specific fix.
+graft_remap_featured_images() {
+  local id_map_tsv="$1"
+  local old_id new_id post_type
+  while IFS=$'\t' read -r old_id new_id post_type <&3; do
+    [ "$post_type" != "attachment" ] || continue
+    local current_thumb
+    # MAJOR-1 fix-pack bug found live: `wp post meta get` exits non-zero
+    # for a post that has no _thumbnail_id at all (the common case — most
+    # migrated posts never had a featured image) — under bin/sitegraft's
+    # `set -e`, an unguarded `var=$(cmd)` assignment where cmd fails aborts
+    # the WHOLE graft immediately, silently (stderr already redirected to
+    # /dev/null), the instant it hit the first post with no thumbnail.
+    # Reproduced live: the full DDEV harness run died right after the
+    # id-remap step, no error printed, no further log lines at all.
+    # `|| true` keeps the (correctly empty) result and lets the `[ -n ... ]`
+    # check below do its job as originally intended.
+    current_thumb=$(wp_remote b post meta get "$new_id" _thumbnail_id 2>/dev/null || true)
+    [ -n "$current_thumb" ] || continue
+    local new_thumb
+    new_thumb=$(awk -F'\t' -v old="$current_thumb" '$1==old && $3=="attachment"{print $2}' "$id_map_tsv")
+    if [ -n "$new_thumb" ]; then
+      run_or_echo wp_remote b post meta update "$new_id" _thumbnail_id "$new_thumb"
+    fi
+  done 3< "$id_map_tsv"
+}
+
+# design doc §9.2 — verify.sh is where orphan post_parent gets reported; this
+# function is the shared query both graft (for a debug log) and verify (for a
+# hard check, Step 5) can call.
+graft_check_orphan_parents() {
+  wp_remote b eval '
+    global $wpdb;
+    $rows = $wpdb->get_col("SELECT ID FROM {$wpdb->posts} p WHERE p.post_parent <> 0
+      AND NOT EXISTS (SELECT 1 FROM {$wpdb->posts} q WHERE q.ID = p.post_parent)");
+    echo implode(PHP_EOL, $rows);
+  '
+}
+
+# --- Task 4.4: options migration, domain remap, module hooks, pruning ------
+
+graft_step_done() { [ -f "${1}/graft.${2}.done" ]; }
+graft_mark_step() { touch "${1}/graft.${2}.done"; }
+
+# design doc §6.4 step 8 / review finding A1: this step was missing entirely from
+# the previous draft — sitegraft migrated content but never the Etch/ACSS settings.
+# page_on_front/page_for_posts are written to disk (for core_wp_post_import, §9.3)
+# but never blind-copied here, since A's value is A's own page ID.
+# graft_migrate_options <run_dir> <manifest> [domain_from] [domain_to] —
+# domain_from/domain_to are optional (both default to "", meaning no
+# rewrite) purely to keep this backward-compatible with every existing
+# call/test that only ever passed the first two arguments.
+#
+# MAJOR-2 fix-pack addition: this is now also where design doc §9.4's
+# "Etch stores some data as JSON blobs in certain options" case is
+# handled — graft_search_replace_domain (above) deliberately stopped
+# covering wp_options entirely (a table-wide search-replace there could
+# reach a protected plugin's own settings). This function already only
+# ever touches the manifest's explicitly-listed option_keys, one at a
+# time, never a table scan — so applying the same plain-text domain
+# substitution to the already-fetched VALUE here, before it's pushed to B,
+# closes that gap with the exact same "only what's explicitly selected"
+# safety property this function already had for everything else.
+graft_migrate_options() {
+  local run_dir="$1" manifest="$2" domain_from="${3:-}" domain_to="${4:-}"
+  local key
+  for key in $(echo "$manifest" | jq -r '[.migrate[].option_keys[]?] | unique[]'); do
+    local value
+    value=$(wp_remote a option get "$key" --format=json 2>/dev/null || echo 'null')
+    if [ -n "$domain_from" ]; then
+      # jq's own decode/encode round-trip, deliberately NOT a bash/sed
+      # string or regex replace: `value` is valid JSON text (from
+      # `--format=json`), which can spell the exact same domain string two
+      # different ways depending on nesting/re-encoding (plain "https://..."
+      # vs. JSON-escaped "https:\/\/..."). Walking the DECODED structure and
+      # doing a plain, non-regex substring split/join on every string leaf
+      # (jq's `split($x) | join($y)` idiom — never `gsub`, which IS regex
+      # and would need its own dot-escaping) handles both forms in one pass
+      # for free, since jq re-serializes consistently regardless of which
+      # form the input used. Also sidesteps a real bug found while building
+      # this: bash's `${var//pattern/replacement}` treats a LITERAL
+      # backslash in `pattern` as glob escape syntax, not as a character to
+      # match — a hand-rolled "plain + escaped" bash double-pass here
+      # silently failed to rewrite the escaped form at all (reproduced live
+      # via this function's own test).
+      local rewritten
+      rewritten=$(printf '%s' "$value" | jq -c --arg from "$domain_from" --arg to "$domain_to" \
+        'def replace_domain: if type == "string" then split($from) | join($to) else . end; walk(replace_domain)' 2>/dev/null)
+      [ -n "$rewritten" ] && value="$rewritten"
+    fi
+    printf '%s' "$value" > "${run_dir}/option-${key}.value"
+    case "$key" in
+      page_on_front|page_for_posts) continue ;; # remapped by core_wp_post_import, §9.3
+    esac
+    run_or_echo wp_remote b option update "$key" "$value" --format=json
+  done
+}
+
+# design doc §9.4: two passes (plain + JSON-escaped, since Etch stores some
+# data as JSON blobs inside post_content).
+#
+# MAJOR-2 (review, Viktor) — same fix, same reasoning as
+# graft_remap_attachment_ids immediately above (read that function's own
+# comment for the full explanation): rebuilt from a whole-content-tables
+# `wp search-replace` to a post_content/post_excerpt-only rewrite of
+# exactly the posts THIS run imported, via a pushed JSON payload + a single
+# `wp eval`. A protected plugin's domain-string-shaped data sitting in
+# wp_options or wp_postmeta (a real, if lower-probability, collision than
+# the ID case, but the exact same class of exposure) is never in scope.
+#
+# Migrated OPTIONS' own values (design doc §9.4's original "Etch stores
+# some data as JSON blobs in certain options" case) are handled separately
+# and more narrowly by graft_migrate_options — which already only ever
+# touches the manifest's explicitly-listed option_keys, never a table scan
+# — see that function's own domain-rewrite step.
+graft_search_replace_domain() {
+  local from="$1" to="$2" id_map_tsv="$3" run_dir="$4"
+  [ -n "$from" ] && [ -s "$id_map_tsv" ] || return 0
+
+  local post_ids_json payload_json remote_path lib_path
+  post_ids_json=$(graft_migrated_post_ids_json "$id_map_tsv")
+  payload_json=$(jq -n --arg from "$from" --arg to "$to" --argjson post_ids "$post_ids_json" \
+    '{from: $from, to: $to, post_ids: $post_ids}')
+  remote_path=$(graft_push_remap_payload "$run_dir" "$payload_json" "sitegraft-domain-remap-payload.json")
+  lib_path=$(graft_push_remap_lib "$run_dir")
+
+  # sitegraft_remap_domain lives in lib/php/content-remap-functions.php —
+  # same reasoning as graft_remap_attachment_ids' own require_once above.
+  run_or_echo wp_remote b eval '
+    require_once WP_CONTENT_DIR . "/sitegraft-content-remap-functions.php";
+    $payload_path = WP_CONTENT_DIR . "/sitegraft-domain-remap-payload.json";
+    $payload = json_decode( file_get_contents( $payload_path ), true );
+    if ( ! $payload ) { echo "sitegraft: no domain-remap payload found or unreadable\n"; return; }
+    $count = 0;
+    foreach ( $payload["post_ids"] as $post_id ) {
+      $post_id = (int) $post_id;
+      $post = get_post( $post_id );
+      if ( ! $post ) { continue; }
+      $content = sitegraft_remap_domain( $post->post_content, $payload["from"], $payload["to"] );
+      $excerpt = sitegraft_remap_domain( $post->post_excerpt, $payload["from"], $payload["to"] );
+      if ( $content !== $post->post_content || $excerpt !== $post->post_excerpt ) {
+        wp_update_post( array( "ID" => $post_id, "post_content" => $content, "post_excerpt" => $excerpt ) );
+        $count++;
+      }
+    }
+    echo "sitegraft: domain-remap rewrote {$count} post(s)\n";
+  '
+  graft_remove_file b "$remote_path"
+  graft_remove_file b "$lib_path"
+}
+
+# design doc §11 "idempotent reimport": before importing, delete any post B already
+# has from a previous sitegraft run (marked with _sitegraft_source_id), for the
+# post_types in this run's manifest. Distinct from the optional `clean` step, which
+# removes B's pre-existing ORIGINAL content instead.
+graft_prune_previous_run() {
+  local post_types_csv="$1"
+  [ -n "$post_types_csv" ] || return 0
+  local ids
+  ids=$(wp_remote b post list --post_type="$post_types_csv" --meta_key=_sitegraft_source_id --field=ID)
+  [ -n "$ids" ] || return 0
+  log_warn "pruning $(echo "$ids" | wc -l | tr -d ' ') post(s) left by a previous sitegraft run before re-importing"
+  # Same fd0-collision class as graft_remap_attachment_ids's own fix above
+  # (`echo | while read` binds the loop's fd0 to the pipe; wp_remote's
+  # wrapped-local branch execs a child that inherits/drains that same fd0
+  # on every iteration) — reading from fd 3 instead avoids it here too,
+  # even though this specific loop wasn't the one caught live (the DDEV
+  # harness only has one leftover post to prune, one iteration, nothing to
+  # silently truncate) — fixed proactively rather than waiting to reproduce
+  # it a second time with a multi-post fixture.
+  local id
+  while read -r id <&3; do
+    [ -n "$id" ] && run_or_echo wp_remote b post delete "$id" --force
+  done 3<<< "$ids"
+}
+
+graft_run_module_post_import() {
+  local run_dir="$1" id_map_tsv="$2"
+  local mod
+  for mod in $SITEGRAFT_MODULES; do
+    module_has_fn "$mod" post_import || continue
+    log_info "running post_import hook for module: ${mod}"
+    module_call "$mod" post_import "$run_dir" "$id_map_tsv" "wp_remote b"
+  done
+}
+
+# _graft_exit_trap — recommended addition beyond the plan's literal Task 4.4
+# wiring (Marcel's nightshift mandate — prefer the safer option even at
+# extra cost): the mapping mu-plugin is removed even if graft fails partway
+# through (a real wp-cli error, an interrupted run), not only on the happy
+# path. Without this, an interrupted run would leave the mu-plugin active on
+# B indefinitely, silently logging every future insert/update.
+#
+# Deliberately reads its state from a GLOBAL (SITEGRAFT_GRAFT_RUN_DIR), never
+# from phase_graft's own `local run_dir` — this codebase already documents,
+# at length (lib/core.sh's sitegraft_cleanup, bin/sitegraft's own trap
+# placement), how a bash EXIT trap's execution context can outlive the
+# function that installed it: `local` bindings are torn down the moment
+# their function returns, but an EXIT trap fires at PROCESS/subshell exit,
+# which can be later — a trap that closes over a `local` risks reading an
+# already-unbound variable. Copying the one value the trap actually needs
+# into a global right before arming the trap sidesteps that timing hazard
+# entirely, verified live against bats' own `run` (which forks a subshell
+# for capturing output — the trap fires within that subshell only, so this
+# never leaks into or clobbers bats' own per-test EXIT trap machinery,
+# unlike installing a trap at library SOURCE time, which is the documented
+# bug bin/sitegraft's own header comment warns about).
+#
+# Chains to sitegraft_cleanup (bin/sitegraft's own EXIT trap, if this process
+# came through bin/sitegraft and already installed it) instead of silently
+# replacing it — `trap ... EXIT` set here would otherwise clobber it for the
+# rest of the process, losing SITEGRAFT_TMP_REGISTRY cleanup. Captures the
+# REAL original `$?` first, as sitegraft_cleanup's own extensively-documented
+# fix requires, and returns that value regardless of what either cleanup
+# operation's own exit status was.
+_graft_exit_trap() {
+  local rc=$?
+  local rd="${SITEGRAFT_GRAFT_RUN_DIR:-}"
+  if [ -n "$rd" ] && graft_step_done "$rd" mu_plugin 2>/dev/null && ! graft_step_done "$rd" mu_cleanup 2>/dev/null; then
+    log_warn "graft interrupted or failed — removing the mapping mu-plugin from B before exiting (never left running unattended)"
+    graft_remove_mu_plugin 2>/dev/null || true
+    graft_mark_step "$rd" mu_cleanup 2>/dev/null || true
+  fi
+  # NIT-3 (review, Viktor): graft_remove_file for the id-remap/domain-remap
+  # JSON payload and the pushed content-remap-functions.php only ever runs
+  # AFTER a successful run_or_echo wp eval — a `wp eval` that hard-fails
+  # partway through (graft_remap_attachment_ids/graft_search_replace_domain,
+  # both above) would leave one or more of these behind on B indefinitely.
+  # No secret in any of them (id-map.tsv values are WordPress-internal
+  # integer post IDs, and the domain/from-to strings are already public in
+  # the manifest), but a stray file left on a genuinely public-facing site's
+  # wp-content root is still worth cleaning up rather than shrugging off.
+  # Filenames are fixed/predictable (never per-run-unique), so this is safe
+  # to attempt unconditionally whenever SITE_B_* is valid (same "profile_load
+  # already succeeded" guard the mu-plugin cleanup above relies on) —
+  # `graft_remove_file`'s underlying `rm -f` is a silent no-op if the file
+  # was already removed normally or never existed.
+  if [ -n "$rd" ] && [ -n "${SITE_B_WP_PATH:-}" ]; then
+    graft_remove_file b "${SITE_B_WP_PATH}/wp-content/sitegraft-id-remap-payload.json" 2>/dev/null || true
+    graft_remove_file b "${SITE_B_WP_PATH}/wp-content/sitegraft-domain-remap-payload.json" 2>/dev/null || true
+    graft_remove_file b "${SITE_B_WP_PATH}/wp-content/sitegraft-content-remap-functions.php" 2>/dev/null || true
+  fi
+  if declare -F sitegraft_cleanup >/dev/null 2>&1; then
+    sitegraft_cleanup || true
+  fi
+  return "$rc"
+}
+
+# phase_graft --profile <name> [--run <run-dir>] [--allow-stack-mismatch]
+# [--dry-run] — design doc §6.4: performs the actual A -> B transfer.
+phase_graft() {
+  local profile="" run_dir="" allow_mismatch=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --profile) profile="$2"; shift 2 ;;
+      --run) run_dir="$2"; shift 2 ;;
+      --allow-stack-mismatch) allow_mismatch=1; shift ;;
+      --dry-run) SITEGRAFT_DRY_RUN=1; shift ;;
+      *) log_error "unknown flag for graft: $1"; return 1 ;;
+    esac
+  done
+  [ -n "$profile" ] || { log_error "graft requires --profile <name>"; return 1; }
+  profile_load "$profile" || return 1
+  [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1)
+  [ -n "$run_dir" ] || { log_error "no scan/plan run found for profile ${profile} — run 'sitegraft scan' and 'sitegraft plan' first"; return 1; }
+  [ -f "${run_dir}/backup.complete" ] || {
+    log_error "no backup.complete marker for this run — refusing to graft without a backup"
+    return 1
+  }
+
+  modules_discover
+  local manifest; manifest=$(cat "${run_dir}/manifest.json")
+  local post_types_csv; post_types_csv=$(echo "$manifest" | jq -r '[.migrate[].post_types[]?] | join(",")')
+  # attachment is deliberately excluded from the WXR export's own post_type
+  # filter — graft_import_attachments handles attachments itself (see its
+  # own comment for why the standard WXR/wordpress-importer path doesn't
+  # work at all against the currently-shipped wordpress-importer). Kept in
+  # the full post_types_csv (used by prune and the integrity-gate allowlist)
+  # since a future re-import should still prune any previously-migrated
+  # attachment the same way as any other migrated content.
+  local wxr_post_types_csv; wxr_post_types_csv=$(echo "$manifest" | jq -r '[.migrate[].post_types[]? | select(. != "attachment")] | join(",")')
+
+  SITEGRAFT_GRAFT_RUN_DIR="$run_dir"
+  trap _graft_exit_trap EXIT
+
+  # design doc §6.4 step 0a/0b (Marcel's revision of finding B1): sync whatever
+  # plan approved for copying, THEN enforce the hard precondition on whatever
+  # is left unresolved — never the other order, or the precondition would
+  # refuse components graft_sync_stack was about to fix anyway.
+  graft_step_done "$run_dir" stack_sync || { graft_sync_stack "$run_dir" "$manifest"; graft_mark_step "$run_dir" stack_sync; }
+  graft_check_stack_precondition "${run_dir}/scan-a.json" "${run_dir}/scan-b.json" "$manifest" "$allow_mismatch" || return 1
+
+  graft_step_done "$run_dir" media_sync    || { graft_media_sync "$run_dir"; graft_mark_step "$run_dir" media_sync; }
+  graft_step_done "$run_dir" mu_plugin     || { graft_deploy_mu_plugin; graft_mark_step "$run_dir" mu_plugin; }
+  # prune MUST run before import_attachments (bug found live): prune deletes
+  # every post carrying _sitegraft_source_id as leftover from a PREVIOUS
+  # run — import_attachments sets that exact meta on whatever it creates,
+  # in THIS run. Reversed, prune would delete the attachment(s)
+  # import_attachments just created a moment earlier, mistaking this run's
+  # own fresh content for a prior run's leftovers (reproduced live: the
+  # attachment vanished, and WordPress's next auto-increment ID for the
+  # "Home" page happened to land exactly on the deleted attachment's old ID
+  # — reading as "the page overwrote the attachment" until traced back to
+  # prune actually deleting it first).
+  graft_step_done "$run_dir" prune         || { graft_prune_previous_run "$post_types_csv"; graft_mark_step "$run_dir" prune; }
+  graft_step_done "$run_dir" import_attachments || { graft_import_attachments "$run_dir"; graft_mark_step "$run_dir" import_attachments; }
+  graft_step_done "$run_dir" importer_setup || { graft_ensure_importer "$run_dir"; graft_mark_step "$run_dir" importer_setup; }
+  graft_step_done "$run_dir" export        || {
+    graft_export_wxr "$wxr_post_types_csv" "$run_dir"
+    if ! is_dry_run; then
+      local f found_any=0
+      for f in "${run_dir}/export"/*.xml; do
+        [ -e "$f" ] || continue
+        found_any=1
+        graft_integrity_gate "$f" "$(echo "$manifest" | jq -c '[.migrate[].post_types[]?]')" || return 1
+      done
+      [ "$found_any" -eq 1 ] || { log_error "WXR export produced no .xml file(s) in ${run_dir}/export"; return 1; }
+    fi
+    graft_mark_step "$run_dir" export
+  }
+  graft_step_done "$run_dir" import        || { graft_import_wxr "$run_dir"; graft_mark_step "$run_dir" import; }
+  graft_step_done "$run_dir" fetch_id_map  || { graft_fetch_id_map "$run_dir"; graft_mark_step "$run_dir" fetch_id_map; }
+  graft_step_done "$run_dir" mu_cleanup    || { graft_remove_mu_plugin; graft_mark_step "$run_dir" mu_cleanup; }
+  graft_step_done "$run_dir" importer_cleanup || { graft_restore_importer_state "$run_dir"; graft_mark_step "$run_dir" importer_cleanup; }
+  graft_step_done "$run_dir" remap_ids     || { graft_remap_attachment_ids "${run_dir}/id-map.tsv" "$run_dir"; graft_mark_step "$run_dir" remap_ids; }
+  # MAJOR-1 fix-pack: featured images (_thumbnail_id), which never go
+  # through wordpress-importer's own native remap since attachments are
+  # migrated outside `wp import` entirely — see graft_remap_featured_images'
+  # own comment. Runs after remap_ids (same id-map.tsv dependency, no
+  # ordering requirement between the two beyond both needing it populated).
+  graft_step_done "$run_dir" remap_featured_images || { graft_remap_featured_images "${run_dir}/id-map.tsv"; graft_mark_step "$run_dir" remap_featured_images; }
+  local domain_from domain_to
+  domain_from=$(echo "$manifest" | jq -r '.options.search_replace.from')
+  domain_to=$(echo "$manifest" | jq -r '.options.search_replace.to')
+  # NIT-4 (review, Viktor): `jq -r` on a manifest missing
+  # .options.search_replace.from/to (a hand-written manifest — manifest_new
+  # always populates this key in the normal scan/plan flow, so this never
+  # happens there) prints the literal 4-character string "null", not an
+  # empty string — which would pass every `[ -n "$domain_from" ]` guard
+  # downstream and get search-replaced as if "null" were a real domain.
+  # Normalized to "" here, same treatment as any other genuinely-missing
+  # value in this codebase.
+  [ "$domain_from" = "null" ] && domain_from=""
+  [ "$domain_to" = "null" ] && domain_to=""
+  graft_step_done "$run_dir" remap_domain  || {
+    graft_search_replace_domain "$domain_from" "$domain_to" "${run_dir}/id-map.tsv" "$run_dir"
+    graft_mark_step "$run_dir" remap_domain
+  }
+  graft_step_done "$run_dir" migrate_options || { graft_migrate_options "$run_dir" "$manifest" "$domain_from" "$domain_to"; graft_mark_step "$run_dir" migrate_options; }
+  graft_step_done "$run_dir" module_hooks  || { graft_run_module_post_import "$run_dir" "${run_dir}/id-map.tsv"; graft_mark_step "$run_dir" module_hooks; }
+
+  # MINOR-1 (review, Viktor): the plan's own literal Task 4.4 pseudocode for
+  # this block only ever LOGGED "removing B's pre-existing content" and
+  # marked the step done — it never actually deleted anything (§6.6's
+  # clean step, which removes B's pre-existing ORIGINAL content of a
+  # migrated post_type, is not implemented in v1). Dead code today (no
+  # `plan.sh` path ever sets clean.enabled=true — plan_defaults/manifest_new
+  # both default it to false, and nothing in this codebase flips it), but a
+  # hand-written manifest with clean.enabled:true would have gotten a false
+  # "clean step: removing..." success message and silently NOT had anything
+  # removed. Refusing loudly instead of claiming a success that never
+  # happened, until §6.6 is actually implemented.
+  if [ "$(echo "$manifest" | jq -r '.clean.enabled')" = "true" ]; then
+    graft_step_done "$run_dir" clean || {
+      log_error "manifest.clean.enabled is true, but the clean step (design doc §6.6 — removing B's pre-existing content for a migrated post_type) is not implemented yet in this version of sitegraft. Refusing to report a false success: re-run with clean.enabled=false, or remove B's stale content by hand first."
+      return 1
+    }
+  fi
+
+  log_info "graft complete for run: ${run_dir}"
+}

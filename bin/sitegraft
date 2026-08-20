@@ -16,7 +16,7 @@ SITEGRAFT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # invisible, not merely unclear.
 trap sitegraft_cleanup EXIT
 
-SITEGRAFT_VERSION="0.3.1"
+SITEGRAFT_VERSION="0.4.1"
 
 usage() {
   cat <<EOF
@@ -88,6 +88,10 @@ main() {
       require_lib profile 1 || exit 1
       require_lib modules 1 || exit 1
       require_lib inventory 1 || exit 1
+      # graft.sh reuses backup.sh's _backup_local_exec_prefix for every local
+      # (non-ssh) transfer that touches a wrapped-local site (e.g. DDEV) — see
+      # lib/graft.sh's own header comment for why.
+      require_lib backup 3 || exit 1
       require_lib graft 4 || exit 1
       modules_discover
       phase_graft "$@"
