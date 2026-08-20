@@ -70,6 +70,7 @@ setup() {
   local tsv="$BATS_TEST_TMPDIR/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
   wp_remote() { echo "SHOULD NOT BE CALLED"; }
   graft_push_remap_payload() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
   run graft_search_replace_domain "" "https://b.example.com" "$tsv" "$run_dir"
   [ "$status" -eq 0 ]
   [[ "$output" != *"SHOULD NOT BE CALLED"* ]]
@@ -86,6 +87,7 @@ setup() {
   printf '10\t42\tattachment\n5\t105\tpage\n' > "$tsv"
   local captured="$BATS_TEST_TMPDIR/captured.json"
   graft_push_remap_payload() { printf '%s' "$2" > "$captured"; echo "/fake/remote/path.json"; }
+  graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   wp_remote() { echo "sitegraft: domain-remap rewrote 0 post(s)"; }
   graft_remove_file() { :; }
   run graft_search_replace_domain "https://a.example.com" "https://b.example.com" "$tsv" "$run_dir"
@@ -97,17 +99,21 @@ setup() {
   [[ "$output" != *"--tables"* ]]
 }
 
-@test "graft_search_replace_domain's wp eval call rewrites post_content/post_excerpt via wp_update_post, not a table-wide search-replace" {
+@test "graft_search_replace_domain's wp eval call requires the shared content-remap library and calls its function, never a table-wide search-replace" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
   printf '5\t105\tpage\n' > "$tsv"
   graft_push_remap_payload() { echo "/fake/remote/path.json"; }
+  graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   graft_remove_file() { :; }
   SITEGRAFT_DRY_RUN=1
   run graft_search_replace_domain "https://a.example.com" "https://b.example.com" "$tsv" "$run_dir"
   [[ "$output" == *"wp_remote b eval"* ]]
+  [[ "$output" == *"require_once"* ]]
+  [[ "$output" == *"sitegraft-content-remap-functions.php"* ]]
+  [[ "$output" == *"sitegraft_remap_domain("* ]]
   [[ "$output" == *"wp_update_post"* ]]
-  [[ "$output" == *'str_replace( "/", "\\/", $from )'* ]]
+  [[ "$output" != *'str_replace( "/", "\\/", $from )'* ]]  # the substitution itself must live in the required file, not inline here
   [[ "$output" != *"search-replace"* ]]
 }
 

@@ -16,8 +16,9 @@ setup() {
   [ "$status" -eq 0 ]
 }
 
-@test "graft_content_tables_csv builds the exact three-table allowlist from B's live prefix (finding A6)" {
-  inventory_table_prefix() { echo "wp_test_"; }
-  run graft_content_tables_csv b
-  [ "$output" = "wp_test_posts,wp_test_postmeta,wp_test_options" ]
-}
+# graft_content_tables_csv's own test used to live here — removed (review,
+# Viktor, NIT-1) along with the function itself: it went orphaned the
+# moment graft_remap_attachment_ids/graft_search_replace_domain stopped
+# scanning whole tables (MAJOR-2 fix-pack). See
+# tests/unit/test_content_remap_functions.bats for where the remap logic's
+# real test coverage lives now.

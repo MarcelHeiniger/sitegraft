@@ -591,33 +591,29 @@ graft_fetch_id_map() {
 
 # --- Task 4.3: ID-map remap (two-pass sentinel technique) ------------------
 
-# design doc §9.1/§9.4 / review finding A6: the only table scope any
-# search-replace call is allowed to use — a protected plugin's own tables are
-# never in this list, so they can never be touched by a remap, even by
-# accident. This is a structural invariant, not a convention to remember:
-# every function below that calls `wp search-replace` takes its table scope
-# as a parameter computed by THIS function (or graft_search_replace_domain's
-# own identical call), never re-derived and never a live "whatever's on B"
-# scan (design doc §3.6 / manifest.sh's own note on the same invariant).
-graft_content_tables_csv() {
-  local alias_lc="$1"
-  local prefix; prefix=$(inventory_table_prefix "$alias_lc")
-  printf '%sposts,%spostmeta,%soptions' "$prefix" "$prefix" "$prefix"
-}
+# graft_content_tables_csv and graft_build_sentinel_commands used to live
+# here — REMOVED (review, Viktor, NIT-1). Both went orphaned the moment
+# graft_remap_attachment_ids/graft_search_replace_domain were rebuilt for
+# MAJOR-2 (this same fix-pack) to stop scanning whole tables and instead
+# rewrite only the specific posts this run imported: the two-pass sentinel
+# logic moved into lib/php/content-remap-functions.php, run via a single
+# `wp eval` per remap step, and neither bash function had any remaining
+# caller. Their own unit tests stayed green regardless — a real, if
+# accidental, false-coverage signal on exactly the logic (the remap that
+# must never contaminate protected data) where a coverage gap matters most.
+# See lib/php/content-remap-functions.php and its own bats-driven `php`
+# tests (tests/unit/test_content_remap_functions.bats) for where this logic
+# and its test coverage live now.
 
-# Prints, one per line, tab-separated "pass<TAB>pattern<TAB>replacement" tuples
-# implementing the two-pass sentinel technique from design doc §9.1. Pass 1: old_id
-# -> unique sentinel token. Pass 2: sentinel token -> real new_id. Kept pure (no
-# wp-cli calls) so the substitution logic is unit-testable on its own.
-graft_build_sentinel_commands() {
-  local id_map_tsv="$1"
-  local old_id new_id post_type
-  while IFS=$'\t' read -r old_id new_id post_type; do
-    [ "$post_type" = "attachment" ] || continue
-    printf '1\t"id":%s(?!\\d)\t"id":__SITEGRAFT_%s__\n' "$old_id" "$old_id"
-    printf '1\twp-image-%s(?!\\d)\twp-image-__SITEGRAFT_%s__\n' "$old_id" "$old_id"
-    printf '2\t__SITEGRAFT_%s__\t%s\n' "$old_id" "$new_id"
-  done < "$id_map_tsv"
+# graft_push_remap_lib <run_dir> — pushes lib/php/content-remap-functions.php
+# onto B (wrapper-aware, same graft_push_file every other B-bound transfer
+# in this file uses) so the `wp eval` snippets below can `require_once` it
+# instead of re-embedding the substitution logic inline. Caller removes it
+# afterward via graft_remove_file, same lifecycle as the JSON payload.
+graft_push_remap_lib() {
+  local run_dir="$1"
+  graft_push_file b "${SITEGRAFT_ROOT}/lib/php/content-remap-functions.php" "${SITE_B_WP_PATH}/wp-content" "sitegraft-content-remap-functions.php"
+  printf '%s/wp-content/sitegraft-content-remap-functions.php' "$SITE_B_WP_PATH"
 }
 
 # graft_migrated_post_ids_json <id_map_tsv> — every NEW post ID this run
@@ -690,7 +686,7 @@ graft_remap_attachment_ids() {
   local id_map_tsv="$1" run_dir="$2"
   [ -s "$id_map_tsv" ] || return 0
 
-  local attach_map_json post_ids_json payload_json remote_path
+  local attach_map_json post_ids_json payload_json remote_path lib_path
   attach_map_json=$(awk -F'\t' '$3=="attachment"{printf "%s\t%s\n", $1, $2}' "$id_map_tsv" \
     | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {old: .[0], new: .[1]})')
   [ "$(echo "$attach_map_json" | jq 'length')" != "0" ] || return 0
@@ -698,8 +694,15 @@ graft_remap_attachment_ids() {
   payload_json=$(jq -n --argjson attachments "$attach_map_json" --argjson post_ids "$post_ids_json" \
     '{attachments: $attachments, post_ids: $post_ids}')
   remote_path=$(graft_push_remap_payload "$run_dir" "$payload_json" "sitegraft-id-remap-payload.json")
+  lib_path=$(graft_push_remap_lib "$run_dir")
 
+  # The actual substitution (sitegraft_remap_attachment_refs) lives in
+  # lib/php/content-remap-functions.php — required here, never re-embedded
+  # inline (review, Viktor, NIT-1: keeps production and
+  # tests/unit/test_content_remap_functions.bats running the literal same
+  # code, and the substitution logic itself independently unit-testable).
   run_or_echo wp_remote b eval '
+    require_once WP_CONTENT_DIR . "/sitegraft-content-remap-functions.php";
     $payload_path = WP_CONTENT_DIR . "/sitegraft-id-remap-payload.json";
     $payload = json_decode( file_get_contents( $payload_path ), true );
     if ( ! $payload ) { echo "sitegraft: no id-remap payload found or unreadable\n"; return; }
@@ -708,27 +711,9 @@ graft_remap_attachment_ids() {
       $post_id = (int) $post_id;
       $post = get_post( $post_id );
       if ( ! $post ) { continue; }
-      $content = $post->post_content;
-      $excerpt = $post->post_excerpt;
-      $orig_content = $content;
-      $orig_excerpt = $excerpt;
-      // Pass 1 fully before pass 2, per design doc §9.1: every attachment
-      // gets a unique sentinel FIRST, so a later pass can never re-match an
-      // already-resolved ID from an earlier one in the same batch.
-      foreach ( $payload["attachments"] as $row ) {
-        $old_id = $row["old"];
-        $sentinel = "__SITEGRAFT_" . $old_id . "__";
-        $content = preg_replace( "/\"id\":" . $old_id . "(?!\\d)/", "\"id\":" . $sentinel, $content );
-        $content = preg_replace( "/wp-image-" . $old_id . "(?!\\d)/", "wp-image-" . $sentinel, $content );
-        $excerpt = preg_replace( "/\"id\":" . $old_id . "(?!\\d)/", "\"id\":" . $sentinel, $excerpt );
-        $excerpt = preg_replace( "/wp-image-" . $old_id . "(?!\\d)/", "wp-image-" . $sentinel, $excerpt );
-      }
-      foreach ( $payload["attachments"] as $row ) {
-        $sentinel = "__SITEGRAFT_" . $row["old"] . "__";
-        $content = str_replace( $sentinel, $row["new"], $content );
-        $excerpt = str_replace( $sentinel, $row["new"], $excerpt );
-      }
-      if ( $content !== $orig_content || $excerpt !== $orig_excerpt ) {
+      $content = sitegraft_remap_attachment_refs( $payload["attachments"], $post->post_content );
+      $excerpt = sitegraft_remap_attachment_refs( $payload["attachments"], $post->post_excerpt );
+      if ( $content !== $post->post_content || $excerpt !== $post->post_excerpt ) {
         wp_update_post( array( "ID" => $post_id, "post_content" => $content, "post_excerpt" => $excerpt ) );
         $count++;
       }
@@ -736,6 +721,7 @@ graft_remap_attachment_ids() {
     echo "sitegraft: id-remap rewrote {$count} post(s)\n";
   '
   graft_remove_file b "$remote_path"
+  graft_remove_file b "$lib_path"
 }
 
 # MAJOR-1 (found by review, Viktor): design doc §9.2 counts on
@@ -892,27 +878,27 @@ graft_search_replace_domain() {
   local from="$1" to="$2" id_map_tsv="$3" run_dir="$4"
   [ -n "$from" ] && [ -s "$id_map_tsv" ] || return 0
 
-  local post_ids_json payload_json remote_path
+  local post_ids_json payload_json remote_path lib_path
   post_ids_json=$(graft_migrated_post_ids_json "$id_map_tsv")
   payload_json=$(jq -n --arg from "$from" --arg to "$to" --argjson post_ids "$post_ids_json" \
     '{from: $from, to: $to, post_ids: $post_ids}')
   remote_path=$(graft_push_remap_payload "$run_dir" "$payload_json" "sitegraft-domain-remap-payload.json")
+  lib_path=$(graft_push_remap_lib "$run_dir")
 
+  # sitegraft_remap_domain lives in lib/php/content-remap-functions.php —
+  # same reasoning as graft_remap_attachment_ids' own require_once above.
   run_or_echo wp_remote b eval '
+    require_once WP_CONTENT_DIR . "/sitegraft-content-remap-functions.php";
     $payload_path = WP_CONTENT_DIR . "/sitegraft-domain-remap-payload.json";
     $payload = json_decode( file_get_contents( $payload_path ), true );
     if ( ! $payload ) { echo "sitegraft: no domain-remap payload found or unreadable\n"; return; }
-    $from = $payload["from"];
-    $to = $payload["to"];
-    $from_escaped = str_replace( "/", "\\/", $from );
-    $to_escaped = str_replace( "/", "\\/", $to );
     $count = 0;
     foreach ( $payload["post_ids"] as $post_id ) {
       $post_id = (int) $post_id;
       $post = get_post( $post_id );
       if ( ! $post ) { continue; }
-      $content = str_replace( array( $from, $from_escaped ), array( $to, $to_escaped ), $post->post_content );
-      $excerpt = str_replace( array( $from, $from_escaped ), array( $to, $to_escaped ), $post->post_excerpt );
+      $content = sitegraft_remap_domain( $post->post_content, $payload["from"], $payload["to"] );
+      $excerpt = sitegraft_remap_domain( $post->post_excerpt, $payload["from"], $payload["to"] );
       if ( $content !== $post->post_content || $excerpt !== $post->post_excerpt ) {
         wp_update_post( array( "ID" => $post_id, "post_content" => $content, "post_excerpt" => $excerpt ) );
         $count++;
@@ -921,6 +907,7 @@ graft_search_replace_domain() {
     echo "sitegraft: domain-remap rewrote {$count} post(s)\n";
   '
   graft_remove_file b "$remote_path"
+  graft_remove_file b "$lib_path"
 }
 
 # design doc §11 "idempotent reimport": before importing, delete any post B already
@@ -994,6 +981,25 @@ _graft_exit_trap() {
     log_warn "graft interrupted or failed — removing the mapping mu-plugin from B before exiting (never left running unattended)"
     graft_remove_mu_plugin 2>/dev/null || true
     graft_mark_step "$rd" mu_cleanup 2>/dev/null || true
+  fi
+  # NIT-3 (review, Viktor): graft_remove_file for the id-remap/domain-remap
+  # JSON payload and the pushed content-remap-functions.php only ever runs
+  # AFTER a successful run_or_echo wp eval — a `wp eval` that hard-fails
+  # partway through (graft_remap_attachment_ids/graft_search_replace_domain,
+  # both above) would leave one or more of these behind on B indefinitely.
+  # No secret in any of them (id-map.tsv values are WordPress-internal
+  # integer post IDs, and the domain/from-to strings are already public in
+  # the manifest), but a stray file left on a genuinely public-facing site's
+  # wp-content root is still worth cleaning up rather than shrugging off.
+  # Filenames are fixed/predictable (never per-run-unique), so this is safe
+  # to attempt unconditionally whenever SITE_B_* is valid (same "profile_load
+  # already succeeded" guard the mu-plugin cleanup above relies on) —
+  # `graft_remove_file`'s underlying `rm -f` is a silent no-op if the file
+  # was already removed normally or never existed.
+  if [ -n "$rd" ] && [ -n "${SITE_B_WP_PATH:-}" ]; then
+    graft_remove_file b "${SITE_B_WP_PATH}/wp-content/sitegraft-id-remap-payload.json" 2>/dev/null || true
+    graft_remove_file b "${SITE_B_WP_PATH}/wp-content/sitegraft-domain-remap-payload.json" 2>/dev/null || true
+    graft_remove_file b "${SITE_B_WP_PATH}/wp-content/sitegraft-content-remap-functions.php" 2>/dev/null || true
   fi
   if declare -F sitegraft_cleanup >/dev/null 2>&1; then
     sitegraft_cleanup || true
@@ -1087,6 +1093,16 @@ phase_graft() {
   local domain_from domain_to
   domain_from=$(echo "$manifest" | jq -r '.options.search_replace.from')
   domain_to=$(echo "$manifest" | jq -r '.options.search_replace.to')
+  # NIT-4 (review, Viktor): `jq -r` on a manifest missing
+  # .options.search_replace.from/to (a hand-written manifest — manifest_new
+  # always populates this key in the normal scan/plan flow, so this never
+  # happens there) prints the literal 4-character string "null", not an
+  # empty string — which would pass every `[ -n "$domain_from" ]` guard
+  # downstream and get search-replaced as if "null" were a real domain.
+  # Normalized to "" here, same treatment as any other genuinely-missing
+  # value in this codebase.
+  [ "$domain_from" = "null" ] && domain_from=""
+  [ "$domain_to" = "null" ] && domain_to=""
   graft_step_done "$run_dir" remap_domain  || {
     graft_search_replace_domain "$domain_from" "$domain_to" "${run_dir}/id-map.tsv" "$run_dir"
     graft_mark_step "$run_dir" remap_domain

@@ -9,27 +9,15 @@ setup() {
   load '../../lib/graft.sh'
 }
 
-@test "graft_build_sentinel_commands emits pass-1 sentinel substitutions for attachments only" {
-  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
-  printf '10\t42\tattachment\n11\t43\tpage\n' > "$tsv"
-  run graft_build_sentinel_commands "$tsv"
-  [[ "$output" == *'"id":10(?!\d)'*'"id":__SITEGRAFT_10__'* ]]
-  [[ "$output" != *"11"*"page"* ]] || true  # page rows must not produce id-remap commands
-}
-
-@test "graft_build_sentinel_commands pass-2 maps each sentinel to the real new id" {
-  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
-  printf '10\t42\tattachment\n' > "$tsv"
-  run graft_build_sentinel_commands "$tsv"
-  [[ "$output" == *'__SITEGRAFT_10__'*'42'* ]]
-}
-
-@test "graft_build_sentinel_commands skips non-attachment rows entirely" {
-  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
-  printf '5\t99\tpage\n' > "$tsv"
-  run graft_build_sentinel_commands "$tsv"
-  [ -z "$output" ]
-}
+# graft_build_sentinel_commands's own tests used to live here — removed
+# (review, Viktor, NIT-1) along with the function itself: it went orphaned
+# the moment graft_remap_attachment_ids stopped calling it (MAJOR-2
+# fix-pack, below). The two-pass sentinel logic itself moved to
+# lib/php/content-remap-functions.php — see
+# tests/unit/test_content_remap_functions.bats for its real, isolated test
+# coverage (including a mutation-tested negative-lookahead check), which the
+# old bash-string-building tests here never actually exercised (they only
+# ever asserted the printf'd COMMAND text, never ran a real substitution).
 
 # MAJOR-2 (review, Viktor): `wp search-replace` has no row-level scoping —
 # scoping to content TABLES (posts/postmeta/options) still put every row of
@@ -48,6 +36,7 @@ setup() {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   wp_remote() { echo "SHOULD NOT BE CALLED"; }
   graft_push_remap_payload() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
   run graft_remap_attachment_ids "$tsv" "$run_dir"
   [ "$status" -eq 0 ]
   [[ "$output" != *"SHOULD NOT BE CALLED"* ]]
@@ -59,6 +48,7 @@ setup() {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   local captured="$BATS_TEST_TMPDIR/captured.json"
   graft_push_remap_payload() { printf '%s' "$2" > "$captured"; echo "/fake/remote/path.json"; }
+  graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   wp_remote() { echo "sitegraft: id-remap rewrote 0 post(s)"; }
   graft_remove_file() { :; }
   run graft_remap_attachment_ids "$tsv" "$run_dir"
@@ -70,17 +60,21 @@ setup() {
   [[ "$output" != *"--tables"* ]]
 }
 
-@test "graft_remap_attachment_ids's wp eval call is a single post_content/post_excerpt rewrite via wp_update_post, not a table-wide search-replace" {
+@test "graft_remap_attachment_ids's wp eval call requires the shared content-remap library and calls its function, never a table-wide search-replace" {
   local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
   printf '10\t42\tattachment\n' > "$tsv"
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   graft_push_remap_payload() { echo "/fake/remote/path.json"; }
+  graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   graft_remove_file() { :; }
   SITEGRAFT_DRY_RUN=1
   run graft_remap_attachment_ids "$tsv" "$run_dir"
   [[ "$output" == *"wp_remote b eval"* ]]
+  [[ "$output" == *"require_once"* ]]
+  [[ "$output" == *"sitegraft-content-remap-functions.php"* ]]
+  [[ "$output" == *"sitegraft_remap_attachment_refs("* ]]
   [[ "$output" == *"wp_update_post"* ]]
-  [[ "$output" == *"preg_replace"* ]]
+  [[ "$output" != *"preg_replace"* ]]  # the substitution itself must live in the required file, not inline here
   [[ "$output" != *"search-replace"* ]]
 }
 
