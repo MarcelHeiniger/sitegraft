@@ -16,7 +16,7 @@ SITEGRAFT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # invisible, not merely unclear.
 trap sitegraft_cleanup EXIT
 
-SITEGRAFT_VERSION="0.4.1"
+SITEGRAFT_VERSION="0.5.0"
 
 usage() {
   cat <<EOF
