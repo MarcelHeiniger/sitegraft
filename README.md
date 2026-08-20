@@ -13,9 +13,13 @@ sitegraft is not a general WordPress migration tool. It does one job precisely:
 replace the *design/content* layer of B with A's, and never so much as glance at
 anything B's plugins own.
 
-> **Status: design complete, implementation not started.** See
-> [`PROJECT.md`](PROJECT.md) for the current state of the project. The full design
-> document lives at
+> **Status: v1, feature-complete.** All six phases (`scan`, `plan`, `backup`,
+> `graft`, `verify`, `restore`) are implemented and covered by both unit tests and
+> a full DDEV integration harness. See [`PROJECT.md`](PROJECT.md) for the current
+> state of the project, [`docs/definition-of-done.md`](docs/definition-of-done.md)
+> for exactly what "done" means (including the one gate still open before a plain
+> `1.0.0` tag — a real dry run against a genuine A/B pair), and the full design
+> document at
 > [`docs/superpowers/specs/2026-08-19-sitegraft-design.md`](docs/superpowers/specs/2026-08-19-sitegraft-design.md).
 
 ## Why
@@ -65,23 +69,34 @@ prevent data loss that's already covered.)
 The core of sitegraft is generic. What it can migrate on A and what it must protect on
 B is declared by small, pluggable **graft modules** — one file per WordPress plugin or
 content domain, in `modules/`. Adding support for a new plugin tomorrow is one new
-file; the core never changes. See the design doc for the exact contract and a worked
-example module.
+file; the core never changes. See [`docs/usage.md`](docs/usage.md#5-the-module-system)
+for the exact contract and how to write one.
 
-Modules shipped in v1: `core-wp` (pages, posts, blocks, navigation, templates, global
-styles, media), `etch` (Etch's custom post types and options), `acss` (Automatic CSS
-settings and generated inventory). A `_template.sh` is provided for writing new ones.
+Modules shipped in v1: `core-wp` (pages, posts, the front-page option trio) and
+`etch` (Etch's custom post types and options). `acss` (Automatic.css) is
+deliberately not shipped yet — see `docs/usage.md` for why. A `_template.sh` and a
+complete worked example (`motopress.sh.example`) are provided for writing new ones.
 
 ## Requirements
 
 - bash (works on the stock bash 3.2 shipped with macOS, and on any bash ≥ 4 on Linux/WSL)
 - `ssh`, `rsync` — never `scp`
-- `wp-cli`, reachable on both A and B (directly, or via a `ddev wp` wrapper for local
-  DDEV sites)
+- `wp-cli`, reachable on both A and B (directly, or via a wrapper like
+  `ddev exec --raw -p <project> -- wp` for a local DDEV site)
 - `jq` — manifest parsing
 - `gum` (falls back to `fzf`, falls back to plain text prompts) — interactive selection
 
 Test-only: `bats-core` for unit tests, `ddev` for the integration test harness.
+
+```sh
+# macOS
+brew install jq gum bats-core rsync
+brew install ddev/ddev/ddev   # only if running the integration test harness
+
+# Debian/Ubuntu
+sudo apt install jq rsync
+# gum has no apt package — see https://github.com/charmbracelet/gum#installation
+```
 
 **Windows without admin rights:** WSL requires admin privileges to install, so it's
 not an option on a locked-down machine. Instead, run sitegraft itself on a remote
@@ -91,35 +106,37 @@ The orchestrator only needs the dependencies above; it doesn't need to be A or B
 
 ## Install
 
-Not published yet. Once implemented:
-
 ```sh
 git clone https://github.com/MarcelHeiniger/sitegraft.git
 cd sitegraft
-# add bin/ to PATH, or symlink bin/sitegraft somewhere on it
+# add bin/ to PATH, or symlink bin/sitegraft onto something already on it:
+ln -s "$(pwd)/bin/sitegraft" /usr/local/bin/sitegraft
 ```
 
-## Usage
+## Quickstart
 
 ```sh
-sitegraft scan    --profile <profile>
-sitegraft plan    --profile <profile>
-sitegraft backup  --profile <profile>
-sitegraft graft   --profile <profile> [--dry-run] [--allow-stack-mismatch]
-sitegraft verify  --profile <profile>
-sitegraft restore --profile <profile> --run <run-id>
+cp profiles/example.conf profiles/my-migration.conf   # edit hosts/paths for real
+sitegraft scan    --profile my-migration                          # read-only inventory of A and B
+sitegraft plan    --profile my-migration                          # interactive: pick what to migrate/protect
+sitegraft backup  --profile my-migration                          # full backup of B, with a ready-to-run restore.sh
+sitegraft graft   --profile my-migration --dry-run                # preview the transfer, touches nothing
+sitegraft graft   --profile my-migration                          # the real A -> B transfer
+sitegraft verify  --profile my-migration                          # confirm nothing protected changed
+sitegraft restore --profile my-migration --run <run-id>           # only if you need to roll back
 ```
 
-A `<profile>` is a file in `profiles/<name>.conf` describing the A/B pair (hosts,
+`<profile>` is a file at `profiles/<name>.conf` describing the A/B pair (hosts,
 paths, wrapper commands) — see `profiles/example.conf`. Profiles never contain
-secrets; credentials are read from `~/.config/sitegraft/<profile>.creds` (chmod 600,
-never committed) or entered interactively.
+secrets; an optional credentials file at `~/.config/sitegraft/<profile>.creds`
+(chmod 600, never committed) can pin a specific SSH key per site — without one,
+sitegraft falls back to your ssh-agent/default identity, which is enough for most
+setups.
 
-## Writing a module
-
-See [`modules/_template.sh`](modules/_template.sh) and the design doc's module
-contract section for the full walkthrough, including a worked example for a
-hypothetical booking plugin.
+**Full usage guide:** [`docs/usage.md`](docs/usage.md) — every flag, the exact
+contract for writing a new module, and the full security model (non-contamination,
+default-deny, the custom-code gate, backup-before-write, the rendering-stack
+precondition).
 
 ## Testing
 

@@ -608,7 +608,17 @@ phase_restore() {
   [ -x "${run_dir}/restore.sh" ] || { log_error "no restore.sh found for run: ${run_dir}"; return 1; }
 
   if is_dry_run; then
-    log_info "--dry-run: restore will still take a real pre-restore snapshot of B (read-only against B, and a safety net independent of dry-run) but will print restore.sh's command instead of running it"
+    # NIT-F (review fix-pack): this message used to claim the pre-restore
+    # snapshot is "still taken for real" under --dry-run — it isn't. The
+    # snapshot below reuses backup_db_export/backup_wp_content, the exact
+    # same functions phase_backup itself calls, and both are run_or_echo-
+    # wrapped internally like everything else in this codebase's dry-run
+    # story — under dry-run they print their commands instead of running
+    # them, same as the restore.sh execution that follows. The BEHAVIOR is
+    # correct (a real --dry-run genuinely touches nothing on B, snapshot
+    # included — verified, this is the safe direction) — only this message
+    # was wrong about what it does.
+    log_info "--dry-run: restore will print the commands it would run for both the pre-restore snapshot and restore.sh's execution — neither actually runs, and nothing on B is touched"
   fi
 
   if [ "$yes" -ne 1 ]; then

@@ -75,25 +75,25 @@ core_wp: page"
   local manifest='{"migrate":{"etch":{"post_types":["etch_cfs","etch_cpts"],"option_keys":["etch_settings"]}},"protect":{"fakebooking":{"post_types":["fake_reservation"],"tables":["fakebooking_reservations"],"option_keys":["fakebooking_settings"]},"_unclaimed":{"post_types":["mystery_cpt"],"tables":[],"option_keys":[]}}}'
   run _plan_freeze_summary "$manifest"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"etch: etch_cfs, etch_cpts, etch_settings"* ]]
-  [[ "$output" == *"fakebooking: fake_reservation, fakebooking_reservations, fakebooking_settings"* ]]
-  [[ "$output" == *"_unclaimed: mystery_cpt"* ]]
+  [[ "$output" == *"etch: etch_cfs, etch_cpts, etch_settings"* ]] || false
+  [[ "$output" == *"fakebooking: fake_reservation, fakebooking_reservations, fakebooking_settings"* ]] || false
+  [[ "$output" == *"_unclaimed: mystery_cpt"* ]] || false
 }
 
 @test "_plan_freeze_summary shows a module with nothing selected explicitly, not silently" {
   local manifest='{"migrate":{"acss":{"post_types":[],"option_keys":[]}},"protect":{}}'
   run _plan_freeze_summary "$manifest"
-  [[ "$output" == *"acss: (nothing selected)"* ]]
+  [[ "$output" == *"acss: (nothing selected)"* ]] || false
 }
 
 @test "_plan_freeze_summary truncates a long item list (e.g. a real-world _unclaimed.option_keys) instead of printing an unreadable wall of text" {
   local many; many=$(jq -n -c '[range(30) | "opt_\(.)"]')
   local manifest; manifest=$(jq -n --argjson opts "$many" '{migrate:{},protect:{_unclaimed:{post_types:[],tables:[],option_keys:$opts}}}')
   run _plan_freeze_summary "$manifest"
-  [[ "$output" == *"opt_0"* ]]
-  [[ "$output" == *"opt_14"* ]]
-  [[ "$output" == *"... and 15 more"* ]]
-  [[ "$output" != *"opt_29"* ]]
+  [[ "$output" == *"opt_0"* ]] || false
+  [[ "$output" == *"opt_14"* ]] || false
+  [[ "$output" == *"... and 15 more"* ]] || false
+  [[ "$output" != *"opt_29"* ]] || false
 }
 
 @test "plan_select_interactive is a no-op passthrough when migrate is empty" {
@@ -170,4 +170,56 @@ a: three" ]
   [ "$status" -eq 0 ]
   [ "$output" = "a: one
 a: two" ]
+}
+
+# --- Durcissement (Step 6), tracked from Viktor's Step 2 review: EOF on
+# stdin (no TTY / unattended invocation, stdin exhausted or /dev/null) is
+# NOT the same signal as a real operator pressing Enter on the [Y/n]
+# default — before this fix, `${ans:-y}` could not tell them apart and
+# silently took the "kept" branch on EOF too, the least conservative
+# possible default for a tool whose whole job is not moving data nobody
+# approved. Fixed: `read`'s own non-zero exit status on EOF is checked
+# explicitly, and the function aborts (returns 1, prints nothing further)
+# instead of guessing.
+@test "_plan_prompt_items plain fallback aborts (does not guess 'kept') when stdin hits genuine EOF, not answered" {
+  run --separate-stderr env PATH=/usr/bin:/bin bash -c '
+    source lib/core.sh; source lib/plan.sh
+    items=$(printf "a: one\na: two")
+    _plan_prompt_items "$items"
+  ' < /dev/null
+  [ "$status" -eq 1 ]
+  [ -z "$output" ]
+  [[ "$stderr" == *"selection interrupted"* ]] || false
+}
+
+@test "_plan_prompt_items plain fallback aborts mid-selection on EOF, discarding any already-answered items too (no partial guess)" {
+  run --separate-stderr env PATH=/usr/bin:/bin bash -c '
+    source lib/core.sh; source lib/plan.sh
+    items=$(printf "a: one\na: two\na: three")
+    _plan_prompt_items "$items"
+  ' <<< $'y'
+  [ "$status" -eq 1 ]
+  [ -z "$output" ]
+  [[ "$stderr" == *"selection interrupted"* ]] || false
+}
+
+@test "_plan_prompt_items plain fallback still works normally when every item is genuinely answered (real Enter keystrokes, not EOF)" {
+  run --separate-stderr env PATH=/usr/bin:/bin bash -c '
+    source lib/core.sh; source lib/plan.sh
+    items=$(printf "a: one\na: two")
+    _plan_prompt_items "$items"
+  ' <<< $'y\ny\n'
+  [ "$status" -eq 0 ]
+  [ "$output" = "a: one
+a: two" ]
+}
+
+@test "plan_select_interactive propagates an aborted selection instead of freezing a guessed manifest" {
+  run --separate-stderr env PATH=/usr/bin:/bin bash -c '
+    source lib/core.sh; source lib/manifest.sh; source lib/plan.sh
+    manifest="{\"migrate\":{\"etch\":{\"post_types\":[\"etch_cfs\"],\"option_keys\":[]}}}"
+    plan_select_interactive "$manifest"
+  ' < /dev/null
+  [ "$status" -eq 1 ]
+  [[ "$stderr" == *"manifest not frozen"* ]] || false
 }

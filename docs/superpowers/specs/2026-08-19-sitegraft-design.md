@@ -173,13 +173,47 @@ For a module with prefix `<mod>` (e.g. `core_wp`, `etch`, `acss`, `motopress`):
 | `<mod>_detect` | yes | `<mod>_detect <scan_json_path>` → exit 0/1 | Is this plugin/domain present on the scanned site? |
 | `<mod>_post_types` | no* | `<mod>_post_types` → stdout: one post_type per line | Post types owned by this module |
 | `<mod>_option_keys` | no* | `<mod>_option_keys` → stdout: one `wp_options` key per line | Options owned by this module |
-| `<mod>_option_keys_exclude` | no | `<mod>_option_keys_exclude` → stdout: one glob pattern per line | Exclusions within a broad prefix (e.g. licenses, DB versions) |
+| `<mod>_option_keys_exclude` | no | `<mod>_option_keys_exclude` → stdout: one glob pattern per line | **NOT WIRED — see status note directly below.** Originally: exclusions within a broad prefix (e.g. licenses, DB versions). |
 | `<mod>_tables` | no* | `<mod>_tables` → stdout: one table suffix per line (without `$table_prefix`) | Plugin-owned SQL tables, outside WXR content |
 | `<mod>_post_import` | no | `<mod>_post_import <state_dir> <id_map_tsv> <wp_cmd_b>` | Hook run after WXR import + generic remaps, for module-specific fixups |
 | `<mod>_stack_candidates` | no | `<mod>_stack_candidates` → stdout: one candidate plugin slug per line, most-preferred first | Declares this module's plugin for §12's stack-sync — **detection only**, see below and §3.4 |
 
 \* At least ONE of the three functions `_post_types` / `_option_keys` / `_tables`
 must exist — a module that declares nothing has no reason to exist.
+
+> **v1 status (Step 6 self-review, review fix-pack, 2026-08-20):
+> `<mod>_option_keys_exclude` is declared in the contract and implemented by
+> `modules/etch.sh` (also shown in `modules/_template.sh`'s stub), but IS NOT
+> READ ANYWHERE — no code in `lib/` or `bin/` ever calls
+> `module_has_fn "$mod" option_keys_exclude` or consumes its output. It is
+> currently inert. Harmless for `etch` specifically, because
+> `etch_option_keys` is already a complete, explicit allowlist that never
+> includes a license/DB-version key in the first place — there is nothing
+> for the exclusion to actually do there. It would NOT be harmless for a
+> future module that returns a broad prefix from `_option_keys` (e.g.
+> `"my_plugin_*"` instead of an explicit list) while counting on
+> `_option_keys_exclude` to carve license/secret keys back out — those keys
+> would migrate anyway, silently. Until this is wired (or removed), every
+> module's `_option_keys` MUST already be a complete, explicit allowlist —
+> never rely on `_option_keys_exclude` for anything.** Deliberately left
+> unimplemented rather than added in this fix-pack (no existing caller
+> needs prefix expansion, and wiring a mechanism nothing uses is exactly the
+> YAGNI this codebase otherwise avoids) — see `docs/todo.md` if this needs
+> to change.
+
+**`<mod>_post_import` and `--dry-run` (added in Step 6's dry-run audit, which
+found and fixed a real violation of this in `modules/core-wp.sh`):**
+`graft_run_module_post_import` (lib/graft.sh) calls every module's
+`post_import` hook unconditionally, whether or not `--dry-run` was passed —
+there is no separate "skip module hooks in dry-run" branch. A hook that
+mutates B (via the `wp_cmd_b` prefix it's handed) MUST wrap every such call in
+`lib/core.sh`'s `run_or_echo` — never invoke `$wp_cmd_b` directly for a
+write. `run_or_echo` is already sourced by the time any module hook runs, so
+this is zero extra work: `run_or_echo $wp_cmd_b option update key value`
+instead of `$wp_cmd_b option update key value`. Read-only `$wp_cmd_b` calls
+(e.g. `post list` to look something up) don't need wrapping. See
+`modules/motopress.sh.example`'s `motopress_post_import` for a worked
+example, and `modules/core-wp.sh`'s `core_wp_post_import` for the real fix.
 
 `lib/modules.sh` discovers modules via the glob `modules/*.sh` (the `.example`
 suffix is explicitly excluded, as is `_template.sh`), sources each file, and builds
@@ -233,6 +267,9 @@ etch_styles
 EOF
 }
 
+# NOT WIRED in v1 — see §3.2's status note. etch_option_keys above is
+# already a complete explicit allowlist, so this is harmless here, but
+# nothing in lib/ or bin/ ever reads this function's output.
 etch_option_keys_exclude() {
   cat <<'EOF'
 etch_license_*
@@ -274,6 +311,9 @@ automatic_css_generated_inventory
 EOF
 }
 
+# NOT WIRED in v1 — see §3.2's status note (not that it matters here: this
+# whole module is unshipped, see the status note further below in this
+# section).
 acss_option_keys_exclude() {
   cat <<'EOF'
 automatic_css_license_*
@@ -297,6 +337,19 @@ TODO_VERIFY_LEGACY_ACSS_SLUG
 EOF
 }
 ```
+
+> **v1 status (Step 6 self-review, 2026-08-20): `modules/acss.sh` does NOT
+> exist in the repo.** Only `modules/core-wp.sh` and `modules/etch.sh`
+> (added in Step 6 — see that file's own header comment) are real, shipped
+> v1 modules; `modules/motopress.sh.example` is the intentional
+> never-loaded worked example (§3.5). Correctly so, not an oversight:
+> `TODO_VERIFY_LEGACY_ACSS_SLUG` above is exactly the blocker this comment
+> already names, and it's still open — nobody has checked a real pre-4.0
+> Automatic.css install to confirm its actual legacy folder name. Shipping
+> `modules/acss.sh` with a guessed value would violate this section's own
+> instruction not to. `docs/definition-of-done.md`'s "3 v1 modules
+> (core-wp, etch, acss)" line is corrected accordingly — see that file and
+> `docs/todo.md` → Backlog for the up-to-date scope.
 
 ### 3.5 Example of a future module — `modules/motopress.sh.example`
 
@@ -553,13 +606,26 @@ if the credentials file referenced by the profile doesn't exist — with an expl
 offer to save it ("save to `~/.config/sitegraft/example.creds` so you don't have to
 re-enter it? [y/N]"), never automatic.
 
+> **v1 status (Step 6 self-review, 2026-08-20): (b) is NOT implemented.**
+> `profile_load` (a) parses the `.creds` file when present, exactly as
+> documented, but when it's absent it only logs a warning and proceeds
+> without `SITE_*_SSH_KEY` — never prompts. Deliberately left as a
+> documented gap rather than added late in the polish pass (see
+> `docs/status.md`/`docs/todo.md` → Backlog): not a broken state in
+> practice, since a missing key just falls back to ssh's own default
+> identity resolution (ssh-agent / `~/.ssh/config`), the common case working
+> fine either way. An operator who needs a specific per-site key today
+> creates `~/.config/sitegraft/<profile>.creds` by hand (chmod 600) — path
+> (a), fully working.
+
 `lib/profile.sh :: profile_load` **parses** the `.conf` file itself, line by line
 (never `source`s/`.`s it — corrected during the post-review fix-pack: a
 source-after-shape-check design was verified live to let both trailing shell
 code and an embedded command substitution execute). Only an anchored
 `KEY="value"` / `KEY='value'` line is accepted, and only for a key on a fixed
 SITE_*/SITEGRAFT_* whitelist — no arbitrary code, ever. Then loads the matching
-`.creds` file the same way if it exists, otherwise triggers (b).
+`.creds` file the same way if it exists — otherwise it warns and proceeds
+without it, per the v1 status note above, rather than triggering (b).
 
 ## 6. Exact phase walkthrough
 
@@ -878,6 +944,20 @@ assuming the file already exists at the computed path
 first** (rsync, step 1 of `graft`), **WXR import second** (step 7). If the order
 were reversed, the import would leave attachments with a missing file.
 
+> **v1 status (Step 6 self-review, 2026-08-20): the mechanism above is no longer
+> how attachments actually get onto B, though the media-before-content ORDERING
+> is still correct.** `lib/graft.sh`'s `graft_import_attachments` (header comment
+> has the full history) found that the shipped `wordpress-importer` 0.9.5's
+> `process_attachment()` unconditionally requires `--fetch_attachments=true` and
+> does a real remote HTTP fetch — there is no "assume the file is already there"
+> path to rely on at all, contrary to what this section assumed. Attachments are
+> instead migrated entirely OUTSIDE the WXR path: `wp media import --skip-copy`
+> against the files `graft_media_sync` already placed on B, run as its own step
+> BEFORE the WXR import (which is itself given `--skip=attachment`, per
+> `graft_export_wxr`, so wordpress-importer never touches attachment posts at
+> all). The media-first ordering this section argues for is still exactly right —
+> just via a different mechanism than described above.
+
 ## 9. Post-import remapping strategy
 
 ### 9.1 Doubly-embedded image ID references (Etch content)
@@ -888,38 +968,56 @@ domain is handled separately (§9.4). The ID must be remapped precisely, with no
 collisions.
 
 **Two-pass sentinel technique** — to eliminate any risk that a new ID already
-substituted gets re-matched by an old ID processed later in the same batch. **Both
-passes are scoped with `--tables=` to the content tables only**
-(`{$prefix}posts,{$prefix}postmeta,{$prefix}options` — computed once from B's live
-`$wpdb->prefix`) — this is deliberate and non-negotiable: `wp search-replace`
-without `--tables=` scans every table sharing the site's prefix, which would include
-any protected plugin's tables and directly violate the tool's core promise:
+substituted gets re-matched by an old ID processed later in the same batch.
 
-```sh
-CONTENT_TABLES="${B_PREFIX}posts,${B_PREFIX}postmeta,${B_PREFIX}options"
-
-# Pass 1: old_id -> unique sentinel token
-while IFS=$'\t' read -r old_id new_id post_type; do
-  [ "$post_type" = "attachment" ] || continue
-  wp --path="$SITE_B_WP_PATH" search-replace \
-    "\"id\":${old_id}(?!\d)" "\"id\":__SITEGRAFT_${old_id}__" \
-    --tables="$CONTENT_TABLES" --regex --precise --skip-columns=guid
-  wp --path="$SITE_B_WP_PATH" search-replace \
-    "wp-image-${old_id}(?!\d)" "wp-image-__SITEGRAFT_${old_id}__" \
-    --tables="$CONTENT_TABLES" --regex --precise --skip-columns=guid
-done < "$STATE_DIR/id-map.tsv"
-
-# Pass 2: sentinel token -> real new_id
-while IFS=$'\t' read -r old_id new_id post_type; do
-  [ "$post_type" = "attachment" ] || continue
-  wp --path="$SITE_B_WP_PATH" search-replace \
-    "__SITEGRAFT_${old_id}__" "${new_id}" --tables="$CONTENT_TABLES" --precise --skip-columns=guid
-done < "$STATE_DIR/id-map.tsv"
-```
+> ⚠️ **SUPERSEDED — do not implement the `wp search-replace --tables=...` shape
+> this subsection originally showed. Kept here (Step 6 self-review,
+> 2026-08-20) ONLY as a paragraph description of what NOT to do, with the
+> actual dangerous command removed, specifically so it can't be copy-pasted.**
+> The original sample scoped both passes with `--tables=` to
+> `{$prefix}posts,{$prefix}postmeta,{$prefix}options`, reasoning that this was
+> "deliberate and non-negotiable" scoping. It was wrong: `wp search-replace`
+> has no ROW-level scoping — `--tables=` only narrows which tables it scans,
+> and within a scoped table it still touches every row, including a protected
+> plugin's own `wp_options`/`wp_postmeta` rows if that plugin happens to share
+> those tables (nearly always true — `wp_options` is one shared table for the
+> whole site). This is exactly the MAJOR-2 bug a pre-Step-6 security-review
+> fix-pack found and fixed live: a protected plugin's own `wp_options` row
+> carrying a colliding `"id":<N>` payload got silently rewritten by this exact
+> shape of command. Reimplementing this subsection literally would reintroduce
+> that real data-corruption bug.
+>
+> **What's actually shipped:** the real two-pass sentinel substitution
+> (`old_id -> sentinel -> new_id`, same ordering guarantee) is applied by
+> `graft_remap_attachment_ids` in `lib/graft.sh`, via PHP `preg_replace` in
+> `lib/php/content-remap-functions.php`'s `sitegraft_remap_attachment_refs` —
+> never `wp search-replace`, and never scoped by TABLE at all. Instead it is
+> scoped by ROW, explicitly: it fetches and rewrites ONLY `post_content` and
+> `post_excerpt` of the exact set of `post_id`s this specific run imported
+> (from `id-map.tsv`) — nothing else in `wp_posts`, and neither `wp_postmeta`
+> nor `wp_options` are touched by this function at all (see the "known
+> consequence" note below for why not, and where those two are actually
+> handled instead). Read `graft_remap_attachment_ids`'s own header comment in
+> `lib/graft.sh` for the full mechanism, including why the payload is pushed
+> as a file rather than embedded in the `wp eval` source.
+>
+> **Known, real, narrower-than-this-subsection's-original-claim consequence:**
+> `wp_postmeta` can hold serialized PHP, which needs WordPress's own
+> `maybe_unserialize()`/`maybe_serialize()` round-trip to touch safely — out
+> of scope for this generic remap, same position as §11's "a CPT-specific meta
+> reference is the relevant module's `post_import` hook's job." An
+> attachment-ID reference living in `wp_postmeta` (not `post_content`/
+> `post_excerpt`) is therefore never remapped by this generic pass — accepted
+> as the safer trade-off, not fixed in Step 6. (`_thumbnail_id`, the one
+> universal postmeta-stored attachment reference every post_type can carry, IS
+> handled — by its own dedicated, narrowly-targeted function,
+> `graft_remap_featured_images` in `lib/graft.sh`, not by this one.)
 
 The sentinel tokens guarantee that no pass-2 substitution can ever be re-matched by
 a pass-1 rule still waiting to run (impossible, since the two passes are strictly
-sequential and disjoint by construction).
+sequential and disjoint by construction) — this guarantee itself still holds
+exactly as described; only the vehicle (PHP `preg_replace` over an explicit
+row set, not `wp search-replace --tables=`) changed.
 
 ### 9.2 `post_parent`
 
@@ -950,19 +1048,35 @@ core_wp_post_import() {
 ### 9.4 Domain search-replace, A→B
 
 Two mandatory passes (a plain variant and a JSON-escaped variant, since Etch stores
-some data as JSON blobs in certain options/postmeta), **scoped with the same
-`--tables=$CONTENT_TABLES` as §9.1** for the same non-negotiable reason — a
-protected plugin's own tables never get anywhere near a `search-replace` call:
+some data as JSON blobs in certain options/postmeta) — A's domain string must be
+scrubbed from every field it could appear in, in migrated content.
 
-```sh
-wp --path="$SITE_B_WP_PATH" search-replace 'https://a.example.com' 'https://b.example.com' \
-  --tables="$CONTENT_TABLES" --skip-columns=guid --precise
-wp --path="$SITE_B_WP_PATH" search-replace 'https:\/\/a.example.com' 'https:\/\/b.example.com' \
-  --tables="$CONTENT_TABLES" --skip-columns=guid --precise
-```
+> ⚠️ **SUPERSEDED — same correction as §9.1's own status note, same reason the
+> dangerous sample itself has been removed rather than merely annotated (Step 6
+> self-review, 2026-08-20).** This subsection originally showed
+> `wp --path="$SITE_B_WP_PATH" search-replace 'https://a.example.com'
+> 'https://b.example.com' --tables="$CONTENT_TABLES" --skip-columns=guid
+> --precise` (plus its JSON-escaped variant), reasoning that `--tables=`
+> scoping made it safe. It is the identical MAJOR-2 mistake as §9.1's original
+> sample: `--tables=` only narrows which TABLES are scanned, not which ROWS
+> within them, so a protected plugin's own `wp_options`/`wp_postmeta` row is
+> still directly in scope. Do not implement this shape.
+>
+> **What's actually shipped:** `graft_search_replace_domain` (`lib/graft.sh`)
+> uses the same run-scoped fetch/`preg_replace`/write-back technique as §9.1 —
+> `sitegraft_remap_domain` in `lib/php/content-remap-functions.php`, applied
+> only to `post_content`/`post_excerpt` of the exact posts this run imported.
+> A domain string living in a migrated `wp_options` value is handled
+> separately and safely, inside `graft_migrate_options` (`lib/graft.sh`),
+> scoped to exactly the manifest's explicit `option_keys` — never a blind
+> table-wide pass over `wp_options`.
 
-`--skip-columns=guid`: WordPress's `guid` isn't supposed to change after creation —
-let wp-cli/the import handle its value natively instead of rewriting it by hand.
+`--skip-columns=guid` (still a real, correct principle even though the sample
+above showing it is gone): WordPress's `guid` isn't supposed to change after
+creation — let wp-cli/the import handle its value natively instead of
+rewriting it by hand. The shipped implementation honors this by construction
+(it never touches `guid` at all — only `post_content`/`post_excerpt`), not via
+an explicit flag.
 
 ## 10. DDEV test harness
 
@@ -1020,9 +1134,9 @@ Orchestration:
 | Case | sitegraft behavior |
 |------|---------------------|
 | A CPT with an internal ID reference in postmeta (e.g. "related product") | Outside the core's generic remap — that's the job of the relevant module's `<mod>_post_import` hook (full example in §3.5). |
-| Slug collisions between B's existing content and the imported content | Handled natively by WordPress (automatic `-2` suffix on insert). `verify` diffs `post_name` A vs. post-import B and **warns** (not a hard failure) if any slugs were renamed — a signal to manually check internal links. |
+| Slug collisions between B's existing content and the imported content | Handled natively by WordPress (automatic `-2` suffix on insert) — that part is real and safe. **v1 status (Step 6 self-review, 2026-08-20): the `verify`-side warning described here (diffing `post_name` A vs. post-import B) was never implemented — `lib/verify.sh` has no such check.** Not a safety gap (WordPress's own renaming is enough to prevent corruption/collision), but it is a real, not-yet-built piece of this row's original claim — an operator gets no automatic heads-up to go check internal links after a slug rename. Left as a documented `docs/todo.md` backlog item rather than added late in Step 6: it would need a new cross-site read (A's pre-migration `post_name`, which nothing in `verify` currently fetches — every existing `verify` check is B-only, see that file's own header comment), not a small addition. |
 | `page_on_front` / `show_on_front` | Dedicated remap via `core_wp_post_import`, see §9.3. |
-| Deep page hierarchies | `plan` **validates** that if a hierarchical post_type (`page`) is selected, ALL of its potential ancestors are selected too (same post_type, all-or-nothing migration) — a partial hierarchy import isn't a supported case in v1 (YAGNI: sitegraft migrates whole post_types, not subtrees). |
+| Deep page hierarchies | Selection is per-post_type, never per-individual-post (`plan`'s item-level toggle operates on a whole module's `post_types`/`option_keys` lists — see `lib/plan.sh`'s `_plan_apply_selection`), and the WXR export for a selected post_type pulls every post of that type via `wp export --post_type=`. A "partial hierarchy" (some but not all ancestors selected) is therefore impossible **by construction** — there was never a need for `plan` to run a separate explicit ancestor-validation step, and none exists in the shipped code. This section originally implied a validation step; the invariant it was protecting is real and does hold, just via a simpler mechanism (whole-post_type, all-or-nothing migration) than "validates ALL potential ancestors are selected too" suggests. |
 | Idempotent reimport | Every post imported by sitegraft carries `_sitegraft_source_id` (set by the mu-plugin, §7). Before any import, `graft` lists and deletes (`wp post delete --force`) any post of the selected post_types carrying this meta from a previous run — a rerun never duplicates content. Distinct from the `clean` step (which removes B's **original pre-existing** content, not content sitegraft placed itself). |
 
 ## 12. Design-layer stack precondition (product decision)

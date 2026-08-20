@@ -762,6 +762,20 @@ graft_remap_attachment_ids() {
 # gets a generic, non-module-specific fix.
 graft_remap_featured_images() {
   local id_map_tsv="$1"
+  # Fix-pack bug found live (running the DDEV harness's new MAJOR-B
+  # dry-run assertion, a genuinely fresh run directory never graft'd for
+  # real before): `graft_fetch_id_map` deliberately never creates
+  # id-map.tsv under --dry-run (its own writes are all run_or_echo-wrapped,
+  # correctly — see that function's own comment), so on a first-time dry
+  # run the file doesn't exist AT ALL yet, not merely empty. The `done 3<
+  # "$id_map_tsv"` redirect below fails outright on a missing file
+  # ("No such file or directory") under this codebase's own `set -e`,
+  # aborting the whole graft. graft_remap_attachment_ids (above) already
+  # guards against exactly this — id-map.tsv genuinely not existing OR
+  # existing empty are the same "nothing to remap yet" case — this
+  # function just never got the same guard. `-s` (exists AND non-empty),
+  # matching that sibling function's own check precisely.
+  [ -s "$id_map_tsv" ] || return 0
   local old_id new_id post_type
   while IFS=$'\t' read -r old_id new_id post_type <&3; do
     [ "$post_type" != "attachment" ] || continue
@@ -801,7 +815,27 @@ graft_check_orphan_parents() {
 # --- Task 4.4: options migration, domain remap, module hooks, pruning ------
 
 graft_step_done() { [ -f "${1}/graft.${2}.done" ]; }
-graft_mark_step() { touch "${1}/graft.${2}.done"; }
+# BLOCKER (review fix-pack, reproduced live by Viktor): this used to `touch`
+# the marker unconditionally, dry-run or not. Every step in phase_graft below
+# is wired as `graft_step_done "$run_dir" X || { <do the step>;
+# graft_mark_step "$run_dir" X; }` — a `--dry-run` graft still calls
+# graft_mark_step after each step (only the step's OWN body is dry-run-aware,
+# via run_or_echo), so a dry run against a run directory wrote every single
+# `graft.<step>.done` marker for real. A REAL graft run against that SAME
+# run directory afterward (`scan -> plan -> backup -> graft --dry-run ->
+# graft`) then sees graft_step_done true for every step and skips the
+# entire pipeline — a silent no-op that reports "graft complete" without
+# having migrated anything. Guarded here, in the one shared function every
+# call site already goes through, rather than repeating an `is_dry_run`
+# check at each of the dozen `graft_mark_step` call sites (including the
+# EXIT trap's own mu-plugin-cleanup marking, `_graft_exit_trap` above) —
+# one fix covers all of them. Within a single dry-run pass this changes
+# nothing an operator sees: `graft_step_done` still reads false for every
+# step (no marker was ever written), so the `|| { ... }` on the right still
+# runs each step's body exactly once and the full dry-run preview output is
+# still produced — the only thing that changes is that nothing persists to
+# disk afterward.
+graft_mark_step() { is_dry_run && return 0; touch "${1}/graft.${2}.done"; }
 
 # design doc §6.4 step 8 / review finding A1: this step was missing entirely from
 # the previous draft — sitegraft migrated content but never the Etch/ACSS settings.
@@ -827,7 +861,27 @@ graft_migrate_options() {
   local key
   for key in $(echo "$manifest" | jq -r '[.migrate[].option_keys[]?] | unique[]'); do
     local value
-    value=$(wp_remote a option get "$key" --format=json 2>/dev/null || echo 'null')
+    # Fix-pack bug found live (DDEV harness, running MAJOR-B's new
+    # graft --dry-run assertion end to end for the first time): wp_remote
+    # (lib/inventory.sh) wraps EVERY call in run_or_echo, including a plain
+    # READ from A — it has no notion of "this particular call is
+    # non-destructive, run it for real". Under --dry-run this read used to
+    # return the literal text "[dry-run] wp_remote a option get ..."
+    # instead of A's real value, which then went straight into `jq` a few
+    # lines below (the domain-rewrite pass) as if it were valid JSON — jq
+    # fails on it (not valid JSON), and under this codebase's `set -euo
+    # pipefail` that failure aborted the whole graft with a bare, unlogged
+    # "exit 5", not even a friendly error message. `SITEGRAFT_DRY_RUN=0`
+    # prefixed onto just this one call is a genuine, temporary shell
+    # variable override for the duration of this single function call
+    # (real bash behavior for a function invocation, not merely an
+    # external-process env var) — it does not affect SITEGRAFT_DRY_RUN
+    # anywhere else, including the real write below (`run_or_echo
+    # wp_remote b option update ...`), which stays correctly simulated.
+    # This mirrors the same principle scan's own M6 fix and verify's own
+    # MAJOR-A fix already establish: reads needed to compute a correct
+    # dry-run PREVIEW must run for real; only writes get simulated.
+    value=$(SITEGRAFT_DRY_RUN=0 wp_remote a option get "$key" --format=json 2>/dev/null || echo 'null')
     if [ -n "$domain_from" ]; then
       # jq's own decode/encode round-trip, deliberately NOT a bash/sed
       # string or regex replace: `value` is valid JSON text (from

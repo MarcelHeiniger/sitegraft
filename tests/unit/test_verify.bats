@@ -30,7 +30,7 @@ setup() {
   local recomputed='{"plugin-x":"sha256:DIFFERENT"}'
   run verify_compare_checksums "$manifest" "$recomputed"
   [ "$status" -eq 1 ]
-  [[ "$output" == *"plugin-x"* ]]
+  [[ "$output" == *"plugin-x"* ]] || false
 }
 
 @test "verify_compare_checksums passes when there is nothing protected to compare" {
@@ -50,7 +50,7 @@ setup() {
   wp_remote() { echo '{"theme_mode":"light"}'; } # stub: B's live value differs
   run verify_options_match "$run_dir" "$manifest"
   [ "$status" -eq 1 ]
-  [[ "$output" == *"etch_settings"* ]]
+  [[ "$output" == *"etch_settings"* ]] || false
 }
 
 @test "verify_options_match passes when B's live value matches" {
@@ -70,7 +70,7 @@ setup() {
   wp_remote() { echo "SHOULD NOT BE CALLED"; }
   run verify_options_match "$run_dir" "$manifest"
   [ "$status" -eq 0 ]
-  [[ "$output" != *"SHOULD NOT BE CALLED"* ]]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }
 
 @test "verify_options_match never compares page_on_front/page_for_posts (remap-aware check lives in verify_page_on_front instead)" {
@@ -127,7 +127,7 @@ setup() {
   wp_remote() { printf '{"logo_url":"https:\\/\\/b.example.com\\/DIFFERENT-PATH"}'; }
   run verify_options_match "$run_dir" "$manifest"
   [ "$status" -eq 1 ]
-  [[ "$output" == *"etch_styles"* ]]
+  [[ "$output" == *"etch_styles"* ]] || false
 }
 
 @test "verify_options_match reports every mismatched key, not just the first" {
@@ -139,8 +139,8 @@ setup() {
   wp_remote() { echo '"DIFFERENT"'; }
   run verify_options_match "$run_dir" "$manifest"
   [ "$status" -eq 1 ]
-  [[ "$output" == *"key_one"* ]]
-  [[ "$output" == *"key_two"* ]]
+  [[ "$output" == *"key_one"* ]] || false
+  [[ "$output" == *"key_two"* ]] || false
 }
 
 # --- verify_domain_absent ----------------------------------------------------
@@ -192,7 +192,7 @@ setup() {
   wp_remote() { echo "HIT:post:105"; }
   run verify_domain_absent "$run_dir" "$tsv" "$manifest" "https://a.example.com"
   [ "$status" -eq 1 ]
-  [[ "$output" == *"post:105"* ]]
+  [[ "$output" == *"post:105"* ]] || false
 }
 
 @test "verify_domain_absent's wp eval requires the shared content-remap library and calls sitegraft_domain_present for both surfaces" {
@@ -202,19 +202,38 @@ setup() {
   graft_push_remap_payload() { echo "/fake/remote/path.json"; }
   graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   graft_remove_file() { :; }
-  SITEGRAFT_DRY_RUN=1
+  # Test-quality fix-pack bug found live (also masked until now by the same
+  # bash 3.2 [[ ]]-under-set-e quirk this fix-pack's `|| false` pass
+  # addresses): this was the ONE verify_domain_absent test in this file
+  # that never stubbed wp_remote — every sibling test above does
+  # (`wp_remote() { echo "OK"; }` etc.). Setting SITEGRAFT_DRY_RUN=1 alone
+  # does NOT substitute for a stub here: unlike lib/graft.sh's remap
+  # functions (which wrap their call as `run_or_echo wp_remote b eval ...`
+  # AT THE CALL SITE, so the literal string "wp_remote" is what run_or_echo
+  # itself echoes under dry-run, before wp_remote's own body ever runs),
+  # verify_domain_absent calls `wp_remote b eval ...` bare — dry-run
+  # handling happens INSIDE the real wp_remote (lib/inventory.sh), which
+  # first requires SITE_B_WP_PATH to be set at all, unset here, so the real
+  # wp_remote failed immediately with "missing SITE_B_WP_PATH" (to stderr,
+  # swallowed by this function's own `2>/dev/null` on that call) — an empty
+  # $result, which verify_domain_absent's own fail-closed design correctly
+  # reports as "could not run", not the PHP body this test actually wants
+  # to inspect. A plain stub that echoes its own invocation (matching the
+  # literal-"wp_remote"-prefix convention the graft.sh sibling tests get
+  # for free via run_or_echo) is what's actually needed.
+  wp_remote() { echo "wp_remote $*"; }
   run verify_domain_absent "$run_dir" "$tsv" "$manifest" "https://a.example.com"
-  [[ "$output" == *"wp_remote b eval"* ]]
-  [[ "$output" == *"require_once"* ]]
-  [[ "$output" == *"sitegraft-content-remap-functions.php"* ]]
+  [[ "$output" == *"wp_remote b eval"* ]] || false
+  [[ "$output" == *"require_once"* ]] || false
+  [[ "$output" == *"sitegraft-content-remap-functions.php"* ]] || false
   # sitegraft_domain_present() must be called for the post-content surface
   # AND the options surface — a regression back to two independently
   # hand-written strpos pairs (review fix-pack, Viktor, MINOR) would still
   # pass every OTHER test in this file (they only stub wp_remote's RESULT,
   # never inspect what PHP was actually sent), so this is the one test that
   # actually looks at the eval body itself.
-  [[ "$(echo "$output" | grep -c 'sitegraft_domain_present(')" -ge 3 ]]
-  [[ "$output" != *"strpos( \$post->post_content"* ]] # the old inline duplication must be gone, not just supplemented
+  [[ "$(echo "$output" | grep -c 'sitegraft_domain_present(')" -ge 3 ]] || false
+  [[ "$output" != *"strpos( \$post->post_content"* ]] || false # the old inline duplication must be gone, not just supplemented
 }
 
 # Security-review fix-pack (Kimi, BLOCKER, root cause): fails CLOSED, not
@@ -266,7 +285,7 @@ setup() {
   graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
   run verify_domain_absent "$BATS_TEST_TMPDIR/run" "$BATS_TEST_TMPDIR/id-map.tsv" '{"migrate":{}}' ""
   [ "$status" -eq 0 ]
-  [[ "$output" != *"SHOULD NOT BE CALLED"* ]]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }
 
 @test "verify_domain_absent is a no-op post_ids list (never calls graft_migrated_post_ids_json) when id-map.tsv is empty/missing" {
@@ -314,8 +333,8 @@ setup() {
   }
   run verify_page_on_front "$run_dir" "$tsv"
   [ "$status" -eq 1 ]
-  [[ "$output" == *"999"* ]]
-  [[ "$output" == *"105"* ]]
+  [[ "$output" == *"999"* ]] || false
+  [[ "$output" == *"105"* ]] || false
 }
 
 @test "verify_page_on_front is a no-op when A never had a front page configured" {
@@ -326,7 +345,7 @@ setup() {
   wp_remote() { echo "SHOULD NOT BE CALLED"; }
   run verify_page_on_front "$run_dir" "$tsv"
   [ "$status" -eq 0 ]
-  [[ "$output" != *"SHOULD NOT BE CALLED"* ]]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }
 
 # --- verify_nav_present ------------------------------------------------------
@@ -350,7 +369,7 @@ setup() {
   wp_remote() { echo "SHOULD NOT BE CALLED"; }
   run verify_nav_present "$manifest"
   [ "$status" -eq 0 ]
-  [[ "$output" != *"SHOULD NOT BE CALLED"* ]]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }
 
 # --- verify_http_smoke --------------------------------------------------------
@@ -436,7 +455,7 @@ EOF
   load '../../lib/profile.sh'
   run phase_verify
   [ "$status" -ne 0 ]
-  [[ "$output" == *"--profile"* ]]
+  [[ "$output" == *"--profile"* ]] || false
 }
 
 @test "phase_verify writes a report and exits 0 when every check passes" {
@@ -456,6 +475,75 @@ EOF
   [ "$status" -eq 0 ]
   [ -f "${RUN_DIR}/verify-report.md" ]
   grep -q "protected data unchanged" "${RUN_DIR}/verify-report.md"
+}
+
+# --- MAJOR-A (review fix-pack): phase_verify used to set
+# SITEGRAFT_DRY_RUN=1 for --dry-run and never reset it, unlike phase_scan's
+# own M6 fix for the identical situation (lib/inventory.sh). Every check in
+# this file reads B through wp_remote, whose REAL implementation wraps its
+# command in run_or_echo (lib/core.sh) — under dry-run that returns the
+# literal text "[dry-run] wp_remote ..." instead of B's actual value, which
+# every check here (being written fail-closed) then reports as a HARD FAIL
+# on a graft that actually succeeded. This test's wp_remote stub is
+# deliberately made is_dry_run-AWARE (mimicking exactly the one aspect of
+# the real wp_remote/run_or_echo relevant to this bug) specifically so it
+# reproduces the failure before the fix: with SITEGRAFT_DRY_RUN left at 1
+# throughout (the pre-fix behavior), every call below would hit the
+# `is_dry_run` branch and return dry-run-echo text instead of the same
+# canned-good data the base passing test above uses, and the report would
+# show a false HARD FAIL. After the fix (phase_verify resets
+# SITEGRAFT_DRY_RUN=0 before any wp_remote call, same as scan), is_dry_run
+# is false by the time this stub runs, so it returns the real canned data
+# and the report passes clean — proving verify's OWN dry-run neutralization
+# actually ran, not merely that this stub ignores dry-run.
+@test "phase_verify --dry-run still runs the real checks and passes on a correct graft (MAJOR-A: dry-run must never fake a HARD FAIL)" {
+  setup_phase_verify_fixture
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if is_dry_run; then
+      echo "[dry-run] wp_remote ${alias_lc} $*"
+      return 0
+    fi
+    case "$1" in
+      db) echo "" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      eval) echo "" ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR" --dry-run
+  [ "$status" -eq 0 ]
+  [ -f "${RUN_DIR}/verify-report.md" ]
+  if grep -q "HARD FAIL" "${RUN_DIR}/verify-report.md"; then
+    echo "verify-report.md contains a HARD FAIL line on a graft that should have passed cleanly:" >&2
+    cat "${RUN_DIR}/verify-report.md" >&2
+    return 1
+  fi
+  grep -q "protected data unchanged" "${RUN_DIR}/verify-report.md"
+}
+
+@test "phase_verify also honors SITEGRAFT_DRY_RUN=1 as an env var the same way --dry-run does (MAJOR-A, env-var path)" {
+  setup_phase_verify_fixture
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if is_dry_run; then
+      echo "[dry-run] wp_remote ${alias_lc} $*"
+      return 0
+    fi
+    case "$1" in
+      db) echo "" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      eval) echo "" ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  SITEGRAFT_DRY_RUN=1 run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  ! grep -q "HARD FAIL" "${RUN_DIR}/verify-report.md"
 }
 
 # Test-quality fix-pack (Kimi): the previous version of this test passed

@@ -39,7 +39,29 @@ setup() {
   graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
   run graft_remap_attachment_ids "$tsv" "$run_dir"
   [ "$status" -eq 0 ]
-  [[ "$output" != *"SHOULD NOT BE CALLED"* ]]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
+# Fix-pack bug found live (DDEV harness, MAJOR-B's new dry-run assertion,
+# running graft --dry-run against a genuinely fresh run directory):
+# graft_fetch_id_map deliberately never creates id-map.tsv under --dry-run
+# (its writes are correctly run_or_echo-wrapped), so on a first-time dry
+# run the file doesn't exist at all — not merely empty. `[ -s ... ]`
+# already covers this for graft_remap_attachment_ids (both "missing" and
+# "empty" read as false), but it's worth a dedicated test asserting the
+# genuinely-missing-file case specifically, since that's the exact
+# real-world shape of the bug (not just "empty file", which behaves
+# identically under -s but wasn't what actually happened live).
+@test "graft_remap_attachment_ids is a no-op when id-map.tsv does not exist at all yet (not just empty) — first-time --dry-run case" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  [ ! -e "$tsv" ]
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_payload() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
+  run graft_remap_attachment_ids "$tsv" "$run_dir"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }
 
 @test "graft_remap_attachment_ids's payload contains exactly the attachment old->new pairs and every migrated post id, never a table name" {
@@ -57,7 +79,7 @@ setup() {
   [ "$status" -eq 0 ]
   run jq -e '.post_ids == ["42","105"]' "$captured"
   [ "$status" -eq 0 ]
-  [[ "$output" != *"--tables"* ]]
+  [[ "$output" != *"--tables"* ]] || false
 }
 
 @test "graft_remap_attachment_ids's wp eval call requires the shared content-remap library and calls its function, never a table-wide search-replace" {
@@ -69,13 +91,14 @@ setup() {
   graft_remove_file() { :; }
   SITEGRAFT_DRY_RUN=1
   run graft_remap_attachment_ids "$tsv" "$run_dir"
-  [[ "$output" == *"wp_remote b eval"* ]]
-  [[ "$output" == *"require_once"* ]]
-  [[ "$output" == *"sitegraft-content-remap-functions.php"* ]]
-  [[ "$output" == *"sitegraft_remap_attachment_refs("* ]]
-  [[ "$output" == *"wp_update_post"* ]]
-  [[ "$output" != *"preg_replace"* ]]  # the substitution itself must live in the required file, not inline here
-  [[ "$output" != *"search-replace"* ]]
+  [[ "$output" == *"wp_remote b eval"* ]] || false
+  [[ "$output" == *"require_once"* ]] || false
+  [[ "$output" == *"sitegraft-content-remap-functions.php"* ]] || false
+  [[ "$output" == *"sitegraft_remap_attachment_refs("* ]] || false
+  [[ "$output" == *"wp_update_post"* ]] || false
+  # the substitution itself must live in the required file, not inline here
+  [[ "$output" != *"preg_replace"* ]] || false
+  [[ "$output" != *"search-replace"* ]] || false
 }
 
 # MAJOR-1 (review, Viktor): wordpress-importer's native _thumbnail_id remap
@@ -95,7 +118,7 @@ setup() {
     fi
   }
   run graft_remap_featured_images "$tsv"
-  [[ "$output" == *"post meta update 105 _thumbnail_id 42"* ]]
+  [[ "$output" == *"post meta update 105 _thumbnail_id 42"* ]] || false
 }
 
 @test "graft_remap_featured_images leaves a post's _thumbnail_id untouched when it doesn't match any migrated attachment" {
@@ -111,7 +134,7 @@ setup() {
     fi
   }
   run graft_remap_featured_images "$tsv"
-  [[ "$output" != *"post meta update"* ]]
+  [[ "$output" != *"post meta update"* ]] || false
 }
 
 @test "graft_remap_featured_images skips a post with no _thumbnail_id set at all" {
@@ -127,5 +150,33 @@ setup() {
     fi
   }
   run graft_remap_featured_images "$tsv"
-  [[ "$output" != *"SHOULD NOT BE CALLED"* ]]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
+# Fix-pack BLOCKER-adjacent bug found live (DDEV harness, running the new
+# MAJOR-B dry-run assertion against a genuinely fresh run directory):
+# graft_fetch_id_map never creates id-map.tsv under --dry-run (correctly
+# run_or_echo-wrapped), so on a first-time dry run the file is missing
+# entirely, not just empty. This function used to go straight into
+# `done 3< "$id_map_tsv"` with no existence check at all (unlike its
+# sibling graft_remap_attachment_ids, which already guards with `[ -s
+# "$id_map_tsv" ] || return 0`) — a missing file made the redirect itself
+# fail under this codebase's `set -e`, aborting the whole graft with a raw
+# "No such file or directory", reproduced live via the DDEV harness.
+@test "graft_remap_featured_images is a no-op (not a crash) when id-map.tsv does not exist at all yet — first-time --dry-run case" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  [ ! -e "$tsv" ]
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  run graft_remap_featured_images "$tsv"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
+@test "graft_remap_featured_images is a no-op when id-map.tsv exists but is empty" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  : > "$tsv"
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  run graft_remap_featured_images "$tsv"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }

@@ -132,14 +132,47 @@ _plan_prompt_items() {
     # (unmodified, on purpose, for consistency) by _plan_confirm/
     # _plan_confirm_strong above, which read fd0 without incident because
     # nothing else in those functions ever contends for it.
-    local line ans
+    local line ans kept_buf=""
     while IFS= read -r line <&3; do
       [ -n "$line" ] || continue
-      read -r -p "Keep '${line}'? [Y/n] " ans
+      # Durcissement (Step 6, tracked from Viktor's Step 2 review, non-
+      # blocking at the time): checking `read`'s own exit status here,
+      # not just `${ans:-y}`, is the fix. A real operator pressing Enter on
+      # this [Y/n] prompt returns 0 with ans="" — that IS a genuine answer
+      # (silence means "accept the pre-picked default", the same UX gum's
+      # own `--selected='*'` pre-checks everywhere else in this file) and
+      # legitimately keeps defaulting to "kept" below. EOF is a different
+      # signal entirely: `read` returns non-zero when stdin is closed/
+      # exhausted before a line was ever delivered (no TTY, output piped
+      # from something that ended, a forgotten redirect) — nobody answered
+      # anything. Before this fix, `${ans:-y}` could not tell the two
+      # apart: on EOF, ans is also unset, so it silently took the SAME "y"
+      # (keep/migrate) branch as a real Enter press — for a tool whose
+      # entire job is not touching data nobody explicitly approved moving,
+      # defaulting an unanswerable prompt to "migrate this" is the least
+      # conservative of the two wrong directions. Fail-safe direction
+      # chosen here: abort the whole selection rather than guess.
+      #
+      # Buffered into $kept_buf rather than printed line-by-line as each
+      # item is answered (a deliberate change from the pre-fix version):
+      # nothing is written to stdout at all until every item has a real
+      # answer. If EOF hits partway through, this function's stdout is
+      # completely empty — not just "missing the unanswered items", the
+      # already-answered ones ahead of it are withheld too — so the
+      # all-or-nothing guarantee holds even for a hypothetical future
+      # caller that reads this function's stdout without checking its exit
+      # status (plan_select_interactive itself does check it, via its own
+      # `|| return 1`, but this makes the function's own contract safe on
+      # its own terms rather than relying solely on the caller).
+      if ! read -r -p "Keep '${line}'? [Y/n] " ans; then
+        log_error "selection interrupted: no operator answer for '${line}' (stdin hit EOF, not a real Enter keystroke) — aborting the whole selection rather than guessing. No manifest will be frozen from this run. Re-run 'sitegraft plan' from a real interactive terminal, or use SITEGRAFT_MANIFEST_PREFILLED for a scripted/non-interactive run (design doc §6.2)."
+        return 1
+      fi
       case "${ans:-y}" in
-        y|Y|'') printf '%s\n' "$line" ;;
+        y|Y|'') kept_buf="${kept_buf}${line}"$'\n' ;;
       esac
     done 3<<< "$items"
+    printf '%s' "$kept_buf"
   fi
 }
 
@@ -211,7 +244,21 @@ plan_select_interactive() {
     return 0
   fi
   echo "Review the items sitegraft will MIGRATE from A onto B (space to toggle, enter to confirm):" >&2
-  kept=$(_plan_prompt_items "$items")
+  # `|| return 1`, not left implicit: matches plan_custom_code_gate's own
+  # explicit-check convention a few lines below in phase_plan (this
+  # codebase's established pattern — see lib/core.sh's sitegraft_cleanup
+  # comment and multiple other spots for why bare reliance on `set -e`
+  # propagating out of a `var=$(...)` assignment is not trusted here).
+  # Needed for real, not just defensive: this is the propagation path for
+  # _plan_prompt_items' EOF durcissement fix above — an aborted selection
+  # (gum/fzf cancelled, or the plain-fallback EOF case) must stop
+  # plan_select_interactive from ever handing a guessed/partial `kept` list
+  # to _plan_apply_selection, and must stop phase_plan from freezing a
+  # manifest built from it.
+  kept=$(_plan_prompt_items "$items") || {
+    log_error "item selection did not complete — manifest not frozen. Re-run 'sitegraft plan' when ready to make a full selection."
+    return 1
+  }
   _plan_apply_selection "$manifest" "$kept"
 }
 
@@ -381,8 +428,21 @@ phase_plan() {
     plan_custom_code_gate_check_prefilled "$manifest" "${run_dir}/scan-b.json" || return 1
   else
     manifest=$(plan_custom_code_gate "$manifest" "$(cat "${run_dir}/scan-b.json")") || return 1
-    manifest=$(plan_resolve_stack "$manifest" "${run_dir}/scan-a.json" "${run_dir}/scan-b.json")
-    manifest=$(plan_select_interactive "$manifest")
+    # `|| return 1` added to both calls below (Step 6 durcissement pass) for
+    # the same reason plan_custom_code_gate already has it just above —
+    # consistency, and the real fix for plan_select_interactive: without
+    # this, an aborted selection (see _plan_prompt_items' EOF handling)
+    # would leave `manifest` holding whatever plan_select_interactive
+    # printed on failure (nothing, since it returns 1 before echoing
+    # anything) while phase_plan carried on toward freezing it anyway.
+    # plan_resolve_stack itself never actually returns non-zero today (an
+    # unanswered/EOF stack-copy prompt already resolves the safe way —
+    # _plan_confirm/_plan_confirm_strong default to declining, i.e.
+    # resolution="skip", the protective direction, not an abort) — added
+    # here defensively, matching the same call shape, so a future change to
+    # that function can't silently regress this propagation.
+    manifest=$(plan_resolve_stack "$manifest" "${run_dir}/scan-a.json" "${run_dir}/scan-b.json") || return 1
+    manifest=$(plan_select_interactive "$manifest") || return 1
   fi
 
   # design doc §3.6: default-deny — computed once, here, after the manifest
