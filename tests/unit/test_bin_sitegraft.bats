@@ -19,31 +19,31 @@ setup() {
 @test "sitegraft with no phase prints usage and exits non-zero" {
   run "$SITEGRAFT_BIN"
   [ "$status" -ne 0 ]
-  [[ "$output" == *"Usage: sitegraft"* ]]
+  [[ "$output" == *"Usage: sitegraft"* ]] || false
 }
 
 @test "sitegraft --help prints usage and exits 0" {
   run "$SITEGRAFT_BIN" --help
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Usage: sitegraft"* ]]
+  [[ "$output" == *"Usage: sitegraft"* ]] || false
 }
 
 @test "sitegraft -h prints usage and exits 0" {
   run "$SITEGRAFT_BIN" -h
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Usage: sitegraft"* ]]
+  [[ "$output" == *"Usage: sitegraft"* ]] || false
 }
 
 @test "sitegraft --version prints the version and exits 0" {
   run "$SITEGRAFT_BIN" --version
   [ "$status" -eq 0 ]
-  [[ "$output" == "sitegraft "* ]]
+  [[ "$output" == "sitegraft "* ]] || false
 }
 
 @test "sitegraft with an unknown phase errors clearly and exits non-zero" {
   run "$SITEGRAFT_BIN" bogus-phase --profile x
   [ "$status" -ne 0 ]
-  [[ "$output" == *"unknown phase: bogus-phase"* ]]
+  [[ "$output" == *"unknown phase: bogus-phase"* ]] || false
 }
 
 # --- Task 6.1 Step 1: global --dry-run handling, applied before dispatch to
@@ -60,20 +60,41 @@ setup() {
   # (no such profile) instead.
   run "$SITEGRAFT_BIN" plan --profile does-not-exist --dry-run
   [ "$status" -ne 0 ]
-  [[ "$output" != *"unknown flag for plan"* ]]
-  [[ "$output" == *"profile not found: does-not-exist"* ]]
+  [[ "$output" != *"unknown flag for plan"* ]] || false
+  [[ "$output" == *"profile not found: does-not-exist"* ]] || false
 }
 
 @test "sitegraft graft --dry-run still reaches phase_graft's own --profile validation (global stripping doesn't eat --profile too)" {
   run "$SITEGRAFT_BIN" graft --profile does-not-exist --dry-run
   [ "$status" -ne 0 ]
-  [[ "$output" != *"unknown flag for graft"* ]]
-  [[ "$output" == *"profile not found: does-not-exist"* ]]
+  [[ "$output" != *"unknown flag for graft"* ]] || false
+  [[ "$output" == *"profile not found: does-not-exist"* ]] || false
 }
 
 @test "sitegraft scan --dry-run still reaches profile_load (scan's own --dry-run handling is unaffected by the global strip)" {
   run "$SITEGRAFT_BIN" scan --profile does-not-exist --dry-run
   [ "$status" -ne 0 ]
-  [[ "$output" != *"unknown flag for scan"* ]]
-  [[ "$output" == *"profile not found: does-not-exist"* ]]
+  [[ "$output" != *"unknown flag for scan"* ]] || false
+  [[ "$output" == *"profile not found: does-not-exist"* ]] || false
+}
+
+# NIT-D (review fix-pack): --dry-run BEFORE the phase name used to read as
+# the phase itself (`local phase="${1:-}"` ran before any stripping), so
+# `sitegraft --dry-run graft ...` failed with the confusing "unknown phase:
+# --dry-run" instead of being accepted like every other position in the
+# argv. Fixed by stripping --dry-run from the whole argv before the phase
+# is ever read out of it.
+@test "sitegraft --dry-run graft (flag BEFORE the phase name) is accepted, not read as the phase itself (NIT-D)" {
+  run "$SITEGRAFT_BIN" --dry-run graft --profile does-not-exist
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"unknown phase"* ]] || false
+  [[ "$output" == *"profile not found: does-not-exist"* ]] || false
+}
+
+@test "sitegraft --dry-run plan (flag BEFORE the phase name, on the phase that has no own --dry-run case) is also accepted (NIT-D)" {
+  run "$SITEGRAFT_BIN" --dry-run plan --profile does-not-exist
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"unknown phase"* ]] || false
+  [[ "$output" != *"unknown flag for plan"* ]] || false
+  [[ "$output" == *"profile not found: does-not-exist"* ]] || false
 }
