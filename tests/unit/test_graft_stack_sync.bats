@@ -23,8 +23,8 @@ setup() {
   SITE_A_WP_PATH="/site-a"; SITE_B_WP_PATH="/site-b"; SITEGRAFT_DRY_RUN=1
   run graft_sync_stack "$run_dir" "$manifest"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"wp-content/plugins/etch"* ]]
-  [[ "$output" == *"plugin activate etch"* ]]
+  [[ "$output" == *"wp-content/plugins/etch"* ]] || false
+  [[ "$output" == *"plugin activate etch"* ]] || false
   [[ "$output" != *"divi"* ]]  # resolution=skip must never be touched here
 }
 
@@ -40,9 +40,9 @@ setup() {
   SITE_A_WP_PATH="/site-a"; SITE_B_WP_PATH="/site-b"; SITEGRAFT_DRY_RUN=1
   run graft_sync_stack "$run_dir" "$manifest"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"wp-content/plugins/automatic-css/"* ]]  # pulled FROM A under A's resolved slug
-  [[ "$output" == *"plugin activate automatic-css"* ]]      # activated under that same resolved slug
-  [[ "$output" != *"wp-content/plugins/acss/"* ]]            # never the internal component key "acss"
+  [[ "$output" == *"wp-content/plugins/automatic-css/"* ]] || false  # pulled FROM A under A's resolved slug
+  [[ "$output" == *"plugin activate automatic-css"* ]] || false      # activated under that same resolved slug
+  [[ "$output" != *"wp-content/plugins/acss/"* ]] || false            # never the internal component key "acss"
   [[ "$output" != *"acss-legacy-slug"* ]]                    # never B's old slug either — A's is authoritative
 }
 
@@ -52,7 +52,7 @@ setup() {
   local manifest='{"stack":{"theme":{"slug_a":"etch-theme","slug_b":null,"version_a":"1.0","version_b":null,"resolution":"copy"}}}'
   SITE_A_WP_PATH="/site-a"; SITE_B_WP_PATH="/site-b"; SITEGRAFT_DRY_RUN=1
   run graft_sync_stack "$run_dir" "$manifest"
-  [[ "$output" == *"wp-content/themes/etch-theme"* ]]
+  [[ "$output" == *"wp-content/themes/etch-theme"* ]] || false
   [[ "$output" == *"theme activate etch-theme"* ]]
 }
 

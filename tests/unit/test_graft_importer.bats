@@ -29,7 +29,7 @@ setup() {
   printf 'installed\ninactive\n' > "${run_dir}/.wordpress-importer-pre-state"
   SITEGRAFT_DRY_RUN=1
   run graft_restore_importer_state "$run_dir"
-  [[ "$output" == *"plugin deactivate wordpress-importer"* ]]
+  [[ "$output" == *"plugin deactivate wordpress-importer"* ]] || false
   [[ "$output" != *"uninstall"* ]]
 }
 
