@@ -161,6 +161,7 @@ setup() {
   local manifest='{"migrate":{"etch":{"option_keys":["etch_settings"]}}}'
   local captured="$BATS_TEST_TMPDIR/captured.json"
   graft_push_remap_payload() { printf '%s' "$2" > "$captured"; echo "/fake/remote/path.json"; }
+  graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   graft_remove_file() { :; }
   wp_remote() { echo "OK"; }
   run verify_domain_absent "$run_dir" "$tsv" "$manifest" "https://a.example.com"
@@ -174,6 +175,7 @@ setup() {
   local tsv="${run_dir}/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
   local manifest='{"migrate":{"core-wp":{"option_keys":[]}}}'
   graft_push_remap_payload() { echo "/fake/remote/path.json"; }
+  graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   graft_remove_file() { :; }
   wp_remote() { echo "OK"; }
   run verify_domain_absent "$run_dir" "$tsv" "$manifest" "https://a.example.com"
@@ -185,11 +187,34 @@ setup() {
   local tsv="${run_dir}/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
   local manifest='{"migrate":{"core-wp":{"option_keys":[]}}}'
   graft_push_remap_payload() { echo "/fake/remote/path.json"; }
+  graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   graft_remove_file() { :; }
   wp_remote() { echo "HIT:post:105"; }
   run verify_domain_absent "$run_dir" "$tsv" "$manifest" "https://a.example.com"
   [ "$status" -eq 1 ]
   [[ "$output" == *"post:105"* ]]
+}
+
+@test "verify_domain_absent's wp eval requires the shared content-remap library and calls sitegraft_domain_present for both surfaces" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
+  local manifest='{"migrate":{"core-wp":{"option_keys":["etch_settings"]}}}'
+  graft_push_remap_payload() { echo "/fake/remote/path.json"; }
+  graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
+  graft_remove_file() { :; }
+  SITEGRAFT_DRY_RUN=1
+  run verify_domain_absent "$run_dir" "$tsv" "$manifest" "https://a.example.com"
+  [[ "$output" == *"wp_remote b eval"* ]]
+  [[ "$output" == *"require_once"* ]]
+  [[ "$output" == *"sitegraft-content-remap-functions.php"* ]]
+  # sitegraft_domain_present() must be called for the post-content surface
+  # AND the options surface — a regression back to two independently
+  # hand-written strpos pairs (review fix-pack, Viktor, MINOR) would still
+  # pass every OTHER test in this file (they only stub wp_remote's RESULT,
+  # never inspect what PHP was actually sent), so this is the one test that
+  # actually looks at the eval body itself.
+  [[ "$(echo "$output" | grep -c 'sitegraft_domain_present(')" -ge 3 ]]
+  [[ "$output" != *"strpos( \$post->post_content"* ]] # the old inline duplication must be gone, not just supplemented
 }
 
 # Security-review fix-pack (Kimi, BLOCKER, root cause): fails CLOSED, not
@@ -201,6 +226,7 @@ setup() {
   local tsv="${run_dir}/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
   local manifest='{"migrate":{"core-wp":{"option_keys":[]}}}'
   graft_push_remap_payload() { echo "/fake/remote/path.json"; }
+  graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   graft_remove_file() { :; }
   wp_remote() { return 1; } # simulates a real wp-cli/connectivity failure
   run verify_domain_absent "$run_dir" "$tsv" "$manifest" "https://a.example.com"
@@ -212,28 +238,32 @@ setup() {
   local tsv="${run_dir}/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
   local manifest='{"migrate":{"core-wp":{"option_keys":[]}}}'
   graft_push_remap_payload() { echo "/fake/remote/path.json"; }
+  graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   graft_remove_file() { :; }
   wp_remote() { echo "some garbage that is neither OK nor HIT:"; }
   run verify_domain_absent "$run_dir" "$tsv" "$manifest" "https://a.example.com"
   [ "$status" -eq 1 ]
 }
 
-@test "verify_domain_absent always removes the pushed payload file, pass or fail" {
+@test "verify_domain_absent always removes both the pushed payload file and the pushed lib file, pass or fail" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   local tsv="${run_dir}/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
   local manifest='{"migrate":{"core-wp":{"option_keys":[]}}}'
   local removed="$BATS_TEST_TMPDIR/removed-marker"
   graft_push_remap_payload() { echo "/fake/remote/path.json"; }
-  graft_remove_file() { echo "$2" > "$removed"; }
+  graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
+  graft_remove_file() { echo "$2" >> "$removed"; }
   wp_remote() { echo "HIT:post:105"; } # a FAILING check
   run verify_domain_absent "$run_dir" "$tsv" "$manifest" "https://a.example.com"
   [ -f "$removed" ]
-  [ "$(cat "$removed")" = "/fake/remote/path.json" ]
+  grep -qx "/fake/remote/path.json" "$removed"
+  grep -qx "/fake/remote/lib.php" "$removed"
 }
 
 @test "verify_domain_absent is a no-op (passes) when domain is empty" {
   wp_remote() { echo "SHOULD NOT BE CALLED"; }
   graft_push_remap_payload() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
   run verify_domain_absent "$BATS_TEST_TMPDIR/run" "$BATS_TEST_TMPDIR/id-map.tsv" '{"migrate":{}}' ""
   [ "$status" -eq 0 ]
   [[ "$output" != *"SHOULD NOT BE CALLED"* ]]
@@ -245,6 +275,7 @@ setup() {
   local manifest='{"migrate":{"core-wp":{"option_keys":[]}}}'
   local captured="$BATS_TEST_TMPDIR/captured.json"
   graft_push_remap_payload() { printf '%s' "$2" > "$captured"; echo "/fake/remote/path.json"; }
+  graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   graft_remove_file() { :; }
   wp_remote() { echo "OK"; }
   run verify_domain_absent "$run_dir" "$tsv" "$manifest" "https://a.example.com"
@@ -505,6 +536,7 @@ EOF
   setup_phase_verify_fixture
   jq '.options.search_replace.from = "https://a.example.com"' "${RUN_DIR}/manifest.json" > "${RUN_DIR}/manifest.json.tmp" && mv "${RUN_DIR}/manifest.json.tmp" "${RUN_DIR}/manifest.json"
   graft_push_remap_payload() { echo "/fake/remote/path.json"; }
+  graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   graft_remove_file() { :; }
   wp_remote() {
     local alias_lc="$1"; shift
@@ -526,6 +558,7 @@ EOF
   setup_phase_verify_fixture
   jq '.options.search_replace.from = "https://a.example.com"' "${RUN_DIR}/manifest.json" > "${RUN_DIR}/manifest.json.tmp" && mv "${RUN_DIR}/manifest.json.tmp" "${RUN_DIR}/manifest.json"
   graft_push_remap_payload() { echo "/fake/remote/path.json"; }
+  graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   graft_remove_file() { :; }
   wp_remote() {
     local alias_lc="$1"; shift

@@ -129,3 +129,51 @@ php_run() {
   [ "$status" -eq 0 ]
   [[ "$output" == "OK" ]]
 }
+
+# --- sitegraft_domain_present (lib/verify.sh's verify_domain_absent) -------
+# Security-review fix-pack (Viktor, MINOR): an earlier draft of
+# verify_domain_absent checked the JSON-escaped form ("https:\/\/...") for
+# post_content/post_excerpt but only the PLAIN form for a migrated option's
+# serialized value — an asymmetry that would miss a migrated option whose
+# value is (or contains) a plain string carrying literal escaped-JSON bytes.
+# sitegraft_domain_present() is the ONE function both surfaces in
+# verify_domain_absent now call, so this exact asymmetry cannot recur
+# silently. These tests run the REAL production function via a bare `php`
+# CLI call (same convention as every other test in this file) — not a bash
+# stub standing in for it — so a regression back to the old
+# plain-form-only behavior on either call site would show up here.
+
+@test "sitegraft_domain_present finds the PLAIN form of the domain" {
+  run php_run '
+    $found = sitegraft_domain_present("see https://a.example.com/booking for details", "https://a.example.com", "https:\/\/a.example.com");
+    echo $found ? "OK" : "NOT-FOUND";
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == "OK" ]]
+}
+
+@test "sitegraft_domain_present finds the JSON-ESCAPED form of the domain (the exact case a plain-form-only check would miss)" {
+  run php_run '
+    // A migrated option whose live value is (or, for a plain string,
+    // maybe_serialize()-passes-through-unchanged-as) literal escaped-JSON
+    // bytes — e.g. a raw JSON blob a module stored as a string rather than
+    // an array/object. NO plain-form occurrence anywhere in this haystack —
+    // a plain-form-only check (the pre-fix behavior) would report this as
+    // absent.
+    $serialized_option_value = "{\"url\":\"https:\/\/a.example.com\"}";
+    if (strpos($serialized_option_value, "https://a.example.com") !== false) { fwrite(STDERR, "test fixture is broken: the plain form is ALSO present, this would not distinguish the fix\n"); exit(1); }
+    $found = sitegraft_domain_present($serialized_option_value, "https://a.example.com", "https:\/\/a.example.com");
+    echo $found ? "OK" : "NOT-FOUND";
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == "OK" ]]
+}
+
+@test "sitegraft_domain_present returns false when neither form is present" {
+  run php_run '
+    $found = sitegraft_domain_present("nothing relevant here at all", "https://a.example.com", "https:\/\/a.example.com");
+    echo $found ? "FOUND-BUT-SHOULD-NOT-BE" : "OK";
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == "OK" ]]
+}

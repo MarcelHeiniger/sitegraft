@@ -142,10 +142,20 @@ verify_options_match() {
 #    real backslash-slash byte sequence, not a SQL escape of one) — strpos()
 #    on raw bytes has no escaping-layer ambiguity at all.
 #  - a migrated option's LIVE value is run through maybe_serialize() before
-#    strpos(): PHP's serialize() format never escapes `/` or any other byte
-#    (unlike JSON), so a single plain-domain strpos against the serialized
-#    form reliably finds the domain inside ANY nested array/object without
-#    needing a second escaped-form check for options.
+#    the same check: PHP's serialize() format never escapes `/` or any other
+#    byte (unlike JSON) for a value PHP itself constructs. But an option can
+#    also be, or contain, a plain STRING that itself holds literal JSON text
+#    (a module storing a raw JSON blob as a string value, not an array/
+#    object) — that string's own bytes can legitimately carry the escaped
+#    `https:\/\/` form, exactly like post_content can (review fix-pack,
+#    Viktor, MINOR: an earlier draft of this function checked only the plain
+#    form on the options side, asymmetric with post_content/post_excerpt's
+#    own two-form check). Both surfaces now call the SAME
+#    sitegraft_domain_present() (lib/php/content-remap-functions.php,
+#    required via graft_push_remap_lib — the identical require_once pattern
+#    graft's own remap steps already use) instead of two independently
+#    hand-written strpos pairs, so the two checks can never drift apart on
+#    which forms they look for again.
 # The domain travels to B inside a pushed JSON payload file (the same
 # graft_push_remap_payload/graft_remove_file pattern every other B-bound
 # transfer in this codebase already uses), decoded server-side by PHP's own
@@ -168,13 +178,21 @@ verify_domain_absent() {
   local run_dir="$1" id_map_tsv="$2" manifest="$3" domain="$4"
   [ -n "$domain" ] || return 0
 
-  local post_ids_json option_keys_json payload_json remote_path
+  local post_ids_json option_keys_json payload_json remote_path lib_path
   post_ids_json='[]'
   [ -s "$id_map_tsv" ] && post_ids_json=$(graft_migrated_post_ids_json "$id_map_tsv")
   option_keys_json=$(echo "$manifest" | jq -c '[.migrate[]?.option_keys[]?] | unique')
   payload_json=$(jq -n --argjson post_ids "$post_ids_json" --argjson option_keys "$option_keys_json" --arg domain "$domain" \
     '{post_ids: $post_ids, option_keys: $option_keys, domain: $domain}')
   remote_path=$(graft_push_remap_payload "$run_dir" "$payload_json" "sitegraft-verify-domain-payload.json")
+  # sitegraft_domain_present (lib/php/content-remap-functions.php) is the
+  # exact same require_once/pattern graft's own remap steps already use
+  # (see graft_remap_attachment_ids/graft_search_replace_domain) — the ONE
+  # shared implementation of "does this string contain the plain OR
+  # JSON-escaped domain form", used identically for both surfaces below, so
+  # the two checks structurally cannot drift apart on which forms they look
+  # for again (review fix-pack, Viktor, MINOR).
+  lib_path=$(graft_push_remap_lib "$run_dir")
 
   # `&&`/`||` (not a bare assignment) so a failing wp_remote call is exempt
   # from bin/sitegraft's `set -e` (the same class of pitfall lib/core.sh's
@@ -183,6 +201,7 @@ verify_domain_absent() {
   # before `rc=$?` is ever reached.
   local result rc
   result=$(wp_remote b eval '
+    require_once WP_CONTENT_DIR . "/sitegraft-content-remap-functions.php";
     $payload_path = WP_CONTENT_DIR . "/sitegraft-verify-domain-payload.json";
     $payload = json_decode( file_get_contents( $payload_path ), true );
     if ( ! $payload ) { echo "ERROR:unreadable-payload"; return; }
@@ -193,21 +212,22 @@ verify_domain_absent() {
       $post_id = (int) $post_id;
       $post = get_post( $post_id );
       if ( ! $post ) { continue; }
-      if ( strpos( $post->post_content, $domain ) !== false || strpos( $post->post_content, $escaped ) !== false
-        || strpos( $post->post_excerpt, $domain ) !== false || strpos( $post->post_excerpt, $escaped ) !== false ) {
+      if ( sitegraft_domain_present( $post->post_content, $domain, $escaped )
+        || sitegraft_domain_present( $post->post_excerpt, $domain, $escaped ) ) {
         $hits[] = "post:{$post_id}";
       }
     }
     foreach ( $payload["option_keys"] as $key ) {
       $value = get_option( $key );
       if ( $value === false ) { continue; }
-      if ( strpos( maybe_serialize( $value ), $domain ) !== false ) {
+      if ( sitegraft_domain_present( maybe_serialize( $value ), $domain, $escaped ) ) {
         $hits[] = "option:{$key}";
       }
     }
     echo empty( $hits ) ? "OK" : ( "HIT:" . implode( ",", $hits ) );
   ' 2>/dev/null) && rc=0 || rc=$?
   graft_remove_file b "$remote_path" 2>/dev/null || true
+  graft_remove_file b "$lib_path" 2>/dev/null || true
 
   if [ "$rc" -ne 0 ] || [ -z "$result" ]; then
     log_error "domain-absence check could not run (wp eval failed or returned nothing) — treated as UNKNOWN, never as a silent pass"

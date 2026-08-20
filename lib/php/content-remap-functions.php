@@ -93,3 +93,26 @@ function sitegraft_remap_domain( $content, $from, $to ) {
 	$to_escaped   = str_replace( '/', '\\/', $to );
 	return str_replace( array( $from, $from_escaped ), array( $to, $to_escaped ), $content );
 }
+
+/**
+ * sitegraft_domain_present( string $haystack, string $domain, string $escaped ): bool
+ *
+ * design doc §6.5/§9.4, verify's domain-absence check (lib/verify.sh,
+ * verify_domain_absent): true if either the plain domain string or its
+ * JSON-escaped form (`https:\/\/...`, produced the same way
+ * sitegraft_remap_domain above computes it) appears anywhere in $haystack.
+ *
+ * Shared by BOTH surfaces verify_domain_absent scans — a migrated post's
+ * post_content/post_excerpt (plain TEXT, may embed literal JSON-escaped
+ * bytes the way Etch's own blocks do) and a migrated option's live value
+ * (run through maybe_serialize() by the caller before reaching here, so a
+ * plain-string option value that itself holds literal JSON text carries the
+ * exact same escaped-byte-sequence possibility a post's content does).
+ * Review fix-pack (Viktor, MINOR): the options side originally checked only
+ * the plain form, asymmetric with the post-content side's own two-form
+ * check — extracting ONE shared function is what makes it structurally
+ * impossible for the two call sites to drift apart on this again.
+ */
+function sitegraft_domain_present( $haystack, $domain, $escaped ) {
+	return strpos( $haystack, $domain ) !== false || strpos( $haystack, $escaped ) !== false;
+}
