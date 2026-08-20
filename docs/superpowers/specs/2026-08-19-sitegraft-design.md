@@ -918,6 +918,20 @@ assuming the file already exists at the computed path
 first** (rsync, step 1 of `graft`), **WXR import second** (step 7). If the order
 were reversed, the import would leave attachments with a missing file.
 
+> **v1 status (Step 6 self-review, 2026-08-20): the mechanism above is no longer
+> how attachments actually get onto B, though the media-before-content ORDERING
+> is still correct.** `lib/graft.sh`'s `graft_import_attachments` (header comment
+> has the full history) found that the shipped `wordpress-importer` 0.9.5's
+> `process_attachment()` unconditionally requires `--fetch_attachments=true` and
+> does a real remote HTTP fetch — there is no "assume the file is already there"
+> path to rely on at all, contrary to what this section assumed. Attachments are
+> instead migrated entirely OUTSIDE the WXR path: `wp media import --skip-copy`
+> against the files `graft_media_sync` already placed on B, run as its own step
+> BEFORE the WXR import (which is itself given `--skip=attachment`, per
+> `graft_export_wxr`, so wordpress-importer never touches attachment posts at
+> all). The media-first ordering this section argues for is still exactly right —
+> just via a different mechanism than described above.
+
 ## 9. Post-import remapping strategy
 
 ### 9.1 Doubly-embedded image ID references (Etch content)
@@ -961,6 +975,28 @@ The sentinel tokens guarantee that no pass-2 substitution can ever be re-matched
 a pass-1 rule still waiting to run (impossible, since the two passes are strictly
 sequential and disjoint by construction).
 
+> **v1 status (Step 6 self-review, 2026-08-20): the `--tables=$CONTENT_TABLES`
+> approach shown above (including `postmeta`/`options`) was superseded during a
+> security-review fix-pack (MAJOR-2, before Step 6) and is NOT what's shipped —
+> reimplementing this section literally would reintroduce a real, previously
+> found data-corruption bug.** `wp search-replace` has no row-level scoping:
+> even with `--tables=` narrowed to content tables, it still scans every ROW in
+> those tables — reproduced live, a protected plugin's own `wp_options` row
+> carrying a colliding `"id":<N>` payload got silently rewritten. The shipped
+> `graft_remap_attachment_ids` (`lib/graft.sh`, full reasoning in its own header
+> comment) instead fetches ONLY `post_content`/`post_excerpt` of exactly the
+> posts this run imported (never a table scan), applies the identical two-pass
+> sentinel technique via PHP `preg_replace` (`lib/php/content-remap-functions.php`,
+> `sitegraft_remap_attachment_refs`), and writes back only what changed.
+> `wp_postmeta`/`wp_options` are OUT of scope for this generic remap — postmeta
+> can hold serialized PHP, which needs WordPress's own
+> `maybe_unserialize()`/`maybe_serialize()` round-trip to touch safely, out of
+> scope here, same position as §11's "a CPT-specific meta reference is the
+> relevant module's `post_import` hook's job." **Known, real, narrower-than-this-
+> section's-original-claim consequence:** an attachment-ID or domain reference
+> living in `wp_postmeta` (not `post_content`/`post_excerpt`) is never remapped
+> by this generic pass — accepted as the safer trade-off, not fixed in Step 6.
+
 ### 9.2 `post_parent`
 
 `wordpress-importer` already natively remaps `post_parent` (and the featured-image
@@ -1003,6 +1039,16 @@ wp --path="$SITE_B_WP_PATH" search-replace 'https:\/\/a.example.com' 'https:\/\/
 
 `--skip-columns=guid`: WordPress's `guid` isn't supposed to change after creation —
 let wp-cli/the import handle its value natively instead of rewriting it by hand.
+
+> **v1 status (Step 6 self-review, 2026-08-20): same correction as §9.1's own
+> status note.** `graft_search_replace_domain` (`lib/graft.sh`) does not run a
+> table-wide `wp search-replace` either — it uses the same run-scoped
+> fetch/`preg_replace`/write-back technique against exactly this run's imported
+> posts' `post_content`/`post_excerpt` (`sitegraft_remap_domain` in
+> `lib/php/content-remap-functions.php`). A domain string living in a migrated
+> `wp_options` value is handled separately, inside `graft_migrate_options`,
+> scoped to the manifest's explicit `option_keys` only — never a blind
+> table-wide pass over `wp_options`, for the identical MAJOR-2 reason.
 
 ## 10. DDEV test harness
 
@@ -1060,9 +1106,9 @@ Orchestration:
 | Case | sitegraft behavior |
 |------|---------------------|
 | A CPT with an internal ID reference in postmeta (e.g. "related product") | Outside the core's generic remap — that's the job of the relevant module's `<mod>_post_import` hook (full example in §3.5). |
-| Slug collisions between B's existing content and the imported content | Handled natively by WordPress (automatic `-2` suffix on insert). `verify` diffs `post_name` A vs. post-import B and **warns** (not a hard failure) if any slugs were renamed — a signal to manually check internal links. |
+| Slug collisions between B's existing content and the imported content | Handled natively by WordPress (automatic `-2` suffix on insert) — that part is real and safe. **v1 status (Step 6 self-review, 2026-08-20): the `verify`-side warning described here (diffing `post_name` A vs. post-import B) was never implemented — `lib/verify.sh` has no such check.** Not a safety gap (WordPress's own renaming is enough to prevent corruption/collision), but it is a real, not-yet-built piece of this row's original claim — an operator gets no automatic heads-up to go check internal links after a slug rename. Left as a documented `docs/todo.md` backlog item rather than added late in Step 6: it would need a new cross-site read (A's pre-migration `post_name`, which nothing in `verify` currently fetches — every existing `verify` check is B-only, see that file's own header comment), not a small addition. |
 | `page_on_front` / `show_on_front` | Dedicated remap via `core_wp_post_import`, see §9.3. |
-| Deep page hierarchies | `plan` **validates** that if a hierarchical post_type (`page`) is selected, ALL of its potential ancestors are selected too (same post_type, all-or-nothing migration) — a partial hierarchy import isn't a supported case in v1 (YAGNI: sitegraft migrates whole post_types, not subtrees). |
+| Deep page hierarchies | Selection is per-post_type, never per-individual-post (`plan`'s item-level toggle operates on a whole module's `post_types`/`option_keys` lists — see `lib/plan.sh`'s `_plan_apply_selection`), and the WXR export for a selected post_type pulls every post of that type via `wp export --post_type=`. A "partial hierarchy" (some but not all ancestors selected) is therefore impossible **by construction** — there was never a need for `plan` to run a separate explicit ancestor-validation step, and none exists in the shipped code. This section originally implied a validation step; the invariant it was protecting is real and does hold, just via a simpler mechanism (whole-post_type, all-or-nothing migration) than "validates ALL potential ancestors are selected too" suggests. |
 | Idempotent reimport | Every post imported by sitegraft carries `_sitegraft_source_id` (set by the mu-plugin, §7). Before any import, `graft` lists and deletes (`wp post delete --force`) any post of the selected post_types carrying this meta from a previous run — a rerun never duplicates content. Distinct from the `clean` step (which removes B's **original pre-existing** content, not content sitegraft placed itself). |
 
 ## 12. Design-layer stack precondition (product decision)

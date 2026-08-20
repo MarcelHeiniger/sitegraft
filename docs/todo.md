@@ -43,6 +43,15 @@
       default it `false`), so this is inert, not reachable, in the normal flow.
 - [ ] An install script (`install.sh`) beyond the manual `brew`/`apt` snippets now
       in `README.md`/`docs/usage.md`.
+- [ ] **`verify`'s slug-collision warning (design doc §11) — not implemented.**
+      WordPress itself safely handles a `post_name` collision on B (automatic
+      `-2` suffix), so this isn't a data-safety gap — but `verify` never warns an
+      operator that a slug was renamed, which the design doc originally
+      described. Needs a new cross-site read (A's pre-migration `post_name` for
+      each migrated post) that no existing `verify` check currently does (every
+      one is B-only today). Found in the Step 6 self-review; deliberately not
+      added then (real feature work, not a small addition, this late in a
+      polish pass).
 
 ## Ideas / later
 
