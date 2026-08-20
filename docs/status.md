@@ -1,94 +1,115 @@
 # Status — sitegraft
 
-**STATUS: idea**  <!-- idea → in progress → live/production → maintenance → archived -->
-**Last updated: 2026-08-19** (via "update the project")
+**STATUS: in progress**  <!-- idea → in progress → live/production → maintenance → archived -->
+**Last updated: 2026-08-20** (Step 6 self-review)
 
 ## Summary
 
-The brainstorming session with Marcel is complete (13 decisions locked in, see
-design doc §0). Rosalinde delivered the full design doc, a 6-step implementation
-plan, the project skeleton, and the handoff documentation, then an independent
-review of the plan (done by Kimi before Step 1 started) surfaced 7 concrete
-plan-code defects and 3 scope gaps; Rosalinde resolved every one of them — the
-plan was rewritten, the design doc gained two new sections plus several
-clarifications, and the review file now carries a one-line resolution per
-finding. No line of the tool's own code exists yet. Nothing blocks starting Step
-1 of the (now-revised) plan, pending Marcel's validation of the 5 technical
-decisions Rosalinde made alone (see "Recent decisions" below).
+All 6 steps of the implementation plan are done. `main` has scan, plan, backup,
+graft, verify, and restore fully implemented, unit-tested (`bats`), and exercised
+end-to-end by the DDEV integration harness. This Step 6 pass (polish) audited
+`--dry-run`/`--allow-stack-mismatch` consistency across every writing phase, closed
+an EOF-defaults-to-migrate durcissement flagged (non-blocking) back in the Step 2
+review, ran a full design-doc-vs-code self-review, and wrote the public-facing
+usage docs. `SITEGRAFT_VERSION` is `1.0.0-rc1` — the one thing still blocking a
+plain `1.0.0` tag is the pre-`1.0.0` DoD gate (a real dry run against a genuine A/B
+pair), which is deliberately **not** satisfiable by more DDEV-only work; see
+`docs/definition-of-done.md`.
 
 ## Done
 
 - [x] Full brainstorming session with Marcel (13 decisions locked in, out of scope to reopen)
-- [x] Project skeleton created (`repo/` + `dist/` + `.credentials/`)
-- [x] `PROJECT.md` + `docs/{idea,infrastructure,status,todo,definition-of-done}.md` written
-- [x] Project `CLAUDE.md` adapted
-- [x] Full design doc (`docs/superpowers/specs/2026-08-19-sitegraft-design.md`)
-- [x] 6-step implementation plan (`docs/plans/2026-08-19-sitegraft-implementation.md`)
-- [x] Design doc self-review (placeholders/contradictions/ambiguities)
-- [x] ADRs for the open decisions (`docs/decisions/000x-*.md`)
-- [x] Entire repo rewritten in US English for public release to the Etch community (2026-08-19)
-- [x] Independent plan review (Kimi) done and every finding resolved: 7 plan-code
-      defects (A1-A7 — missing options migration, non-self-contained `restore.sh`,
-      missing wp-content backup, unhandled remote-A transfers, unstable
-      mysqldump-timestamp checksums, unscoped search-replace, missing
-      wordpress-importer provisioning), 3 scope gaps (B1 rendering-stack
-      precondition, B2 classic-menu v1 assumption, B3 weak harness assertions),
-      and a sequencing fix (C1 — DDEV harness built incrementally from Step 1, not
-      as a Step 5 afterthought). Design doc gained §12 (stack precondition
-      product decision) and §13 (classic-menu scope), plus clarifications in §6.1,
-      §6.3, §6.4, §6.5, §9.1, §9.4. `docs/definition-of-done.md` gained a
-      pre-`1.0.0` real-dry-run gate (item D). See
-      `docs/plans/2026-08-19-sitegraft-plan-review.md` for the full
-      finding-by-finding resolution log (2026-08-19, Rosalinde).
-- [x] Marcel amended B1/B2 and added a third guardrail before Step 1 started
-      (2026-08-19, Rosalinde): **B1 revised** — `plan` now offers to *copy* a
-      missing/mismatched rendering-stack component from A (never installed from
-      anywhere else), recorded in the manifest's new `stack` key, with the
-      original refuse/`--allow-stack-mismatch` behavior kept only for whatever's
-      declined; **B2 clarified** — design doc reworded so "block themes only"
-      reads unambiguously as A-only, B running Divi/Elementor/Bricks/classic
-      themes is the normal case, not a precondition; **new guardrail** —
-      `scan` detects custom-code signals on B (child theme, `functions.php`,
-      mu-plugins, snippet plugins) and `plan` blocks on any of them until an
-      explicit acknowledgment, since replacing B's theme would otherwise
-      silently drop that code. Design doc gained new §12 rewrite + new §14
-      (self-review renumbered to §15); plan gained Tasks 1.6, 2.4, 2.5, and a
-      revised Task 4.1. See `docs/plans/2026-08-19-sitegraft-plan-review.md` §E
-      for the resolution notes.
+- [x] Project skeleton, `PROJECT.md` + `docs/*.md`, design doc, 6-step implementation
+      plan, ADRs — all delivered 2026-08-19 before Step 1 started
+- [x] Independent plan review (Kimi) resolved: 7 plan-code defects + 3 scope gaps,
+      see `docs/plans/2026-08-19-sitegraft-plan-review.md` for the finding-by-finding log
+- [x] **Step 1** — core (`lib/core.sh`: logging, dry-run, temp/trap handling),
+      profiles + credentials (`lib/profile.sh`), `scan` (`lib/inventory.sh`), the
+      module registry (`lib/modules.sh`), and the DDEV harness skeleton. Merged as PR #1.
+- [x] **Step 2** — manifest format (`lib/manifest.sh`), interactive `plan`
+      (`lib/plan.sh`): item selection via `gum choose`/`fzf`/plain-text fallback,
+      rendering-stack resolution, the custom-code awareness gate, default-deny
+      computation. Merged as PR #2.
+- [x] **Step 3** — `backup` + `restore` (`lib/backup.sh`): full DB + wp-content
+      export/import, checksums of protected data, a genuinely self-contained
+      generated `restore.sh`. Merged as PR #3.
+- [x] **Step 4** — `graft` (`lib/graft.sh`): rendering-stack sync + hard
+      precondition, media sync routed through the orchestrator, WXR export/import,
+      `wordpress-importer` provisioning, the mapping mu-plugin
+      (`mu-plugins/sitegraft-id-mapper.php`), ID/domain remaps, options migration,
+      idempotent-reimport pruning. Merged as PR #4.
+- [x] **Step 5** — `verify` (`lib/verify.sh`): protected-checksum comparison,
+      migrated-option/`page_on_front`/domain-absence checks, orphan-`post_parent`
+      warning, an optional HTTP smoke check — plus the full DDEV harness assertion
+      set tying every phase together in one real run. Merged as PR #5.
+- [x] **Step 6 (this pass, 2026-08-20)** — polish:
+  - **Task 6.1** (`--dry-run`/`--allow-stack-mismatch` audit): grepped every
+    mutating call across `lib/*.sh` for `run_or_echo` coverage — found and fixed
+    two real gaps the grep-only pass wouldn't have caught on its own:
+    `modules/core-wp.sh`'s `core_wp_post_import` wrote to B unconditionally
+    (module `post_import` hooks run regardless of `--dry-run`, and this one
+    never routed its write through `run_or_echo`); `bin/sitegraft` never had
+    global `--dry-run` handling (each phase parsed its own, but `plan` — which
+    never needed one — rejected the flag as "unknown"). Fixing the second one
+    surfaced a real bash 3.2 bug: `"${args[@]}"` on an empty array is an
+    "unbound variable" under `set -u` on bash 3.2 (fixed in 4.4) — silently
+    broke `./bin/sitegraft --help`/`-h`/`--version` until caught by a new test
+    file (`tests/unit/test_bin_sitegraft.bats`, the first to exercise the real
+    executable as a subprocess rather than loading `lib/*.sh` functions directly).
+  - **Durcissement** (tracked from Viktor's Step 2 review, non-blocking then):
+    `_plan_prompt_items`' plain (no-gum/no-fzf) fallback used `${ans:-y}` for its
+    `[Y/n]` default, which couldn't distinguish a real Enter keystroke (safe:
+    `read` returns 0) from stdin hitting genuine EOF (`read` returns non-zero) —
+    an unattended/no-TTY invocation silently defaulted to "keep/migrate", the
+    least conservative of the two wrong answers. Fixed to abort the whole
+    selection on EOF instead of guessing, with no manifest ever frozen from it;
+    the normal interactive Enter-keystroke default is unchanged.
+  - **Self-review against the design doc** found three real drifts:
+    `SITE_*_SSH_KEY` (§5.2) was parsed/whitelisted but never actually passed to
+    `ssh -i` (fixed); `modules/etch.sh` was fully spec'd in §3.3 but never
+    created as a real file, meaning a real Etch site never got auto-detected
+    into `plan`'s defaults (fixed — created it, content unchanged from the
+    design doc, plus one small addition (`etch_stack_candidates`) flagged in
+    the PR as a judgment call); `modules/acss.sh` (§3.4) and the §5.2
+    interactive-credentials-prompt are confirmed genuine, deliberate v1 gaps
+    — documented in the design doc and `docs/todo.md` rather than rushed or
+    silently left inconsistent. `docs/definition-of-done.md`'s "3 v1 modules"
+    line corrected to reflect 2 shipped (`core-wp`, `etch`).
+  - `docs/usage.md` written (install, profile setup, all six phases with exact
+    flags, the module contract including the dry-run requirement for
+    `post_import` hooks, the security model). `README.md` resynced with the
+    real CLI (was still describing `ddev wp` as the DDEV wrapper — wrong per
+    §5.1's own correction — and claiming "implementation not started").
+  - `SITEGRAFT_VERSION` bumped `0.5.1` → `1.0.0-rc1`.
+  - Full `bats tests/unit/` suite green throughout (grew from 283 to 300+ tests
+    across this pass); DDEV harness re-run at the end of the pass — see the PR
+    report for its exit status.
 
 ## In progress
 
-- [ ] Nothing — waiting on Marcel's go-ahead to start Step 1 of the revised implementation plan
+- [ ] Nothing — Step 6 PR ready for review/merge.
 
 ## Blocked / pending
 
-- Validation of the 5 technical decisions Rosalinde made alone (see below)
-- Marcel's go-ahead to create the public GitHub repo (Nat handles that, not Rosalinde)
+- **Pre-`1.0.0` gate**: a real dry run against a staging copy of a genuine A/B
+  pair (design doc §0.2's R2/R4) — Marcel's call, on a real pair, not something
+  any further DDEV-only work can close. See `docs/definition-of-done.md`.
+- `modules/acss.sh`: needs someone with a real pre-4.0 Automatic.css install to
+  confirm the legacy plugin-folder name before it can ship (see `docs/todo.md`).
 
 ## Recent decisions
 
-Technical decisions made alone during design, **to be validated by Marcel**
-(detail and rationale in design doc §0 and the matching ADRs):
-1. `jq` as a dependency to parse/write the manifest as JSON (structure nested by
-   module × post_types/option_keys).
-2. Targeted bash 3.2 portability (no associative arrays) rather than requiring
-   bash ≥ 4 — so it runs unmodified on stock macOS.
-3. Run state-dir location and retention: `~/.sitegraft/runs/<profile>-<timestamp>/`
-   on the orchestrator, never cleaned up automatically (left to the operator).
-4. Mapping mu-plugin delivered by dropping a file via `rsync` into
-   `wp-content/mu-plugins/` (auto-loaded by WordPress, no wp-cli activation
-   needed) rather than through a `wp plugin install` mechanism.
-5. `bats-core` as the unit test framework for `lib/`'s pure functions.
-
-Clarification received mid-task (already reflected everywhere): the repo will be
-shared with the Etch community as a **public GitHub repo** under MarcelHeiniger —
-consequences (zero secrets/realistic-looking examples, MIT LICENSE, the entire repo
-in US English including internal docs) applied across every affected file.
-
-Additional decisions made alone during the plan-review resolution pass (2026-08-19,
-detail in the review file's resolution notes and design doc §12/§13): the
-`--allow-stack-mismatch` override flag's exact confirmation UX (a distinct,
-louder prompt than the usual `gum confirm`, not reusing it); `graft_content_tables_csv`
-scoping search-replace to exactly `posts,postmeta,options` (not a wider or
-narrower set); `SITEGRAFT_HARNESS_STOP_AFTER` as the mechanism for validating the
-DDEV harness incrementally per step.
+Technical decisions from the original design (§0.1/§0.2 of the design doc) are
+long since validated by the fact that Steps 1-6 were built on them without
+reopening any of the five. Additional decisions made during Step 6 (detail in each
+commit's own message and the design doc's inline status notes):
+- Added `bin/sitegraft`'s global `--dry-run` handling alongside (not instead of)
+  every phase's own per-flag parsing — the per-phase parsing stays load-bearing
+  for the unit tests, which call `phase_*` functions directly.
+- `modules/etch.sh` created for real from the design doc's own §3.3 content, plus
+  one addition beyond that verbatim block (`etch_stack_candidates`) — flagged in
+  the Step 6 PR report for a second look rather than treated as an obviously-safe
+  unilateral call.
+- `modules/acss.sh` deliberately NOT created — its own design doc spec (§3.4)
+  already instructs not to guess the unverified legacy ACSS slug, and Step 6 is
+  a polish pass, not the place to do that real-world verification.

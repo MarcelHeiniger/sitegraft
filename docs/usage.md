@@ -1,0 +1,352 @@
+# sitegraft — Usage Guide
+
+This is the full manual: install, configure a profile, and run every phase from
+`scan` through `restore`. If you only need the elevator pitch and a quick example,
+see [`README.md`](../README.md) instead — this document is the detail behind it.
+
+## 1. What you need before you start
+
+- **bash** — the stock bash 3.2 shipped with macOS works unmodified; bash ≥ 4 on
+  Linux/WSL works too.
+- **ssh**, **rsync** — sitegraft never uses `scp`. Both sites (A and B) must be
+  reachable over SSH with `wp-cli` installed, or be local sites the orchestrator
+  can drive directly (see "Local sites and DDEV" below).
+- **`wp-cli`** — on both A and B (directly, or through a wrapper like DDEV's).
+- **`jq`** — manifest parsing.
+- **`gum`** — interactive selection prompts (menus, confirmations). Falls back to
+  `fzf` if `gum` isn't installed, then to plain numbered `[y/N]` text prompts if
+  neither is — sitegraft always works, gum just makes it nicer to use.
+
+Test-only (not needed to run sitegraft against real sites): **`bats-core`** for the
+unit tests, **`ddev`** for the integration test harness.
+
+### Install the dependencies
+
+```sh
+# macOS
+brew install jq gum bats-core rsync
+brew install ddev/ddev/ddev   # only if you'll run the integration test harness
+
+# Debian/Ubuntu
+sudo apt install jq rsync
+# gum has no apt package — see https://github.com/charmbracelet/gum#installation
+```
+
+### Windows without admin rights
+
+WSL requires admin privileges to install, so it's not an option on a locked-down
+work machine. The fix isn't to run sitegraft on Windows itself — bash 3.2/4 tooling
+doesn't translate — it's to run sitegraft on a **remote orchestrator** instead: any
+spare Linux or macOS machine you already have shell access to (a small cloud VM, a
+Raspberry Pi, a colleague's box). Install the dependencies above there, then connect
+to it over SSH from Windows (PuTTY, Windows Terminal's built-in SSH client, or
+anything else) and drive sitegraft from that shell. The orchestrator only needs the
+dependencies above — it doesn't need to be site A or B itself, it just needs SSH
+reach to both.
+
+### Local sites and DDEV
+
+If A or B is a local DDEV site (common for a freshly built A), point that site's
+`SITE_*_SSH_HOST` at nothing (leave it unset) and set `SITE_*_WP_CMD` to
+`ddev exec --raw -p <project> -- wp` instead of a bare `wp`. See
+[`profiles/example.conf`](../profiles/example.conf) for the exact shape, and the
+design doc §5.1 for why `--raw` specifically is required (without it, DDEV
+re-parses the command through an inner shell, which silently corrupts any `wp eval`
+snippet containing a PHP `$variable`).
+
+## 2. Install sitegraft itself
+
+```sh
+git clone https://github.com/MarcelHeiniger/sitegraft.git
+cd sitegraft
+# add bin/ to PATH, or symlink bin/sitegraft onto something already on it:
+ln -s "$(pwd)/bin/sitegraft" /usr/local/bin/sitegraft
+```
+
+## 3. Set up a profile
+
+A profile is a file at `profiles/<name>.conf` describing the A/B site pair —
+hosts, WordPress install paths, and how to invoke `wp-cli` on each. Profiles are
+**safe to commit**: they never contain secrets.
+
+```sh
+cp profiles/example.conf profiles/my-migration.conf
+```
+
+Then edit it:
+
+```sh
+SITE_A_ALIAS="a"
+SITE_A_SSH_HOST="user@host-a.example.com"   # empty ("") for a local site
+SITE_A_WP_PATH="/var/www/site-a/htdocs"
+SITE_A_WP_CMD="wp"                          # or a DDEV wrapper, see above
+SITE_A_URL="https://a.example.com"
+
+SITE_B_ALIAS="b"
+SITE_B_SSH_HOST="user@host-b.example.com"
+SITE_B_WP_PATH="/var/www/site-b/htdocs"
+SITE_B_WP_CMD="wp"
+SITE_B_URL="https://b.example.com"
+
+SITEGRAFT_STATE_DIR="${HOME}/.sitegraft/runs"
+SITEGRAFT_CREDS_FILE="${HOME}/.config/sitegraft/my-migration.creds"
+```
+
+If either site needs a specific SSH private key (rather than whatever your
+ssh-agent/default identity already provides), create the credentials file
+referenced above — **never commit this file**, and it must be `chmod 600` or
+sitegraft refuses to read it:
+
+```sh
+mkdir -p ~/.config/sitegraft && chmod 700 ~/.config/sitegraft
+cat > ~/.config/sitegraft/my-migration.creds <<'EOF'
+SITE_A_SSH_KEY="/absolute/path/to/private_key_a"
+SITE_B_SSH_KEY="/absolute/path/to/private_key_b"
+EOF
+chmod 600 ~/.config/sitegraft/my-migration.creds
+```
+
+No credentials file at all is a perfectly normal setup too — sitegraft just falls
+back to ssh's own default identity resolution (ssh-agent, `~/.ssh/config`), which
+is all most setups need.
+
+## 4. The six phases
+
+```
+scan → plan → backup → graft → verify → (restore, only if you need to roll back)
+```
+
+Every phase is independently re-runnable. `scan` and `plan` never write to B at
+all; nothing on B is touched until `backup` has completed successfully, and
+nothing about B's design is replaced until `graft`.
+
+### 4.1 `scan` — read-only inventory of A and B
+
+```sh
+sitegraft scan --profile my-migration
+```
+
+Reads (never writes) both sites: post types, options, custom database tables,
+installed plugins, active theme/version. Writes `scan-a.json`/`scan-b.json` into a
+new timestamped run directory under `SITEGRAFT_STATE_DIR`. Always safe to re-run —
+`scan` ignores `--dry-run` entirely because it has nothing to simulate (there's
+nothing to write in the first place).
+
+### 4.2 `plan` — decide what to migrate and what to protect
+
+```sh
+sitegraft plan --profile my-migration
+```
+
+Interactive. Builds a manifest from what `scan` found and what the installed
+[modules](#5-the-module-system) claim, then:
+
+1. **Custom-code awareness gate** (blocking): if `scan` found signs of custom code
+   tied to B's current theme (a child theme, a populated `functions.php`,
+   mu-plugins, known snippet-manager plugins), `plan` refuses to write anything
+   until you explicitly confirm you've reviewed it. Replacing B's theme would
+   otherwise silently stop that code from running — `backup` already archives all
+   of `wp-content` either way, so nothing is actually lost, this gate exists to
+   prevent a surprise, not data loss.
+2. **Rendering-stack resolution**: for the active theme, Etch, and ACSS, if A and B
+   differ (missing on B, or present under a different slug/version), `plan` offers
+   to copy A's version onto B — never installed from anywhere else, only ever
+   replicated from A. A plain confirmation if it's simply missing on B; a heavier,
+   separate confirmation if B already has *something* there (that existing folder
+   is never deleted, just left alongside the new one, inactive).
+3. **Item-level selection**: review exactly which post types/options each detected
+   module wants to migrate, with sensible defaults pre-selected — toggle any of
+   them off.
+
+The result is a **frozen manifest** (`manifest.json` in the run directory).
+Anything not explicitly selected into `migrate` is protected by default
+(default-deny, see [Security](#6-security-model) below) — nothing is migrated by
+accident.
+
+### 4.3 `backup` — back up B before anything is touched
+
+```sh
+sitegraft backup --profile my-migration [--dry-run]
+```
+
+Full database export + `wp-content` archive of B, pulled to the orchestrating
+machine, plus a **self-contained, ready-to-run `restore.sh`** written into the same
+run directory. This must succeed before `graft` will run at all — `graft` refuses
+outright if no `backup.complete` marker exists for the run.
+
+`--dry-run` prints the commands that would run and skips writing real backup
+files, checksums, or the completion marker — it never claims success for a backup
+that wasn't actually taken.
+
+### 4.4 `graft` — the actual A → B transfer
+
+```sh
+sitegraft graft --profile my-migration [--dry-run] [--allow-stack-mismatch]
+```
+
+Syncs whatever the plan approved for the rendering stack, then hard-refuses if
+anything is still mismatched — pass `--allow-stack-mismatch` to override, which
+itself requires a second, louder confirmation than anything else in this tool
+(`plan`'s own copy-offer already gives you a way to avoid ever needing this flag).
+Then: media sync, WXR export/import of the selected content, ID remapping
+(attachments, featured images, `page_on_front`/`page_for_posts`), domain
+search-replace scoped to migrated content only, options migration, and any
+module-specific post-import hooks.
+
+`--dry-run` prints every command it would run instead of running it — nothing on B
+is touched. Every step is also individually idempotent (tracked via marker files in
+the run directory), so a `graft` that's interrupted partway through can simply be
+re-run and picks up where it left off, rather than starting over or duplicating
+content.
+
+### 4.5 `verify` — confirm the graft actually worked
+
+```sh
+sitegraft verify --profile my-migration
+```
+
+Read-only against B, end-to-end. Checks: every protected checksum from `backup`
+still matches (nothing sitegraft wasn't told to touch actually changed), migrated
+options carry A's exact values, `page_on_front` resolves to the correctly remapped
+page, A's domain string is absent from B's migrated content, and (if configured) an
+HTTP smoke check that B's front page actually renders with an expected marker.
+Writes a report into the run directory and exits non-zero on any hard failure.
+
+### 4.6 `restore` — roll B back
+
+```sh
+sitegraft restore --profile my-migration --run <run-id> [--yes] [--dry-run]
+```
+
+Runs the run's generated `restore.sh` — but first takes its own safety snapshot of
+B's *current* state (database and `wp-content`) into a `pre-restore-<timestamp>/`
+subfolder, complete with its own generated `restore.sh`, so even a restore stays
+reversible. Asks for confirmation unless `--yes` is passed. `<run-id>` is the
+directory name `scan` created (printed at the end of every phase, and listable
+under `SITEGRAFT_STATE_DIR/<profile>-*`).
+
+You can also run the run directory's `restore.sh` directly (`./run-dir/restore.sh`)
+without sitegraft at all — it's self-contained on purpose (only needs ssh, rsync,
+tar, gzip/gunzip, wc), so it still works even if you no longer have a sitegraft
+checkout on hand.
+
+### Flag reference
+
+| Flag | Phases | Effect |
+|---|---|---|
+| `--profile <name>` | all | Required. Which `profiles/<name>.conf` to use. |
+| `--run <run-dir>` | plan, backup, graft, verify, restore | Which run directory to operate on. Defaults to the most recent one for the profile (required for `restore`). |
+| `--dry-run` | all (no-op on scan/plan/verify) | Print what would happen instead of doing it. Accepted uniformly on every phase for CLI consistency, even where a phase has nothing to simulate. |
+| `--allow-stack-mismatch` | graft only | Override the rendering-stack hard precondition. Triggers a second, louder confirmation. |
+| `--yes` | restore only | Skip the confirmation prompt. |
+| `-h`, `--help` | — | Print usage. |
+| `--version` | — | Print the installed version. |
+
+## 5. The module system
+
+What sitegraft can migrate and what it must protect is declared by small,
+pluggable **graft modules** — one file per WordPress plugin or content domain, in
+`modules/`. The core (`lib/`, `bin/`) never changes to add support for a new
+plugin; you add one file.
+
+Shipped in this repo:
+- **`core-wp`** (`modules/core-wp.sh`) — WordPress core content: pages, posts, and
+  the front-page option trio (`show_on_front`/`page_on_front`/`page_for_posts`,
+  correctly remapped through the ID map rather than blindly copied).
+- **`etch`** (`modules/etch.sh`) — Etch's custom post types (CFS, CPTs, loops) and
+  options (settings, styles, global stylesheets, CSS toolbar values).
+- `modules/_template.sh` — a documented skeleton, copy it to get started.
+- `modules/motopress.sh.example` — a complete worked example for a hypothetical
+  future module (MotoPress Hotel Booking), showing every part of the contract
+  including a plugin-owned table and a post-import remap hook. Not loaded by
+  default (the `.example` suffix keeps it out of module discovery) — drop the
+  suffix to activate it for real.
+
+**Not shipped: Automatic.css (`acss`).** It's fully spec'd in the design doc (§3.4),
+but the module needs to declare Automatic.css's pre-v4 plugin-folder name as a
+detection candidate, and that legacy name has never been verified against a real
+pre-4.0 install — shipping a guess would risk silently failing to detect (or
+mis-detecting) a real site's ACSS install. If you can verify that folder name, a
+real `modules/acss.sh` PR is very welcome.
+
+### Writing your own module
+
+Copy [`modules/_template.sh`](../modules/_template.sh) to `modules/<your-plugin>.sh`
+(the function prefix is the filename with hyphens turned into underscores, so
+`modules/my-plugin.sh` → functions prefixed `my_plugin_`). A module must define:
+
+| Function | Required | Role |
+|---|:---:|---|
+| `<mod>_name` | yes | Human-readable name shown in prompts. |
+| `<mod>_detect <scan_json>` | yes | Exit 0/1 — is this plugin present on the scanned site? |
+| `<mod>_post_types` | at least one of these three | Post types this module owns, one per line. |
+| `<mod>_option_keys` | | `wp_options` keys this module owns, one per line. |
+| `<mod>_tables` | | Plugin-owned SQL table suffixes (without the live `$table_prefix`), one per line. |
+| `<mod>_option_keys_exclude` | no | Glob patterns to exclude within a broad option-key prefix (e.g. license keys, DB version markers). |
+| `<mod>_post_import <state_dir> <id_map_tsv> <wp_cmd_b>` | no | Hook run after WXR import + generic remaps, for module-specific fixups (e.g. remapping an internal ID reference in postmeta). |
+| `<mod>_stack_candidates` | no | If this plugin also needs to be *present and matching* on B for migrated content to render (like Etch or ACSS), one candidate plugin-folder slug per line, most-preferred/current first. |
+
+**If your `post_import` hook writes to B, wrap every such call in `run_or_echo`**
+(from `lib/core.sh`, already sourced by the time any hook runs) — hooks are called
+unconditionally, including under `--dry-run`, and a hook that calls `$wp_cmd_b`
+directly instead would write to B even on a dry run. See
+`modules/motopress.sh.example`'s `motopress_post_import` for the pattern, and the
+design doc §3.2 for the full contract.
+
+**Never hardcode a plugin's folder name to build a file path.** `_stack_candidates`
+exists purely for *detection* — a plugin's real folder name can differ between
+installs (Automatic.css's pre-4.0 → 4.0 rename is the real-world case this
+protects against). Whichever candidate `scan` actually finds present is what
+travels forward into the manifest; that resolved value, never the module's
+candidate list, is the only thing `graft` is ever allowed to read when building an
+`rsync` path.
+
+## 6. Security model
+
+sitegraft's whole reason to exist is a strict boundary: replace B's *design/content*
+layer with A's, without so much as glancing at anything B's business plugins own.
+Concretely:
+
+- **Non-contamination.** Every table/option a protection module declares on B gets
+  a checksum taken during `backup`, *before* `graft` touches anything, and
+  `verify` recomputes and compares it after. This is byte-for-byte, not visual —
+  if a protected table changed even by one byte, `verify` hard-fails.
+- **Default-deny.** Anything `scan` finds on B that isn't explicitly covered by a
+  known module is listed as "protected by default" and never migrated or
+  overwritten — you have to actively select something into `migrate` for it to
+  move. An unrecognized table doesn't accidentally end up unprotected; it ends up
+  unmigrated.
+- **The custom-code awareness gate.** `plan` refuses to freeze a manifest for a B
+  showing custom-code signals (child theme, `functions.php`, mu-plugins, snippet
+  plugins) until you explicitly confirm you've reviewed it — replacing the theme
+  would otherwise silently stop that code from running.
+- **Backup before any write.** `graft` structurally cannot run without a completed
+  `backup` for the same run (`backup.complete` marker) — there is no path to
+  "graft without a safety net," accidental or otherwise.
+- **The rendering-stack precondition.** `graft` refuses to run if B's active
+  theme, Etch, or ACSS doesn't match A's, unless you pass
+  `--allow-stack-mismatch` and get through its own separate, louder confirmation.
+  Grafted content with nothing on B able to render it would "succeed" by every
+  content-level measure while producing a visibly broken site — this gate exists
+  so that never happens silently.
+- **Nothing sitegraft copies is ever installed from anywhere external.** The only
+  things `graft` ever writes to B's `wp-content/themes/`/`wp-content/plugins/` are
+  literal copies of what's already on A, never a download from wp.org or a
+  marketplace, never a license activation.
+- **`--dry-run` everywhere.** Every phase that writes (`backup`, `graft`,
+  `restore`) supports it, and it's accepted as a safe no-op on every other phase
+  too — you can always see exactly what a run would do before it does it.
+
+## 7. Testing
+
+```sh
+bats tests/unit/                    # pure lib/ functions, no external dependencies
+tests/integration/ddev-harness.sh   # 2 disposable DDEV sites, full scan->graft->verify run
+```
+
+The integration harness is the actual proof this tool is safe: it spins up a fake
+"site A" with simulated Etch content and a fake "site B" with a fake protected
+plugin (its own custom post type, its own SQL table, its own options), runs a full
+graft, and asserts the protected plugin's data is byte-identical before and after —
+plus the positive assertions (migrated content actually landed correctly, domain
+strings were rewritten, `page_on_front` resolves right).

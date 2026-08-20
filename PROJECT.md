@@ -5,8 +5,8 @@
 > else to look up (no vault, no API, no Slack): idea, infra, status, todo, definition
 > of done.
 >
-> **STATUS: idea (design + plan delivered, implementation not started)**
-> **Last updated: 2026-08-19** (via "update the project")
+> **STATUS: in progress (v1 feature-complete — `1.0.0-rc1`, pending the pre-`1.0.0` gate)**
+> **Last updated: 2026-08-20** (via "update the project")
 
 ---
 
@@ -37,30 +37,31 @@ database of its own. Run state is stored on the machine running the tool (the
 
 ## 4. Where the project stands (status)
 
-Design doc and implementation plan delivered 2026-08-19 (Rosalinde). No tool code
-exists yet — only the project skeleton and documentation are in place. No pilot run
-is planned: validation happens exclusively through the DDEV test harness (2
-disposable WP sites) described in the design doc.
+All 6 implementation-plan steps are done (`main`, PRs #1-#5 plus the Step 6 polish
+pass): scan, plan, backup, graft, verify, and restore are fully implemented,
+unit-tested, and exercised end-to-end by the DDEV harness. `SITEGRAFT_VERSION` is
+`1.0.0-rc1` — not a plain `1.0.0` yet, because the pre-`1.0.0` DoD gate (a real dry
+run against a genuine A/B pair, not the DDEV harness) is still open and deliberately
+not closeable by more DDEV-only work. No pilot run has happened yet.
 → Detail: [`docs/status.md`](docs/status.md)
 
 ## 5. What's left to do (todo)
 
-- [ ] Validate the design doc and the 5 open decisions with Marcel (see
-      `docs/status.md` → Recent decisions)
-- [ ] Plan step 1: core + profiles/credentials + scan (see
-      `docs/plans/2026-08-19-sitegraft-implementation.md`)
-- [ ] Step 2: manifest + interactive selection
-- [ ] Step 3: backup + restore
-- [ ] Step 4: graft (media + WXR + mu-plugin mapping + remaps)
-- [ ] Step 5: verify + DDEV integration harness
-- [ ] Step 6: polish (dry-run everywhere, usage docs, LICENSE, public README)
+- [ ] **Pre-`1.0.0` gate**: a real dry run against a staging copy of a genuine A/B
+      pair — Marcel's call, on a real pair (see `docs/definition-of-done.md`).
+- [ ] Review/merge the Step 6 polish PR.
+- [ ] Backlog: `modules/acss.sh` (blocked on verifying a real legacy ACSS slug),
+      the §5.2 interactive-credentials prompt, the `motopress`/`classic-menus`
+      modules, the `clean` sub-step of `graft`.
 → Detail: [`docs/todo.md`](docs/todo.md)
 
 ## 6. Definition of Done
 
-A full `scan → plan → backup → graft → verify` run succeeds on the DDEV harness
-(site A with simulated Etch content, site B with a fake protected plugin) without
-altering a single byte of B's fake plugin data, with a working, tested `restore.sh`.
+The v1 DoD (all 6 phases implemented, 2 shipped modules working end-to-end on the
+DDEV harness, non-contamination + restore + `--dry-run` + default-deny all verified,
+repo publish-ready) is met. The separate pre-`1.0.0` gate (a real dry run on a
+genuine A/B pair, closing design doc §0.2's R2/R4) is **not** — that's the one item
+left unchecked, deliberately, pending a real run.
 → Detail: [`docs/definition-of-done.md`](docs/definition-of-done.md)
 
 ## 7. Getting started (dev)
