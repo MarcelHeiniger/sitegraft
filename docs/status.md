@@ -11,10 +11,12 @@ end-to-end by the DDEV integration harness. This Step 6 pass (polish) audited
 `--dry-run`/`--allow-stack-mismatch` consistency across every writing phase, closed
 an EOF-defaults-to-migrate durcissement flagged (non-blocking) back in the Step 2
 review, ran a full design-doc-vs-code self-review, and wrote the public-facing
-usage docs. `SITEGRAFT_VERSION` is `1.0.0-rc1` — the one thing still blocking a
-plain `1.0.0` tag is the pre-`1.0.0` DoD gate (a real dry run against a genuine A/B
-pair), which is deliberately **not** satisfiable by more DDEV-only work; see
-`docs/definition-of-done.md`.
+usage docs. PR #6 (Step 6) then went through a double review (Kimi + Viktor); a
+fix-pack on the same PR closed 2 blocking findings and several smaller ones (see
+"Step 6 fix-pack" below). `SITEGRAFT_VERSION` is `1.0.0-rc2` — the one thing still
+blocking a plain `1.0.0` tag is the pre-`1.0.0` DoD gate (a real dry run against a
+genuine A/B pair), which is deliberately **not** satisfiable by more DDEV-only
+work; see `docs/definition-of-done.md`.
 
 ## Done
 
@@ -84,10 +86,50 @@ pair), which is deliberately **not** satisfiable by more DDEV-only work; see
   - Full `bats tests/unit/` suite green throughout (grew from 283 to 300+ tests
     across this pass); DDEV harness re-run at the end of the pass — see the PR
     report for its exit status.
+- [x] **Step 6 fix-pack (same PR #6, 2026-08-20)** — after a double review
+  (Kimi: not mergeable; Viktor: mergeable but with a required in-PR fix):
+  - **BLOCKER (both reviewers, reproduced live by Viktor):**
+    `graft_mark_step` (`lib/graft.sh`) wrote its `graft.<step>.done` marker
+    unconditionally, dry-run or not — a `graft --dry-run` against a run
+    directory wrote every marker for real, so a REAL `graft` against that
+    SAME run directory right after saw every step as already done and
+    silently skipped the whole pipeline (reported "graft complete" without
+    migrating anything). Fixed by guarding the one shared function every
+    call site goes through; added both a fast unit-level regression test and
+    a new DDEV harness assertion (`graft --dry-run` first, assert no marker
+    files, then the real graft that follows, whose existing assertions only
+    pass if it actually did the work).
+  - **MAJOR-A (Viktor):** `phase_verify` (`lib/verify.sh`) set
+    `SITEGRAFT_DRY_RUN=1` for `--dry-run` and never reset it (unlike
+    `phase_scan`'s own identical-shape M6 fix) — every read in `verify` goes
+    through `wp_remote`/`run_or_echo`, so under dry-run every check parsed
+    `"[dry-run] ..."` text instead of real data and reported a false HARD
+    FAIL on a graft that actually succeeded. Fixed with the same
+    scan-style neutralization; `docs/usage.md`'s incorrect "no-op on verify"
+    claim corrected too.
+  - **MINOR-C (Viktor):** `<mod>_option_keys_exclude` is declared in the
+    module contract and implemented by `modules/etch.sh`, but nothing in
+    `lib/`/`bin/` ever reads it — inert. Documented as NOT WIRED (design doc
+    §3.2/§3.3, `modules/_template.sh`, `modules/etch.sh`) rather than wired
+    up unreviewed this late, per the reviewers' own stated default.
+  - **NITs:** `sitegraft --dry-run graft` (flag before the phase name) used
+    to read "--dry-run" as the phase itself and fail with a confusing
+    "unknown phase" error — fixed to strip `--dry-run` from the whole argv
+    before the phase is read. Design doc §9.1/§9.4 had their superseded,
+    copy-pasteable `wp search-replace --tables=...postmeta,options` sample
+    commands actually removed (not just annotated) — the exact shape of the
+    MAJOR-2 data-corruption bug they described could otherwise still be
+    copy-pasted into a future implementation. `phase_restore`'s `--dry-run`
+    log message claimed the pre-restore safety snapshot is "still taken for
+    real" — it isn't (same `run_or_echo` gating as everything else); message
+    corrected, behavior was already correct.
+  - `SITEGRAFT_VERSION` bumped `1.0.0-rc1` → `1.0.0-rc2`.
+  - `bats tests/unit/` green (310 tests); DDEV harness re-run live — see the
+    PR report for its exit status and the new dry-run-marker assertion.
 
 ## In progress
 
-- [ ] Nothing — Step 6 PR ready for review/merge.
+- [ ] Nothing — Step 6 PR (with the fix-pack applied) ready for review/merge.
 
 ## Blocked / pending
 

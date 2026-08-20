@@ -8,11 +8,12 @@
 - [ ] **Pre-`1.0.0` gate:** a real dry run against a staging copy of a genuine A/B
       pair, closing design doc §0.2's R2/R4 — see `docs/definition-of-done.md`.
       Not satisfiable by more DDEV-only testing. This is the one thing standing
-      between the current `1.0.0-rc1` tag and a plain `1.0.0` — Marcel's call, on
+      between the current `1.0.0-rc2` tag and a plain `1.0.0` — Marcel's call, on
       a real pair, not something Step 6 (or any DDEV-only work) can close.
 - [ ] Review/merge the Step 6 PR (dry-run + stack-override audit, EOF durcissement
       on the plain selection fallback, `docs/usage.md`, LICENSE/README already in
-      place, version bumped to `1.0.0-rc1`).
+      place; double-reviewed by Kimi + Viktor, fix-pack applied on the same PR —
+      see `docs/status.md` → "Step 6 fix-pack" — version now `1.0.0-rc2`).
 
 ## Backlog
 
@@ -91,3 +92,10 @@
     started").
   - `SITEGRAFT_VERSION` bumped to `1.0.0-rc1` (not `1.0.0` — see the pre-`1.0.0`
     gate above).
+  - **Fix-pack (same PR #6), after a double review (Kimi + Viktor):** fixed a
+    BLOCKER (`graft --dry-run` wrote real resumability markers, so a real
+    `graft` right after could silently skip the whole pipeline) and a MAJOR
+    (`verify --dry-run` produced false HARD FAILs, mirrored `scan`'s own
+    already-fixed version of the identical bug) plus smaller findings — see
+    `docs/status.md` → "Step 6 fix-pack" for the full list.
+    `SITEGRAFT_VERSION` bumped again to `1.0.0-rc2`.
