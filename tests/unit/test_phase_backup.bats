@@ -108,13 +108,14 @@ EOF
 @test "phase_backup produces a verified backup, checksums, restore.sh, and a completion marker" {
   run phase_backup --profile t --run "$RUN_DIR"
   [ "$status" -eq 0 ]
+  local backup_output="$output"
   [ -f "${RUN_DIR}/backup/b-db.sql.gz" ]
   [ -d "${RUN_DIR}/backup/b-wp-content" ]
   [ -f "${RUN_DIR}/backup.complete" ]
   [ -x "${RUN_DIR}/restore.sh" ]
   run jq -e '.checksums_protected_pre_graft.fakebooking | startswith("sha256:")' "${RUN_DIR}/manifest.json"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"to restore this backup"* ]] || true
+  [[ "$backup_output" == *"to restore this backup"* ]] || false
 }
 
 @test "phase_backup's checksum loop skips a protect module with no tables (plan bug fix, empty --tables=)" {
