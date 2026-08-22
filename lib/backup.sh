@@ -237,9 +237,29 @@ backup_verify_db_export() {
   # in CREATE TABLE statements with backticks, and grep -F needs the exact
   # literal to search for.
   local bt='`'
-  local table
+  local table found
   for table in "${table_prefix}options" "${table_prefix}posts"; do
-    if ! gunzip -c "$gz_file" 2>/dev/null | grep -qF "CREATE TABLE ${bt}${table}${bt}"; then
+    # `grep -q` exits the instant it finds a match. That closes the pipe on
+    # the still-writing `gunzip`, which is killed by SIGPIPE and exits 141 —
+    # and under bin/sitegraft's `set -o pipefail` (line 3) the PIPELINE then
+    # reports 141, i.e. a failure, even though the table was found.
+    #
+    # It is size-dependent, which is why it stayed hidden: on a dump small
+    # enough that gunzip finishes writing before grep exits, no signal is
+    # ever delivered and the check passes. Every DDEV-harness backup is that
+    # small. The first real target's 73 MB database was rejected with both
+    # of its tables plainly present in the file — and since `graft`
+    # structurally refuses to run without the `backup.complete` marker this
+    # check gates, it made the tool unable to finish a backup against any
+    # genuine site.
+    #
+    # `grep -c` consumes the whole stream rather than exiting early, so no
+    # SIGPIPE is ever delivered. The `|| true` keeps a legitimate zero-match
+    # result (grep exits 1 when it matches nothing) from tripping `set -e`
+    # before the count below can be tested — the two cases must stay
+    # distinguishable, which is exactly what the previous version lost.
+    found=$(gunzip -c "$gz_file" 2>/dev/null | grep -cF "CREATE TABLE ${bt}${table}${bt}" || true)
+    if [ "${found:-0}" -eq 0 ]; then
       log_error "backup verification failed: expected table '${table}' not found in ${gz_file}"
       return 1
     fi
@@ -496,7 +516,7 @@ phase_backup() {
   [ -n "$profile" ] || { log_error "backup requires --profile <name>"; return 1; }
   profile_load "$profile" || return 1
 
-  [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1)
+  [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1 || true)
   [ -n "$run_dir" ] || {
     log_error "no scan/plan run found for profile ${profile} — run 'sitegraft scan' and 'sitegraft plan' first"
     return 1

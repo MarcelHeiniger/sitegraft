@@ -151,31 +151,108 @@ graft_sync_stack() {
       rel_dir="wp-content/plugins/${slug}"
     fi
     log_info "syncing stack component '${component}' (resolved slug: ${slug}) from A to B (design doc §12)..."
-    local staging="${run_dir}/stack-staging/${component}"
-    mkdir -p "$staging"
-
-    if [ -n "${SITE_A_SSH_HOST:-}" ]; then
-      run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${SITE_A_WP_PATH}/${rel_dir}/" "${staging}/"
-    elif [ -n "$(graft_local_prefix a)" ]; then
-      graft_pull_dir a "${SITE_A_WP_PATH}/${rel_dir}" "$staging"
-    else
-      run_or_echo rsync -avz "${SITE_A_WP_PATH}/${rel_dir}/" "${staging}/"
-    fi
-
-    if [ -n "${SITE_B_SSH_HOST:-}" ]; then
-      run_or_echo rsync -avz "${staging}/" "${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/${rel_dir}/"
-    elif [ -n "$(graft_local_prefix b)" ]; then
-      graft_push_dir b "$staging" "${SITE_B_WP_PATH}/${rel_dir}"
-    else
-      run_or_echo rsync -avz "${staging}/" "${SITE_B_WP_PATH}/${rel_dir}/"
-    fi
+    graft_copy_wp_content_dir "$rel_dir" "${run_dir}/stack-staging/${component}"
 
     if [ "$component" = "theme" ]; then
+      graft_sync_theme_parent "$slug" "$run_dir"
       run_or_echo wp_remote b theme activate "$slug"
     else
       run_or_echo wp_remote b plugin activate "$slug"
     fi
   done
+}
+
+# graft_copy_wp_content_dir <rel_dir> <staging> — copy one wp-content
+# subdirectory from A to B, through whichever transport each side needs.
+# Extracted out of graft_sync_stack so the parent-theme copy below reuses
+# this exact three-branch logic instead of carrying a second copy of it that
+# would drift.
+graft_copy_wp_content_dir() {
+  local rel_dir="$1" staging="$2"
+  mkdir -p "$staging"
+
+  if [ -n "${SITE_A_SSH_HOST:-}" ]; then
+    run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${SITE_A_WP_PATH}/${rel_dir}/" "${staging}/"
+  elif [ -n "$(graft_local_prefix a)" ]; then
+    graft_pull_dir a "${SITE_A_WP_PATH}/${rel_dir}" "$staging"
+  else
+    run_or_echo rsync -avz "${SITE_A_WP_PATH}/${rel_dir}/" "${staging}/"
+  fi
+
+  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
+    run_or_echo rsync -avz "${staging}/" "${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/${rel_dir}/"
+  elif [ -n "$(graft_local_prefix b)" ]; then
+    graft_push_dir b "$staging" "${SITE_B_WP_PATH}/${rel_dir}"
+  else
+    run_or_echo rsync -avz "${staging}/" "${SITE_B_WP_PATH}/${rel_dir}/"
+  fi
+}
+
+# graft_sync_theme_parent <child_slug> <run_dir> — a child theme cannot be
+# activated without its parent, and graft_sync_stack only ever copied the
+# ACTIVE theme. A child theme on A therefore landed on a B holding no parent
+# for it, and the `wp theme activate` right after produced a broken site.
+#
+# Found on the first real pair, whose A runs a child theme: it worked there
+# only because B happened to already carry the exact parent at the exact same
+# version. That is luck. The next target — a B on an unrelated theme — has no
+# reason to carry it at all.
+#
+# The parent is resolved with get_template(), which returns the parent's
+# DIRECTORY slug (and, for a theme that is not a child, the theme's own
+# slug — hence the equality check). `wp theme get --field=parent_theme`
+# deliberately not used: it returns the parent's display Name, which is not a
+# path.
+#
+# The parent is copied but never activated — a parent theme is activated
+# through its child, not on its own.
+graft_sync_theme_parent() {
+  local child_slug="$1" run_dir="$2"
+
+  # The two queries below are READS, and they have to run for real even under
+  # --dry-run, because every decision this function makes depends on their
+  # answers. wp_remote routes everything through run_or_echo, which under
+  # --dry-run returns the literal string "[dry-run] <command>" instead of the
+  # value — so without this, $parent becomes "[dry-run] docker exec ...
+  # get_template();" and the copy path below is built out of that text.
+  # Observed on this function's very first dry run. It is the same defect
+  # docs/status.md records for `verify --dry-run`, which read "[dry-run] ..."
+  # as though it were B's data and hard-failed a graft that had in fact
+  # succeeded.
+  #
+  # The flag is saved, cleared for the two reads, and restored IMMEDIATELY
+  # afterwards — before any branch below can return early. verify's original
+  # version of this same manoeuvre cleared the flag and never restored it;
+  # keeping the restore unconditional and in one place is what stops that
+  # from happening again. The directory copy further down stays under
+  # run_or_echo, as it must: that one is a write, and a dry run has to
+  # simulate it.
+  local saved_dry_run="${SITEGRAFT_DRY_RUN:-0}"
+  local parent b_themes
+  SITEGRAFT_DRY_RUN=0
+  parent=$(wp_remote a eval "echo wp_get_theme('${child_slug}')->get_template();" 2>/dev/null || true)
+  b_themes=$(wp_remote b theme list --field=name 2>/dev/null || true)
+  SITEGRAFT_DRY_RUN="$saved_dry_run"
+
+  parent=$(printf '%s' "$parent" | tr -d '\r' | tr -d '\n')
+  b_themes=$(printf '%s' "$b_themes" | tr -d '\r')
+
+  case "$parent" in
+    ''|"$child_slug") return 0 ;;
+  esac
+
+  # Matched from a here-string rather than `... | grep -qx`: grep -q exits at
+  # the first match and SIGPIPEs whatever is still writing upstream, which
+  # under bin/sitegraft's `set -o pipefail` turns a successful match into a
+  # failed pipeline (exit 141) — the same defect that made
+  # backup_verify_dump reject every valid real-site backup.
+  if grep -qx "$parent" <<< "$b_themes"; then
+    log_info "parent theme '${parent}' is already present on B — not copying it"
+    return 0
+  fi
+
+  log_info "active theme '${child_slug}' is a child of '${parent}', which B does not have — copying the parent from A as well (never activated on its own)"
+  graft_copy_wp_content_dir "wp-content/themes/${parent}" "${run_dir}/stack-staging/theme-parent"
 }
 
 # design doc §6.4 step 0b (Marcel's revision of finding B1): a hard precondition
@@ -1076,7 +1153,7 @@ phase_graft() {
   done
   [ -n "$profile" ] || { log_error "graft requires --profile <name>"; return 1; }
   profile_load "$profile" || return 1
-  [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1)
+  [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1 || true)
   [ -n "$run_dir" ] || { log_error "no scan/plan run found for profile ${profile} — run 'sitegraft scan' and 'sitegraft plan' first"; return 1; }
   [ -f "${run_dir}/backup.complete" ] || {
     log_error "no backup.complete marker for this run — refusing to graft without a backup"

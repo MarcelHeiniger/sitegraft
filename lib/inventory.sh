@@ -6,7 +6,13 @@
 # inside a jq program string, which is fragile to quote from the shell side
 # (Kimi's review note) and harder to extend (adding one is a one-line change
 # here instead of hunting for the jq filter that embeds it).
-SITEGRAFT_SNIPPET_PLUGIN_SLUGS='["code-snippets","wpcode","insert-headers-and-footers"]'
+# `wpcodebox2` added after a real target site was found running WPCodeBox 2
+# with this list not matching it: scan recorded snippet_plugins_detected as
+# [] on a site where a snippet manager was active. §14's gate still fired
+# there, but only because that site independently had mu-plugins — on a B
+# whose sole custom-code signal is WPCodeBox, plan would have frozen a
+# manifest with no warning at all.
+SITEGRAFT_SNIPPET_PLUGIN_SLUGS='["code-snippets","wpcode","insert-headers-and-footers","wpcodebox2"]'
 
 # sq <string> — single-quote a string safely for embedding in a shell command
 # line that will be re-parsed by another shell (e.g. the far end of an ssh
@@ -224,31 +230,85 @@ inventory_scan_site() {
     esac
   fi
 
-  jq -n \
-    --argjson post_types "$post_types" \
-    --argjson options "$options" \
-    --argjson tables "$tables" \
-    --argjson plugins "$plugins" \
-    --argjson active_theme "$active_theme" \
-    --argjson menus "$menus" \
+  # Every large payload below used to reach jq as a command-line argument via
+  # --argjson. Found on the first real A/B pair: on a genuine site, `wp option
+  # list --format=json` alone is megabytes — a WooCommerce + multilingual +
+  # booking stack pushes the combined argv straight past ARG_MAX and jq dies
+  # with "Argument list too long". The DDEV harness's two sites are orders of
+  # magnitude too small to ever reach that limit, so this was invisible until
+  # a real site was scanned.
+  #
+  # The silent-failure half was worse than the crash: jq's non-zero exit left
+  # `> "$out_json"` holding a 0-BYTE file, inventory_scan_site returned that
+  # status into a caller that ignored it, and the phase moved on to the next
+  # site announcing it as if nothing had happened. Two empty scan files, exit
+  # 0. `plan` would then read them as two empty sites rather than refusing to
+  # run.
+  #
+  # Fixed on both counts: the large payloads go through FILES (--slurpfile
+  # reads the file itself, bounded by disk rather than by argv), and every
+  # step is now checked. Each --slurpfile binding is an ARRAY of the file's
+  # JSON values, hence the [0] on each reference below. The three small
+  # scalars stay on --argjson — they are two booleans and a boolean-or-null.
+  local payload_dir
+  payload_dir=$(mktemp -d) || { log_error "could not create a temp dir for scan payloads"; return 1; }
+
+  printf '%s' "$post_types"          > "${payload_dir}/post_types.json"
+  printf '%s' "$options"             > "${payload_dir}/options.json"
+  printf '%s' "$tables"              > "${payload_dir}/tables.json"
+  printf '%s' "$plugins"             > "${payload_dir}/plugins.json"
+  printf '%s' "$active_theme"        > "${payload_dir}/active_theme.json"
+  printf '%s' "$menus"               > "${payload_dir}/menus.json"
+  printf '%s' "$custom_code_signals" > "${payload_dir}/custom_code_signals.json"
+
+  # Fail CLOSED on a query that came back empty or garbled, rather than
+  # embedding a null for it and writing a scan file that looks complete.
+  local pf
+  for pf in post_types options tables plugins active_theme menus custom_code_signals; do
+    if ! jq -e . "${payload_dir}/${pf}.json" >/dev/null 2>&1; then
+      log_error "site '${alias_lc}': the '${pf}' query returned empty or invalid JSON — refusing to write a partial scan file"
+      rm -rf "$payload_dir"
+      return 1
+    fi
+  done
+
+  if ! jq -n \
+    --slurpfile post_types "${payload_dir}/post_types.json" \
+    --slurpfile options "${payload_dir}/options.json" \
+    --slurpfile tables "${payload_dir}/tables.json" \
+    --slurpfile plugins "${payload_dir}/plugins.json" \
+    --slurpfile active_theme "${payload_dir}/active_theme.json" \
+    --slurpfile menus "${payload_dir}/menus.json" \
+    --slurpfile custom_code_signals "${payload_dir}/custom_code_signals.json" \
     --argjson menus_unknown "$menus_unknown" \
-    --argjson custom_code_signals "$custom_code_signals" \
     --argjson custom_code_detected "$custom_code_detected" \
     --argjson nav_uses_dynamic_page_list "$nav_dynamic" \
     '{
-      post_types: $post_types,
-      options: $options,
-      tables: $tables,
-      plugins: $plugins,
-      active_theme: $active_theme,
-      classic_menus_detected: (($menus_unknown == true) or ([$menus[]? | select((.count // 0) > 0)] | length > 0)),
+      post_types: $post_types[0],
+      options: $options[0],
+      tables: $tables[0],
+      plugins: $plugins[0],
+      active_theme: $active_theme[0],
+      classic_menus_detected: (($menus_unknown == true) or ([$menus[0][]? | select((.count // 0) > 0)] | length > 0)),
       classic_menus_unknown: $menus_unknown,
-      classic_menu_names: [$menus[]? | select((.count // 0) > 0) | .name],
-      custom_code_signals: $custom_code_signals,
+      classic_menu_names: [$menus[0][]? | select((.count // 0) > 0) | .name],
+      custom_code_signals: $custom_code_signals[0],
       custom_code_detected: $custom_code_detected,
       nav_uses_dynamic_page_list: $nav_uses_dynamic_page_list
     }' \
-    > "$out_json"
+    > "$out_json"; then
+    rm -rf "$payload_dir"
+    log_error "could not assemble ${out_json} — the scan of site '${alias_lc}' did NOT succeed"
+    return 1
+  fi
+  rm -rf "$payload_dir"
+
+  # Never leave a 0-byte or malformed scan file behind while reporting
+  # success — that is precisely what this function used to do.
+  if ! jq -e . "$out_json" >/dev/null 2>&1; then
+    log_error "the scan of site '${alias_lc}' produced empty or invalid JSON at ${out_json}"
+    return 1
+  fi
 }
 
 # design doc §3.2's rule: the ONLY function allowed to turn a module's
@@ -517,14 +577,19 @@ phase_scan() {
   # it is restored on the parent shell whether this block succeeds or a
   # scan step fails partway through, without needing a manual save/restore
   # that a failure could skip over.
+  # Every step needs its own `|| exit 1`. A subshell's exit status is simply
+  # that of its LAST command — here the trailing chmod, which succeeds as
+  # long as the files exist at all, even at 0 bytes. So both scans could fail
+  # and `( ... ) || return 1` would still see a clean exit 0: that is exactly
+  # how a run whose two scan files were empty went on to report success.
   (
     umask 077
-    mkdir -p "$run_dir"
-    chmod 700 "$run_dir"
-    inventory_scan_site a "${run_dir}/scan-a.json"
-    inventory_scan_site b "${run_dir}/scan-b.json"
-    chmod 600 "${run_dir}/scan-a.json" "${run_dir}/scan-b.json"
-  ) || return 1
+    mkdir -p "$run_dir" || exit 1
+    chmod 700 "$run_dir" || exit 1
+    inventory_scan_site a "${run_dir}/scan-a.json" || exit 1
+    inventory_scan_site b "${run_dir}/scan-b.json" || exit 1
+    chmod 600 "${run_dir}/scan-a.json" "${run_dir}/scan-b.json" || exit 1
+  ) || { log_error "scan failed (see the error above) — no usable run directory was produced at ${run_dir}"; return 1; }
 
   if jq -e '.classic_menus_unknown == true' "${run_dir}/scan-a.json" >/dev/null 2>&1; then
     log_warn "could not verify whether site A has classic nav menu(s) with items (the wp-cli query failed) — treat as unverified, not as clean (design doc §13)"

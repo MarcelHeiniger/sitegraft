@@ -401,7 +401,7 @@ phase_plan() {
   # established this exact pattern (lib/inventory.sh) — the plan's own Task
   # 2.3 pseudocode for phase_plan omitted it, an inconsistency fixed here.
   profile_load "$profile" || return 1
-  [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1)
+  [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1 || true)
   [ -n "$run_dir" ] || { log_error "no scan run found for profile ${profile} — run 'sitegraft scan' first"; return 1; }
 
   modules_discover
