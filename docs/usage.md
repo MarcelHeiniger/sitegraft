@@ -254,7 +254,7 @@ still matches (nothing sitegraft wasn't told to touch actually changed), migrate
 options carry A's exact values, `page_on_front` resolves to the correctly remapped
 page, A's domain string is absent from B's migrated content, and (if configured) an
 HTTP smoke check that B's front page actually renders with an expected marker.
-Writes a report into the run directory and exits non-zero on any hard failure.
+Writes a report into the run directory.
 
 Every check in the report is accounted for on every run — verified, explicitly not
 applicable, or explicitly unverifiable — never silently absent while `Result: PASS`
@@ -265,11 +265,29 @@ still prints. Concretely:
   before the options step and later resumed), that is reported as unverified —
   never as a plain, uncounted pass.
 - The domain-absence check always prints a line, even when no domain is configured
-  for the migration — marked not applicable rather than simply missing.
+  for the migration — marked not applicable rather than simply missing, because
+  that absence is a known fact read from the manifest, not an uncertainty.
 - `page_on_front` fails verify if A had a front page selected for migration and
   `graft` could not resolve it through `id-map.tsv` — that used to be read as "A
   never configured one" and passed silently; a missing remap is now a hard failure,
-  not an exemption.
+  not an exemption. If page_on_front was selected but its recorded value was never
+  written to disk at all (the same "interrupted, later resumed" shape as the
+  migrated-options case above), that is reported as unverified too, not folded into
+  "A never configured one".
+
+**The overall `Result:` and exit code are three-valued, not a plain pass/fail:**
+
+| Result | Meaning | Exit code |
+|---|---|---|
+| `PASS` | Every check verified correct, or was genuinely not applicable (a known fact, e.g. no domain configured for this migration). | `0` |
+| `HARD FAIL` | At least one check found a confirmed defect, or a check's own execution failed outright (a query/`wp eval` that could not run — this signals the read machinery itself may be unreliable, a strictly worse condition than "some data just wasn't produced yet"). | `1` |
+| `INCOMPLETE` | No hard failure, but at least one check had nothing to compare because an earlier step's data was never produced (a graft interrupted and later resumed). The check's own machinery is fine; there is simply nothing on disk yet to check. The graft is not confirmed good, but it is also not confirmed bad. | `2` |
+
+`HARD FAIL` outranks `INCOMPLETE` when a run has both — a confirmed defect is the
+stronger, more actionable signal. A caller scripting against `verify`'s exit code
+should treat anything non-zero as "do not consider this graft done", and treat `2`
+specifically as "re-run `graft` to resume the interrupted step(s), then verify
+again" rather than as a defect to investigate.
 
 `--dry-run` is accepted here too, but `verify` is already read-only against B by
 construction — there is nothing for it to simulate, so it just runs the real checks

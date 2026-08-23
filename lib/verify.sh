@@ -311,15 +311,39 @@ verify_domain_absent() {
 # (not the empty/null/false/0 "A never configured one" case just below), a
 # missing id-map.tsv entry is no longer ambiguous — it can only mean the
 # remap did not happen, and this now fails.
+#
+# Return codes are deliberately three-valued, not a plain boolean: 0 =
+# verified correct (or genuinely not applicable), 1 = verified WRONG (a
+# hard failure), 2 = COULD NOT VERIFY at all (see below) — phase_verify
+# tells these apart and must never fold 2 into a pass (Nat's review of PR
+# #26, same root cause as issue #23: "0 of N compared" silently read as a
+# pass is the exact defect this file exists to stop making).
+#
+# Nat's review, blocking finding: page_on_front IS selected here (the guard
+# just above already returned if it weren't), so graft_migrate_options
+# (lib/graft.sh) unconditionally writes option-page_on_front.value for it —
+# every selected key gets a file in the same pass, nothing selective about
+# it. The file's ABSENCE therefore means the migrate_options step itself
+# never reached this run_dir at all (interrupted mid-loop, not yet resumed)
+# — the identical "0 of N" shape issue #23 fixed for the options-match
+# report line, just manifesting in this sibling function instead. The OLD
+# code read the missing file via `tr -d '"' < missing_file`, silently got
+# back an empty string, and the ''|null|false|0 case right below folded
+# that into "A never configured one" — a pass on data that was simply never
+# produced, indistinguishable from the genuine "A had none" case it was
+# meant to also cover. Checking existence FIRST, before ever reading the
+# file's content, is what makes the two cases distinguishable again: a file
+# that exists and says "0" is a real, positive statement from A; a file
+# that does not exist is silence, and silence must never be read as a pass.
 verify_page_on_front() {
   local run_dir="$1" id_map_tsv="$2" manifest="$3"
   echo "$manifest" | jq -e '[.migrate[].option_keys[]?] | index("page_on_front") != null' >/dev/null 2>&1 \
     || return 0 # page_on_front was not part of this run's migrate selection — nothing to check
+  if [ ! -f "${run_dir}/option-page_on_front.value" ]; then
+    log_error "page_on_front was selected for migration but ${run_dir}/option-page_on_front.value does not exist — graft's migrate_options step for this key never ran (an interrupted run resumed past it?), so page_on_front cannot be verified"
+    return 2
+  fi
   local old_front_id
-  # A missing file here fails the `<` redirect itself (bash-level error, not
-  # tr's), which would abort under `set -e` on its own — safe only because
-  # every caller of this function (verify.sh:447) invokes it as the LHS of
-  # `||`, which neutralizes `set -e` for the whole command per bash's rules.
   old_front_id=$(tr -d '"' 2>/dev/null < "${run_dir}/option-page_on_front.value")
   case "$old_front_id" in
     ''|null|false|0) return 0 ;; # A never had a front page configured — nothing to check
@@ -427,6 +451,35 @@ verify_http_smoke() {
 # already (see this function's own header comment above) — there is nothing
 # for --dry-run to protect here, so the fix is identical in shape to scan's:
 # accept the flag, then immediately run the real reads anyway.
+#
+# Result / exit code is THREE-valued, not a plain pass/fail boolean (Nat's
+# review of PR #26, blocking finding): a run can produce checks that come
+# back verified-correct, verified-WRONG, or genuinely unable-to-be-verified
+# at all (e.g. verify_options_match's own documented "a key graft never
+# reached is not this function's job to have an opinion about" — real and
+# correct for the FUNCTION, but "N of M selected keys had nothing to
+# compare" cannot be reported as a plain pass to the OPERATOR, or CLAUDE.md's
+# first rule — "a check must distinguish verified true from could not
+# verify... report unknown, never OK" — is violated at exactly the layer
+# that's supposed to enforce it).
+#   - **PASS** (exit 0): every check either verified correct, or was
+#     genuinely not applicable (a KNOWN fact — e.g. no domain configured for
+#     this migration, nothing was selected for option migration at all —
+#     never an unknown).
+#   - **HARD FAIL** (exit 1): at least one check found a confirmed defect,
+#     OR a check's own execution machinery failed (a query/eval that could
+#     not run at all — see the orphan-check and domain-check comments below
+#     for why THOSE stay hard fails rather than becoming INCOMPLETE).
+#   - **INCOMPLETE** (exit 2): no hard failure, but at least one check had
+#     nothing to compare against because an earlier step's data was never
+#     produced (an interrupted graft resumed past it) — the check's own
+#     machinery is fine, there is simply nothing on disk yet to check. This
+#     graft is NOT confirmed good; it is also not confirmed bad. A caller
+#     testing `$?` gets a third value precisely so it cannot mistake this
+#     for either.
+# HARD FAIL outranks INCOMPLETE when a run has both: a confirmed defect is
+# the stronger, more actionable signal, and the exit code must reflect the
+# worse of the two.
 phase_verify() {
   local profile="" run_dir=""
   while [ $# -gt 0 ]; do
@@ -460,6 +513,7 @@ phase_verify() {
   local id_map_tsv="${run_dir}/id-map.tsv"
   local report="${run_dir}/verify-report.md"
   local hard_fail=0
+  local incomplete=0 incomplete_names=""
 
   {
     echo "# sitegraft verify report"
@@ -507,8 +561,15 @@ phase_verify() {
     # issue #23 describes (an interrupted run resumed past migrate_options).
     # verify_options_match's own return code stays 0 here on purpose (see
     # its header comment — a key graft never reached is not ITS job to fail
-    # on), but the report must not read as a plain pass either.
-    echo "- [ ] migrated options match A's values on B: **UNVERIFIED — 0 of ${options_total} selected option(s) could be compared** (not written to disk this run — see lib/verify.sh's verify_options_match; not a hard fail on its own, but not a pass)" >> "$report"
+    # on) — but Nat's review of PR #26 is exactly right that the REPORT
+    # cannot just print prose saying "not a pass" while the summary footer
+    # still says PASS. This is INCOMPLETE, not a hard fail and not a pass:
+    # counted separately so the final Result reflects it and the exit code
+    # is non-zero (see phase_verify's own header comment for the 3-state
+    # model).
+    echo "- [ ] migrated options match A's values on B: **UNVERIFIED — 0 of ${options_total} selected option(s) could be compared** (not written to disk this run — see lib/verify.sh's verify_options_match)" >> "$report"
+    incomplete=$((incomplete + 1))
+    incomplete_names="${incomplete_names}migrated-options "
   else
     echo "- [x] migrated options match A's values on B (${options_compared} of ${options_total} compared)" >> "$report"
   fi
@@ -523,6 +584,17 @@ phase_verify() {
   # not tell "A's domain is confirmed absent" from "that was never looked
   # at". The check must now be accounted for in every run: either genuinely
   # verified, or explicitly marked not applicable — never silently missing.
+  #
+  # Nat's review of PR #26, decided consciously rather than by omission: "no
+  # domain configured" stays a PASS (`[x]`), not INCOMPLETE, under the new
+  # 3-state model (see phase_verify's header comment) — deliberately, not
+  # because it's outside this file's scope. INCOMPLETE means "we don't know
+  # whether this is true"; "not applicable" here is a KNOWN FACT read
+  # straight from the manifest (`options.search_replace.from` is empty —
+  # this migration was never configured to rewrite a domain at all), not an
+  # uncertainty. That is exactly the distinction issue #22's own acceptance
+  # criteria draw ("verified, or explicitly not applicable, or not
+  # verifiable" — three different things, not two).
   # ---------------------------------------------------------------------------
   local domain; domain=$(echo "$manifest" | jq -r '.options.search_replace.from // ""')
   [ "$domain" = "null" ] && domain=""
@@ -538,11 +610,20 @@ phase_verify() {
   # --- page_on_front resolves to the CORRECT remapped page (finding B3;
   # issue #12 — the manifest is what lets verify_page_on_front tell "wasn't
   # part of this run" apart from "was selected but the remap didn't happen",
-  # see that function's own header comment) ----------------------------------
-  local front_result=0
-  verify_page_on_front "$run_dir" "$id_map_tsv" "$manifest" 2>>"$report" || front_result=1
-  if [ "$front_result" -eq 0 ]; then
+  # see that function's own header comment). verify_page_on_front's exit
+  # code is three-valued (0/1/2 — see its own header comment), so this MUST
+  # capture the actual code with `|| front_rc=$?`, not collapse every
+  # non-zero into 1 the way the rest of this file's `|| x=1` idiom does —
+  # doing that here would silently turn its INCOMPLETE (2) into a HARD FAIL.
+  # ----------------------------------------------------------------------
+  local front_rc=0
+  verify_page_on_front "$run_dir" "$id_map_tsv" "$manifest" 2>>"$report" || front_rc=$?
+  if [ "$front_rc" -eq 0 ]; then
     echo "- [x] page_on_front resolves to the correctly remapped page (or A never configured one)" >> "$report"
+  elif [ "$front_rc" -eq 2 ]; then
+    echo "- [ ] page_on_front: **UNVERIFIED — selected for migration but its recorded value was never written this run** (see above; not a hard fail on its own, but not a pass)" >> "$report"
+    incomplete=$((incomplete + 1))
+    incomplete_names="${incomplete_names}page_on_front "
   else
     echo "- [ ] **HARD FAIL: page_on_front does not resolve to the correctly remapped page** — see above" >> "$report"
     hard_fail=1
@@ -559,7 +640,24 @@ phase_verify() {
   # as UNKNOWN and IS a hard failure (an unverified check must never pass
   # silently); only a query that ran and genuinely found nothing prints the
   # pass line, and only a query that ran and found real orphans prints the
-  # (non-blocking) warning. -------------------------------------------------
+  # (non-blocking) warning.
+  #
+  # Nat's review of PR #26 asked, given the new INCOMPLETE state (see
+  # phase_verify's header comment), whether this belongs there instead of
+  # HARD FAIL — it does not, and the distinction is real: INCOMPLETE is for
+  # a check whose OWN machinery is fine but had nothing to compare because
+  # an earlier step's data was never produced (migrated-options/
+  # page_on_front above — the read succeeds, the file just isn't there yet,
+  # a known and well-understood shape of an interrupted, resumed run). A
+  # QUERY ERROR here means graft_check_orphan_parents' own read against B
+  # failed to execute — wp-cli or the DB connection itself is broken RIGHT
+  # NOW. That is not "some earlier step's data is missing", it is "the tool
+  # this entire phase depends on may not be trustworthy for any of the
+  # OTHER checks either" — a strictly worse, more urgent signal that HARD
+  # FAIL communicates correctly and INCOMPLETE would understate. Same
+  # reasoning applies to verify_domain_absent's own fail-closed "could not
+  # run" branch below (a `wp eval` that errors), left unchanged for the
+  # identical reason. ---------------------------------------------------
   local orphans orphan_rc
   orphans=$(graft_check_orphan_parents 2>>"$report") && orphan_rc=0 || orphan_rc=$?
   if [ "$orphan_rc" -ne 0 ]; then
@@ -602,15 +700,24 @@ phase_verify() {
     echo "- [ ] **REMINDER: re-license on B before going live** — copied from A and activated: $(echo "$copied" | tr '\n' ' ')" >> "$report"
   fi
 
+  # --- overall result: three-valued, not a plain pass/fail boolean (Nat's
+  # review of PR #26 — see this function's own header comment for the full
+  # model). HARD FAIL outranks INCOMPLETE: a confirmed defect is checked
+  # first and wins regardless of how many checks were also incomplete. ------
+  local exit_code=0
   {
     echo
-    if [ "$hard_fail" -eq 0 ]; then
-      echo "**Result: PASS**"
-    else
+    if [ "$hard_fail" -ne 0 ]; then
       echo "**Result: HARD FAIL — see the item(s) above marked HARD FAIL. Do not consider this graft done.**"
+      exit_code=1
+    elif [ "$incomplete" -ne 0 ]; then
+      echo "**Result: INCOMPLETE — ${incomplete} check(s) could not be verified: ${incomplete_names}. This graft is not confirmed — re-run \`sitegraft graft\` to resume the interrupted step(s), then verify again.**"
+      exit_code=2
+    else
+      echo "**Result: PASS**"
     fi
   } >> "$report"
 
   log_info "verify report written: ${report}"
-  return "$hard_fail"
+  return "$exit_code"
 }

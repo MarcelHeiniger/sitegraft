@@ -390,6 +390,29 @@ setup() {
   [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }
 
+# --- Nat's review of PR #26: the same "0 of N" shape #23 fixed for
+# migrated-options exists here too. page_on_front IS selected, so
+# graft_migrate_options unconditionally writes option-page_on_front.value —
+# its absence means the migrate_options step itself never reached this key
+# (an interrupted run, not yet resumed). The OLD code read the missing file
+# via `tr -d '"' < missing_file`, got an empty string back, and the
+# ''|null|false|0 case below silently folded that into "A never configured
+# one" — a PASS on data that was simply never produced. This must return a
+# THIRD, distinct exit code (2) so phase_verify can report it as INCOMPLETE,
+# never as a plain pass.
+@test "verify_page_on_front returns exit code 2 (INCOMPLETE, not a pass) when page_on_front is selected but its value file was never written" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  # option-page_on_front.value deliberately NOT created — selected, but
+  # graft's migrate_options step never reached it.
+  local tsv="${run_dir}/id-map.tsv"
+  : > "$tsv"
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  run verify_page_on_front "$run_dir" "$tsv" '{"migrate":{"core-wp":{"option_keys":["page_on_front"]}}}'
+  [ "$status" -eq 2 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
 # --- verify_nav_present ------------------------------------------------------
 
 @test "verify_nav_present fails when wp_navigation was migrated but B has no navigation post" {
@@ -909,4 +932,143 @@ EOF
   run phase_verify --profile t --run "$RUN_DIR"
   [ "$status" -eq 0 ]
   grep -q "migrated options match A's values on B (2 of 2 compared)" "${RUN_DIR}/verify-report.md"
+}
+
+# --- Nat's blocking review of PR #26: an UNVERIFIED line must not let
+# Result: PASS print, and the overall exit code must be non-zero ---------
+#
+# The first pass of the #23 fix wrote "UNVERIFIED" into the report body but
+# never told phase_verify's own hard_fail bookkeeping about it — the report
+# contradicted itself (a line saying "not a pass" under a footer saying
+# "Result: PASS"), and CLAUDE.md's first rule is exactly "a check must
+# distinguish verified true from could not verify... report unknown, NEVER
+# OK". PASS is OK. This introduces a genuine third result state —
+# INCOMPLETE — distinct from both PASS (0) and HARD FAIL (1), with its own
+# exit code (2), so a caller testing $? cannot mistake "some check could not
+# run" for "everything passed" OR for "something is confirmed wrong".
+@test "phase_verify's overall Result is INCOMPLETE (not PASS) and exit status is non-zero when migrated options could not be compared" {
+  setup_phase_verify_fixture
+  cat > "${RUN_DIR}/manifest.json" <<'EOF'
+{
+  "frozen": true,
+  "checksums_protected_pre_graft": {},
+  "migrate": {"etch": {"option_keys": ["etch_settings", "etch_styles"]}},
+  "protect": {"_unclaimed": {"tables": []}},
+  "stack": {},
+  "options": {"search_replace": {"from": "", "to": ""}}
+}
+EOF
+  rm -f "${RUN_DIR}"/option-*.value # nothing written this run — interrupted before migrate_options
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 2 ]
+  grep -q "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md"
+  ! grep -q "Result: PASS" "${RUN_DIR}/verify-report.md"
+  ! grep -q "Result: HARD FAIL" "${RUN_DIR}/verify-report.md"
+  # the INCOMPLETE result must name which check(s) it covers, not just say
+  # "something, somewhere" — this is the same "list the affected checks"
+  # requirement as the HARD FAIL summary line already has.
+  grep "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md" | grep -qi "migrated-options"
+}
+
+@test "phase_verify's Result stays PASS with exit status 0 when nothing at all was selected for option migration (0 of 0 is not incomplete)" {
+  setup_phase_verify_fixture # shared fixture only selects page_on_front (excluded from the options count) -> 0 of 0
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  grep -q "Result: PASS" "${RUN_DIR}/verify-report.md"
+}
+
+@test "phase_verify's Result stays PASS with exit status 0 when no domain was configured (not applicable is a known fact, not an uncertainty)" {
+  setup_phase_verify_fixture
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  grep -q "Result: PASS" "${RUN_DIR}/verify-report.md"
+}
+
+# --- Same defect, sibling function: page_on_front selected but its value
+# file was never written (graft interrupted before migrate_options reached
+# it) used to silently fold into "A never configured one" via the missing
+# file -> empty string -> ''|null|false|0 case. Now returns exit code 2
+# (verify_page_on_front's own test above), and phase_verify must turn that
+# into INCOMPLETE, never a pass.
+@test "phase_verify's overall Result is INCOMPLETE when page_on_front was selected but its value file was never written" {
+  setup_phase_verify_fixture
+  rm -f "${RUN_DIR}/option-page_on_front.value" # selected (see fixture manifest) but never written this run
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 2 ]
+  grep -q "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md"
+  grep "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md" | grep -qi "page_on_front"
+}
+
+# --- HARD FAIL must outrank INCOMPLETE when a run has both: a confirmed
+# defect is a stronger, more actionable signal than "some other check
+# lacked data", and the exit code must reflect the worse of the two.
+@test "phase_verify's Result is HARD FAIL, not INCOMPLETE, when a run has both a hard failure and an incomplete check (exit code stays 1)" {
+  setup_phase_verify_fixture
+  local pre_sum; pre_sum=$(backup_checksum "PRE-GRAFT PROTECTED CONTENT")
+  cat > "${RUN_DIR}/manifest.json" <<EOF
+{
+  "frozen": true,
+  "checksums_protected_pre_graft": {"fakebooking": "sha256:${pre_sum}"},
+  "migrate": {"etch": {"option_keys": ["etch_settings"]}, "core-wp": {"option_keys": ["page_on_front"]}},
+  "protect": {"fakebooking": {"tables": ["fakebooking_reservations"]}},
+  "stack": {},
+  "options": {"search_replace": {"from": "", "to": ""}}
+}
+EOF
+  rm -f "${RUN_DIR}/option-etch_settings.value" # etch_settings selected but never written -> incomplete
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      eval) echo "wp_" ;;
+      db) echo "POST-GRAFT CONTAMINATED CONTENT" ;; # deliberately different -> HARD FAIL
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 1 ]
+  grep -q "Result: HARD FAIL" "${RUN_DIR}/verify-report.md"
+  ! grep -q "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md"
 }
