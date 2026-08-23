@@ -104,6 +104,13 @@ is headed for:
 | `protect` | `scan-b.json` | the selection describes what must not be touched on B |
 | `tables` (any bucket) | `scan-b.json` | migration never copies tables — `manifest_add_migrate` takes no tables argument (design doc §3.2), so a table claim can only ever be about B |
 
+One ordering consequence worth knowing: `tables` is expanded *before* detection,
+for every discovered module, because whether a module owns tables is what decides
+which side it is detected against first (`plan_defaults`' own comment explains
+why). So a `<mod>_tables_dynamic` that fails aborts the run even for a module
+present on neither site. Accepted rather than worked around — a module that cannot
+answer is a defect either way, and no shipped module declares one.
+
 Because dynamic names land in the manifest exactly like static ones, `plan`'s
 interactive selection lists and toggles each of them individually, and
 `_plan_apply_selection` classifies them from the manifest's own lists — never by
