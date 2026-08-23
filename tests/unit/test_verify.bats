@@ -1522,3 +1522,49 @@ EOF
   local nav_line; nav_line=$(grep -F -- "] expected navigation" "${RUN_DIR}/verify-report.md")
   [ "$nav_line" = "- [x] expected navigation (not applicable — wp_navigation was not part of this run's migrate selection)" ]
 }
+
+# --- Re-review of the fix-pack (both reviewers, converging from two
+# different angles on the same class): the marker `case` blocks for
+# page_on_front and navigation each got a fail-closed default branch, but
+# the DOMAIN_SCOPE one did not — and the nav one had no test. Both branches
+# are UNREACHABLE today (every success path emits its marker as its last
+# echo). That is exactly why they need tests: their whole reason to exist is
+# the future success path that forgets its marker, and a guard nothing holds
+# in place is the guard the next refactor deletes without anything saying so.
+@test "phase_verify reports the domain check as UNVERIFIED when it succeeds without reporting the scope it examined" {
+  setup_phase_verify_fixture
+  jq '.options.search_replace.from = "https://a.example.com"' "${RUN_DIR}/manifest.json" > "${RUN_DIR}/m.tmp" && mv "${RUN_DIR}/m.tmp" "${RUN_DIR}/manifest.json"
+  verify_domain_absent() { return 0; } # a future success path that forgot its DOMAIN_SCOPE marker
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;; option) echo "105" ;; post) return 0 ;; *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 2 ]
+  grep -q "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md"
+  grep "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md" | grep -qi "domain-absence"
+  # and above all it must NOT tick the box while announcing a zero scope —
+  # that is finding B1 walking back in through a different door, on the very
+  # line B1 was filed against.
+  ! grep -qF -- "- [x] A's domain string is absent" "${RUN_DIR}/verify-report.md"
+  ! grep -qF "0 migrated post(s) + 0 migrated option(s) scanned" "${RUN_DIR}/verify-report.md"
+}
+
+@test "phase_verify reports the navigation check as UNVERIFIED when it succeeds without saying which of its outcomes applied" {
+  setup_phase_verify_fixture
+  verify_nav_present() { return 0; } # a future success path that forgot its marker
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;; option) echo "105" ;; post) return 0 ;; *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 2 ]
+  grep -q "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md"
+  grep "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md" | grep -qi "navigation"
+}

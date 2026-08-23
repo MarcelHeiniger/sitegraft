@@ -564,6 +564,24 @@ verify_http_smoke() {
 # count, an ID) or names the KNOWN fact that made it not applicable. "It
 # passed" and "there was nothing to look at" must never render the same.
 #
+# Three checks below (domain absence, page_on_front, navigation) report
+# their outcome to this function through a marker printed on stdout, and
+# each of the three `case` blocks that reads one has a fail-closed DEFAULT
+# branch: a success with no recognizable marker is reported UNVERIFIED, not
+# assigned whichever claim happened to be listed first.
+#
+# All three default branches are UNREACHABLE as this file stands — every
+# success path ends in its own `echo <marker>`. They are kept, and tested
+# anyway, on purpose. Their entire reason to exist is the success path
+# somebody adds later and forgets to mark, and an untested guard is the
+# guard the next refactor deletes with nothing to say otherwise. That is not
+# hypothetical here: the domain one was MISSING until a re-review found it,
+# and a success without its marker printed `- [x] ... (0 migrated post(s) +
+# 0 migrated option(s) scanned)` under `Result: PASS` with exit 0 — the same
+# fail-open this file exists to close, on the very line it had just been
+# closed on. The nav one existed but had no test, and could be replaced with
+# a silent tick without a single test noticing.
+#
 # Deliberately NOT claimed here: that `- [ ]` now means UNVERIFIED and
 # nothing else. Three other lines below still use an unticked box for a
 # non-blocking FINDING (orphan parents found, the best-effort HTTP smoke
@@ -735,15 +753,30 @@ phase_verify() {
     # run where nothing was ever examined.
     local domain_output="" domain_rc=0
     domain_output=$(verify_domain_absent "$run_dir" "$id_map_tsv" "$manifest" "$domain" 2>>"$report") || domain_rc=$?
-    local domain_posts=0 domain_options=0
+    # The scope marker is not optional decoration: a success WITHOUT it left
+    # the counters at their initialized 0 and printed
+    #   `- [x] ... (0 migrated post(s) + 0 migrated option(s) scanned)`
+    # under `Result: PASS`, exit 0 — finding B1 walking back in through a
+    # different door, on the exact line B1 was filed against. So a missing
+    # marker is UNVERIFIED, never a tick, exactly like the page_on_front and
+    # navigation cases below. `domain_marker_seen` (rather than testing the
+    # counters for 0) keeps "the check said zero" separable from "the check
+    # said nothing"; a genuine zero scope is already handled inside
+    # verify_domain_absent, which returns 2 for it.
+    local domain_posts=0 domain_options=0 domain_marker_seen=0
     case "$domain_output" in
       *DOMAIN_SCOPE:*)
         local domain_scope="${domain_output##*DOMAIN_SCOPE:}"
         domain_posts="${domain_scope%%:*}"
         domain_options="${domain_scope##*:}"
+        domain_marker_seen=1
         ;;
     esac
-    if [ "$domain_rc" -eq 0 ]; then
+    if [ "$domain_rc" -eq 0 ] && [ "$domain_marker_seen" -eq 0 ]; then
+      echo "- [ ] A's domain string absent from the content graft imported: **UNVERIFIED — the check reported success without reporting the scope it examined** (a success path added without its marker — see lib/verify.sh's verify_domain_absent)" >> "$report"
+      incomplete=$((incomplete + 1))
+      incomplete_names="${incomplete_names}domain-absence "
+    elif [ "$domain_rc" -eq 0 ]; then
       # The counts are the point, not decoration: "(migrated posts + migrated
       # options)" was a claim about what had been examined that the check
       # could make while having examined nothing at all.
