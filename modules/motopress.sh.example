@@ -7,7 +7,7 @@
 motopress_name() { echo "MotoPress Hotel Booking"; }
 
 motopress_detect() {
-  jq -e '.plugins[] | select(.slug == "motopress-hotel-booking")' "$1" >/dev/null 2>&1
+  jq -e '.plugins[] | select(.name == "motopress-hotel-booking")' "$1" >/dev/null 2>&1
 }
 
 motopress_post_types() {
