@@ -5,7 +5,7 @@
 > else to look up (no vault, no API, no Slack): idea, infra, status, todo, definition
 > of done.
 >
-> **STATUS: in progress (v1 feature-complete — `1.0.0-rc2`, pending the pre-`1.0.0` gate)**
+> **STATUS: in progress (v1 feature-complete — `1.0.0-rc4`, pending the pre-`1.0.0` gate)**
 > **Last updated: 2026-08-20** (via "update the project")
 
 ---
@@ -44,7 +44,7 @@ DDEV harness. PR #6 went through a double review (Kimi + Viktor) that found and 
 fix-pack then closed two review-blocking issues (`verify --dry-run` was producing
 false HARD FAILs; `graft --dry-run` was writing real resumability markers, which
 could make a REAL `graft` right after silently skip the whole pipeline) plus several
-smaller findings — `SITEGRAFT_VERSION` is now `1.0.0-rc2`, not a plain `1.0.0` yet,
+smaller findings — `SITEGRAFT_VERSION` is now `1.0.0-rc4`, not a plain `1.0.0` yet,
 because the pre-`1.0.0` DoD gate (a real dry run against a genuine A/B pair, not the
 DDEV harness) is still open and deliberately not closeable by more DDEV-only work.
 No pilot run has happened yet.

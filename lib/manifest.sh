@@ -96,6 +96,32 @@ manifest_validate() {
     log_error "manifest invalid: ${overlap_tb} table(s) present in both migrate and protect"
     bad=true
   fi
+
+  # B4 (third review round, second reviewer): the SAME rule module_selection applies
+  # (lib/modules.sh), applied at the second entry point. module_selection only
+  # ever runs on the plan_defaults path — a SITEGRAFT_MANIFEST_PREFILLED or
+  # hand-edited manifest, both documented workflows for repairing or resuming
+  # a run, reach `graft` without passing through it. A name carrying a comma
+  # or whitespace then survives into graft_export_wxr's comma-joined
+  # `--post_type=` CSV and into graft_migrate_options' key loop, where it
+  # splits into two names nobody planned and writes them to B's live database.
+  # One enforcement point is elegant and fragile; this is the belt.
+  #
+  # jq does the scan, not a bash loop, so nothing has to survive word
+  # splitting in the very function whose job is to reject names that cannot.
+  local malformed
+  malformed=$(echo "$manifest" | jq -r '
+    [ (.migrate // {}), (.protect // {}) ]
+    | map(to_entries[]?.value | (.post_types[]?, .option_keys[]?, .tables[]?))
+    | flatten
+    | map(select(type == "string" and test("[,[:space:]]")))
+    | unique
+    | join(", ")')
+  if [ -n "$malformed" ]; then
+    log_error "manifest invalid: name(s) carrying a comma or whitespace — ${malformed}. No WordPress post type, option key or table name can contain either, and such a name cannot survive graft's comma-joined post-type CSV or its option-key loop: it would silently be read as two different names and written to B under both. Rebuild the manifest with 'sitegraft plan'."
+    bad=true
+  fi
+
   [ "$bad" = false ]
 }
 
@@ -223,7 +249,16 @@ manifest_compute_unclaimed() {
          | ($t | if startswith($p) then .[($p | length):] else . end) as $suffix
          | select(($claimed | index($suffix)) | not)
          | select(($core    | index($suffix)) | not)
-         | $t ]' 2>/dev/null || echo '[]')
+         | $t ]') || {
+      # Fail closed. `2>/dev/null || echo '[]'` — the shape this line was first
+      # written in — turns any jq error into "no unclaimed tables", which is
+      # indistinguishable from a site that genuinely has none. That silently
+      # reinstates the exact defect this function was changed to fix: an empty
+      # list means backup takes no checksum for anything outside a module, and
+      # verify then reports "protected data unchanged" having compared nothing.
+      log_error "could not compute the unclaimed table list from scan-b.json — refusing to write a manifest whose _unclaimed.tables would be silently empty"
+      return 1
+    }
   fi
 
   echo "$manifest" | jq --argjson u "$unclaimed_pt" --argjson uo "$unclaimed_ok" --argjson ut "$unclaimed_tb" \

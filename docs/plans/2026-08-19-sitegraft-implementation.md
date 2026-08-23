@@ -405,7 +405,8 @@ Expected: PASS (3 tests)
       copied verbatim so the repo ships a real, working example):
 
 ```sh
-# profiles/example.conf — sitegraft profile. No secrets here — safe to commit.
+# profiles/example.conf — sitegraft profile template. No secrets here, but a
+# real profile holds real hosts and paths, so profiles/*.conf are gitignored.
 
 SITE_A_ALIAS="a"
 SITE_A_SSH_HOST="user@host-a.example.com"

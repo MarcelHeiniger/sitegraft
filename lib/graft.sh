@@ -1149,9 +1149,28 @@ graft_mark_step() { is_dry_run && return 0; touch "${1}/graft.${2}.done"; }
 # safety property this function already had for everything else.
 graft_migrate_options() {
   local run_dir="$1" manifest="$2" domain_from="${3:-}" domain_to="${4:-}"
-  local key
-  for key in $(echo "$manifest" | jq -r '[.migrate[].option_keys[]?] | unique[]'); do
-    local value
+  local keys key
+  keys=$(echo "$manifest" | jq -r '[.migrate[].option_keys[]?] | unique[]')
+  # A read loop over fd 3, not `for key in $(...)`. The old form relied on
+  # UNQUOTED word splitting, so an option key containing whitespace became
+  # two keys and `wp option update` ran twice against names nobody planned —
+  # on B's live database. module_selection rejects such a name, but only on
+  # the plan_defaults path: a SITEGRAFT_MANIFEST_PREFILLED or hand-edited
+  # manifest reaches here without ever passing through it. manifest_validate
+  # now applies the same rule (second entry point, same rule), and this loop
+  # is the third line: a manifest edited AFTER being frozen never passes
+  # through validation again either. fd 3 rather than stdin, the discipline
+  # module_selection and _plan_prompt_items already follow, because the loop
+  # body runs wp-cli over ssh and must leave fd 0 alone.
+  while IFS= read -r key <&3; do
+    [ -n "$key" ] || continue
+    case "$key" in
+      *,*|*[[:space:]]*)
+        log_error "graft: manifest option key '${key}' contains a comma or whitespace — refusing to migrate options from a manifest that cannot be read unambiguously (such a name would word-split into two different keys and run 'wp option update' against names nobody planned, on B's live database). This manifest did not come from 'sitegraft plan' unmodified; rebuild it."
+        return 1
+        ;;
+    esac
+    local value get_rc=0
     # Fix-pack bug found live (DDEV harness, running MAJOR-B's new
     # graft --dry-run assertion end to end for the first time): wp_remote
     # (lib/inventory.sh) wraps EVERY call in run_or_echo, including a plain
@@ -1172,7 +1191,22 @@ graft_migrate_options() {
     # This mirrors the same principle scan's own M6 fix and verify's own
     # MAJOR-A fix already establish: reads needed to compute a correct
     # dry-run PREVIEW must run for real; only writes get simulated.
-    value=$(SITEGRAFT_DRY_RUN=0 wp_remote a option get "$key" --format=json 2>/dev/null || echo 'null')
+    # N3 (third review round): this used to be `... || echo 'null'`, which
+    # wrote the LITERAL string `null` for any key A does not have, and then
+    # pushed it to B — ERASING B's own value. Reproduced: a site A without
+    # Etch's Loop Manager has no `etch_cfs`, but `etch_option_keys` is a
+    # static allowlist that names it regardless, so graft ran
+    # `option update etch_cfs null` on B. core_wp_option_keys_dynamic's own
+    # header comment already warned about exactly this mechanism ("claiming a
+    # key A does not have would BLANK B's own theme_mods") — documented
+    # there, unguarded here. A key A does not have is nothing to migrate, so
+    # it is skipped, out loud, and no `option-<key>.value` file is left
+    # behind for a post_import hook to act on either.
+    value=$(SITEGRAFT_DRY_RUN=0 wp_remote a option get "$key" --format=json 2>/dev/null) || get_rc=$?
+    if [ "$get_rc" -ne 0 ]; then
+      log_warn "graft: A has no '${key}' option (wp option get exited ${get_rc}) — leaving B's own value untouched. Migrating nothing is the only safe reading: writing the literal 'null' here, which is what this used to do, would have ERASED whatever B had under that key."
+      continue
+    fi
     if [ -n "$domain_from" ]; then
       # jq's own decode/encode round-trip, deliberately NOT a bash/sed
       # string or regex replace: `value` is valid JSON text (from
@@ -1199,7 +1233,7 @@ graft_migrate_options() {
       page_on_front|page_for_posts) continue ;; # remapped by core_wp_post_import, §9.3
     esac
     run_or_echo wp_remote b option update "$key" "$value" --format=json
-  done
+  done 3<<< "$keys"
 }
 
 # design doc §9.4: two passes (plain + JSON-escaped, since Etch stores some

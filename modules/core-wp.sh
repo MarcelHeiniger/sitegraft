@@ -49,6 +49,54 @@ page_for_posts
 EOF
 }
 
+# Issue #15, closed through the extended module contract rather than by a
+# special case in `plan` (docs/decisions/0007-module-dynamic-selections.md).
+# The active theme's customizer settings live in `theme_mods_<stylesheet>`,
+# which belongs with a migrated design — but its KEY NAME depends on the
+# site's active theme slug, so no static list can name it. It is declared
+# here, resolved from the scan `plan` hands this function.
+#
+# WHY core-wp and not etch, where the gap was originally noted: `theme_mods_`
+# is written by WordPress core for whatever theme is active, on classic and
+# block themes alike. modules/etch.sh's own §-note explains why it keeps
+# wp_template/wp_global_styles (they are core post types that only carry a
+# design worth migrating when the target's theme is being replaced by a block
+# theme, which is what etch_detect identifies) — theme_mods_ has no such
+# condition attached, so it goes with the module that claims core's own
+# content. etch.sh's KNOWN GAP note now points here.
+#
+# The key name is correct for B as well as for A: graft's §12 stack
+# precondition refuses to run unless B's active theme matches A's, so the
+# option lands on B under the name B's own theme reads.
+#
+# Two fail-closed cases, deliberately distinguished from "nothing to claim":
+#   - the scan records no active theme  -> error. There is no such WordPress
+#     site; a scan saying otherwise cannot be reasoned from.
+#   - the scan has no options list      -> error, for the same reason. Its
+#     absence would otherwise be indistinguishable from "A never customized
+#     this theme", and those must not produce the same answer.
+# The genuine "A never customized this theme" case (an active theme with no
+# theme_mods_ row) returns nothing, successfully — and must: graft_migrate_
+# options (lib/graft.sh) falls back to the literal `null` when `wp option
+# get` finds nothing on A and writes that to B, so claiming a key A does not
+# have would BLANK B's own theme_mods.
+core_wp_option_keys_dynamic() {
+  local scan_json="$1" slug
+
+  if ! jq -e 'has("options") and (.options | type == "array")' "$scan_json" >/dev/null 2>&1; then
+    log_error "core-wp: ${scan_json} has no options list — cannot tell whether this site stored theme_mods for its active theme, so refusing to guess (re-run 'sitegraft scan')"
+    return 1
+  fi
+
+  slug=$(jq -r '.active_theme.stylesheet // .active_theme.name // ""' "$scan_json" 2>/dev/null) || slug=""
+  if [ -z "$slug" ] || [ "$slug" = "null" ]; then
+    log_error "core-wp: ${scan_json} records no active theme (active_theme.stylesheet) — every WordPress site has one, so this scan cannot be trusted to say which theme_mods_ option belongs to the design (re-run 'sitegraft scan')"
+    return 1
+  fi
+
+  jq -r --arg k "theme_mods_${slug}" '.options[]?.option_name | select(. == $k)' "$scan_json"
+}
+
 # design doc §9.3: page_on_front/page_for_posts on A hold A's OWN page IDs —
 # a plain `wp option update` would copy the wrong ID onto B. Remaps each
 # through id-map.tsv (Task 4.1's mu-plugin log, §7) after the WXR import has
@@ -118,5 +166,117 @@ core_wp_post_import() {
     else
       log_warn "core-wp post_import: A's ${key} (page ${old_id}) has no corresponding entry in id-map.tsv — leaving B's ${key} unchanged (the page was likely not included in this run's migrate selection)"
     fi
+  done
+
+  _core_wp_fix_theme_mods "$run_dir" "$id_map_tsv" "$wp_cmd_b"
+}
+
+# B2 (third review round), and the same class of bug as page_on_front just
+# above: `theme_mods_<slug>` is FULL of A's own local IDs, and
+# core_wp_option_keys_dynamic is what started migrating it.
+#
+# graft_migrate_options pushes that option to B verbatim; graft_remap_
+# attachment_ids only ever rewrites post_content/post_excerpt, never an option
+# value. So every id inside theme_mods_ travels to B unchanged:
+#
+#   custom_logo          an ATTACHMENT id      -> remapped through id-map.tsv
+#   nav_menu_locations   TERM ids per location -> removed
+#   custom_css_post_id   a POST id             -> removed
+#
+# custom_logo is the dangerous one, and its failure mode is the bad kind: if B
+# happens to own an attachment carrying A's number, B's logo silently becomes
+# a DIFFERENT, WRONG image rather than a missing one. Nothing on B looks
+# broken, so nothing prompts a second look.
+#
+# The other two are REMOVED, not remapped, because there is nothing to remap
+# through: sitegraft v1 migrates neither classic nav menus (design doc §13)
+# nor `custom_css`, so B has no counterpart for those ids and id-map.tsv has
+# no rows for them. Removing the key restores WordPress's own "not
+# configured" default; carrying A's number would point B's theme at whatever
+# term or post happens to hold it.
+#
+# And when id-map.tsv has no row for the logo, the key is DROPPED, out loud,
+# rather than guessed at — CLAUDE.md's "a check must distinguish verified-true
+# from could-not-verify", applied to a value rather than to a check.
+#
+# Runs after graft_migrate_options by construction (graft_run_module_
+# post_import is the step immediately after it, lib/graft.sh), so the
+# option-*.value files this reads are already on disk and B has already
+# received the unfixed value this corrects.
+_core_wp_fix_theme_mods() {
+  local run_dir="$1" id_map_tsv="$2" wp_cmd_b="$3"
+  local f key value fixed removed logo_old logo_new
+
+  # A glob, because the key name carries the active theme's slug and is only
+  # knowable from the scan (that is the whole point of #15). `nullglob` is not
+  # available on the bash 3.2 this repo targets in the portable way this needs,
+  # so the no-match case is handled with the usual existence test instead.
+  for f in "${run_dir}"/option-theme_mods_*.value; do
+    [ -f "$f" ] || continue
+    key=$(basename "$f" .value); key="${key#option-}"
+    value=$(cat "$f")
+    # A value that is not an object carries no ids to fix. Not an error: an
+    # unset theme_mods_ row legitimately reads as `false` or `null`.
+    printf '%s' "$value" | jq -e 'type == "object"' >/dev/null 2>&1 || continue
+
+    removed=""
+    fixed="$value"
+
+    logo_old=$(printf '%s' "$value" | jq -r '.custom_logo // empty' 2>/dev/null) || logo_old=""
+    case "$logo_old" in
+      ''|null|false|0) logo_old="" ;;
+    esac
+    if [ -n "$logo_old" ]; then
+      logo_new=""
+      if [ -f "$id_map_tsv" ]; then
+        logo_new=$(awk -F'\t' -v old="$logo_old" '$1==old && $3=="attachment"{print $2}' "$id_map_tsv" 2>/dev/null | head -1)
+      fi
+      # An id that is not a plain integer never reaches `jq --argjson` (nit 2):
+      # --argjson would fail to parse it, `fixed` would come back EMPTY, and
+      # the push below would write that empty value to B — the same "BLANK B's
+      # own theme_mods" this module warns about elsewhere, arrived at from the
+      # other side. Unreachable today (column 2 is written by the mapping
+      # mu-plugin from a WordPress post ID), so this is not a bug being fixed
+      # but a guard on a path a future change could open without saying so.
+      # A malformed id is treated exactly like a missing one: the key is
+      # dropped, out loud.
+      case "$logo_new" in
+        ''|*[!0-9]*) logo_new="" ;;
+      esac
+      if [ -n "$logo_new" ]; then
+        fixed=$(printf '%s' "$fixed" | jq -c --argjson n "$logo_new" '.custom_logo = $n')
+      else
+        fixed=$(printf '%s' "$fixed" | jq -c 'del(.custom_logo)')
+        removed="${removed} custom_logo(attachment ${logo_old}, no id-map.tsv row — dropped rather than pointed at whatever B numbers ${logo_old})"
+      fi
+    fi
+
+    if printf '%s' "$fixed" | jq -e 'has("nav_menu_locations")' >/dev/null 2>&1; then
+      fixed=$(printf '%s' "$fixed" | jq -c 'del(.nav_menu_locations)')
+      removed="${removed} nav_menu_locations(classic menus are not migrated, design doc §13)"
+    fi
+    if printf '%s' "$fixed" | jq -e 'has("custom_css_post_id")' >/dev/null 2>&1; then
+      fixed=$(printf '%s' "$fixed" | jq -c 'del(.custom_css_post_id)')
+      removed="${removed} custom_css_post_id(custom_css is not migrated)"
+    fi
+
+    [ "$fixed" != "$value" ] || continue
+    # Backstop for the same failure (nit 2): every rewrite above goes through
+    # `jq`, and a `jq` that fails leaves `fixed` empty — which then propagates
+    # unchanged through the remaining steps and would be written to B as an
+    # empty option. An empty result is never a legitimate outcome here (the
+    # value was a non-empty object one line above), so it can only mean a
+    # rewrite failed. Leave B's value alone and say so.
+    if [ -z "$fixed" ]; then
+      log_warn "core-wp post_import: rewriting ${key} produced an empty value — a jq step must have failed. Leaving B's ${key} exactly as it is: writing this would BLANK the option rather than fix it. Report this with the run directory."
+      continue
+    fi
+
+    [ -z "$removed" ] || log_warn "core-wp post_import: rewrote B's ${key} — removed:${removed}. These held A's own local IDs and had no counterpart on B."
+    printf '%s' "$fixed" > "$f"
+    # run_or_echo, for the same reason the page_on_front write above uses it:
+    # module post_import hooks run unconditionally, dry-run included.
+    # shellcheck disable=SC2086 # intentionally unquoted: wp_cmd_b may be a multi-word wrapper (e.g. ddev exec ... wp) and must word-split
+    run_or_echo $wp_cmd_b option update "$key" "$fixed" --format=json
   done
 }

@@ -110,8 +110,14 @@ ln -s "$(pwd)/bin/sitegraft" /usr/local/bin/sitegraft
 ## 3. Set up a profile
 
 A profile is a file at `profiles/<name>.conf` describing the A/B site pair —
-hosts, WordPress install paths, and how to invoke `wp-cli` on each. Profiles are
-**safe to commit**: they never contain secrets.
+hosts, WordPress install paths, and how to invoke `wp-cli` on each. Profiles
+**never contain secrets** — but they do contain real infrastructure details:
+real hostnames, real filesystem paths, real site URLs, a real SSH user. That is
+exactly the material `CLAUDE.md` keeps out of this public repo, so profiles are
+**local-only, not committed** — `.gitignore` excludes every `profiles/*.conf`
+except `profiles/example.conf` itself, which holds only placeholders. A newly
+created profile is untracked by default; verify with `git status` before you
+ever `git add` one by hand.
 
 ```sh
 cp profiles/example.conf profiles/my-migration.conf
@@ -266,7 +272,64 @@ still matches (nothing sitegraft wasn't told to touch actually changed), migrate
 options carry A's exact values, `page_on_front` resolves to the correctly remapped
 page, A's domain string is absent from B's migrated content, and (if configured) an
 HTTP smoke check that B's front page actually renders with an expected marker.
-Writes a report into the run directory and exits non-zero on any hard failure.
+Writes a report into the run directory.
+
+Every check in the report is accounted for on every run — verified, explicitly not
+applicable, or explicitly unverifiable — never silently absent while `Result: PASS`
+still prints. A ticked check either **names what it examined** (a count, a page ID)
+or **names the known fact** that made it not applicable; "it passed" and "there was
+nothing to look at" never render the same way. Concretely:
+
+- The migrated-options line names how many of the selected keys were actually
+  compared, e.g. `migrated options match A's values on B (12 of 12 compared)`. If
+  some were selected but none had a value to compare against (a run interrupted
+  before the options step and later resumed), that is reported as unverified —
+  never as a plain, uncounted pass.
+- The domain-absence check always prints a line, and when it really ran it says how
+  much it looked at, e.g. `A's domain string is absent from the content graft
+  imported (48 migrated post(s) + 3 migrated option(s) scanned)`. The counts matter:
+  the check is scoped to what *this run* migrated, so if `id-map.tsv` is empty and
+  no option keys were selected there is nothing in scope, and it reports
+  **unverified** rather than "absent". (An empty `id-map.tsv` is exactly what a run
+  whose ID-mapper never loaded looks like — `graft` warns about it — and it is the
+  run most likely to have left A's domain behind.)
+- When no domain is configured for the migration at all, the same line is marked
+  not applicable — a known fact read from the manifest, not an uncertainty. If the
+  manifest has no `options.search_replace.from` key whatsoever (a hand-written
+  manifest; `plan` always writes one), that is different again: nothing is known
+  either way, and it is reported as not verifiable.
+- `page_on_front` gets one of four distinct lines, never a single line covering
+  several of them at once: verified against B (naming the page ID it resolved to),
+  not applicable because it was not part of this run's migrate selection, not
+  applicable because A's own recorded value says A never had a front page, or
+  unverified. It **fails** verify if A had a front page selected for migration and
+  `graft` could not resolve it through `id-map.tsv` — that used to be read as "A
+  never configured one" and passed silently; a missing remap is now a hard failure,
+  not an exemption. If page_on_front was selected but its recorded value was never
+  written to disk at all (the same "interrupted, later resumed" shape as the
+  migrated-options case above), that is reported as unverified too.
+- The navigation line likewise separates "present on B (N wp_navigation post(s)
+  found)" from "not applicable — wp_navigation was not part of this run's migrate
+  selection".
+- The HTTP smoke check, when the profile has no `SITE_B_URL`, is marked not
+  applicable rather than left as an unticked box under a `PASS` footer.
+- A `manifest.json` that is not valid JSON aborts the phase outright. Every check
+  reads its scope from that file, so a malformed manifest would otherwise produce a
+  report full of confident ticks for checks that examined nothing.
+
+**The overall `Result:` and exit code are three-valued, not a plain pass/fail:**
+
+| Result | Meaning | Exit code |
+|---|---|---|
+| `PASS` | Every check verified correct, or was genuinely not applicable (a known fact, e.g. no domain configured for this migration). | `0` |
+| `HARD FAIL` | At least one check found a confirmed defect, or a check's own execution failed outright (a query/`wp eval` that could not run — this signals the read machinery itself may be unreliable, a strictly worse condition than "some data just wasn't produced yet"). | `1` |
+| `INCOMPLETE` | No hard failure, but at least one check had nothing to work with — an earlier step's data was never produced (a graft interrupted and later resumed), or the check's scope came out empty, or the manifest never recorded what it would have needed. The check's own machinery is fine; there is simply nothing to check it against. The graft is not confirmed good, but it is also not confirmed bad. | `2` |
+
+`HARD FAIL` outranks `INCOMPLETE` when a run has both — a confirmed defect is the
+stronger, more actionable signal. A caller scripting against `verify`'s exit code
+should treat anything non-zero as "do not consider this graft done", and treat `2`
+specifically as "re-run `graft` to resume the interrupted step(s), then verify
+again" rather than as a defect to investigate.
 
 `--dry-run` is accepted here too, but `verify` is already read-only against B by
 construction — there is nothing for it to simulate, so it just runs the real checks
@@ -314,24 +377,29 @@ pluggable **graft modules** — one file per WordPress plugin or content domain,
 plugin; you add one file.
 
 Shipped in this repo:
-- **`core-wp`** (`modules/core-wp.sh`) — WordPress core content: pages, posts, and
-  the front-page option trio (`show_on_front`/`page_on_front`/`page_for_posts`,
-  correctly remapped through the ID map rather than blindly copied).
-- **`etch`** (`modules/etch.sh`) — Etch's custom post types (CFS, CPTs, loops) and
-  options (settings, styles, global stylesheets, CSS toolbar values).
+- **`core-wp`** (`modules/core-wp.sh`) — WordPress core content: pages, posts, the
+  front-page option trio (`show_on_front`/`page_on_front`/`page_for_posts`,
+  correctly remapped through the ID map rather than blindly copied), and the
+  active theme's `theme_mods_<slug>` customizer settings, resolved from the scan
+  and rewritten before they land on B — `custom_logo` is remapped through the ID
+  map (A's attachment number would otherwise point at whatever image B happens to
+  give that number), and `nav_menu_locations`/`custom_css_post_id` are removed,
+  since sitegraft migrates neither classic menus nor `custom_css` and B has no
+  counterpart for those IDs.
+- **`etch`** (`modules/etch.sh`) — the WordPress post types Etch actually stores
+  content in (`wp_block`, `wp_template`, `wp_global_styles`), its options
+  (settings, styles, global stylesheets, CSS toolbar values, CFS/CPT definitions),
+  the post types `etch_cpts` declares on the scanned site, and a post-import hook
+  that remaps Etch's own component references.
+- **`acss`** (`modules/acss.sh`) — Automatic.css's framework configuration, plus
+  the stack-sync candidates for both plugin-folder names the plugin has shipped
+  under (the pre-4.0 → 4.0 rename).
 - `modules/_template.sh` — a documented skeleton, copy it to get started.
 - `modules/motopress.sh.example` — a complete worked example for a hypothetical
   future module (MotoPress Hotel Booking), showing every part of the contract
   including a plugin-owned table and a post-import remap hook. Not loaded by
   default (the `.example` suffix keeps it out of module discovery) — drop the
   suffix to activate it for real.
-
-**Not shipped: Automatic.css (`acss`).** It's fully spec'd in the design doc (§3.4),
-but the module needs to declare Automatic.css's pre-v4 plugin-folder name as a
-detection candidate, and that legacy name has never been verified against a real
-pre-4.0 install — shipping a guess would risk silently failing to detect (or
-mis-detecting) a real site's ACSS install. If you can verify that folder name, a
-real `modules/acss.sh` PR is very welcome.
 
 ### Writing your own module
 
@@ -343,12 +411,75 @@ Copy [`modules/_template.sh`](../modules/_template.sh) to `modules/<your-plugin>
 |---|:---:|---|
 | `<mod>_name` | yes | Human-readable name shown in prompts. |
 | `<mod>_detect <scan_json>` | yes | Exit 0/1 — is this plugin present on the scanned site? |
-| `<mod>_post_types` | at least one of these three | Post types this module owns, one per line. |
+| `<mod>_post_types` | at least one of these six | Post types this module owns, one per line. |
+| `<mod>_post_types_dynamic <scan_json>` | | Same, but computed from the scan — for names only knowable after `scan`. |
 | `<mod>_option_keys` | | `wp_options` keys this module owns, one per line. |
+| `<mod>_option_keys_dynamic <scan_json>` | | Same, but computed from the scan. |
 | `<mod>_tables` | | Plugin-owned SQL table suffixes (without the live `$table_prefix`), one per line. |
-| `<mod>_option_keys_exclude` | no | Glob patterns to exclude within a broad option-key prefix (e.g. license keys, DB version markers). |
+| `<mod>_tables_dynamic <scan_json>` | | Same, but computed from the scan. |
+| `<mod>_option_keys_exclude` | no | Glob patterns removed from the option keys this module claims (e.g. license keys, DB version markers). Applied to both the static and the dynamic lists. Note it filters *names your module returned*; sitegraft never expands a pattern into keys, so a broad claim has to be enumerated from the scan by `_option_keys_dynamic` — see below. |
 | `<mod>_post_import <state_dir> <id_map_tsv> <wp_cmd_b>` | no | Hook run after WXR import + generic remaps, for module-specific fixups (e.g. remapping an internal ID reference in postmeta). |
 | `<mod>_stack_candidates` | no | If this plugin also needs to be *present and matching* on B for migrated content to render (like Etch or ACSS), one candidate plugin-folder slug per line, most-preferred/current first. |
+
+### Selections computed from the scan
+
+Some names cannot be written down in advance, because they depend on the site.
+The active theme's customizer settings live in `theme_mods_<stylesheet>`, and Etch
+lets a site declare its own post types in the `etch_cpts` option — in both cases
+the *name* is only knowable once `scan` has run. That is what the `_dynamic`
+functions are for. Each receives one argument, the path to a `scan-*.json`, and
+prints names one per line just like its static counterpart:
+
+```sh
+# The active theme's customizer settings — modules/core-wp.sh does this for real.
+my_plugin_option_keys_dynamic() {
+  jq -r '"theme_mods_" + .active_theme.stylesheet' "$1"
+}
+```
+
+The two lists are merged, so a module can have both; every name — static or
+dynamic — appears individually in `plan`'s selection prompt and can be
+deselected there.
+
+A `_dynamic` function must work from the scan file alone. `plan` never touches the
+live sites, so calling `wp` or `ssh` from one is not supported.
+
+**Exiting non-zero means "I could not tell", and stops the run.** Printing nothing
+and exiting 0 means "this module claims nothing here", and is fine. Those are
+different answers and sitegraft treats them differently: a `_dynamic` function that
+fails aborts `plan` with a message naming the function, rather than quietly
+planning a smaller migration. (If you need to get a run through while a module is
+broken, `SITEGRAFT_MANIFEST_PREFILLED` skips module defaults entirely — see §4.)
+
+The same applies to `<mod>_option_keys_exclude`: if it fails, `plan` refuses,
+because continuing would migrate exactly the keys it was there to hold back.
+
+**Keeping secrets out of a broad prefix.** A "prefix" is never a wildcard sitegraft
+resolves for you: `graft_migrate_options` runs `wp option get <key>` on the literal
+string in the manifest, so returning `my_plugin_*` from the static `_option_keys`
+would end up running `wp option update 'my_plugin_*'` on B. Enumerate the prefix
+from the scan with `_option_keys_dynamic`, as below, and let
+`_option_keys_exclude` carve the secrets back out. It is applied to the
+static and dynamic option keys alike, before anything is written to the manifest —
+and the manifest is the only thing `graft` and `verify` ever read, so an excluded
+key is excluded everywhere. That makes "return the whole prefix, exclude the
+secrets" a safe way to write a module:
+
+```sh
+my_plugin_option_keys_dynamic() {
+  jq -r '.options[]?.option_name | select(startswith("my_plugin_"))' "$1"
+}
+my_plugin_option_keys_exclude() {
+  printf 'my_plugin_license_*\nmy_plugin_*_api_key\n'
+}
+```
+
+Names containing a comma or whitespace are rejected: they cannot survive `graft`'s
+post-type CSV or its option-key word splitting, and would silently be read as two
+different names.
+
+See [`docs/decisions/0007-module-dynamic-selections.md`](decisions/0007-module-dynamic-selections.md)
+for the full contract and the reasoning behind each rule.
 
 **If your `post_import` hook writes to B, wrap every such call in `run_or_echo`**
 (from `lib/core.sh`, already sourced by the time any hook runs) — hooks are called
