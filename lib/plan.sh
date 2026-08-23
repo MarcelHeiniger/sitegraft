@@ -55,26 +55,91 @@ plan_defaults() {
   # Everything else keeps the old order exactly: core-wp, etch and acss
   # declare no tables, so they still go to `migrate` when present on A, and
   # to `protect` when found only on B.
+  # Selections are resolved through module_selection (lib/modules.sh), never
+  # by calling a module's `_post_types`/`_option_keys` directly, so that the
+  # scan-computed `_dynamic` lists and the `_option_keys_exclude` globs are
+  # applied HERE — at the one point where a module's claim becomes manifest
+  # content. That placement is the whole reason issue #13's fix is complete
+  # rather than partial: graft and verify read the manifest and nothing else
+  # (graft_migrate_options, verify_*), so an option key excluded before the
+  # manifest is written is excluded everywhere downstream, with no second
+  # enforcement point to keep in sync. See
+  # docs/decisions/0007-module-dynamic-selections.md.
+  #
+  # WHICH scan a `_dynamic` function is resolved against follows the bucket
+  # the module is headed for, decided below: a module bound for `migrate`
+  # describes what leaves A, so it sees scan A; a module bound for `protect`
+  # describes what must not be touched on B, so it sees scan B. `tables` is
+  # always resolved against B — migration never copies tables by design
+  # (manifest_add_migrate takes no tables argument), so a table claim can
+  # only ever be about B.
   local mod
   for mod in $SITEGRAFT_MODULES; do
-    local pt tb ok
-    pt=$(module_has_fn "$mod" post_types && module_call "$mod" post_types | jq -R -s -c 'split("\n") | map(select(length > 0))' || echo '[]')
-    tb=$(module_has_fn "$mod" tables && module_call "$mod" tables | jq -R -s -c 'split("\n") | map(select(length > 0))' || echo '[]')
-    ok=$(module_has_fn "$mod" option_keys && module_call "$mod" option_keys | jq -R -s -c 'split("\n") | map(select(length > 0))' || echo '[]')
-
+    # N5: whether a module OWNS tables is decided from whether it DECLARES a
+    # tables function, not from expanding one. The expansion used to come
+    # first, for every discovered module, so a `_tables_dynamic` that failed
+    # took the whole run down even for a module present on NEITHER site —
+    # while the identical failure in a `_post_types_dynamic` was harmless,
+    # because that expansion already happened after detection. The asymmetry
+    # was an accident of ordering, not a rule anyone chose.
+    #
+    # Declaring the function is the claim of kind this ordering rule is
+    # actually about ("a module that declares `_tables` can only be
+    # describing data to protect"), so reading the declaration is if anything
+    # closer to the rule's own wording than counting the expanded list was.
+    # One behavior does change: a module that declares a tables function which
+    # legitimately returns nothing for THIS site is now tested against B
+    # first, where it used to be treated as tableless. That is the same
+    # answer for every shipped module (core-wp, etch and acss declare no
+    # tables at all) and the safer direction for any other: a module that
+    # says it owns tables is describing data to protect even on a site where
+    # it currently owns none.
     local owns_tables=0
-    [ "$(printf '%s' "$tb" | jq 'length')" != "0" ] && owns_tables=1
+    if module_has_fn "$mod" tables || module_has_fn "$mod" tables_dynamic; then
+      owns_tables=1
+    fi
 
+    local bucket="" target_scan=""
     if [ "$owns_tables" = "1" ] && module_call "$mod" detect "$scan_b_json"; then
-      manifest=$(manifest_add_protect "$manifest" "$mod" "$pt" "$tb" "$ok")
+      bucket=protect; target_scan="$scan_b_json"
     elif module_call "$mod" detect "$scan_a_json"; then
-      manifest=$(manifest_add_migrate "$manifest" "$mod" "$pt" "$ok")
+      bucket=migrate; target_scan="$scan_a_json"
     elif module_call "$mod" detect "$scan_b_json"; then
+      bucket=protect; target_scan="$scan_b_json"
+    else
+      continue
+    fi
+
+    local pt_lines ok_lines pt ok
+    pt_lines=$(module_selection "$mod" post_types "$target_scan") || return 1
+    ok_lines=$(module_selection "$mod" option_keys "$target_scan") || return 1
+    pt=$(_plan_lines_to_json "$pt_lines")
+    ok=$(_plan_lines_to_json "$ok_lines")
+
+    if [ "$bucket" = migrate ]; then
+      manifest=$(manifest_add_migrate "$manifest" "$mod" "$pt" "$ok")
+    else
+      # Expanded HERE, and only here: `manifest_add_migrate` takes no tables
+      # argument by design, so the list is needed for the protect bucket and
+      # nowhere else. Narrowing the expansion to the one place its result is
+      # used is what removes the "aborts on a module nobody detected" case,
+      # while keeping it fail-closed for the module whose manifest entry
+      # actually depends on it.
+      local tb_lines tb
+      tb_lines=$(module_selection "$mod" tables "$scan_b_json") || return 1
+      tb=$(_plan_lines_to_json "$tb_lines")
       manifest=$(manifest_add_protect "$manifest" "$mod" "$pt" "$tb" "$ok")
     fi
   done
 
   echo "$manifest"
+}
+
+# _plan_lines_to_json <newline_separated> — the one place the "one name per
+# line" module convention is turned into the JSON array the manifest stores.
+# Empty lines are dropped, so an empty input yields [] rather than [""].
+_plan_lines_to_json() {
+  printf '%s\n' "$1" | jq -R -s -c 'split("\n") | map(select(length > 0))'
 }
 
 # design doc §13 (review finding B2): plan only ever builds a manifest, it
@@ -434,11 +499,40 @@ phase_plan() {
   [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1 || true)
   [ -n "$run_dir" ] || { log_error "no scan run found for profile ${profile} — run 'sitegraft scan' first"; return 1; }
 
+  # N6: every failure below leaves through one place, so the stale-manifest
+  # warning is stated once and can never be forgotten on a path added later.
+  local rc=0
+  _phase_plan_build "$profile" "$run_dir" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    _plan_warn_stale_manifest "$run_dir"
+  fi
+  return "$rc"
+}
+
+# _plan_warn_stale_manifest <run_dir> — N6 (third review round). "no manifest
+# will be frozen from this run" is true and misleading in the same breath: a
+# manifest.json left by an EARLIER, successful plan is still sitting in the
+# run directory, still `frozen: true`, and `sitegraft graft` reads that file
+# and nothing else. An operator who fixes nothing and simply runs `graft`
+# gets the old plan, silently — which is CLAUDE.md's "a skipped step is
+# visible", applied to a step that was skipped by failing.
+#
+# Deliberately NOT deleted: removing an operator's frozen plan on a failure
+# path is destructive, and the old plan may be exactly what they intend to
+# run. Named instead, together with what would happen if they ran graft.
+_plan_warn_stale_manifest() {
+  local run_dir="$1"
+  [ -f "${run_dir}/manifest.json" ] || return 0
+  log_warn "a manifest from an earlier run is still present: ${run_dir}/manifest.json — this run froze nothing, but 'sitegraft graft' reads that file and would run the EARLIER plan. Delete it, or re-run 'sitegraft plan' successfully, before grafting."
+}
+
+_phase_plan_build() {
+  local profile="$1" run_dir="$2"
+
   modules_discover
   plan_warn_scope_gaps "${run_dir}/scan-a.json" "${run_dir}/scan-b.json"
 
   local manifest
-  manifest=$(plan_defaults "${run_dir}/scan-a.json" "${run_dir}/scan-b.json" "$profile")
 
   # design doc §14: runs before any step below — none of them should matter
   # until this is settled. Deviation from the plan's literal Task 2.5 wiring
@@ -454,9 +548,27 @@ phase_plan() {
     # acknowledgment AND stack decisions its scenario needs (design doc §12,
     # §14) — plan_resolve_stack's and plan_custom_code_gate's prompts are
     # skipped entirely here, same reasoning as plan_select_interactive below.
+    #
+    # plan_defaults is deliberately NOT called on this path (it used to be
+    # called unconditionally, above the branch, and its result discarded one
+    # line later). Two reasons, one cosmetic and one load-bearing: nothing
+    # here consumes module defaults, and module_selection's own failure
+    # message names SITEGRAFT_MANIFEST_PREFILLED as the way to get a run
+    # through while a module's dynamic selection is broken — which would
+    # have been a lie if a module failure still aborted this branch.
     manifest=$(cat "$SITEGRAFT_MANIFEST_PREFILLED")
     plan_custom_code_gate_check_prefilled "$manifest" "${run_dir}/scan-b.json" || return 1
   else
+    # `|| return 1`, explicit rather than left to the caller's `set -e` (the
+    # convention every other call in this function follows, and a real
+    # propagation path, not a defensive one): plan_defaults returns non-zero
+    # when a module's `_dynamic` selection function fails, and a plan built
+    # from a claim a module could not produce must never reach the freeze
+    # step (docs/decisions/0007-module-dynamic-selections.md).
+    manifest=$(plan_defaults "${run_dir}/scan-a.json" "${run_dir}/scan-b.json" "$profile") || {
+      log_error "could not build the default selections from the discovered modules — no manifest will be frozen from this run"
+      return 1
+    }
     manifest=$(plan_custom_code_gate "$manifest" "$(cat "${run_dir}/scan-b.json")") || return 1
     # `|| return 1` added to both calls below (Step 6 durcissement pass) for
     # the same reason plan_custom_code_gate already has it just above —

@@ -46,6 +46,61 @@ setup() {
   [[ "$output" == *"show_on_front"* ]] || false
 }
 
+# --- core_wp_option_keys_dynamic: issue #15. `theme_mods_<stylesheet>` holds
+# the active theme's customizer settings and belongs with a migrated design,
+# but its KEY NAME depends on the site's active theme slug — unknowable until
+# `scan` has run, so a static _option_keys list can never express it. See
+# docs/decisions/0007-module-dynamic-selections.md.
+@test "core_wp_option_keys_dynamic derives theme_mods_<slug> from the scanned active theme (#15)" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  cat > "$scan" <<'EOF'
+{"active_theme":{"stylesheet":"etch-theme-child"},
+ "options":[{"option_name":"blogname"},{"option_name":"theme_mods_etch-theme-child"}]}
+EOF
+  run core_wp_option_keys_dynamic "$scan"
+  [ "$status" -eq 0 ]
+  [ "$output" = "theme_mods_etch-theme-child" ]
+}
+
+@test "core_wp_option_keys_dynamic follows whatever slug the scan actually shows, never a hardcoded one (#15)" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  cat > "$scan" <<'EOF'
+{"active_theme":{"stylesheet":"twentytwentyfive"},
+ "options":[{"option_name":"theme_mods_twentytwentyfive"}]}
+EOF
+  run core_wp_option_keys_dynamic "$scan"
+  [ "$status" -eq 0 ]
+  [ "$output" = "theme_mods_twentytwentyfive" ]
+}
+
+# graft_migrate_options (lib/graft.sh) falls back to the literal `null` when
+# `wp option get` finds nothing on A, and writes that to B. Offering a key A
+# does not have would therefore BLANK B's own theme_mods — the opposite of
+# what migrating a design is for.
+@test "core_wp_option_keys_dynamic claims nothing when the site never stored theme_mods for its active theme" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  echo '{"active_theme":{"stylesheet":"never-customized"},"options":[{"option_name":"blogname"}]}' > "$scan"
+  run core_wp_option_keys_dynamic "$scan"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "core_wp_option_keys_dynamic fails closed on a scan that records no active theme at all" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  echo '{"active_theme":{},"options":[]}' > "$scan"
+  run core_wp_option_keys_dynamic "$scan"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"active theme"* ]] || false
+}
+
+@test "core_wp_option_keys_dynamic fails closed on a scan with no options list, rather than reporting 'nothing to migrate'" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  echo '{"active_theme":{"stylesheet":"t"}}' > "$scan"
+  run core_wp_option_keys_dynamic "$scan"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"options"* ]] || false
+}
+
 @test "core_wp_post_import remaps page_on_front through id-map.tsv" {
   local run_dir="$BATS_TEST_TMPDIR/run"
   mkdir -p "$run_dir"
@@ -150,4 +205,164 @@ setup() {
   SITEGRAFT_DRY_RUN=1 run core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
   [ "$status" -eq 0 ]
   [[ "$output" == *"[dry-run] wp_cmd_b_stub option update page_on_front 105"* ]] || false
+}
+
+# --- B2 (third review round): theme_mods_<slug> is FULL of A's own
+# local IDs, and this PR is what started migrating it.
+#
+# core_wp_option_keys_dynamic added `theme_mods_<active-theme>` to migrate.
+# graft_migrate_options then pushes that option to B verbatim — and every
+# theme_mods_ row carries `custom_logo` (an ATTACHMENT id), plus
+# `nav_menu_locations` (TERM ids) and `custom_css_post_id` (a POST id).
+# graft_remap_attachment_ids only ever rewrites post_content/post_excerpt,
+# never an option value, so A's numbers land on B unchanged.
+#
+# The failure mode is the bad one: if B happens to own an attachment with
+# that number, B's logo silently becomes a DIFFERENT, WRONG image — not a
+# missing one. This hook is the existing answer for exactly this shape of
+# problem (it is why page_on_front is remapped rather than copied), and it
+# already runs after both the import and graft_migrate_options.
+#
+# nav_menu_locations and custom_css_post_id are REMOVED rather than remapped:
+# sitegraft v1 migrates neither classic menus (design doc §13) nor
+# `custom_css`, so there is nothing on B for those ids to point at, and a
+# remap would have nothing to remap through.
+
+@test "core_wp_post_import remaps theme_mods' custom_logo through id-map.tsv instead of carrying A's attachment id to B (B2)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '%s' '{"custom_logo":42,"other_setting":"keep-me"}' > "${run_dir}/option-theme_mods_etch-child.value"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '42\t907\tattachment\n' > "$tsv"
+  wp_cmd_b_stub() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  run cat "$BATS_TEST_TMPDIR/calls.log"
+  [[ "$output" == *"option update theme_mods_etch-child"* ]] || false
+  local pushed
+  pushed=$(grep -F 'option update theme_mods_etch-child' "$BATS_TEST_TMPDIR/calls.log" \
+    | sed 's/^option update theme_mods_etch-child //; s/ --format=json$//')
+  run jq -e '.custom_logo == 907 and .other_setting == "keep-me"' <<< "$pushed"
+  [ "$status" -eq 0 ]
+}
+
+@test "core_wp_post_import drops theme_mods' custom_logo, out loud, when id-map.tsv has no entry for it (never guesses) (B2)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '%s' '{"custom_logo":42,"other_setting":"keep-me"}' > "${run_dir}/option-theme_mods_etch-child.value"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '7\t107\tpage\n' > "$tsv"
+  wp_cmd_b_stub() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  run --separate-stderr core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
+  [[ "$stderr" == *"custom_logo"* ]] || false
+  local pushed
+  pushed=$(grep -F 'option update theme_mods_etch-child' "$BATS_TEST_TMPDIR/calls.log" \
+    | sed 's/^option update theme_mods_etch-child //; s/ --format=json$//')
+  run jq -e 'has("custom_logo") | not' <<< "$pushed"
+  [ "$status" -eq 0 ]
+}
+
+@test "core_wp_post_import strips nav_menu_locations and custom_css_post_id from theme_mods, naming both (B2)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '%s' '{"nav_menu_locations":{"primary":9},"custom_css_post_id":31,"other_setting":"keep-me"}' \
+    > "${run_dir}/option-theme_mods_etch-child.value"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '9\t109\tterm:nav_menu\n' > "$tsv"
+  wp_cmd_b_stub() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  run --separate-stderr core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
+  [[ "$stderr" == *"nav_menu_locations"* ]] || false
+  [[ "$stderr" == *"custom_css_post_id"* ]] || false
+  local pushed
+  pushed=$(grep -F 'option update theme_mods_etch-child' "$BATS_TEST_TMPDIR/calls.log" \
+    | sed 's/^option update theme_mods_etch-child //; s/ --format=json$//')
+  run jq -e 'has("nav_menu_locations") == false and has("custom_css_post_id") == false and .other_setting == "keep-me"' <<< "$pushed"
+  [ "$status" -eq 0 ]
+}
+
+@test "core_wp_post_import leaves a theme_mods value alone when it holds none of the id-bearing keys (B2)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '%s' '{"other_setting":"keep-me"}' > "${run_dir}/option-theme_mods_etch-child.value"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '7\t107\tpage\n' > "$tsv"
+  wp_cmd_b_stub() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  run core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
+  [ ! -f "$BATS_TEST_TMPDIR/calls.log" ]
+}
+
+@test "core_wp_post_import does NOT write B's theme_mods for real under SITEGRAFT_DRY_RUN=1 (B2)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '%s' '{"custom_logo":42}' > "${run_dir}/option-theme_mods_etch-child.value"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '42\t907\tattachment\n' > "$tsv"
+  wp_cmd_b_stub() { printf '%s\n' "REALLY-RAN $*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  SITEGRAFT_DRY_RUN=1 run core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
+  [ ! -f "$BATS_TEST_TMPDIR/calls.log" ]
+  [[ "$output" == *"[dry-run]"* ]] || false
+}
+
+# Nit 2 (third review round, second reviewer). If id-map.tsv's column 2 is
+# not an integer, `jq --argjson n` fails, `$fixed` comes back EMPTY, and the
+# push writes that empty value to B — the exact "BLANK B's own theme_mods"
+# this module warns about elsewhere, arrived at from the other side.
+#
+# Unreachable today: column 2 is written by the mapping mu-plugin from a
+# WordPress post ID, always an integer. Guarded anyway, for the same reason a
+# fail-closed default matters on a branch nothing takes — a guard missing on
+# an unreachable path is the one a future change makes reachable without
+# anything saying so.
+#
+# Two guards sit on this failure and they are NOT redundant, which is why this
+# test asserts the good outcome rather than merely "nothing bad was pushed":
+#   - a malformed id never reaches `jq --argjson` at all, so it is treated
+#     like a missing one (key dropped, out loud) and the REST of the rewrite
+#     still happens — that is what this test pins;
+#   - `[ -n "$fixed" ]` before the write is the last-resort backstop for any
+#     other jq failure, which with the first guard in place is unreachable by
+#     construction (see the mutation notes in the PR).
+@test "core_wp_post_import treats a malformed id-map entry like a missing one, and still rewrites the rest (nit 2)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '%s' '{"custom_logo":42,"nav_menu_locations":{"primary":9},"other_setting":"keep-me"}' \
+    > "${run_dir}/option-theme_mods_etch-child.value"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  # Column 2 is not an integer — a corrupt or hand-edited map.
+  printf '42\tnot-a-number\tattachment\n' > "$tsv"
+  wp_cmd_b_stub() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  run --separate-stderr core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
+  # A push DID happen — the malformed logo must not abort the whole rewrite,
+  # which would leave nav_menu_locations (A's term ids) sitting on B.
+  [ -f "$BATS_TEST_TMPDIR/calls.log" ]
+  local pushed
+  pushed=$(grep -F 'option update theme_mods_etch-child' "$BATS_TEST_TMPDIR/calls.log" \
+    | sed 's/^option update theme_mods_etch-child //; s/ --format=json$//')
+  # ...and it is a real object, never the empty string.
+  [ -n "$pushed" ]
+  run jq -e 'has("custom_logo") == false and has("nav_menu_locations") == false and .other_setting == "keep-me"' <<< "$pushed"
+  [ "$status" -eq 0 ]
+}
+
+# Nit 3 / mutant C2 (third review round, second reviewer): the behaviour is
+# already correct — `custom_logo: 0` is WordPress's "no logo", not attachment
+# zero — but nothing asserted it, so removing `0` from the skip list left the
+# suite green.
+@test "core_wp_post_import treats custom_logo 0 as 'no logo', not as attachment id 0 (nit 3)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '%s' '{"custom_logo":0,"other_setting":"keep-me"}' > "${run_dir}/option-theme_mods_etch-child.value"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  # A row that WOULD match if 0 were treated as a real id.
+  printf '0\t907\tattachment\n' > "$tsv"
+  wp_cmd_b_stub() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  run --separate-stderr core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
+  # Nothing to fix, so nothing is pushed and nothing is warned about.
+  [ ! -f "$BATS_TEST_TMPDIR/calls.log" ]
+  [[ "$stderr" != *"custom_logo"* ]] || false
 }

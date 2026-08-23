@@ -126,3 +126,35 @@ EOF
   run jq -e '.custom_code_review.acknowledged == true' "${RUN_DIR}/manifest.json"
   [ "$status" -eq 0 ]
 }
+
+# N6 (third review round). "no manifest will be frozen from this run"
+# is true and misleading in the same breath: a manifest.json left by an
+# EARLIER, successful plan is still sitting in the run directory, still
+# `frozen: true`, and `sitegraft graft` reads that file and nothing else. An
+# operator who fixes nothing and simply runs `graft` gets the stale plan. The
+# file is NOT deleted here (destructive, and the old plan may be exactly what
+# they want) — it is named, along with what would happen if they ran graft.
+@test "phase_plan warns that a stale frozen manifest.json is still on disk when the plan itself fails (N6)" {
+  echo '{"post_types":[],"plugins":[],"classic_menus_detected":false,"custom_code_detected":false,"active_theme":{}}' > "${RUN_DIR}/scan-b.json"
+  # A manifest from an earlier, successful plan.
+  echo '{"frozen":true,"migrate":{},"protect":{}}' > "${RUN_DIR}/manifest.json"
+  cat > "${RUN_DIR}/prefilled.json" <<'EOF'
+{"migrate":{"core-wp":{"post_types":["page"]}},"protect":{"x":{"post_types":["page"]}},"clean":{"enabled":false,"post_types":[]},"options":{}}
+EOF
+  SITEGRAFT_MANIFEST_PREFILLED="${RUN_DIR}/prefilled.json" run phase_plan --profile t --run "$RUN_DIR"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"${RUN_DIR}/manifest.json"* ]] || false
+  [[ "$output" == *"graft"* ]] || false
+  # Never deleted — that is the operator's call, not this tool's.
+  [ -f "${RUN_DIR}/manifest.json" ]
+}
+
+@test "phase_plan says nothing about a stale manifest when there is none (N6)" {
+  echo '{"post_types":[],"plugins":[],"classic_menus_detected":false,"custom_code_detected":false,"active_theme":{}}' > "${RUN_DIR}/scan-b.json"
+  cat > "${RUN_DIR}/prefilled.json" <<'EOF'
+{"migrate":{"core-wp":{"post_types":["page"]}},"protect":{"x":{"post_types":["page"]}},"clean":{"enabled":false,"post_types":[]},"options":{}}
+EOF
+  SITEGRAFT_MANIFEST_PREFILLED="${RUN_DIR}/prefilled.json" run phase_plan --profile t --run "$RUN_DIR"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"still present"* ]] || false
+}

@@ -220,3 +220,79 @@ setup() {
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 }
+
+# N3 (third review round). `value=$(... option get ... || echo 'null')`
+# wrote the LITERAL string `null` for any key A does not have — and then
+# pushed it to B. Concretely: A has no Loop Manager, so A has no `etch_cfs`;
+# the manifest still lists the key (etch_option_keys is a static allowlist);
+# graft therefore ran `option update etch_cfs null` on B and ERASED B's own
+# value. The same mechanism core_wp_option_keys_dynamic's own header comment
+# already warns about ("claiming a key A does not have would BLANK B's own
+# theme_mods") — documented there, unguarded here.
+@test "graft_migrate_options skips a key A does not have instead of writing the literal null onto B (N3)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_settings","etch_cfs"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then
+      case "$*" in
+        "option get etch_cfs --format=json") return 1 ;;   # A simply has no such option
+        *) echo '"real-value"' ;;
+      esac
+    else
+      echo "[dry-run] wp_remote b $*"
+    fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"option update etch_settings"* ]] || false
+  [[ "$output" != *"option update etch_cfs"* ]] || false
+  [[ "$output" == *"etch_cfs"* ]] || false            # said out loud, not dropped silently
+  [ ! -f "${run_dir}/option-etch_cfs.value" ]         # and no `null` left on disk either
+}
+
+# B4 (third review round, second reviewer), graft-side half. manifest_validate now
+# rejects such a name too, but a manifest hand-edited AFTER being frozen never
+# passes through validation again — and this loop writes to B's live database.
+# The test is written so BOTH halves of the fix are load-bearing: with the
+# guard removed it exits 0, and with the fd-3 read loop reverted to
+# `for key in $(...)` the name splits into "two"/"words" (neither of which
+# trips the guard) and B gets two `option update` calls nobody planned.
+@test "graft_migrate_options refuses a manifest option key carrying whitespace, and never word-splits it into two keys (B4)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"demo":{"option_keys":["two words"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then echo '"v"'; else echo "[dry-run] wp_remote b $*"; fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"option update two "* ]] || false
+  [[ "$output" != *"option update words"* ]] || false
+}
+
+# Nit 3 / mutant G1 (third review round, second reviewer): a manifest whose
+# migrate entries carry no option_keys at all — the ordinary case for a
+# content-only module — makes `jq -r '[…] | unique[]'` print nothing, and the
+# read loop then sees a single empty line. Removing `[ -n "$key" ] || continue`
+# left the suite green, so nothing proved the empty case was handled: without
+# it, `wp option get ''` runs and, on the fd-3 loop, an empty key would reach
+# B as `option update ''`.
+@test "graft_migrate_options does nothing at all for a manifest with no option keys (nit 3)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"core-wp":{"post_types":["page"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then echo '"v"'; else echo "[dry-run] wp_remote b $*"; fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"option update"* ]] || false
+  [ -z "$(ls -A "$run_dir")" ]
+}

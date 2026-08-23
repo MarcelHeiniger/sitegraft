@@ -196,6 +196,153 @@ EOF
   echo "$output" | jq -e '.protect == {}' >/dev/null
 }
 
+# --- plan_defaults: dynamic selections and option-key exclusions (issues
+# #13/#15/#16, docs/decisions/0007-module-dynamic-selections.md). Asserted
+# through plan_defaults rather than through module_selection alone, because
+# the manifest is what graft and verify actually read — a mechanism that
+# works in isolation but never reaches the manifest fixes nothing.
+_plan_dynamic_scans() {
+  cat > "$BATS_TEST_TMPDIR/a.json" <<'EOF'
+{"plugins":[{"name":"demo","version":"1.0"}],
+ "active_theme":{"stylesheet":"a-child-theme"},
+ "post_types":[{"name":"page"},{"name":"fotos"}],
+ "options":[{"option_name":"demo_settings"},{"option_name":"demo_license_key"},{"option_name":"demo_ai_api_key"}],
+ "tables":[],"table_prefix":"wp_"}
+EOF
+  cat > "$BATS_TEST_TMPDIR/b.json" <<'EOF'
+{"plugins":[],"active_theme":{"stylesheet":"b-theme"},
+ "post_types":[{"name":"page"}],"options":[],"tables":[],"table_prefix":"wp_"}
+EOF
+}
+
+_plan_dynamic_module() {
+  export SITEGRAFT_MODULES_DIR="$BATS_TEST_TMPDIR/modules"
+  mkdir -p "$SITEGRAFT_MODULES_DIR"
+  cat > "$SITEGRAFT_MODULES_DIR/demo.sh"
+  modules_discover
+  _plan_dynamic_scans
+}
+
+@test "plan_defaults keeps a module's excluded option keys out of the manifest even when its list is a broad prefix (#13)" {
+  _plan_dynamic_module <<'EOF'
+demo_name() { echo "Demo"; }
+demo_detect() { jq -e '.plugins[]? | select(.name == "demo")' "$1" >/dev/null 2>&1; }
+demo_option_keys_dynamic() { jq -r '.options[]?.option_name | select(startswith("demo_"))' "$1"; }
+demo_option_keys_exclude() { printf 'demo_license_*\ndemo_*_api_key\n'; }
+EOF
+  run plan_defaults "$BATS_TEST_TMPDIR/a.json" "$BATS_TEST_TMPDIR/b.json"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.migrate.demo.option_keys == ["demo_settings"]' >/dev/null
+}
+
+@test "plan_defaults puts a dynamic, scan-derived option key into migrate (#15)" {
+  _plan_dynamic_module <<'EOF'
+demo_name() { echo "Demo"; }
+demo_detect() { jq -e '.plugins[]? | select(.name == "demo")' "$1" >/dev/null 2>&1; }
+demo_option_keys() { printf 'demo_settings\n'; }
+demo_option_keys_dynamic() { printf 'theme_mods_%s\n' "$(jq -r '.active_theme.stylesheet' "$1")"; }
+EOF
+  run plan_defaults "$BATS_TEST_TMPDIR/a.json" "$BATS_TEST_TMPDIR/b.json"
+  [ "$status" -eq 0 ]
+  # A's theme slug, not B's: a module bound for migrate is resolved against scan A.
+  echo "$output" | jq -e '.migrate.demo.option_keys | index("theme_mods_a-child-theme")' >/dev/null
+  echo "$output" | jq -e '.migrate.demo.option_keys | index("theme_mods_b-theme") | not' >/dev/null
+}
+
+@test "plan_defaults puts dynamic, scan-derived post types into migrate (#16)" {
+  _plan_dynamic_module <<'EOF'
+demo_name() { echo "Demo"; }
+demo_detect() { jq -e '.plugins[]? | select(.name == "demo")' "$1" >/dev/null 2>&1; }
+demo_post_types() { printf 'wp_block\n'; }
+demo_post_types_dynamic() { jq -r '.post_types[]?.name | select(. == "fotos")' "$1"; }
+EOF
+  run plan_defaults "$BATS_TEST_TMPDIR/a.json" "$BATS_TEST_TMPDIR/b.json"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.migrate.demo.post_types == ["wp_block","fotos"]' >/dev/null
+}
+
+@test "a dynamic post type is individually deselectable in plan's interactive selection (#16)" {
+  # #16 asks for each such type to appear individually in plan's selection.
+  # _plan_apply_selection is the half of that flow that is testable without
+  # a TTY: it must classify a dynamic name as a post_type (from the
+  # manifest's own list, never from the string's shape) and drop it when the
+  # operator deselects it, leaving the rest alone.
+  local manifest='{"migrate":{"demo":{"post_types":["wp_block","fotos"],"option_keys":["demo_settings","theme_mods_a-child-theme"]}}}'
+  run _plan_apply_selection "$manifest" "$(printf 'demo: wp_block\ndemo: demo_settings\n')"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.migrate.demo.post_types == ["wp_block"]' >/dev/null
+  echo "$output" | jq -e '.migrate.demo.option_keys == ["demo_settings"]' >/dev/null
+}
+
+@test "plan_defaults resolves a protect-only module's dynamic selection against scan B, not scan A" {
+  _plan_dynamic_module <<'EOF'
+demo_name() { echo "Demo"; }
+demo_detect() { jq -e '.post_types[]? | select(.name == "page")' "$1" >/dev/null 2>&1; }
+demo_tables() { printf 'demo_data\n'; }
+demo_option_keys_dynamic() { printf 'theme_mods_%s\n' "$(jq -r '.active_theme.stylesheet' "$1")"; }
+EOF
+  run plan_defaults "$BATS_TEST_TMPDIR/a.json" "$BATS_TEST_TMPDIR/b.json"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.protect.demo.option_keys == ["theme_mods_b-theme"]' >/dev/null
+}
+
+@test "plan_defaults fails loudly instead of planning an empty selection when a module's dynamic function errors" {
+  _plan_dynamic_module <<'EOF'
+demo_name() { echo "Demo"; }
+demo_detect() { jq -e '.plugins[]? | select(.name == "demo")' "$1" >/dev/null 2>&1; }
+demo_post_types() { printf 'wp_block\n'; }
+demo_post_types_dynamic() { echo "cannot parse that option" >&2; return 1; }
+EOF
+  run plan_defaults "$BATS_TEST_TMPDIR/a.json" "$BATS_TEST_TMPDIR/b.json"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"demo_post_types_dynamic"* ]] || false
+}
+
+# N5 (third review round). `tables` used to be expanded for EVERY
+# discovered module before detection ran, because the expanded list was what
+# decided which side the module got tested against first. So a module present
+# on neither site could still abort the whole run through a failing
+# `_tables_dynamic` — while the identical bug in a `_post_types_dynamic` of an
+# undetected module was harmless, because that expansion happens after
+# detection. Deciding the bucket from whether the module DECLARES a tables
+# function (which is the claim of kind the ordering rule is actually about)
+# removes the asymmetry.
+@test "plan_defaults is not taken down by a broken _tables_dynamic in a module present on NEITHER site (N5)" {
+  export SITEGRAFT_MODULES_DIR="$BATS_TEST_TMPDIR/modules"
+  mkdir -p "$SITEGRAFT_MODULES_DIR"
+  cat > "$SITEGRAFT_MODULES_DIR/absent.sh" <<'EOF'
+absent_name() { echo "Absent"; }
+absent_detect() { return 1; }
+absent_tables_dynamic() { echo "boom" >&2; return 9; }
+EOF
+  modules_discover
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[]}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[]}' > "$b"
+  run plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.migrate == {} and .protect == {}' >/dev/null
+}
+
+# The counterpart: a module that IS detected and whose tables claim is what
+# the manifest needs must still fail the run when it cannot produce it. The
+# fix above must not turn fail-closed into fail-open.
+@test "plan_defaults still fails when a DETECTED module's _tables_dynamic cannot answer (N5, the opposite direction)" {
+  export SITEGRAFT_MODULES_DIR="$BATS_TEST_TMPDIR/modules"
+  mkdir -p "$SITEGRAFT_MODULES_DIR"
+  cat > "$SITEGRAFT_MODULES_DIR/present.sh" <<'EOF'
+present_name() { echo "Present"; }
+present_detect() { jq -e '.plugins[]? | select(.name == "present")' "$1" >/dev/null 2>&1; }
+present_tables_dynamic() { echo "boom" >&2; return 9; }
+EOF
+  modules_discover
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[]}' > "$a"
+  echo '{"plugins":[{"name":"present"}],"post_types":[],"options":[],"tables":[]}' > "$b"
+  run plan_defaults "$a" "$b"
+  [ "$status" -ne 0 ]
+}
+
 # --- plan_defaults: protect wins over migrate for a table-owning module -----
 #
 # The pair of tests below pins both halves of a rule that is easy to get

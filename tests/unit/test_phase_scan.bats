@@ -29,7 +29,7 @@ EOF
     local args="$*"
     case "$args" in
       "post-type list --format=json") echo '[]' ;;
-      "option list --format=json") echo '[]' ;;
+      "option list --unserialize --format=json") echo '[]' ;;
       "db tables --format=list --all-tables-with-prefix") printf 'wp_options\nwp_posts\n' ;;
       "plugin list --format=json") echo '[]' ;;
       "theme list --status=active --format=json") echo '[{"stylesheet":"twentytwentyfour","version":"1.0"}]' ;;
@@ -104,7 +104,7 @@ EOF
     local args="$*"
     case "$args" in
       "post-type list --format=json") echo '[]' ;;
-      "option list --format=json") echo '[]' ;;
+      "option list --unserialize --format=json") echo '[]' ;;
       "db tables --format=list --all-tables-with-prefix") echo 'wp_options' ;;
       "plugin list --format=json") echo '[]' ;;
       "theme list --status=active --format=json") echo '[{"stylesheet":"t","version":"1"}]' ;;
@@ -135,7 +135,7 @@ EOF
     local args="$*"
     case "$args" in
       "post-type list --format=json") echo '[]' ;;
-      "option list --format=json") echo '[]' ;;
+      "option list --unserialize --format=json") echo '[]' ;;
       "db tables --format=list --all-tables-with-prefix") echo 'wp_options' ;;
       "plugin list --format=json") echo '[]' ;;
       "theme list --status=active --format=json") echo '[{"stylesheet":"t","version":"1"}]' ;;
@@ -164,7 +164,7 @@ EOF
     local args="$*"
     case "$args" in
       "post-type list --format=json") echo '[]' ;;
-      "option list --format=json") echo '[]' ;;
+      "option list --unserialize --format=json") echo '[]' ;;
       "db tables --format=list --all-tables-with-prefix") echo 'wp_options' ;;
       "plugin list --format=json") echo '[]' ;;
       "theme list --status=active --format=json") echo '[{"stylesheet":"t","version":"1"}]' ;;
@@ -203,7 +203,7 @@ EOF
     local args="$*"
     case "$args" in
       "post-type list --format=json") echo '[]' ;;
-      "option list --format=json") echo '[]' ;;
+      "option list --unserialize --format=json") echo '[]' ;;
       "db tables --format=list --all-tables-with-prefix") echo 'wp_options' ;;
       "plugin list --format=json") echo '[]' ;;
       "theme list --status=active --format=json") echo '[{"stylesheet":"t","version":"1"}]' ;;

@@ -96,6 +96,32 @@ manifest_validate() {
     log_error "manifest invalid: ${overlap_tb} table(s) present in both migrate and protect"
     bad=true
   fi
+
+  # B4 (third review round, second reviewer): the SAME rule module_selection applies
+  # (lib/modules.sh), applied at the second entry point. module_selection only
+  # ever runs on the plan_defaults path — a SITEGRAFT_MANIFEST_PREFILLED or
+  # hand-edited manifest, both documented workflows for repairing or resuming
+  # a run, reach `graft` without passing through it. A name carrying a comma
+  # or whitespace then survives into graft_export_wxr's comma-joined
+  # `--post_type=` CSV and into graft_migrate_options' key loop, where it
+  # splits into two names nobody planned and writes them to B's live database.
+  # One enforcement point is elegant and fragile; this is the belt.
+  #
+  # jq does the scan, not a bash loop, so nothing has to survive word
+  # splitting in the very function whose job is to reject names that cannot.
+  local malformed
+  malformed=$(echo "$manifest" | jq -r '
+    [ (.migrate // {}), (.protect // {}) ]
+    | map(to_entries[]?.value | (.post_types[]?, .option_keys[]?, .tables[]?))
+    | flatten
+    | map(select(type == "string" and test("[,[:space:]]")))
+    | unique
+    | join(", ")')
+  if [ -n "$malformed" ]; then
+    log_error "manifest invalid: name(s) carrying a comma or whitespace — ${malformed}. No WordPress post type, option key or table name can contain either, and such a name cannot survive graft's comma-joined post-type CSV or its option-key loop: it would silently be read as two different names and written to B under both. Rebuild the manifest with 'sitegraft plan'."
+    bad=true
+  fi
+
   [ "$bad" = false ]
 }
 
