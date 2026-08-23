@@ -73,8 +73,25 @@ EOF
 # etch_license_options and etchtheme_license_options straight to B. Also
 # deliberately left out, being schema state rather than design:
 # etch_db_version, etch_migrations, etch_svg_version.
+# `etch_cfs` and `etch_cpts` deserve a note. The original version of this
+# module declared those two names as POST TYPES, and no such post type exists
+# on any real site — that was the headline error. But the names themselves
+# were not invented: on a second real Etch site they turn up as OPTIONS,
+# holding the custom-field-set and custom-post-type definitions the builder
+# lets you declare. The first site had neither option, which is what made the
+# earlier conclusion ("these names are fiction") look safe. Right names,
+# wrong kind.
+#
+# KNOWN CONSEQUENCE, not solved here: `etch_cpts` DEFINES post types, so a
+# site using it stores real content under names only that option knows
+# (`fotos`, on the site this was found on). Migrating the definition without
+# migrating the posts it describes leaves B with a registered-but-empty post
+# type. A static post_types list cannot express "whatever etch_cpts happens
+# to declare" — closing that needs a contract change, not another line here.
 etch_option_keys() {
   cat <<'EOF'
+etch_cfs
+etch_cpts
 etch_css_toolbar_values
 etch_global_stylesheets
 etch_loops
