@@ -112,7 +112,26 @@ verify_compare_checksums() {
 verify_options_match() {
   local run_dir="$1" manifest="$2"
   local key mismatched="" compared=0 total=0
-  for key in $(echo "$manifest" | jq -r '[.migrate[].option_keys[]?] | unique[]'); do
+  local keys
+  keys=$(echo "$manifest" | jq -r '[.migrate[].option_keys[]?] | unique[]')
+  # A read loop over fd 3, not `for key in $(...)` (issue #34) — the exact
+  # same fix, for the exact same reason, as graft_migrate_options
+  # (lib/graft.sh): the old form relied on UNQUOTED word splitting, so an
+  # option key containing whitespace became two keys, neither of which has
+  # an "option-<fragment>.value" file on disk, so both silently hit the
+  # `[ -f ... ] || continue` guard below — a key that was never genuinely
+  # compared, AND `total` inflated by one per fragment rather than one per
+  # real key, corrupting the "N of M compared" count issue #23/#26 added
+  # specifically so a shortened comparison could never pass unnoticed.
+  # #29 already fixed this shape in graft_migrate_options and rejects such
+  # names at three entry points (module_selection, manifest_validate,
+  # graft_migrate_options itself) — that rejection is not repeated here on
+  # purpose, since manifest_validate already closes it upstream for every
+  # manifest this function is ever handed; a fourth copy of the same rule
+  # would only be duplicated debt. fd 3 rather than stdin so the loop body
+  # (wp_remote, which shells out) never disturbs it.
+  while IFS= read -r key <&3; do
+    [ -n "$key" ] || continue
     case "$key" in
       page_on_front|page_for_posts) continue ;;
     esac
@@ -125,7 +144,7 @@ verify_options_match() {
     expected_canon=$(printf '%s' "$expected" | jq -c . 2>/dev/null) || expected_canon="$expected"
     actual_canon=$(printf '%s' "$actual" | jq -c . 2>/dev/null) || actual_canon="$actual"
     [ "$expected_canon" = "$actual_canon" ] || mismatched="${mismatched}${key} "
-  done
+  done 3<<< "$keys"
   echo "OPTIONS_COMPARED:${compared}:${total}"
   if [ -n "$mismatched" ]; then
     log_error "migrated option value(s) do not match A's on B: ${mismatched}"

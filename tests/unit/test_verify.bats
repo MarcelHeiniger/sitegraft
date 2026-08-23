@@ -143,6 +143,50 @@ setup() {
   [[ "$output" == *"key_two"* ]] || false
 }
 
+# Issue #34: the loop used to be `for key in $(jq ...)` — UNQUOTED command
+# substitution, so the shell word-split the result on IFS. A manifest edited
+# by hand after a graft (manifest_validate only rejects a comma/space name
+# while the manifest is still frozen — see lib/graft.sh's own comma/space
+# check for the identical story on graft_migrate_options) can still carry an
+# option key containing a space, and that key would silently turn into two
+# lookups for a file that was never written (`option-<fragment>.value`),
+# both hit the `[ -f ... ] || continue` guard, and the key was never
+# genuinely compared — while `total` was inflated by one PER FRAGMENT, not
+# per real key, corrupting the very "N of M compared" count issue #23/#26
+# added specifically so a shortened comparison could never pass unnoticed.
+
+@test "verify_options_match compares a key containing a space as ONE key, not two word-split fragments (issue #34)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '"same"' > "${run_dir}/option-hero image.value"
+  local manifest='{"migrate":{"m":{"option_keys":["hero image"]}}}'
+  wp_remote() { echo '"same"'; }
+  run verify_options_match "$run_dir" "$manifest"
+  [ "$status" -eq 0 ]
+  # The real bug: today's word-split loop reports 0 of 2 (two fragments,
+  # "hero" and "image", neither of which has a value file) instead of the
+  # true 1 of 1 — inflating the denominator with fragments that were never
+  # actually requested.
+  [[ "$output" == *"OPTIONS_COMPARED:1:1"* ]] || false
+}
+
+@test "verify_options_match does not silently pass a genuine mismatch on a key containing a space (issue #34)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '"a"' > "${run_dir}/option-hero image.value"
+  local manifest='{"migrate":{"m":{"option_keys":["hero image"]}}}'
+  wp_remote() { echo '"DIFFERENT"'; } # B's live value genuinely differs
+  run verify_options_match "$run_dir" "$manifest"
+  # Today's word-split loop never finds "option-hero.value" or
+  # "option-image.value" (the file is "option-hero image.value"), so the
+  # comparison never runs at all -- a REAL mismatch reported as though
+  # nothing was wrong (status 0, mismatched empty), instead of either
+  # comparing it correctly (status 1, naming the key) or at minimum
+  # reporting it as not compared with an honest 1-key total.
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"hero image"* ]] || false
+}
+
 # --- verify_domain_absent ----------------------------------------------------
 # Rewritten in the security-review fix-pack (Viktor + Kimi): the previous SQL
 # `UNION ... LIMIT` version was a DEAD check (invalid MySQL/MariaDB syntax on
