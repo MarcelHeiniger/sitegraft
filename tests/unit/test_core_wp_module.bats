@@ -305,3 +305,64 @@ EOF
   [ ! -f "$BATS_TEST_TMPDIR/calls.log" ]
   [[ "$output" == *"[dry-run]"* ]] || false
 }
+
+# Nit 2 (third review round, second reviewer). If id-map.tsv's column 2 is
+# not an integer, `jq --argjson n` fails, `$fixed` comes back EMPTY, and the
+# push writes that empty value to B — the exact "BLANK B's own theme_mods"
+# this module warns about elsewhere, arrived at from the other side.
+#
+# Unreachable today: column 2 is written by the mapping mu-plugin from a
+# WordPress post ID, always an integer. Guarded anyway, for the same reason a
+# fail-closed default matters on a branch nothing takes — a guard missing on
+# an unreachable path is the one a future change makes reachable without
+# anything saying so.
+#
+# Two guards sit on this failure and they are NOT redundant, which is why this
+# test asserts the good outcome rather than merely "nothing bad was pushed":
+#   - a malformed id never reaches `jq --argjson` at all, so it is treated
+#     like a missing one (key dropped, out loud) and the REST of the rewrite
+#     still happens — that is what this test pins;
+#   - `[ -n "$fixed" ]` before the write is the last-resort backstop for any
+#     other jq failure, which with the first guard in place is unreachable by
+#     construction (see the mutation notes in the PR).
+@test "core_wp_post_import treats a malformed id-map entry like a missing one, and still rewrites the rest (nit 2)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '%s' '{"custom_logo":42,"nav_menu_locations":{"primary":9},"other_setting":"keep-me"}' \
+    > "${run_dir}/option-theme_mods_etch-child.value"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  # Column 2 is not an integer — a corrupt or hand-edited map.
+  printf '42\tnot-a-number\tattachment\n' > "$tsv"
+  wp_cmd_b_stub() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  run --separate-stderr core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
+  # A push DID happen — the malformed logo must not abort the whole rewrite,
+  # which would leave nav_menu_locations (A's term ids) sitting on B.
+  [ -f "$BATS_TEST_TMPDIR/calls.log" ]
+  local pushed
+  pushed=$(grep -F 'option update theme_mods_etch-child' "$BATS_TEST_TMPDIR/calls.log" \
+    | sed 's/^option update theme_mods_etch-child //; s/ --format=json$//')
+  # ...and it is a real object, never the empty string.
+  [ -n "$pushed" ]
+  run jq -e 'has("custom_logo") == false and has("nav_menu_locations") == false and .other_setting == "keep-me"' <<< "$pushed"
+  [ "$status" -eq 0 ]
+}
+
+# Nit 3 / mutant C2 (third review round, second reviewer): the behaviour is
+# already correct — `custom_logo: 0` is WordPress's "no logo", not attachment
+# zero — but nothing asserted it, so removing `0` from the skip list left the
+# suite green.
+@test "core_wp_post_import treats custom_logo 0 as 'no logo', not as attachment id 0 (nit 3)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '%s' '{"custom_logo":0,"other_setting":"keep-me"}' > "${run_dir}/option-theme_mods_etch-child.value"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  # A row that WOULD match if 0 were treated as a real id.
+  printf '0\t907\tattachment\n' > "$tsv"
+  wp_cmd_b_stub() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  run --separate-stderr core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
+  # Nothing to fix, so nothing is pushed and nothing is warned about.
+  [ ! -f "$BATS_TEST_TMPDIR/calls.log" ]
+  [[ "$stderr" != *"custom_logo"* ]] || false
+}

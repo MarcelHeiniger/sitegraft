@@ -231,6 +231,18 @@ _core_wp_fix_theme_mods() {
       if [ -f "$id_map_tsv" ]; then
         logo_new=$(awk -F'\t' -v old="$logo_old" '$1==old && $3=="attachment"{print $2}' "$id_map_tsv" 2>/dev/null | head -1)
       fi
+      # An id that is not a plain integer never reaches `jq --argjson` (nit 2):
+      # --argjson would fail to parse it, `fixed` would come back EMPTY, and
+      # the push below would write that empty value to B — the same "BLANK B's
+      # own theme_mods" this module warns about elsewhere, arrived at from the
+      # other side. Unreachable today (column 2 is written by the mapping
+      # mu-plugin from a WordPress post ID), so this is not a bug being fixed
+      # but a guard on a path a future change could open without saying so.
+      # A malformed id is treated exactly like a missing one: the key is
+      # dropped, out loud.
+      case "$logo_new" in
+        ''|*[!0-9]*) logo_new="" ;;
+      esac
       if [ -n "$logo_new" ]; then
         fixed=$(printf '%s' "$fixed" | jq -c --argjson n "$logo_new" '.custom_logo = $n')
       else
@@ -249,6 +261,16 @@ _core_wp_fix_theme_mods() {
     fi
 
     [ "$fixed" != "$value" ] || continue
+    # Backstop for the same failure (nit 2): every rewrite above goes through
+    # `jq`, and a `jq` that fails leaves `fixed` empty — which then propagates
+    # unchanged through the remaining steps and would be written to B as an
+    # empty option. An empty result is never a legitimate outcome here (the
+    # value was a non-empty object one line above), so it can only mean a
+    # rewrite failed. Leave B's value alone and say so.
+    if [ -z "$fixed" ]; then
+      log_warn "core-wp post_import: rewriting ${key} produced an empty value — a jq step must have failed. Leaving B's ${key} exactly as it is: writing this would BLANK the option rather than fix it. Report this with the run directory."
+      continue
+    fi
 
     [ -z "$removed" ] || log_warn "core-wp post_import: rewrote B's ${key} — removed:${removed}. These held A's own local IDs and had no counterpart on B."
     printf '%s' "$fixed" > "$f"

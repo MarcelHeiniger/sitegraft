@@ -274,3 +274,25 @@ setup() {
   [[ "$output" != *"option update two "* ]] || false
   [[ "$output" != *"option update words"* ]] || false
 }
+
+# Nit 3 / mutant G1 (third review round, second reviewer): a manifest whose
+# migrate entries carry no option_keys at all — the ordinary case for a
+# content-only module — makes `jq -r '[…] | unique[]'` print nothing, and the
+# read loop then sees a single empty line. Removing `[ -n "$key" ] || continue`
+# left the suite green, so nothing proved the empty case was handled: without
+# it, `wp option get ''` runs and, on the fd-3 loop, an empty key would reach
+# B as `option update ''`.
+@test "graft_migrate_options does nothing at all for a manifest with no option keys (nit 3)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"core-wp":{"post_types":["page"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then echo '"v"'; else echo "[dry-run] wp_remote b $*"; fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"option update"* ]] || false
+  [ -z "$(ls -A "$run_dir")" ]
+}
