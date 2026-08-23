@@ -291,7 +291,10 @@ setup() {
 @test "verify_domain_absent is a no-op post_ids list (never calls graft_migrated_post_ids_json) when id-map.tsv is empty/missing" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   local tsv="${run_dir}/id-map.tsv" # never created — no posts imported this run
-  local manifest='{"migrate":{"core-wp":{"option_keys":[]}}}'
+  # An option key IS selected on purpose: this test is about the post_ids
+  # half of the scope being empty, not about the whole scope being empty
+  # (that case is its own test below, and is NOT a pass).
+  local manifest='{"migrate":{"core-wp":{"option_keys":["etch_settings"]}}}'
   local captured="$BATS_TEST_TMPDIR/captured.json"
   graft_push_remap_payload() { printf '%s' "$2" > "$captured"; echo "/fake/remote/path.json"; }
   graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
@@ -301,6 +304,47 @@ setup() {
   [ "$status" -eq 0 ]
   run jq -e '.post_ids == []' "$captured"
   [ "$status" -eq 0 ]
+}
+
+# --- Viktor's re-review of PR #26, BLOCKING (B1): the same fail-open class
+# this whole PR exists to close, still live inside the check that closes
+# #22. With no id-map.tsv AND no selected option keys, the payload is
+# `{"post_ids": [], "option_keys": [], "domain": "..."}` — the PHP body
+# loops over two empty arrays, `$hits` stays empty, and the function
+# returned 0 having examined literally nothing, while the report line
+# CLAIMS "migrated posts + migrated options" were examined. That state is
+# reachable in exactly the run this PR is about: lib/graft.sh warns and
+# leaves id-map.tsv untouched when the mu-plugin didn't run, making every
+# later remap a no-op.
+@test "verify_domain_absent returns 2 (INCOMPLETE, never a pass) when nothing at all is in scope — 0 migrated posts AND 0 migrated options" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv" # never created — the mu-plugin didn't run
+  local manifest='{"migrate":{"core-wp":{"option_keys":[]}}}'
+  graft_push_remap_payload() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
+  graft_remove_file() { :; }
+  wp_remote() { echo "OK"; } # a wp eval over two empty arrays says "OK" — that is the trap
+  run verify_domain_absent "$run_dir" "$tsv" "$manifest" "https://a.example.com"
+  [ "$status" -eq 2 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
+# The counterpart requirement: a run that DID examine something must say how
+# much it examined, on the same "(N of M compared)" principle issue #23
+# established for the options line — a bare tick is what let the defect
+# above hide in the first place.
+@test "verify_domain_absent reports the size of the scope it actually examined" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '10\t42\tattachment\n5\t105\tpage\n' > "$tsv"
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_settings"]}}}'
+  graft_push_remap_payload() { echo "/fake/remote/path.json"; }
+  graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
+  graft_remove_file() { :; }
+  wp_remote() { echo "OK"; }
+  run verify_domain_absent "$run_dir" "$tsv" "$manifest" "https://a.example.com"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"DOMAIN_SCOPE:2:1"* ]] || false
 }
 
 # --- verify_page_on_front ----------------------------------------------------
@@ -1071,4 +1115,410 @@ EOF
   [ "$status" -eq 1 ]
   grep -q "Result: HARD FAIL" "${RUN_DIR}/verify-report.md"
   ! grep -q "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md"
+}
+
+# --- Viktor's re-review of PR #26, BLOCKING (B1), wiring half. The unit
+# tests above prove verify_domain_absent's own three-valued contract; these
+# prove phase_verify actually HONORS it. `elif verify_domain_absent ...` (the
+# shape this file used) folds 2 into "non-zero" and mislabels an empty scope
+# as a HARD FAIL — the identical pitfall the page_on_front wiring already
+# documents at its own `|| front_rc=$?`.
+@test "phase_verify's domain line names how many posts and options were actually scanned" {
+  setup_phase_verify_fixture
+  jq '.options.search_replace.from = "https://a.example.com"' "${RUN_DIR}/manifest.json" > "${RUN_DIR}/m.tmp" && mv "${RUN_DIR}/m.tmp" "${RUN_DIR}/manifest.json"
+  graft_push_remap_payload() { echo "/fake/remote/path.json"; }
+  graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
+  graft_remove_file() { :; }
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      eval) echo "OK" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      db) echo "" ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  grep -qF "1 migrated post(s) + 1 migrated option(s) scanned" "${RUN_DIR}/verify-report.md"
+}
+
+@test "phase_verify's Result is INCOMPLETE (not PASS, not HARD FAIL) when the domain check had nothing in scope to examine" {
+  setup_phase_verify_fixture
+  cat > "${RUN_DIR}/manifest.json" <<'EOF'
+{
+  "frozen": true,
+  "checksums_protected_pre_graft": {},
+  "migrate": {"core-wp": {"post_types": ["page"], "option_keys": []}},
+  "protect": {"_unclaimed": {"tables": []}},
+  "stack": {},
+  "options": {"search_replace": {"from": "https://a.example.com", "to": "https://b.example.com"}}
+}
+EOF
+  : > "${RUN_DIR}/id-map.tsv" # graft warned the mu-plugin never ran: every remap after it was a no-op
+  graft_push_remap_payload() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
+  graft_remove_file() { :; }
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      eval) echo "OK" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      db) echo "" ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 2 ]
+  grep -q "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md"
+  ! grep -q "Result: PASS" "${RUN_DIR}/verify-report.md"
+  ! grep -q "Result: HARD FAIL" "${RUN_DIR}/verify-report.md"
+  grep "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md" | grep -qi "domain-absence"
+  # and it must NOT still claim, on the check's own line, to have looked at
+  # the migrated posts and options — that claim is the whole defect.
+  ! grep -qF -- "- [x] A's domain string is absent" "${RUN_DIR}/verify-report.md"
+}
+
+# --- Viktor's re-review of PR #26, BLOCKING (B2): three `hard_fail=1`
+# assignments could each be deleted outright and the entire suite stayed
+# green — the report said HARD FAIL while `verify` exited 0. Issue #12's
+# acceptance criterion is "a run where the front-page remap did not happen
+# FAILS verify", and verify is the phase plus its exit code, not a line of
+# prose in a file. Each test below asserts BOTH the exit status and the
+# report footer; asserting only the text is what let the mutation survive.
+@test "phase_verify exits 1 with Result: HARD FAIL when page_on_front on B is not the remapped page (issue #12's actual acceptance criterion)" {
+  setup_phase_verify_fixture
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;;
+      option) echo "999" ;; # some other page entirely — the remap did not land
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 1 ]
+  grep -q "Result: HARD FAIL" "${RUN_DIR}/verify-report.md"
+  grep -q "HARD FAIL: page_on_front does not resolve" "${RUN_DIR}/verify-report.md"
+}
+
+@test "phase_verify exits 1 with Result: HARD FAIL when a migrated option's live value on B does not match what graft wrote" {
+  setup_phase_verify_fixture
+  cat > "${RUN_DIR}/manifest.json" <<'EOF'
+{
+  "frozen": true,
+  "checksums_protected_pre_graft": {},
+  "migrate": {"etch": {"option_keys": ["etch_settings"]}},
+  "protect": {"_unclaimed": {"tables": []}},
+  "stack": {},
+  "options": {"search_replace": {"from": "", "to": ""}}
+}
+EOF
+  printf '"dark"' > "${RUN_DIR}/option-etch_settings.value" # what graft migrated from A
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;;
+      option) echo '"light"' ;; # B drifted
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 1 ]
+  grep -q "Result: HARD FAIL" "${RUN_DIR}/verify-report.md"
+  grep -q "HARD FAIL: migrated option value mismatch" "${RUN_DIR}/verify-report.md"
+}
+
+@test "phase_verify exits 1 with Result: HARD FAIL when wp_navigation was migrated but B has no navigation post" {
+  setup_phase_verify_fixture
+  cat > "${RUN_DIR}/manifest.json" <<'EOF'
+{
+  "frozen": true,
+  "checksums_protected_pre_graft": {},
+  "migrate": {"core-wp": {"post_types": ["wp_navigation"], "option_keys": []}},
+  "protect": {"_unclaimed": {"tables": []}},
+  "stack": {},
+  "options": {"search_replace": {"from": "", "to": ""}}
+}
+EOF
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;;
+      option) echo "105" ;;
+      post)
+        if [ "$2" = "list" ]; then echo ""; else return 0; fi # no wp_navigation posts on B
+        ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 1 ]
+  grep -q "Result: HARD FAIL" "${RUN_DIR}/verify-report.md"
+  grep -q "HARD FAIL: wp_navigation was migrated but B has no navigation post" "${RUN_DIR}/verify-report.md"
+}
+
+# --- Viktor's re-review of PR #26, N1: verify_page_on_front returns 0 for
+# THREE different reasons and the report printed one byte-identical line for
+# all three — the same ambiguous disjunction issue #12 was filed about,
+# simply moved from the code into the report, and inconsistent with the
+# domain line this PR just made explicit.
+@test "phase_verify's page_on_front line says VERIFIED, and names the page, when the remap really was checked against B" {
+  setup_phase_verify_fixture
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  # Asserted as the WHOLE line, not a substring: the point of N1 is that the
+  # three success outcomes must not share wording, and a substring match
+  # would still pass if the line kept its old "(or A never configured one)"
+  # disjunction appended to it.
+  local front_line; front_line=$(grep -F -- "] page_on_front" "${RUN_DIR}/verify-report.md")
+  [ "$front_line" = "- [x] page_on_front resolves to the correctly remapped page on B (post 105)" ]
+}
+
+@test "phase_verify's page_on_front line says NOT SELECTED, distinctly, when page_on_front was not part of this run's migrate selection" {
+  setup_phase_verify_fixture
+  cat > "${RUN_DIR}/manifest.json" <<'EOF'
+{
+  "frozen": true,
+  "checksums_protected_pre_graft": {},
+  "migrate": {"core-wp": {"post_types": ["page"], "option_keys": []}},
+  "protect": {"_unclaimed": {"tables": []}},
+  "stack": {},
+  "options": {"search_replace": {"from": "", "to": ""}}
+}
+EOF
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  local front_line; front_line=$(grep -F -- "] page_on_front" "${RUN_DIR}/verify-report.md")
+  [ "$front_line" = "- [x] page_on_front (not applicable — page_on_front was not part of this run's migrate selection)" ]
+}
+
+@test "phase_verify's page_on_front line says A NEVER CONFIGURED ONE, distinctly, when A's own recorded value is 0" {
+  setup_phase_verify_fixture
+  printf '"0"' > "${RUN_DIR}/option-page_on_front.value" # A's own value: A had no front page
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  local front_line; front_line=$(grep -F -- "] page_on_front" "${RUN_DIR}/verify-report.md")
+  [ "$front_line" = "- [x] page_on_front (not applicable — A's own recorded value says A never configured a front page)" ]
+}
+
+# The three branches above are selected by a marker the function itself
+# prints. A fourth success path added later without a marker must not
+# silently inherit one of the three claims — the default is UNVERIFIED, in
+# keeping with this file's fail-closed rule.
+@test "phase_verify reports page_on_front as UNVERIFIED when the check succeeds without saying which of its outcomes applied" {
+  setup_phase_verify_fixture
+  verify_page_on_front() { return 0; } # a future success path that forgot its marker
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 2 ]
+  grep -q "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md"
+  grep "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md" | grep -qi "page_on_front"
+}
+
+# --- N2: `- [ ]` now means "not verified" everywhere else in this report,
+# so the skipped HTTP smoke check must not keep an unticked box while the
+# footer says PASS. It is a KNOWN not-applicable (no SITE_B_URL in the
+# profile), exactly like the no-domain-configured case.
+@test "phase_verify marks the skipped HTTP smoke check as a ticked not-applicable, never as an unchecked box" {
+  setup_phase_verify_fixture
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  grep -qF -- "- [x] HTTP smoke check (not applicable — no SITE_B_URL configured in this profile)" "${RUN_DIR}/verify-report.md"
+  ! grep -qF -- "- [ ] HTTP smoke check skipped" "${RUN_DIR}/verify-report.md"
+}
+
+# --- N3: the manifest is read by `jq` in every check below, but was never
+# validated as JSON. A malformed manifest.json made every `jq` call fail
+# quietly, and the report came out with four misleading `[x]` ticks plus a
+# HARD FAIL attributed to "protected data changed" — a wrong diagnosis
+# pointing the operator at the wrong problem entirely.
+@test "phase_verify refuses to run at all against a manifest.json that is not valid JSON" {
+  setup_phase_verify_fixture
+  printf '{ this is not json at all' > "${RUN_DIR}/manifest.json"
+  wp_remote() { echo ""; }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"not valid JSON"* ]] || false
+  # and it must not have produced a report full of ticks about checks it
+  # could not possibly have performed
+  [ ! -f "${RUN_DIR}/verify-report.md" ]
+}
+
+# --- N4: `jq -r '.options.search_replace.from // ""'` maps "the key is
+# absent" onto "the key is empty", so a hand-written manifest with no
+# `.options` at all printed "not applicable — no domain was configured" as
+# though that were a fact read from the manifest. It is not a fact; it is
+# the absence of one. (lib/graft.sh documents the same hand-written-manifest
+# case at its own `.options.search_replace.from` read.)
+@test "phase_verify reports the domain check as NOT VERIFIABLE, not as not-applicable, when the manifest has no options.search_replace.from" {
+  setup_phase_verify_fixture
+  cat > "${RUN_DIR}/manifest.json" <<'EOF'
+{
+  "frozen": true,
+  "checksums_protected_pre_graft": {},
+  "migrate": {"core-wp": {"post_types": ["page"], "option_keys": []}},
+  "protect": {"_unclaimed": {"tables": []}},
+  "stack": {}
+}
+EOF
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 2 ]
+  grep -qF "not verifiable — the manifest has no options.search_replace.from" "${RUN_DIR}/verify-report.md"
+  ! grep -q "no domain was configured" "${RUN_DIR}/verify-report.md"
+  grep -q "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md"
+}
+
+# --- N6: the INCOMPLETE footer joined its check names with a trailing space
+# and then appended a period, printing "... migrated-options ." to every
+# operator reading the report.
+@test "phase_verify's INCOMPLETE footer has no stray space before its final period" {
+  setup_phase_verify_fixture
+  cat > "${RUN_DIR}/manifest.json" <<'EOF'
+{
+  "frozen": true,
+  "checksums_protected_pre_graft": {},
+  "migrate": {"etch": {"option_keys": ["etch_settings"]}},
+  "protect": {"_unclaimed": {"tables": []}},
+  "stack": {},
+  "options": {"search_replace": {"from": "", "to": ""}}
+}
+EOF
+  rm -f "${RUN_DIR}"/option-*.value
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 2 ]
+  grep -qF "could not be verified: migrated-options." "${RUN_DIR}/verify-report.md"
+}
+
+# --- Same N1 defect class as page_on_front, one check further down and not
+# in Viktor's list: "expected navigation is present on B (or wp_navigation
+# was not part of this run's migrate selection)" is the identical ambiguous
+# disjunction, ticked identically for two different facts. Shipping the
+# page_on_front fix while leaving its sibling reading the old way would make
+# two adjacent lines in the same report use opposite conventions.
+@test "phase_verify's navigation line says VERIFIED, and counts the posts, when wp_navigation really was migrated" {
+  setup_phase_verify_fixture
+  cat > "${RUN_DIR}/manifest.json" <<'EOF'
+{
+  "frozen": true,
+  "checksums_protected_pre_graft": {},
+  "migrate": {"core-wp": {"post_types": ["wp_navigation"], "option_keys": []}},
+  "protect": {"_unclaimed": {"tables": []}},
+  "stack": {},
+  "options": {"search_replace": {"from": "", "to": ""}}
+}
+EOF
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;;
+      option) echo "105" ;;
+      post)
+        if [ "$2" = "list" ]; then printf '77\n78\n'; else return 0; fi
+        ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  local nav_line; nav_line=$(grep -F -- "] expected navigation" "${RUN_DIR}/verify-report.md")
+  [ "$nav_line" = "- [x] expected navigation is present on B (2 wp_navigation post(s) found)" ]
+}
+
+@test "phase_verify's navigation line says NOT SELECTED, distinctly, when wp_navigation was not part of this run's migrate selection" {
+  setup_phase_verify_fixture # fixture migrates post_types ["page"], never wp_navigation
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  local nav_line; nav_line=$(grep -F -- "] expected navigation" "${RUN_DIR}/verify-report.md")
+  [ "$nav_line" = "- [x] expected navigation (not applicable — wp_navigation was not part of this run's migrate selection)" ]
 }

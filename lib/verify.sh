@@ -211,6 +211,27 @@ verify_options_match() {
 # `https://`, or a protocol-relative `//a.example.com`) is not detected,
 # because graft's own search-replace never targeted it either. Not a gap
 # this check introduces; it inherits graft's own documented scope exactly.
+#
+# Return codes are three-valued, like verify_page_on_front's (Viktor's
+# re-review of PR #26, BLOCKING): 0 = examined a non-empty scope and found
+# the domain absent, 1 = found it (or the check's own machinery failed —
+# fail closed), 2 = COULD NOT VERIFY, because the scope was EMPTY. That last
+# state is not hypothetical and it is not benign: with no id-map.tsv and no
+# selected option keys, the payload is `{"post_ids": [], "option_keys": []}`,
+# the PHP body below loops over two empty arrays, `$hits` stays empty, and
+# the function would return "OK" having examined literally nothing — the
+# exact "0 of N read as a pass" defect issue #23 exists to stop, reappearing
+# inside the check that closes issue #22. It is reachable in precisely the
+# run this file is about: lib/graft.sh warns and leaves id-map.tsv untouched
+# when the ID-mapper mu-plugin did not run, which makes every remap after it
+# a no-op — and it is the one run where a stale domain is MOST likely.
+#
+# The scope size is also echoed on stdout as `DOMAIN_SCOPE:<posts>:<options>`
+# (same machine-readable-marker convention as verify_options_match's
+# OPTIONS_COMPARED above, and read the same way by phase_verify) so the
+# report can state what was examined instead of just ticking a box. A count
+# on the line is what makes this class of defect impossible to reintroduce
+# unnoticed.
 verify_domain_absent() {
   local run_dir="$1" id_map_tsv="$2" manifest="$3" domain="$4"
   [ -n "$domain" ] || return 0
@@ -219,6 +240,16 @@ verify_domain_absent() {
   post_ids_json='[]'
   [ -s "$id_map_tsv" ] && post_ids_json=$(graft_migrated_post_ids_json "$id_map_tsv")
   option_keys_json=$(echo "$manifest" | jq -c '[.migrate[]?.option_keys[]?] | unique')
+
+  local post_count option_count
+  post_count=$(echo "$post_ids_json" | jq 'length')
+  option_count=$(echo "$option_keys_json" | jq 'length')
+  echo "DOMAIN_SCOPE:${post_count}:${option_count}"
+  if [ "$post_count" -eq 0 ] && [ "$option_count" -eq 0 ]; then
+    log_error "domain-absence check has nothing in scope to examine: this run recorded 0 migrated post(s) (${id_map_tsv}) and 0 migrated option(s) in its manifest — a check that examined nothing must never report the domain absent"
+    return 2
+  fi
+
   payload_json=$(jq -n --argjson post_ids "$post_ids_json" --argjson option_keys "$option_keys_json" --arg domain "$domain" \
     '{post_ids: $post_ids, option_keys: $option_keys, domain: $domain}')
   remote_path=$(graft_push_remap_payload "$run_dir" "$payload_json" "sitegraft-verify-domain-payload.json")
@@ -335,10 +366,34 @@ verify_domain_absent() {
 # file's content, is what makes the two cases distinguishable again: a file
 # that exists and says "0" is a real, positive statement from A; a file
 # that does not exist is silence, and silence must never be read as a pass.
+#
+# Why the two missing-file cases are treated ASYMMETRICALLY (Viktor's
+# re-review of PR #26, N9 — the asymmetry is deliberate and worth stating,
+# because it looks arbitrary otherwise): a missing `option-page_on_front.value`
+# is INCOMPLETE (2), but a missing id-map.tsv ENTRY for a front page A really
+# had is a HARD FAIL (1). The difference is what each absence proves about
+# B's current state. A missing .value file means graft never got as far as
+# recording A's value — nothing was written to B on the strength of it, so B
+# is merely UNKNOWN. A missing id-map entry means the import DID run (posts
+# were created on B) but without a working remap, so B's page_on_front is
+# now pointing at whatever ID it pointed at before: confirmed-wrong, not
+# just unknown. Confirmed-wrong is a hard failure; unknown is not.
+#
+# Success is also three-valued in MEANING even though all three exit 0 — not
+# selected / A never configured one / verified correct against B are three
+# different statements, and the report must not print one line for all
+# three (that ambiguous disjunction is exactly what issue #12 was filed
+# about). Each success path therefore echoes a marker on stdout —
+# `PAGE_ON_FRONT:not-selected`, `PAGE_ON_FRONT:a-had-none`,
+# `PAGE_ON_FRONT:verified:<id>` — the same machine-readable-marker
+# convention verify_options_match and verify_domain_absent use, read by
+# phase_verify to pick the right report line. A success path added later
+# without a marker is reported as UNVERIFIED rather than silently inheriting
+# one of the three claims.
 verify_page_on_front() {
   local run_dir="$1" id_map_tsv="$2" manifest="$3"
   echo "$manifest" | jq -e '[.migrate[].option_keys[]?] | index("page_on_front") != null' >/dev/null 2>&1 \
-    || return 0 # page_on_front was not part of this run's migrate selection — nothing to check
+    || { echo "PAGE_ON_FRONT:not-selected"; return 0; } # not part of this run's migrate selection — nothing to check
   if [ ! -f "${run_dir}/option-page_on_front.value" ]; then
     log_error "page_on_front was selected for migration but ${run_dir}/option-page_on_front.value does not exist — graft's migrate_options step for this key never ran (an interrupted run resumed past it?), so page_on_front cannot be verified"
     return 2
@@ -346,7 +401,7 @@ verify_page_on_front() {
   local old_front_id
   old_front_id=$(tr -d '"' 2>/dev/null < "${run_dir}/option-page_on_front.value")
   case "$old_front_id" in
-    ''|null|false|0) return 0 ;; # A never had a front page configured — nothing to check
+    ''|null|false|0) echo "PAGE_ON_FRONT:a-had-none"; return 0 ;; # A never had a front page configured — nothing to check
   esac
   local expected_new_id
   expected_new_id=$(awk -F'\t' -v old="$old_front_id" '$1==old{print $2}' "$id_map_tsv" 2>/dev/null)
@@ -365,6 +420,7 @@ verify_page_on_front() {
     log_error "page_on_front on B ('${live_front_id}') does not resolve to an existing page"
     return 1
   }
+  echo "PAGE_ON_FRONT:verified:${live_front_id}"
 }
 
 # verify_nav_present <manifest_json> — design doc §6.5 ("verifies the
@@ -377,15 +433,24 @@ verify_page_on_front() {
 # to actually exist on B post-graft — distinct from the generic post_type
 # recount (§6.5's first bullet), which only compares counts and would not by
 # itself catch a wp_navigation post that imported empty of content.
+#
+# Same marker convention, and for the same reason, as verify_page_on_front
+# above (Viktor's re-review of PR #26, N1 — extended here because the
+# navigation report line carried the identical ambiguous disjunction,
+# "present on B (or wp_navigation was not part of this run's migrate
+# selection)", ticked identically for two completely different facts):
+# `NAV:not-selected` vs `NAV:verified:<count>`.
 verify_nav_present() {
   local manifest="$1"
-  echo "$manifest" | jq -e '[.migrate[].post_types[]?] | index("wp_navigation") != null' >/dev/null 2>&1 || return 0
+  echo "$manifest" | jq -e '[.migrate[].post_types[]?] | index("wp_navigation") != null' >/dev/null 2>&1 \
+    || { echo "NAV:not-selected"; return 0; }
   local count
   count=$(wp_remote b post list --post_type=wp_navigation --field=ID 2>/dev/null | grep -c . || true)
   if [ "${count:-0}" -lt 1 ]; then
     log_error "wp_navigation was migrated but B has no navigation post after graft"
     return 1
   fi
+  echo "NAV:verified:${count}"
 }
 
 # verify_http_smoke <url> [expected_marker] — design doc §6.5: best-effort
@@ -480,6 +545,32 @@ verify_http_smoke() {
 # HARD FAIL outranks INCOMPLETE when a run has both: a confirmed defect is
 # the stronger, more actionable signal, and the exit code must reflect the
 # worse of the two.
+#
+# Viktor's re-review of PR #26 widened INCOMPLETE from two checks to four,
+# all four the same shape — a check whose own machinery is fine but which
+# had nothing to work with:
+#   - migrated options: N selected, 0 on disk to compare (issue #23).
+#   - page_on_front: selected, but its recorded value was never written.
+#   - domain absence: 0 migrated posts AND 0 migrated option keys in scope,
+#     so the check would otherwise have "confirmed" absence having read
+#     nothing (B1 — the same fail-open, one function further along).
+#   - domain absence, second shape: the manifest has no
+#     `options.search_replace.from` key at all, so this run cannot even say
+#     whether a domain was configured (N4). Distinct from the key being
+#     present and EMPTY, which is a real fact and stays a PASS.
+# The rule those four share, and the one to keep applying to any check added
+# later: a check that did not look at anything reports `- [ ] UNVERIFIED`
+# and says why; a check that ticks `- [x]` either names what it examined (a
+# count, an ID) or names the KNOWN fact that made it not applicable. "It
+# passed" and "there was nothing to look at" must never render the same.
+#
+# Deliberately NOT claimed here: that `- [ ]` now means UNVERIFIED and
+# nothing else. Three other lines below still use an unticked box for a
+# non-blocking FINDING (orphan parents found, the best-effort HTTP smoke
+# check failing) or for the re-licensing REMINDER, all of which coexist
+# with `Result: PASS` on purpose. Those are reported observations, not
+# unverified checks; unifying that notation is a separate change and is not
+# what this one did.
 phase_verify() {
   local profile="" run_dir=""
   while [ $# -gt 0 ]; do
@@ -507,6 +598,18 @@ phase_verify() {
   }
   [ -f "${run_dir}/manifest.json" ] || {
     log_error "no manifest found at ${run_dir}/manifest.json — nothing to verify against"
+    return 1
+  }
+  # Viktor's re-review of PR #26, N3: existing != parsable. Every check below
+  # reads its scope out of this file with `jq`, and a malformed manifest makes
+  # each of those reads fail quietly and return nothing — which the checks
+  # then read as "nothing was selected", i.e. four confident `[x]` ticks plus
+  # a HARD FAIL blamed on "protected data changed". That diagnosis points the
+  # operator at the wrong problem entirely. Validate once, up front, and
+  # refuse the whole phase rather than producing a report that is wrong in
+  # both directions at once.
+  jq -e . "${run_dir}/manifest.json" >/dev/null 2>&1 || {
+    log_error "the manifest at ${run_dir}/manifest.json is not valid JSON — every check in this phase reads its scope from it, so nothing here can be verified against it"
     return 1
   }
   local manifest; manifest=$(cat "${run_dir}/manifest.json")
@@ -595,16 +698,64 @@ phase_verify() {
   # uncertainty. That is exactly the distinction issue #22's own acceptance
   # criteria draw ("verified, or explicitly not applicable, or not
   # verifiable" — three different things, not two).
+  #
+  # Viktor's re-review of PR #26, N4/N5: `jq -r '...from // ""'` maps THREE
+  # distinct manifest states onto one empty string — the key is present and
+  # empty (a real "no domain configured" fact), the key is absent, and
+  # `.options` itself is absent. Only the first justifies the not-applicable
+  # PASS line; the other two are a manifest that never said anything on the
+  # subject, and printing a known fact on the strength of a missing key is
+  # the same shape of claim this PR is closing everywhere else. The key's
+  # presence is therefore tested SEPARATELY, before its value is read. (A
+  # hand-written manifest is exactly where this happens: manifest_new always
+  # populates the key, and lib/graft.sh documents the identical case at its
+  # own read of it.) N5: the old `[ "$domain" = "null" ] && domain=""` line
+  # that followed was dead code — jq's `// ""` already maps a JSON null onto
+  # "" — and is gone; the explicit has("from") test below is what actually
+  # separates the cases it was reaching for.
   # ---------------------------------------------------------------------------
-  local domain; domain=$(echo "$manifest" | jq -r '.options.search_replace.from // ""')
-  [ "$domain" = "null" ] && domain=""
-  if [ -z "$domain" ]; then
+  local domain="" domain_key_present=0
+  if echo "$manifest" | jq -e '.options.search_replace | has("from")' >/dev/null 2>&1; then
+    domain_key_present=1
+    domain=$(echo "$manifest" | jq -r '.options.search_replace.from // ""')
+  fi
+  if [ "$domain_key_present" -eq 0 ]; then
+    echo "- [ ] A's domain string is absent from the content graft imported: **UNVERIFIED** (not verifiable — the manifest has no options.search_replace.from, so this run cannot tell whether a domain was configured at all)" >> "$report"
+    incomplete=$((incomplete + 1))
+    incomplete_names="${incomplete_names}domain-absence "
+  elif [ -z "$domain" ]; then
     echo "- [x] A's domain string is absent from the content graft imported (not applicable — no domain was configured for this migration)" >> "$report"
-  elif verify_domain_absent "$run_dir" "$id_map_tsv" "$manifest" "$domain" 2>>"$report"; then
-    echo "- [x] A's domain string is absent from the content graft imported (migrated posts + migrated options)" >> "$report"
   else
-    echo "- [ ] **HARD FAIL: A's domain string is still present in content graft imported, or the check could not be verified** — see above" >> "$report"
-    hard_fail=1
+    # verify_domain_absent's exit code is three-valued (0/1/2 — see its own
+    # header comment), so this MUST capture the real code with `|| rc=$?`
+    # rather than fold every non-zero into a hard fail the way an `elif
+    # verify_domain_absent ...; then` chain would: that is the identical
+    # pitfall the page_on_front wiring below already documents, and folding
+    # 2 into 1 here would report "the domain is still present on B" for a
+    # run where nothing was ever examined.
+    local domain_output="" domain_rc=0
+    domain_output=$(verify_domain_absent "$run_dir" "$id_map_tsv" "$manifest" "$domain" 2>>"$report") || domain_rc=$?
+    local domain_posts=0 domain_options=0
+    case "$domain_output" in
+      *DOMAIN_SCOPE:*)
+        local domain_scope="${domain_output##*DOMAIN_SCOPE:}"
+        domain_posts="${domain_scope%%:*}"
+        domain_options="${domain_scope##*:}"
+        ;;
+    esac
+    if [ "$domain_rc" -eq 0 ]; then
+      # The counts are the point, not decoration: "(migrated posts + migrated
+      # options)" was a claim about what had been examined that the check
+      # could make while having examined nothing at all.
+      echo "- [x] A's domain string is absent from the content graft imported (${domain_posts} migrated post(s) + ${domain_options} migrated option(s) scanned)" >> "$report"
+    elif [ "$domain_rc" -eq 2 ]; then
+      echo "- [ ] A's domain string absent from the content graft imported: **UNVERIFIED — 0 migrated post(s) and 0 migrated option(s) were in scope, so nothing was examined** (see above; not a hard fail on its own, but not a pass)" >> "$report"
+      incomplete=$((incomplete + 1))
+      incomplete_names="${incomplete_names}domain-absence "
+    else
+      echo "- [ ] **HARD FAIL: A's domain string is still present in content graft imported, or the check could not be verified** — see above" >> "$report"
+      hard_fail=1
+    fi
   fi
 
   # --- page_on_front resolves to the CORRECT remapped page (finding B3;
@@ -616,10 +767,35 @@ phase_verify() {
   # non-zero into 1 the way the rest of this file's `|| x=1` idiom does —
   # doing that here would silently turn its INCOMPLETE (2) into a HARD FAIL.
   # ----------------------------------------------------------------------
-  local front_rc=0
-  verify_page_on_front "$run_dir" "$id_map_tsv" "$manifest" 2>>"$report" || front_rc=$?
+  #
+  # Viktor's re-review of PR #26, N1: exit code 0 covers THREE different
+  # outcomes and this printed one byte-identical line for all of them —
+  # "resolves to the correctly remapped page (or A never configured one)".
+  # That "or" is the ambiguous disjunction issue #12 is about, preserved in
+  # the report after being removed from the code, and inconsistent with the
+  # domain line above that this same PR just made explicit. The function now
+  # says WHICH outcome applied (see its header comment); each gets its own
+  # line, and an unmarked success is reported as unverified rather than
+  # assigned one of the three claims by default.
+  local front_output="" front_rc=0
+  front_output=$(verify_page_on_front "$run_dir" "$id_map_tsv" "$manifest" 2>>"$report") || front_rc=$?
   if [ "$front_rc" -eq 0 ]; then
-    echo "- [x] page_on_front resolves to the correctly remapped page (or A never configured one)" >> "$report"
+    case "$front_output" in
+      *PAGE_ON_FRONT:not-selected*)
+        echo "- [x] page_on_front (not applicable — page_on_front was not part of this run's migrate selection)" >> "$report"
+        ;;
+      *PAGE_ON_FRONT:a-had-none*)
+        echo "- [x] page_on_front (not applicable — A's own recorded value says A never configured a front page)" >> "$report"
+        ;;
+      *PAGE_ON_FRONT:verified:*)
+        echo "- [x] page_on_front resolves to the correctly remapped page on B (post ${front_output##*PAGE_ON_FRONT:verified:})" >> "$report"
+        ;;
+      *)
+        echo "- [ ] page_on_front: **UNVERIFIED — the check reported success without saying which of its outcomes applied** (a success path added without its marker — see lib/verify.sh's verify_page_on_front)" >> "$report"
+        incomplete=$((incomplete + 1))
+        incomplete_names="${incomplete_names}page_on_front "
+        ;;
+    esac
   elif [ "$front_rc" -eq 2 ]; then
     echo "- [ ] page_on_front: **UNVERIFIED — selected for migration but its recorded value was never written this run** (see above; not a hard fail on its own, but not a pass)" >> "$report"
     incomplete=$((incomplete + 1))
@@ -669,12 +845,27 @@ phase_verify() {
     echo "- [ ] orphan post_parent references found (post ID(s), design doc §9.2 — check manually / remap via id-map.tsv): $(echo "$orphans" | tr '\n' ' ')" >> "$report"
   fi
 
-  # --- expected navigation present -------------------------------------------
-  if verify_nav_present "$manifest" 2>>"$report"; then
-    echo "- [x] expected navigation is present on B (or wp_navigation was not part of this run's migrate selection)" >> "$report"
-  else
+  # --- expected navigation present. Two success outcomes, two distinct
+  # lines, same reasoning as page_on_front above (N1). ------------------------
+  local nav_output="" nav_rc=0
+  nav_output=$(verify_nav_present "$manifest" 2>>"$report") || nav_rc=$?
+  if [ "$nav_rc" -ne 0 ]; then
     echo "- [ ] **HARD FAIL: wp_navigation was migrated but B has no navigation post** — see above" >> "$report"
     hard_fail=1
+  else
+    case "$nav_output" in
+      *NAV:not-selected*)
+        echo "- [x] expected navigation (not applicable — wp_navigation was not part of this run's migrate selection)" >> "$report"
+        ;;
+      *NAV:verified:*)
+        echo "- [x] expected navigation is present on B (${nav_output##*NAV:verified:} wp_navigation post(s) found)" >> "$report"
+        ;;
+      *)
+        echo "- [ ] expected navigation: **UNVERIFIED — the check reported success without saying which of its outcomes applied** (a success path added without its marker — see lib/verify.sh's verify_nav_present)" >> "$report"
+        incomplete=$((incomplete + 1))
+        incomplete_names="${incomplete_names}navigation "
+        ;;
+    esac
   fi
 
   # --- HTTP smoke check (best-effort — never a hard fail on its own absence,
@@ -689,7 +880,13 @@ phase_verify() {
       echo "- [ ] HTTP smoke check FAILED (best-effort, not a hard fail — see above): ${site_b_url}" >> "$report"
     fi
   else
-    echo "- [ ] HTTP smoke check skipped — no SITE_B_URL configured in this profile" >> "$report"
+    # Viktor's re-review of PR #26, N2: `- [ ]` means "not verified"
+    # everywhere else in this report now, so an unticked box here sat
+    # underneath a "Result: PASS" footer saying two contradictory things. No
+    # SITE_B_URL in the profile is a KNOWN not-applicable read straight from
+    # the loaded profile — the same category as "no domain was configured",
+    # which is ticked — not an uncertainty.
+    echo "- [x] HTTP smoke check (not applicable — no SITE_B_URL configured in this profile)" >> "$report"
   fi
 
   # --- stack re-licensing reminder (design doc §12/§6.5) — not a pass/fail
@@ -711,7 +908,10 @@ phase_verify() {
       echo "**Result: HARD FAIL — see the item(s) above marked HARD FAIL. Do not consider this graft done.**"
       exit_code=1
     elif [ "$incomplete" -ne 0 ]; then
-      echo "**Result: INCOMPLETE — ${incomplete} check(s) could not be verified: ${incomplete_names}. This graft is not confirmed — re-run \`sitegraft graft\` to resume the interrupted step(s), then verify again.**"
+      # ${incomplete_names% } — the names are accumulated with a trailing
+      # separator space, which otherwise prints as "... migrated-options ."
+      # (N6 of Viktor's re-review of PR #26).
+      echo "**Result: INCOMPLETE — ${incomplete} check(s) could not be verified: ${incomplete_names% }. This graft is not confirmed — re-run \`sitegraft graft\` to resume the interrupted step(s), then verify again.**"
       exit_code=2
     else
       echo "**Result: PASS**"
