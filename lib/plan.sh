@@ -480,7 +480,11 @@ phase_plan() {
   # final migrate/protect state for this run, not inside plan_defaults where
   # it would only ever see the module defaults (see the Task 2.2 commit for
   # why that ordering is wrong).
-  manifest=$(manifest_compute_unclaimed "$manifest" "$(cat "${run_dir}/scan-b.json")")
+  # `|| return 1` for the same reason as the three calls above (Step 6
+  # hardening pass): without it, a failed assignment leaves `manifest`
+  # empty and execution would carry on toward _plan_freeze_summary and
+  # manifest_freeze as if unclaimed had resolved to nothing.
+  manifest=$(manifest_compute_unclaimed "$manifest" "$(cat "${run_dir}/scan-b.json")") || return 1
 
   if [ -z "${SITEGRAFT_MANIFEST_PREFILLED:-}" ]; then
     _plan_freeze_summary "$manifest" >&2
