@@ -520,6 +520,31 @@ B_ATTACH_COUNT=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=att
 # migrated data (site-a-seed.sh's "Main" wp_navigation post).
 ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=wp_navigation --field=post_title | grep -q '^Main$'
 
+# Issue #17: site-a-seed.sh's "Footer" wp_navigation post carries a STATIC
+# navigation-link pointing at A's "Home" page BY ID -- the real proof that
+# _core_wp_remap_nav_page_ids (modules/core-wp.sh) actually rewrites that id
+# against real, wp-cli-produced Gutenberg block markup, not only against
+# the hand-fabricated fixtures tests/unit/test_core_wp_module.bats uses.
+# Same id-map.tsv lookup technique the page_on_front assertion below already
+# uses: resolve A's OWN Home page id through the run's real id-map.tsv to
+# get the id B's copy actually landed on, then require the migrated
+# Footer's content to carry THAT id and never A's original one.
+ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=wp_navigation --field=post_title | grep -q '^Footer$'
+A_HOME_ID=$(ddev exec --raw -p "$PROJECT_A" -- wp post list --post_type=page --title="Home" --field=ID)
+B_HOME_ID_FROM_MAP=$(awk -F'\t' -v old="$A_HOME_ID" '$1==old && $3=="page"{print $2}' "${RUN_DIR}/id-map.tsv")
+[ -n "$B_HOME_ID_FROM_MAP" ]
+B_FOOTER_ID=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=wp_navigation --title="Footer" --field=ID)
+FOOTER_CONTENT_ON_B=$(ddev exec --raw -p "$PROJECT_B" -- wp post get "$B_FOOTER_ID" --field=post_content)
+case "$FOOTER_CONTENT_ON_B" in
+  *"\"id\":${B_HOME_ID_FROM_MAP}"*) : ;;
+  *) echo "FAIL: B's Footer navigation does not carry B's own remapped Home page id (${B_HOME_ID_FROM_MAP}) — content: ${FOOTER_CONTENT_ON_B}" >&2; exit 1 ;;
+esac
+case "$FOOTER_CONTENT_ON_B" in
+  *"\"id\":${A_HOME_ID}"*) echo "FAIL: B's Footer navigation still carries A's OWN Home page id (${A_HOME_ID}) — the id-remap did not run or did not match" >&2; exit 1 ;;
+  *) : ;;
+esac
+echo "==> confirmed: wp_navigation's static navigation-link id was remapped from A's Home page id (${A_HOME_ID}) to B's (${B_HOME_ID_FROM_MAP})"
+
 echo "==> (b) asserting B's protected fake-plugin data is BYTE-IDENTICAL before/after graft (the central non-contamination proof)"
 POST_GRAFT_CHECKSUM=$(b_protected_checksum)
 if [ "$PRE_GRAFT_CHECKSUM" != "$POST_GRAFT_CHECKSUM" ]; then

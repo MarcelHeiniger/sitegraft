@@ -366,3 +366,251 @@ EOF
   [ ! -f "$BATS_TEST_TMPDIR/calls.log" ]
   [[ "$stderr" != *"custom_logo"* ]] || false
 }
+
+# --- core_wp_post_types_dynamic: issue #17. `wp_navigation` — the block
+# themes' navigation post type — was declared by no module at all, so it
+# fell into protect._unclaimed and never travelled, even from a block-theme
+# A whose header component referenced one. See modules/core-wp.sh's own
+# header comment on core_wp_post_types_dynamic for why this is dynamic
+# rather than a third name in core_wp_post_types above, and why it is gated
+# on nav_uses_dynamic_page_list specifically rather than on the post type
+# being registered (verified against WordPress core: wp_navigation is
+# registered unconditionally, so its mere presence in scan.post_types proves
+# nothing about whether A has any actual navigation content).
+@test "core_wp_post_types_dynamic claims wp_navigation when the scan proves A has dynamic navigation content (#17)" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  cat > "$scan" <<'EOF'
+{"post_types":[{"name":"page"},{"name":"wp_navigation"}],"nav_uses_dynamic_page_list":true}
+EOF
+  run core_wp_post_types_dynamic "$scan"
+  [ "$status" -eq 0 ]
+  [ "$output" = "wp_navigation" ]
+}
+
+@test "core_wp_post_types_dynamic claims nothing when nav_uses_dynamic_page_list is false (#17)" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  cat > "$scan" <<'EOF'
+{"post_types":[{"name":"page"},{"name":"wp_navigation"}],"nav_uses_dynamic_page_list":false}
+EOF
+  run core_wp_post_types_dynamic "$scan"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "core_wp_post_types_dynamic claims nothing when nav_uses_dynamic_page_list is null, i.e. the A-side query failed (#17)" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  cat > "$scan" <<'EOF'
+{"post_types":[{"name":"page"}],"nav_uses_dynamic_page_list":null}
+EOF
+  run core_wp_post_types_dynamic "$scan"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "core_wp_post_types_dynamic claims nothing when the scan predates nav_uses_dynamic_page_list entirely -- missing key, not malformed (#17)" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  echo '{"post_types":[{"name":"page"}]}' > "$scan"
+  run core_wp_post_types_dynamic "$scan"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "core_wp_post_types_dynamic fails closed on a scan with no post_types list at all (#17)" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  echo '{"nav_uses_dynamic_page_list":true}' > "$scan"
+  run core_wp_post_types_dynamic "$scan"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"post_types"* ]] || false
+}
+
+# --- Issue #17's id-remap. A wp_navigation post's navigation-link blocks
+# carry POST ids for the pages/posts they point at
+# (`{"id":5,"kind":"post-type"}`). MEASURED, not assumed, that this needed a
+# new hook rather than being covered already: graft_remap_attachment_ids
+# (lib/graft.sh) calls sitegraft_remap_attachment_refs
+# (lib/php/content-remap-functions.php) with an `$attachments` map built
+# exclusively from id-map.tsv rows tagged "attachment" (read directly,
+# `awk -F'\t' '$3=="attachment"'` in graft_remap_attachment_ids) -- a page or
+# post id is never in that set, so it travels to B unrewritten. This
+# module's own post_import hook is where it happens instead, the same
+# division of labour design doc §11 already draws for module-specific
+# references, and the one etch_post_import already uses for Etch's own
+# component "ref" ids.
+@test "core_wp_post_import remaps a static navigation-link's page id through id-map.tsv (#17)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t205\tpage\n77\t177\twp_navigation\n' > "$tsv"
+  wp_cmd_b_stub() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  run cat "$BATS_TEST_TMPDIR/calls.log"
+  [[ "$output" == *"eval"* ]] || false
+  [[ "$output" == *"sitegraft_core_wp_remap_nav_link_ids"* ]] || false
+  [[ "$output" == *'"5":"205"'* ]] || false
+}
+
+@test "core_wp_post_import's nav id-remap is a no-op when id-map.tsv has no wp_navigation row (#17)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t205\tpage\n' > "$tsv"
+  wp_cmd_b_stub() { printf 'SHOULD NOT RUN NAV REMAP %s\n' "$*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  if [ -f "$BATS_TEST_TMPDIR/calls.log" ]; then
+    run grep -c "eval" "$BATS_TEST_TMPDIR/calls.log"
+    [ "$output" = "0" ]
+  fi
+}
+
+@test "core_wp_post_import's nav id-remap is a no-op when id-map.tsv does not exist at all yet -- first-time --dry-run (#17)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  [ ! -e "$tsv" ]
+  wp_cmd_b_stub() { echo "SHOULD NOT BE CALLED" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  run core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
+  [ ! -f "$BATS_TEST_TMPDIR/calls.log" ]
+}
+
+@test "core_wp_post_import's nav id-remap does NOT call wp_cmd_b for real under SITEGRAFT_DRY_RUN=1 (#17)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t205\tpage\n77\t177\twp_navigation\n' > "$tsv"
+  wp_cmd_b_stub() { echo "SHOULD NOT BE CALLED FOR REAL UNDER DRY-RUN" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  SITEGRAFT_DRY_RUN=1 run core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
+  [ ! -f "$BATS_TEST_TMPDIR/calls.log" ]
+  [[ "$output" == *"[dry-run]"* ]] || false
+  [[ "$output" == *"eval"* ]] || false
+}
+
+@test "core_wp_post_import's nav id-remap map excludes attachment rows -- the taxonomy/post-type kind check needs a clean post-id map (#17)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t905\tattachment\n77\t177\twp_navigation\n' > "$tsv"
+  wp_cmd_b_stub() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  run cat "$BATS_TEST_TMPDIR/calls.log"
+  [[ "$output" != *'"5":"905"'* ]] || false
+}
+
+@test "core_wp_post_import's nav id-remap treats a wp_navigation row with a malformed new id as unimportable, not as something to remap toward (#17)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  # A corrupt or hand-edited map: column 2 is not an integer.
+  printf '5\t205\tpage\n77\tnot-a-number\twp_navigation\n' > "$tsv"
+  wp_cmd_b_stub() { printf 'SHOULD NOT RUN NAV REMAP %s\n' "$*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  if [ -f "$BATS_TEST_TMPDIR/calls.log" ]; then
+    run grep -c "eval" "$BATS_TEST_TMPDIR/calls.log"
+    [ "$output" = "0" ]
+  fi
+}
+
+# --- _core_wp_nav_remap_php: the actual substitution logic, tested via a
+# real `php` CLI process -- no WordPress bootstrap needed (json_decode/
+# json_encode/preg_replace_callback are plain PHP, not WordPress functions).
+# Same reasoning lib/php/content-remap-functions.php's own header gives for
+# why this matters (review, Viktor, NIT-1): an inline bash-string PHP
+# payload is syntactically impossible to unit test on its own. Kept in its
+# own bash function (rather than inlined directly into the eval heredoc in
+# _core_wp_remap_nav_page_ids) specifically so this exact source can be
+# captured and run standalone here.
+_php_available() { command -v php >/dev/null 2>&1; }
+
+@test "_core_wp_nav_remap_php remaps a post-type navigation-link's id through the map (#17)" {
+  _php_available || skip "php CLI not available in this environment"
+  local phpfile="$BATS_TEST_TMPDIR/remap.php"
+  { echo '<?php'; _core_wp_nav_remap_php; } > "$phpfile"
+  run php -r "
+    require '${phpfile}';
+    \$out = sitegraft_core_wp_remap_nav_link_ids(
+      ['5' => '205'],
+      '<!-- wp:navigation-link {\"label\":\"Home\",\"type\":\"page\",\"id\":5,\"kind\":\"post-type\"} /-->'
+    );
+    if (strpos(\$out, '\"id\":205') === false) { fwrite(STDERR, \"not remapped: \$out\n\"); exit(1); }
+    if (strpos(\$out, '\"id\":5,') !== false) { fwrite(STDERR, \"old id survived: \$out\n\"); exit(1); }
+    echo 'OK';
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "OK" ]
+}
+
+@test "_core_wp_nav_remap_php leaves a taxonomy-kind navigation-link's id untouched even when it numerically collides with a page id in the map -- kind ambiguity safety (#17)" {
+  _php_available || skip "php CLI not available in this environment"
+  local phpfile="$BATS_TEST_TMPDIR/remap.php"
+  { echo '<?php'; _core_wp_nav_remap_php; } > "$phpfile"
+  run php -r "
+    require '${phpfile}';
+    \$out = sitegraft_core_wp_remap_nav_link_ids(
+      ['5' => '205'],
+      '<!-- wp:navigation-link {\"label\":\"News\",\"type\":\"category\",\"id\":5,\"kind\":\"taxonomy\"} /-->'
+    );
+    if (strpos(\$out, '\"id\":5,') === false) { fwrite(STDERR, \"taxonomy id was wrongly rewritten: \$out\n\"); exit(1); }
+    echo 'OK';
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "OK" ]
+}
+
+@test "_core_wp_nav_remap_php leaves a dynamic wp:page-list block untouched -- nothing to remap (#17)" {
+  _php_available || skip "php CLI not available in this environment"
+  local phpfile="$BATS_TEST_TMPDIR/remap.php"
+  { echo '<?php'; _core_wp_nav_remap_php; } > "$phpfile"
+  run php -r "
+    require '${phpfile}';
+    \$in = '<!-- wp:page-list /-->';
+    \$out = sitegraft_core_wp_remap_nav_link_ids(['5' => '205'], \$in);
+    if (\$out !== \$in) { fwrite(STDERR, \"page-list block was modified: \$out\n\"); exit(1); }
+    echo 'OK';
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "OK" ]
+}
+
+@test "_core_wp_nav_remap_php remaps navigation-submenu ids too, and its nested navigation-link children (#17)" {
+  _php_available || skip "php CLI not available in this environment"
+  local phpfile="$BATS_TEST_TMPDIR/remap.php"
+  { echo '<?php'; _core_wp_nav_remap_php; } > "$phpfile"
+  run php -r "
+    require '${phpfile}';
+    \$in = '<!-- wp:navigation-submenu {\"label\":\"More\",\"type\":\"page\",\"id\":9,\"kind\":\"post-type\"} -->' .
+      '<!-- wp:navigation-link {\"label\":\"Child\",\"type\":\"page\",\"id\":9,\"kind\":\"post-type\"} /-->' .
+      '<!-- /wp:navigation-submenu -->';
+    \$out = sitegraft_core_wp_remap_nav_link_ids(['9' => '209'], \$in);
+    if (substr_count(\$out, '\"id\":209') !== 2) { fwrite(STDERR, \"expected both ids remapped: \$out\n\"); exit(1); }
+    if (strpos(\$out, '\"id\":9,') !== false) { fwrite(STDERR, \"an old id survived: \$out\n\"); exit(1); }
+    echo 'OK';
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "OK" ]
+}
+
+@test "_core_wp_nav_remap_php leaves a navigation-link id untouched when the map has no entry for it (#17)" {
+  _php_available || skip "php CLI not available in this environment"
+  local phpfile="$BATS_TEST_TMPDIR/remap.php"
+  { echo '<?php'; _core_wp_nav_remap_php; } > "$phpfile"
+  # The extra space after each ":" is deliberate, not incidental: it makes
+  # this test distinguish "genuinely took the untouched-comment early
+  # return" from "went through decode/re-encode and merely happened to
+  # produce the same id" -- a mutant that always rewrites (dropping the
+  # array_key_exists guard and falling back to the OLD id when unmapped)
+  # would re-serialize via json_encode either way, which is compact and
+  # would silently swallow this spacing -- caught live: without this
+  # spacing, that exact mutant left every assertion in this file green,
+  # because json_decode(42)/json_encode(42) round-trips to the byte-identical
+  # "42" when the id happens to already match.
+  run php -r "
+    require '${phpfile}';
+    \$in = '<!-- wp:navigation-link {\"label\": \"Orphan\", \"type\": \"page\", \"id\": 42, \"kind\": \"post-type\"} /-->';
+    \$out = sitegraft_core_wp_remap_nav_link_ids([], \$in);
+    if (\$out !== \$in) { fwrite(STDERR, \"unmapped id was modified: \$out\n\"); exit(1); }
+    echo 'OK';
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "OK" ]
+}

@@ -25,6 +25,18 @@ ddev exec --raw -p "$DDEV_PROJECT" -- wp option update automatic_css_settings '{
 # picks this up as true (design doc §0 point 11 / §6.1).
 ddev exec --raw -p "$DDEV_PROJECT" -- wp post create --post_type=wp_navigation --post_title="Main" --post_status=publish --post_content='<!-- wp:page-list /-->'
 
+# Issue #17 fixture: a SECOND wp_navigation post, this one STATIC -- a real
+# navigation-link block pointing at the "Home" page BY ID, the exact shape
+# the design doc's §6.1 note (and this issue) warns needs id-remap treatment
+# ("navigation content holds post IDs for the pages it links to"). Kept
+# deliberately separate from "Main" above: "Main" stays purely dynamic
+# (wp:page-list, no ids at all) so the existing nav_uses_dynamic_page_list
+# assertion keeps testing exactly what it always tested, and this new post
+# is purely static so the harness can assert the id-remap fired against
+# real, wp-cli-produced block markup -- not hand-fabricated test JSON.
+FOOTER_NAV_CONTENT="<!-- wp:navigation-link {\"label\":\"Home\",\"type\":\"page\",\"id\":${HOME_ID},\"kind\":\"post-type\"} /-->"
+ddev exec --raw -p "$DDEV_PROJECT" -- wp post create --post_type=wp_navigation --post_title="Footer" --post_status=publish --post_content="$FOOTER_NAV_CONTENT"
+
 # Step 4 fixture (design doc §9.1): a real media attachment plus an
 # etch_cfs post embedding it BOTH ways Etch actually does — the `"id":X`
 # JSON block attribute AND an absolute-URL <img> tag carrying A's own
