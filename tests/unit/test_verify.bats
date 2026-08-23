@@ -187,6 +187,49 @@ setup() {
   [[ "$output" == *"hero image"* ]] || false
 }
 
+# fd 3, not stdin, is not stylistic: in production wp_remote (lib/inventory.sh)
+# shells out to `ssh` with no `-n` and no `</dev/null`, so `ssh` DRAINS stdin.
+# A read loop fed on stdin (`while read -r key; do ... done <<< "$keys"`)
+# would have the loop body's own `ssh` call swallow the rest of the piped-in
+# keys on its first iteration -- reproduced: 4 keys in, `ssh` drains stdin on
+# key 1, loop exits after 1 iteration, reports "1 of 1 compared" (a full
+# PASS) having never looked at keys 2-4. Every wp_remote stub in this suite
+# is a plain `echo` that never touches stdin, so no other test here would
+# catch a regression back to a stdin-based loop -- this one stubs wp_remote
+# the way the real one behaves (drains stdin) specifically to pin fd 3 down.
+@test "verify_options_match reads keys on fd 3, so a loop-body command that drains stdin (ssh) cannot swallow the remaining keys" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  for k in k1 k2 k3 k4; do printf '"same"' > "${run_dir}/option-${k}.value"; done
+  local manifest='{"migrate":{"m":{"option_keys":["k1","k2","k3","k4"]}}}'
+  # production wp_remote shells out to `ssh` with no -n and no </dev/null
+  # (lib/inventory.sh), so it DRAINS stdin. On a stdin-based loop this
+  # reports 1 of 1 -- a full [x] PASS over three keys never looked at.
+  wp_remote() { cat >/dev/null; echo '"same"'; }
+  run verify_options_match "$run_dir" "$manifest"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"OPTIONS_COMPARED:4:4"* ]] || false
+}
+
+# `IFS=` on the read itself (not just fd 3) is load-bearing too: `read`
+# strips leading/trailing IFS whitespace from a single captured field even
+# with `-r`, unless IFS is cleared first. A key with a boundary space is
+# just as reachable as "hero image"'s internal space (phase_verify never
+# re-validates a hand-edited manifest -- see this function's own header
+# comment), and without `IFS=` it would silently become a DIFFERENT,
+# trimmed key, missing its real "option-<key>.value" file the same way an
+# internal-space split does.
+@test "verify_options_match preserves a key's leading/trailing space, rather than trimming it (IFS= on the read, not just fd 3)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '"same"' > "${run_dir}/option- padded.value"
+  local manifest='{"migrate":{"m":{"option_keys":[" padded"]}}}'
+  wp_remote() { echo '"same"'; }
+  run verify_options_match "$run_dir" "$manifest"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"OPTIONS_COMPARED:1:1"* ]] || false
+}
+
 # --- verify_domain_absent ----------------------------------------------------
 # Rewritten in the security-review fix-pack (Viktor + Kimi): the previous SQL
 # `UNION ... LIMIT` version was a DEAD check (invalid MySQL/MariaDB syntax on

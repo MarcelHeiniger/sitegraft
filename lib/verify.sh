@@ -123,13 +123,30 @@ verify_options_match() {
   # compared, AND `total` inflated by one per fragment rather than one per
   # real key, corrupting the "N of M compared" count issue #23/#26 added
   # specifically so a shortened comparison could never pass unnoticed.
-  # #29 already fixed this shape in graft_migrate_options and rejects such
-  # names at three entry points (module_selection, manifest_validate,
-  # graft_migrate_options itself) — that rejection is not repeated here on
-  # purpose, since manifest_validate already closes it upstream for every
-  # manifest this function is ever handed; a fourth copy of the same rule
-  # would only be duplicated debt. fd 3 rather than stdin so the loop body
-  # (wp_remote, which shells out) never disturbs it.
+  # #29 already fixed this shape in graft_migrate_options and rejects
+  # comma/space names at three entry points (module_selection,
+  # manifest_validate, graft_migrate_options itself) — that rejection is
+  # deliberately NOT repeated here, but not because it's already closed
+  # upstream for every manifest this function sees: unlike
+  # graft_migrate_options, which WRITES to B's live database and must
+  # refuse an ambiguous name outright, this function only reads and
+  # compares — handling the key correctly is strictly better than refusing
+  # it. And phase_verify does NOT re-run manifest_validate before calling
+  # this (it only checks the manifest file is valid JSON, then `cat`s it);
+  # manifest_validate is only ever called from manifest_freeze. So a
+  # manifest hand-edited after being frozen reaches here UNVALIDATED —
+  # exactly the scenario issue #34 names (lib/graft.sh's own comment on
+  # graft_migrate_options documents the identical gap: "a manifest edited
+  # AFTER being frozen never passes through validation again either"). The
+  # fd-3 read below is what makes that safe here, not an upstream check.
+  # fd 3 rather than stdin also matters for a second, independent reason:
+  # the loop body calls wp_remote, which shells out to `ssh` with no `-n`
+  # and no `</dev/null` (lib/inventory.sh) — `ssh` DRAINS stdin. A
+  # stdin-fed loop would have the very first iteration's `ssh` call
+  # swallow every remaining key, silently truncating the comparison to one
+  # key while still reporting a clean "1 of 1" pass (reproduced; see this
+  # function's own test "reads keys on fd 3, so a loop-body command that
+  # drains stdin (ssh) cannot swallow the remaining keys").
   while IFS= read -r key <&3; do
     [ -n "$key" ] || continue
     case "$key" in
