@@ -730,3 +730,87 @@ EOF
   grep -q "REMINDER" "${RUN_DIR}/verify-report.md"
   grep -q "etch" "${RUN_DIR}/verify-report.md"
 }
+
+# --- DEMONSTRATION (#20): the domain check vanishes when no domain is set ---
+#
+# phase_verify wraps the domain check in `if [ -n "$domain" ]`. With no
+# domain configured the check is skipped AND NOTHING IS WRITTEN TO THE
+# REPORT — no [x], no [ ], no warning. The reader cannot tell a check was
+# skipped, and "Result: PASS" is printed regardless.
+#
+# The page_on_front check at least prints a line carrying its own "or A never
+# configured one" caveat. This one leaves no trace at all.
+#
+# Note the fixture used by the tests above already sets "from": "" — so the
+# existing suite has been exercising the skipped path all along, green.
+@test "phase_verify records the domain check even when no domain is configured" {
+  setup_phase_verify_fixture
+  local pre_sum; pre_sum=$(backup_checksum "IDENTICAL PROTECTED CONTENT")
+  cat > "${RUN_DIR}/manifest.json" <<EOF2
+{
+  "frozen": true,
+  "checksums_protected_pre_graft": {"fakebooking": "sha256:${pre_sum}"},
+  "migrate": {},
+  "protect": {"fakebooking": {"tables": ["fakebooking_reservations"]}},
+  "stack": {},
+  "options": {"search_replace": {"from": "", "to": ""}}
+}
+EOF2
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      eval) echo "wp_" ;;
+      db) echo "IDENTICAL PROTECTED CONTENT" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  # Whatever the outcome, the report must account for the domain check.
+  grep -qi "domain" "${RUN_DIR}/verify-report.md"
+}
+
+# --- DEMONSTRATION (#20): "migrated options match" with nothing compared ----
+#
+# verify_options_match skips any key with no "option-<key>.value" file
+# (lib/verify.sh:109). The skip is deliberate and commented — a key graft
+# never reached is not this function's to have an opinion about — but the
+# REPORT does not carry that nuance: it prints a plain
+#   - [x] migrated options match A's values on B
+# even when zero options were actually compared, which is what a run
+# interrupted before the options step and then resumed produces.
+#
+# A green tick for a check that compared nothing is the same defect as
+# "protected data unchanged" printed without a checksum.
+@test "phase_verify does not claim migrated options match when none could be compared" {
+  setup_phase_verify_fixture
+  local pre_sum; pre_sum=$(backup_checksum "IDENTICAL PROTECTED CONTENT")
+  cat > "${RUN_DIR}/manifest.json" <<EOF2
+{
+  "frozen": true,
+  "checksums_protected_pre_graft": {"fakebooking": "sha256:${pre_sum}"},
+  "migrate": {"etch": {"option_keys": ["etch_settings", "etch_styles"]}},
+  "protect": {"fakebooking": {"tables": ["fakebooking_reservations"]}},
+  "stack": {},
+  "options": {"search_replace": {"from": "https://a.example.com", "to": "https://b.example.com"}}
+}
+EOF2
+  # No option-*.value files exist in RUN_DIR: graft never reached that step.
+  rm -f "${RUN_DIR}"/option-*.value
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      eval) echo "wp_" ;;
+      db) echo "IDENTICAL PROTECTED CONTENT" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  verify_domain_absent() { return 0; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  ! grep -qx -- "- \[x\] migrated options match A's values on B" "${RUN_DIR}/verify-report.md"
+}
