@@ -244,3 +244,54 @@ EOF
   run jq -e '.active_theme.name == "twentytwentyfive" and .active_theme.stylesheet == "twentytwentyfive"' "$out"
   [ "$status" -eq 0 ]
 }
+
+# --- inventory_check_path_topology -----------------------------------------
+#
+# The one site shape sitegraft cannot drive: reachable over SSH, with wp-cli
+# running inside a container on the far end. Left undetected it does not fail
+# usefully — `wp export --dir=/tmp/...` writes inside the container while the
+# pull reads the SSH host's /tmp, so the export comes back empty and the graft
+# reports success having moved nothing.
+#
+# The guard tests the invariant (is WP_PATH visible to BOTH wp-cli and the SSH
+# host's filesystem?) rather than the shape of the profile, and the last test
+# below is what pins that difference: `sudo -u www-data wp` behind SSH is a
+# wrapper whose paths match, and must be accepted.
+
+@test "inventory_check_path_topology skips a site with no SSH_HOST (local+wrapper is supported)" {
+  SITE_B_SSH_HOST=""
+  SITE_B_WP_PATH="/var/www/html"
+  wp_remote() { return 1; }   # would fail if it were consulted at all
+  ssh() { return 1; }
+  run inventory_check_path_topology b
+  [ "$status" -eq 0 ]
+}
+
+@test "inventory_check_path_topology refuses when wp-cli sees the path but the SSH host does not" {
+  SITE_B_SSH_HOST="user@host"
+  SITE_B_WP_PATH="/var/www/html"
+  wp_remote() { return 0; }   # wp-cli answers: the container sees the path
+  ssh() { return 1; }         # the host itself has no such directory
+  run inventory_check_path_topology b
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"running inside a container"* ]] || false
+}
+
+@test "inventory_check_path_topology refuses when wp-cli does not answer at all" {
+  SITE_B_SSH_HOST="user@host"
+  SITE_B_WP_PATH="/wrong/path"
+  wp_remote() { return 1; }
+  ssh() { return 0; }
+  run inventory_check_path_topology b
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"did not answer"* ]] || false
+}
+
+@test "inventory_check_path_topology accepts a wrapper behind SSH whose paths agree (sudo -u www-data wp)" {
+  SITE_B_SSH_HOST="user@host"
+  SITE_B_WP_PATH="/var/www/site/htdocs"
+  wp_remote() { return 0; }
+  ssh() { return 0; }
+  run inventory_check_path_topology b
+  [ "$status" -eq 0 ]
+}

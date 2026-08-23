@@ -92,3 +92,51 @@ setup() {
   modules_discover
   [[ " ${SITEGRAFT_MODULES} " == *" etch "* ]] || false
 }
+
+# --- etch_post_import: Etch's own component references ----------------------
+#
+# Etch templates address components by post ID (`{"ref":14468}`), those ids
+# change on import, and graft's generic content remap only handles attachment
+# `"id":` and `wp-image-`. One dangling reference takes a whole template down:
+# on a real graft every page served HTTP 200 with an empty body while the 404
+# template, which references no component, rendered perfectly.
+#
+# These exercise the bash half — which mappings are built, and from which rows
+# — by capturing the PHP the hook hands to wp-cli.
+_etch_capture_eval() {
+  case "$1" in
+    option) echo '{}' ;;
+    eval)   printf '%s' "$2" > "$BATS_TEST_TMPDIR/php.txt" ;;
+  esac
+}
+
+@test "etch_post_import builds its ref map from non-attachment rows only" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '14468\t15506\twp_block\n900\t901\tattachment\n14279\t15505\twp_template\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  grep -q '"14468":15506' "$BATS_TEST_TMPDIR/php.txt"
+  grep -q '"14279":15505' "$BATS_TEST_TMPDIR/php.txt"
+  # `"ref"` addresses blocks; feeding attachment ids in would only give a
+  # numeric coincidence something to match.
+  ! grep -q '"900"' "$BATS_TEST_TMPDIR/php.txt"
+}
+
+@test "etch_post_import scopes the rewrite to the posts this run imported" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '14468\t15506\twp_block\n14279\t15505\twp_template\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  # NEW ids (column 2) are the posts to walk — B's pre-existing content is
+  # protected by default-deny and is not this hook's to rewrite.
+  grep -q '\[15505,15506\]\|\[15506,15505\]' "$BATS_TEST_TMPDIR/php.txt"
+}
+
+@test "etch_post_import does nothing when the run mapped only attachments" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '900\t901\tattachment\n' > "$tsv"
+  rm -f "$BATS_TEST_TMPDIR/php.txt"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  [ ! -f "$BATS_TEST_TMPDIR/php.txt" ]
+}
