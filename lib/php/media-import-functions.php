@@ -28,11 +28,22 @@
  * idempotent-resume guarantee (never re-import something already on B,
  * never silently skip something that IS missing) and the fail-closed
  * accounting invariant (a batch that only got through part of the list
- * must say so, never report a false global success). The other two
- * (sitegraft_media_import_one, sitegraft_media_import_batch) call WordPress
- * core APIs (wp_insert_attachment, get_posts, ...) and can only be
- * exercised against a real WP bootstrap — the DDEV integration harness,
- * not a bare `php` unit test.
+ * must say so, never report a false global success).
+ *
+ * The other two (sitegraft_media_import_one, sitegraft_media_import_batch)
+ * call WordPress core APIs (wp_insert_attachment, get_posts, ...). They
+ * were once described here as testable only against a real WP bootstrap.
+ * That was measurably wrong, and it hid four live guards: the whole suite
+ * stayed green with `update_post_meta( ..., '_sitegraft_source_id', ... )`
+ * — the single write the entire idempotent-resume design rests on, and
+ * the only thing graft_prune_previous_run can find a previous run's posts
+ * by — deleted outright, and likewise with the file_exists guard, the
+ * no_local_file bucket, and the is_wp_error check after the insert. Both
+ * functions now run under tests/unit/fixtures/wpstub.php, an in-memory
+ * stand-in for the handful of core functions this file calls, driven by
+ * tests/unit/test_media_import_batch.bats through the same bare `php` CLI.
+ * The DDEV harness still covers what a stub cannot: real WordPress, real
+ * files, real wp-cli.
  */
 
 /**
@@ -117,12 +128,18 @@ function sitegraft_media_build_report( array $requested_old_ids, array $imported
 		'failed'          => array_values( $failed ),
 		// json_encode(array()) always produces "[]", never "{}" -- PHP has
 		// no way to tell an empty array was meant to be an associative map.
-		// The caller (graft_import_attachments, lib/graft.sh) reads this
-		// with jq's `to_entries[]`, which errors on a JSON array -- forcing
-		// stdClass here when $map is empty keeps the field's TYPE stable
-		// (always a JSON object) regardless of whether anything landed in
-		// it, exactly the case where every requested attachment failed or
-		// had no local file and $map is legitimately empty.
+		// stdClass here keeps this field's TYPE stable (always a JSON
+		// object) regardless of whether anything landed in it, which is the
+		// whole point: the caller's guard (graft_import_attachments,
+		// lib/graft.sh) is `(.map | type) == "object"`, and an empty batch --
+		// every attachment failed, or had no local file -- is a legitimate,
+		// non-error outcome that must not trip it.
+		//
+		// NOT because jq's `to_entries[]` errors on a JSON array. Measured, it
+		// does not: `echo '[]' | jq -r 'to_entries[]'` exits 0 and prints
+		// nothing. The jq error this shape really does avoid is one level up,
+		// on the object guard: `echo '[]' | jq -r '.error // empty'` is
+		// "Cannot index array with string \"error\"", exit 5.
 		'map'             => empty( $map ) ? new stdClass() : $map,
 	);
 }
@@ -130,10 +147,10 @@ function sitegraft_media_build_report( array $requested_old_ids, array $imported
 /**
  * sitegraft_media_import_one( int $old_id, string $abs_path, string $title ): array
  *
- * NOT pure — calls WordPress core media APIs directly, run only inside a
- * real `wp eval` bootstrap on B. Not unit-tested with a bare `php` CLI for
- * that reason (same limitation graft_import_attachments' own wp-cli calls
- * had before this rewrite); exercised by the DDEV integration harness.
+ * NOT pure — calls WordPress core media APIs directly; in production it
+ * runs only inside a real `wp eval` bootstrap on B. Unit-tested against
+ * tests/unit/fixtures/wpstub.php (tests/unit/test_media_import_batch.bats),
+ * and exercised for real by the DDEV integration harness.
  *
  * Registers a file ALREADY PLACED on B's filesystem (by graft_media_sync,
  * which runs before this step) as an attachment, without copying it —
@@ -256,7 +273,17 @@ function sitegraft_media_import_batch( array $requested ) {
 
 	$missing = sitegraft_media_diff_missing( $requested_old_ids, $existing_map );
 
-	$upload_dir    = wp_upload_dir();
+	$upload_dir = wp_upload_dir();
+	// Resolved once. $uploads_base is the canonical uploads root every
+	// rel_path below has to stay inside; $uploads_base_raw is the
+	// unresolved form the attachment path is actually built from, so an
+	// error message echoes back the path that was asked for rather than a
+	// symlink-resolved one the operator never wrote. $uploads_base is
+	// false when basedir itself does not exist, which is treated as
+	// "cannot confine" -> refuse, never as "confinement passes".
+	$uploads_base_raw = rtrim( $upload_dir['basedir'], '/' );
+	$uploads_base     = realpath( $uploads_base_raw );
+	
 	$imported_map  = array();
 	$no_local_file = array();
 	$failed        = array();
@@ -268,7 +295,38 @@ function sitegraft_media_import_batch( array $requested ) {
 			$no_local_file[] = $old_id;
 			continue;
 		}
-		$abs_path = rtrim( $upload_dir['basedir'], '/' ) . '/' . ltrim( $rel_path, '/' );
+		$abs_path = $uploads_base_raw . '/' . ltrim( $rel_path, '/' );
+		
+		// Path confinement (review N1, both reviewers). ltrim( $rel_path, '/' )
+		// strips leading slashes and nothing else -- it does not stop a
+		// rel_path of "../../wp-config.php". Measured before this guard:
+		// rel_path "../secret/wp-config.php" returned
+		// {"ok":true,"imported":[66]} and registered a file from outside the
+		// uploads tree as an attachment on B. That is worse than an
+		// out-of-bounds read: graft_prune_previous_run (lib/graft.sh) deletes
+		// every _sitegraft_source_id-tagged post with `wp post delete
+		// --force`, which removes the attached file from disk -- so the NEXT
+		// graft would delete that out-of-tree file for real.
+		//
+		// realpath() resolves symlinks too, so a link planted inside uploads
+		// that points outside it is caught here as well.
+		//
+		// "the file isn't there" and "that path points outside the uploads
+		// tree" are two different facts about two different problems, and
+		// realpath() returns false for BOTH -- so existence is tested
+		// separately, and only a path that really does resolve OUTSIDE the
+		// tree gets the escape message. A non-existent path (escaping or not)
+		// falls through to sitegraft_media_import_one's own "file not found
+		// on B" report -- nothing was reachable, so nothing was confined out.
+		$real_path = realpath( $abs_path );
+		if ( $real_path !== false && ( $uploads_base === false || strpos( $real_path, $uploads_base . '/' ) !== 0 ) ) {
+			$failed[] = array(
+				'old'   => $old_id,
+				'error' => 'rel_path resolves outside B\'s uploads directory, refusing to import it: ' . $rel_path,
+			);
+			continue;
+		}
+		
 		$title    = isset( $row['title'] ) ? (string) $row['title'] : '';
 		try {
 			$result = sitegraft_media_import_one( $old_id, $abs_path, $title );

@@ -9,9 +9,10 @@
 # granularity than the old per-attachment loop had, and failing closed
 # when a batch doesn't account for every requested attachment. The other
 # two functions in that file (sitegraft_media_import_one,
-# sitegraft_media_import_batch) call WordPress core APIs directly and can
-# only be exercised against a real WP bootstrap — the DDEV integration
-# harness, not here.
+# sitegraft_media_import_batch) call WordPress core APIs directly; they
+# live in tests/unit/test_media_import_batch.bats, which runs them under
+# tests/unit/fixtures/wpstub.php — same bare `php` CLI, an in-memory
+# stand-in for the core functions instead of a real bootstrap.
 setup() {
   PHP_LIB="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)/lib/php/media-import-functions.php"
   [ -f "$PHP_LIB" ] || skip "lib/php/media-import-functions.php not found"

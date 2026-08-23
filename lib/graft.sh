@@ -556,6 +556,28 @@ graft_integrity_gate() {
 # report it explicitly instead of it silently vanishing before ever
 # reaching B, the same case the pre-batch loop logged with its own
 # per-item warning.
+#
+# Two details in the eval below are load-bearing, and both are stated here
+# rather than as PHP comments inside it: that source is bash
+# SINGLE-quoted, so an apostrophe anywhere in it silently ends the string
+# and breaks the script.
+#
+#   - get_post_field( "post_title" ), never get_the_title(). The latter
+#     runs the title through the `the_title` filter, on which WordPress
+#     core itself hangs wptexturize, convert_chars and trim, and which
+#     prefixes "Protected: " for a password-protected attachment. A graft
+#     has to carry the stored title to B byte for byte; the pre-batch loop
+#     read the raw column (`post get --field=post_title`) and so does this.
+#
+#   - JSON_INVALID_UTF8_SUBSTITUTE (PHP 7.2+, i.e. the whole WordPress
+#     baseline this tool supports). A title holding latin1 bytes is routine
+#     on the elderly installs a graft tool exists to migrate, and plain
+#     json_encode returns false on one ("Malformed UTF-8 characters").
+#     false echoes as the empty string, so the eval would print NOTHING and
+#     the step would die on "could not read the attachment list" --
+#     fail-closed, but undiagnosable, and with no way forward short of
+#     hand-editing the source database. Substituting the bad bytes keeps
+#     the payload parseable and keeps every other attachment in the list.
 graft_collect_attachment_metadata_json() {
   local alias_lc="$1"
   wp_remote "$alias_lc" eval '
@@ -572,10 +594,10 @@ graft_collect_attachment_metadata_json() {
       $out[] = array(
         "old"      => (int) $id,
         "rel_path" => (string) get_post_meta( $id, "_wp_attached_file", true ),
-        "title"    => get_the_title( $id ),
+        "title"    => (string) get_post_field( "post_title", $id ),
       );
     }
-    echo json_encode( $out );
+    echo json_encode( $out, JSON_INVALID_UTF8_SUBSTITUTE );
   '
 }
 
@@ -595,19 +617,34 @@ graft_import_attachments() {
 
   local attachments_json
   attachments_json=$(graft_collect_attachment_metadata_json a)
-  # A genuine wp-cli failure on A prints to stderr (visible to the
-  # operator, never swallowed here — CLAUDE.md: never `2>/dev/null`/`|| true`
-  # over a real failure) and leaves $attachments_json empty; under
-  # --dry-run, wp_remote's OWN internal dry-run echo (lib/inventory.sh)
-  # replaces the real query with literal "[dry-run] ..." text instead —
-  # neither is valid JSON, so both are detected the same way here and
-  # handled according to which one actually happened.
+  # Two different things land here as "not a JSON array", and the earlier
+  # version of this comment described the first one wrongly. Under
+  # bin/sitegraft's real `set -euo pipefail`, a wp-cli that EXITS non-zero
+  # never reaches this check at all: `attachments_json=$(cmd)` aborts the
+  # script on the spot. What actually gets here is (a) a wp-cli that exits
+  # ZERO while printing non-JSON — a PHP notice/warning ahead of the
+  # payload, an interactive prompt, a wrapper's own banner — and (b) a
+  # --dry-run, where wp_remote's OWN internal echo (lib/inventory.sh)
+  # substitutes literal "[dry-run] ..." text for the query. Both are
+  # detected the same way and handled according to which one happened.
   if ! echo "$attachments_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
     if is_dry_run; then
+      # A --dry-run cannot know the attachment count: A was never queried.
+      # It CAN name the two files this step writes into B's wp-content and
+      # removes again — real writes on B that a reviewer reading a dry-run
+      # has to see, and that the single generic line here before this
+      # actively implied did not exist. The pre-batch per-attachment loop
+      # listed every file it would import; that fidelity is not recoverable
+      # without querying A, but the B-side writes are, so those are named.
       printf '[dry-run] wp_remote a eval (collect attachment metadata for import)\n'
+      printf '[dry-run] push A'"'"'s attachment list -> %s/wp-content/sitegraft-media-import-payload.json (attachment count unknown under --dry-run: A was not queried)\n' "$SITE_B_WP_PATH"
+      printf '[dry-run] push lib/php/media-import-functions.php -> %s/wp-content/sitegraft-media-import-functions.php\n' "$SITE_B_WP_PATH"
+      printf '[dry-run] wp_remote b eval (sitegraft_media_import_batch over every attachment A reports)\n'
+      printf '[dry-run] rm %s/wp-content/sitegraft-media-import-payload.json\n' "$SITE_B_WP_PATH"
+      printf '[dry-run] rm %s/wp-content/sitegraft-media-import-functions.php\n' "$SITE_B_WP_PATH"
       return 0
     fi
-    log_error "could not read A's attachment list — wp eval on A did not return a JSON array (see any error output above)"
+    log_error "could not read A's attachment list — wp eval on A exited 0 but did not return a JSON array (see any output above). Raw output: ${attachments_json}"
     return 1
   fi
 
@@ -615,6 +652,13 @@ graft_import_attachments() {
   requested_count=$(echo "$attachments_json" | jq 'length')
   [ "$requested_count" -gt 0 ] || { log_info "no attachments on A — nothing to import"; return 0; }
 
+  # Belt and braces, and knowingly unreachable today: under --dry-run
+  # wp_remote never really queries A, so $attachments_json is always the
+  # literal "[dry-run] ..." text and the branch above has already returned.
+  # Getting here at all would mean wp_remote had started executing A-side
+  # reads during a dry run — the one condition under which this second stop
+  # is worth its four lines, since everything below it writes to B. Kept
+  # deliberately; not counted as covered.
   if is_dry_run; then
     printf '[dry-run] wp_remote b eval (media import batch, %s attachment(s) requested)\n' "$requested_count"
     return 0
@@ -635,10 +679,31 @@ graft_import_attachments() {
     $payload_path = WP_CONTENT_DIR . "/sitegraft-media-import-payload.json";
     $payload = json_decode( file_get_contents( $payload_path ), true );
     if ( ! is_array( $payload ) ) {
-      echo json_encode( array( "ok" => false, "error" => "no media-import payload found or unreadable" ) );
+      echo json_encode( array( "ok" => false, "error" => "no media-import payload found or unreadable: " . json_last_error_msg() ) );
       return;
     }
-    echo json_encode( sitegraft_media_import_batch( $payload ) );
+    // JSON_INVALID_UTF8_SUBSTITUTE (PHP 7.2+) for the same reason as the
+    // A-side collection above, but the stakes here are higher: by this
+    // point the batch has ALREADY done all the work — every post inserted,
+    // every _sitegraft_source_id written. A single non-UTF-8 byte anywhere
+    // in the report (a filename, a WordPress error message built from a
+    // path) made plain json_encode return false, which echoes as the empty
+    // string, which graft_import_attachments correctly refuses — leaving
+    // id-map.tsv unwritten with the import fully done. Re-running then
+    // found everything already_present and failed to encode again: a
+    // permanently stuck step. The pre-batch loop never had this failure
+    // mode, because it passed titles through argv and never through JSON.
+    $encoded = json_encode( sitegraft_media_import_batch( $payload ), JSON_INVALID_UTF8_SUBSTITUTE );
+    if ( $encoded === false ) {
+      // Belt and braces, and not reachable by anything this file can
+      // produce: with SUBSTITUTE the only remaining json_encode failures
+      // are INF/NAN floats, recursion and depth, and every value in the
+      // report is an int or a cast string. Kept anyway because the failure
+      // it guards is empty stdout with no explanation at all — the single
+      // hardest thing to diagnose in this whole step.
+      $encoded = json_encode( array( "ok" => false, "error" => "media-import batch result could not be JSON-encoded: " . json_last_error_msg() ) );
+    }
+    echo $encoded;
   ')
 
   graft_remove_file b "$remote_path"
@@ -675,6 +740,20 @@ graft_import_attachments() {
   # same step) — never append. See this function's own header comment for
   # why append-only was the pre-batch implementation's duplicate-row bug on
   # a resumed, partially-completed step.
+  # N5: `.map` missing entirely (an object result from some future/older
+  # library version) sent `jq -r '.map | to_entries[]'` into "null (null)
+  # has no keys", jq exit 5, INSIDE a `map_tsv=$(...)` assignment — under
+  # bin/sitegraft's real `set -euo pipefail` that aborts the whole script
+  # on a raw jq error line instead of this function's own controlled
+  # log_error, exactly what the `type == "object"` guard above already
+  # exists to prevent one level up. An EMPTY map is fine and expected (see
+  # sitegraft_media_build_report's stdClass note) — what is refused is a
+  # map that is absent or not an object.
+  if ! echo "$result_json" | jq -e '(.map | type) == "object"' >/dev/null 2>&1; then
+    log_error "media import batch on B returned no usable id map (.map is absent or not a JSON object) — refusing to rewrite id-map.tsv. Raw output: ${result_json}"
+    return 1
+  fi
+
   local other_rows map_tsv
   other_rows=""
   [ -f "$id_map_tsv" ] && other_rows=$(awk -F'\t' '$3!="attachment"' "$id_map_tsv")
@@ -690,17 +769,50 @@ graft_import_attachments() {
   no_local_file_count=$(echo "$result_json" | jq '.no_local_file | length')
   failed_count=$(echo "$result_json" | jq '.failed | length')
 
+  # An attachment A holds no _wp_attached_file for was never locally
+  # storable in the first place (external/offloaded media): skipping it is
+  # the correct outcome, not a failure, and stays a warning — the same
+  # thing the pre-batch per-attachment loop did.
   if [ "$no_local_file_count" -gt 0 ]; then
     log_warn "skipped ${no_local_file_count} attachment(s) with no _wp_attached_file meta on A (not locally-stored, e.g. external/offloaded media): $(echo "$result_json" | jq -c '.no_local_file')"
-  fi
-  if [ "$failed_count" -gt 0 ]; then
-    log_warn "failed to import ${failed_count} of ${requested_count} attachment(s) onto B: $(echo "$result_json" | jq -c '.failed')"
   fi
 
   # What ACTUALLY landed on B, not what was planned (CLAUDE.md: "never
   # report success you have not earned"). already_present_count is > 0 only
   # when this call resumed a previously-interrupted run of this same step.
+  # Printed BEFORE the refusal below so a failed step still tells the
+  # operator what it did manage to do.
   log_info "media import: ${imported_count} newly imported, ${already_present_count} already present (resumed), ${no_local_file_count} skipped (no local file), ${failed_count} failed — ${requested_count} attachment(s) requested"
+
+  # BLOCKER (review): this used to be a log_warn and a zero exit. `ok` from
+  # the batch only means every attachment landed in SOME bucket, and
+  # `failed` IS one of those buckets — so a batch that got 400 of 518 in
+  # and lost 118 to per-item errors came back ok=true and this function
+  # returned 0. phase_graft wires every step as `graft_step_done ... || {
+  # <step>; graft_mark_step ...; }`, so a zero exit writes
+  # graft.import_attachments.done, a resumed run skips this step FOREVER,
+  # the 118 are never retried, and graft_remap_attachment_ids /
+  # graft_remap_featured_images then hit `[ -s "$id_map_tsv" ] || return 0`
+  # and say nothing at all. The only witness was this warning, in a
+  # 3000-line log. Measured before the fix: 400/518 imported -> exit 0;
+  # 0/518 imported -> exit 0 with a zero-byte id-map.tsv.
+  #
+  # Not theoretical, and routine on a SECOND graft: graft_prune_previous_run
+  # deletes every _sitegraft_source_id-tagged post with `wp post delete
+  # --force`, which removes the attached file from disk, so the next import
+  # finds nothing to register and EVERY attachment fails — and the graft
+  # used to carry on to completion with zero media.
+  #
+  # The id-map rewrite above deliberately stays above this refusal: what
+  # did import is recorded, so a re-run retries only what failed (the
+  # resume path sitegraft_media_import_batch already guarantees). There is
+  # no --allow-partial-media escape hatch on purpose — re-running IS the
+  # escape hatch, and it is the one that ends with the media actually
+  # migrated.
+  if [ "$failed_count" -gt 0 ]; then
+    log_error "failed to import ${failed_count} of ${requested_count} attachment(s) onto B: $(echo "$result_json" | jq -c '.failed') — refusing to report success; re-run to retry only the ones that failed"
+    return 1
+  fi
 }
 
 # design doc §6.4 step 3/5 / review finding A4: export lands in the run directory

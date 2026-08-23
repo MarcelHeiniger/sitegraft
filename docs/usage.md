@@ -249,17 +249,29 @@ Attachment import is batched, not one container invocation per attachment: a sin
 imports and remaps all of them in one WordPress bootstrap. On a site with a few
 hundred attachments this completes in minutes rather than the hours a per-attachment
 loop would take. The step end-of-run report always states how many attachments were
-**actually** imported and remapped — never how many were merely requested — and the
-step fails outright (non-zero exit, listing which attachments) if it cannot account
-for every one of them, rather than silently reporting fewer as a success.
+**actually** imported and remapped — never how many were merely requested.
+
+The step exits non-zero, naming every attachment that failed and why, if **any**
+attachment it was asked to import did not land on B — not only if the batch loses
+track of one. There is no flag to continue past that: re-running `graft` is the way
+forward, and it retries **only** what failed. Whatever did import is already
+recorded in the run's `id-map.tsv` before the step refuses, and the batch asks B
+itself which attachments already carry sitegraft's source-id marker before importing
+anything, so nothing is imported twice.
+
+One case is deliberately **not** a failure: an attachment A holds no local file for
+(external or offloaded media, i.e. no `_wp_attached_file`) was never locally storable
+in the first place. Those are listed as skips, with a warning, and the step still
+succeeds.
 
 `--dry-run` prints every command it would run instead of running it — nothing on B
-is touched. Every step is also individually idempotent (tracked via marker files in
-the run directory), so a `graft` that's interrupted partway through can simply be
-re-run and picks up where it left off, rather than starting over or duplicating
-content — the attachment-import step specifically re-checks, per attachment, what B
-already has before importing anything, so a resumed run neither re-imports an
-attachment already there nor skips one that's still missing.
+is touched. Because A is never actually queried under `--dry-run`, the attachment
+step cannot know how many attachments exist and so cannot list them individually; it
+names the two files it would write into B's `wp-content` (the attachment payload and
+the media-import library) and remove again, plus the two `wp eval` calls. Every step
+is also individually idempotent (tracked via marker files in the run directory), so a
+`graft` that's interrupted partway through can simply be re-run and picks up where it
+left off, rather than starting over or duplicating content.
 
 ### 4.5 `verify` — confirm the graft actually worked
 
