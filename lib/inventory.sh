@@ -166,6 +166,67 @@ echo json_encode($dynamic);
 '
 }
 
+# inventory_check_path_topology <alias: a|b> — refuse, at scan time, the one
+# site shape sitegraft cannot drive: reachable over SSH, but with wp-cli
+# running inside a container on the far end.
+#
+# wp_remote supports exactly two shapes — SSH (wp-cli on the SSH host, same
+# paths rsync uses) and local-with-wrapper (container path indirection handled
+# explicitly). A remote containerized site is neither, and it does not fail
+# usefully: `wp export --dir=/tmp/...` writes inside the container while the
+# pull reads the SSH host's /tmp, so the export comes back EMPTY and the graft
+# reports success having moved nothing. For a tool people run against their
+# clients' sites, that silent version is the real defect — worse than the
+# missing topology itself.
+#
+# Detected by testing the INVARIANT rather than the shape of the profile: is
+# SITE_<A>_WP_PATH visible both to wp-cli and to the SSH host's own
+# filesystem? A profile-shape heuristic ("SSH plus a wrapper means refuse")
+# would reject a perfectly valid setup — `sudo -u www-data wp` behind SSH is
+# a wrapper whose paths match just fine.
+#
+#   wp-cli answers, host cannot see the path  -> containerized far end, refuse
+#   wp-cli does not answer                    -> the path is wrong, refuse
+#   both agree                                -> supported, proceed
+#
+# Sites with no SSH_HOST are the local-with-wrapper case, which IS supported,
+# and are skipped.
+inventory_check_path_topology() {
+  local alias_lc="$1"
+  local alias_uc; alias_uc=$(printf '%s' "$alias_lc" | tr '[:lower:]' '[:upper:]')
+  local host_var="SITE_${alias_uc}_SSH_HOST"
+  local path_var="SITE_${alias_uc}_WP_PATH"
+  local key_var="SITE_${alias_uc}_SSH_KEY"
+  local host="${!host_var:-}" path="${!path_var:-}" ssh_key="${!key_var:-}"
+
+  [ -n "$host" ] || return 0
+
+  # Both probes are reads and must really run, including under --dry-run:
+  # routed through run_or_echo they would return the literal "[dry-run] ..."
+  # text and the check would pass on nothing. Same treatment, and the same
+  # save/restore discipline, as graft_sync_theme_parent.
+  local saved_dry_run="${SITEGRAFT_DRY_RUN:-0}"
+  SITEGRAFT_DRY_RUN=0
+  local wp_ok=0 host_ok=0
+  wp_remote "$alias_lc" option get siteurl >/dev/null 2>&1 && wp_ok=1
+  if [ -n "$ssh_key" ]; then
+    ssh -i "$ssh_key" -- "$host" "test -d $(sq "$path")" >/dev/null 2>&1 && host_ok=1
+  else
+    ssh -- "$host" "test -d $(sq "$path")" >/dev/null 2>&1 && host_ok=1
+  fi
+  SITEGRAFT_DRY_RUN="$saved_dry_run"
+
+  if [ "$wp_ok" = "0" ]; then
+    log_error "site '${alias_lc}': wp-cli on ${host} did not answer with --path=${path}. Check SITE_${alias_uc}_WP_PATH and SITE_${alias_uc}_WP_CMD before going further — every later phase builds on this path."
+    return 1
+  fi
+
+  if [ "$host_ok" = "0" ]; then
+    log_error "site '${alias_lc}': wp-cli answers with --path=${path}, but ${host} has no such directory on its own filesystem. That means wp-cli is running inside a container on the far end, and sitegraft cannot drive that shape: it would copy files to paths the container cannot see, and 'wp export --dir=/tmp/...' would write inside the container while the pull read the host's /tmp — an EMPTY export, reported as a successful graft. Refusing here instead. Workaround: install and run sitegraft ON ${host} itself, leaving SITE_${alias_uc}_SSH_HOST empty so this site takes the supported local+wrapper path (note SITE_${alias_uc}_WP_PATH must then be the CONTAINER path, and SITE_${alias_uc}_WP_CMD must end in ' wp'). Tracked as issue #19."
+    return 1
+  fi
+}
+
 inventory_scan_site() {
   local alias_lc="$1" out_json="$2"
   log_info "scanning site '${alias_lc}' -> ${out_json}"
@@ -600,6 +661,10 @@ phase_scan() {
     umask 077
     mkdir -p "$run_dir" || exit 1
     chmod 700 "$run_dir" || exit 1
+    # Both topologies checked BEFORE either site is read: an unusable profile
+    # should be rejected in seconds, not after a full scan of the other site.
+    inventory_check_path_topology a || exit 1
+    inventory_check_path_topology b || exit 1
     inventory_scan_site a "${run_dir}/scan-a.json" || exit 1
     inventory_scan_site b "${run_dir}/scan-b.json" || exit 1
     chmod 600 "${run_dir}/scan-a.json" "${run_dir}/scan-b.json" || exit 1
