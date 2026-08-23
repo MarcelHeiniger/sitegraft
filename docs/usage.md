@@ -110,8 +110,14 @@ ln -s "$(pwd)/bin/sitegraft" /usr/local/bin/sitegraft
 ## 3. Set up a profile
 
 A profile is a file at `profiles/<name>.conf` describing the A/B site pair —
-hosts, WordPress install paths, and how to invoke `wp-cli` on each. Profiles are
-**safe to commit**: they never contain secrets.
+hosts, WordPress install paths, and how to invoke `wp-cli` on each. Profiles
+**never contain secrets** — but they do contain real infrastructure details:
+real hostnames, real filesystem paths, real site URLs, a real SSH user. That is
+exactly the material `CLAUDE.md` keeps out of this public repo, so profiles are
+**local-only, not committed** — `.gitignore` excludes every `profiles/*.conf`
+except `profiles/example.conf` itself, which holds only placeholders. A newly
+created profile is untracked by default; verify with `git status` before you
+ever `git add` one by hand.
 
 ```sh
 cp profiles/example.conf profiles/my-migration.conf
@@ -254,7 +260,64 @@ still matches (nothing sitegraft wasn't told to touch actually changed), migrate
 options carry A's exact values, `page_on_front` resolves to the correctly remapped
 page, A's domain string is absent from B's migrated content, and (if configured) an
 HTTP smoke check that B's front page actually renders with an expected marker.
-Writes a report into the run directory and exits non-zero on any hard failure.
+Writes a report into the run directory.
+
+Every check in the report is accounted for on every run — verified, explicitly not
+applicable, or explicitly unverifiable — never silently absent while `Result: PASS`
+still prints. A ticked check either **names what it examined** (a count, a page ID)
+or **names the known fact** that made it not applicable; "it passed" and "there was
+nothing to look at" never render the same way. Concretely:
+
+- The migrated-options line names how many of the selected keys were actually
+  compared, e.g. `migrated options match A's values on B (12 of 12 compared)`. If
+  some were selected but none had a value to compare against (a run interrupted
+  before the options step and later resumed), that is reported as unverified —
+  never as a plain, uncounted pass.
+- The domain-absence check always prints a line, and when it really ran it says how
+  much it looked at, e.g. `A's domain string is absent from the content graft
+  imported (48 migrated post(s) + 3 migrated option(s) scanned)`. The counts matter:
+  the check is scoped to what *this run* migrated, so if `id-map.tsv` is empty and
+  no option keys were selected there is nothing in scope, and it reports
+  **unverified** rather than "absent". (An empty `id-map.tsv` is exactly what a run
+  whose ID-mapper never loaded looks like — `graft` warns about it — and it is the
+  run most likely to have left A's domain behind.)
+- When no domain is configured for the migration at all, the same line is marked
+  not applicable — a known fact read from the manifest, not an uncertainty. If the
+  manifest has no `options.search_replace.from` key whatsoever (a hand-written
+  manifest; `plan` always writes one), that is different again: nothing is known
+  either way, and it is reported as not verifiable.
+- `page_on_front` gets one of four distinct lines, never a single line covering
+  several of them at once: verified against B (naming the page ID it resolved to),
+  not applicable because it was not part of this run's migrate selection, not
+  applicable because A's own recorded value says A never had a front page, or
+  unverified. It **fails** verify if A had a front page selected for migration and
+  `graft` could not resolve it through `id-map.tsv` — that used to be read as "A
+  never configured one" and passed silently; a missing remap is now a hard failure,
+  not an exemption. If page_on_front was selected but its recorded value was never
+  written to disk at all (the same "interrupted, later resumed" shape as the
+  migrated-options case above), that is reported as unverified too.
+- The navigation line likewise separates "present on B (N wp_navigation post(s)
+  found)" from "not applicable — wp_navigation was not part of this run's migrate
+  selection".
+- The HTTP smoke check, when the profile has no `SITE_B_URL`, is marked not
+  applicable rather than left as an unticked box under a `PASS` footer.
+- A `manifest.json` that is not valid JSON aborts the phase outright. Every check
+  reads its scope from that file, so a malformed manifest would otherwise produce a
+  report full of confident ticks for checks that examined nothing.
+
+**The overall `Result:` and exit code are three-valued, not a plain pass/fail:**
+
+| Result | Meaning | Exit code |
+|---|---|---|
+| `PASS` | Every check verified correct, or was genuinely not applicable (a known fact, e.g. no domain configured for this migration). | `0` |
+| `HARD FAIL` | At least one check found a confirmed defect, or a check's own execution failed outright (a query/`wp eval` that could not run — this signals the read machinery itself may be unreliable, a strictly worse condition than "some data just wasn't produced yet"). | `1` |
+| `INCOMPLETE` | No hard failure, but at least one check had nothing to work with — an earlier step's data was never produced (a graft interrupted and later resumed), or the check's scope came out empty, or the manifest never recorded what it would have needed. The check's own machinery is fine; there is simply nothing to check it against. The graft is not confirmed good, but it is also not confirmed bad. | `2` |
+
+`HARD FAIL` outranks `INCOMPLETE` when a run has both — a confirmed defect is the
+stronger, more actionable signal. A caller scripting against `verify`'s exit code
+should treat anything non-zero as "do not consider this graft done", and treat `2`
+specifically as "re-run `graft` to resume the interrupted step(s), then verify
+again" rather than as a defect to investigate.
 
 `--dry-run` is accepted here too, but `verify` is already read-only against B by
 construction — there is nothing for it to simulate, so it just runs the real checks

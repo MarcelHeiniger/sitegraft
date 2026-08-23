@@ -24,8 +24,9 @@ Full brainstorming session with Marcel, 2026-08-19. Summarized here for the reco
    (fallback `fzf`), result = a frozen manifest.
 7. Backup built into the tool, host-agnostic, with a generated `restore.sh`.
 8. Old→new ID mapping via a temporary mu-plugin on B, hooked into wordpress-importer.
-9. Two credential paths (per-profile file OR interactive prompt); profiles are
-   committable with no secrets.
+9. Two credential paths (per-profile file OR interactive prompt); profiles hold
+   no secrets, but they do hold real hosts and paths, so they are local-only
+   and gitignored (issue #18).
 10. Bash portability, minimal dependencies, never `scp`.
 11. Etch specifics: templates live in the database only (no file fallback);
     navigation is often a dynamic `wp:page-list` block — verify per site in `scan`,
@@ -553,10 +554,12 @@ Validation rules (`lib/manifest.sh :: manifest_validate`):
 
 ## 5. Profile + credentials format
 
-### 5.1 Profile — `profiles/<name>.conf` (committable, zero secrets)
+### 5.1 Profile — `profiles/<name>.conf` (local-only and gitignored, zero secrets)
 
 ```sh
-# profiles/example.conf — sitegraft profile. No secrets here — safe to commit.
+# profiles/example.conf — sitegraft profile template. No secrets here, but a
+# real profile holds real hosts, paths and site URLs, so profiles/*.conf are
+# gitignored and only this example is tracked. Copy it; never commit the copy.
 
 SITE_A_ALIAS="a"
 SITE_A_SSH_HOST="user@host-a.example.com"
