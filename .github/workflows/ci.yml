@@ -15,12 +15,22 @@ on:
 permissions:
   contents: read
 
+# Two pushes/PR-updates close together used to run two full sets of jobs
+# in parallel, with the checks list flapping between them. Cancel the
+# in-flight run for the same PR/branch when a newer one starts.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   shellcheck:
     name: Shell lint (shellcheck)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout v5, pinned by commit SHA (the only third-party
+      # action this workflow uses).
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
@@ -30,18 +40,21 @@ jobs:
         # it disables a handful of codes that are systemic false positives
         # for this codebase's architecture (lib/*.sh sourced together into
         # one process, wp-cli wrapper strings intentionally word-split).
-        # Everything else stays at shellcheck's default severity.
+        # Everything else stays at shellcheck's default severity. A few
+        # narrower codes are disabled inline at their exact site instead
+        # of here (see .shellcheckrc's own header for why).
         run: |
           shellcheck bin/sitegraft
           shellcheck lib/*.sh
           shellcheck modules/*.sh modules/*.sh.example
-          shellcheck tests/integration/*.sh
+          shellcheck tests/integration/*.sh tests/integration/fixtures/*.sh
 
   unit-tests:
     name: Unit tests (bats)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install bats and sitegraft's runtime dependencies
         # The unit suite exercises bin/sitegraft's real require_cmd checks
@@ -61,8 +74,9 @@ jobs:
   php-lint:
     name: PHP lint (php -l)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install php-cli
         run: sudo apt-get update && sudo apt-get install -y php-cli

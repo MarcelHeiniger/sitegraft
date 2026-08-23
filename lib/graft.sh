@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034 # this file sets variables read by OTHER sourced files in the same bash process (lib/*.sh sourced together by bin/sitegraft / lib/modules.sh); shellcheck lints each file in isolation and can't see that cross-file usage
 # lib/graft.sh — phase: graft. Rendering-stack sync/precondition, media sync,
 # WXR export/import, mu-plugin mapping, ID/domain remaps, options migration,
 # optional clean/idempotence pruning. See design doc §6.4, §9, §12.
@@ -155,6 +156,7 @@ graft_sync_stack() {
     mkdir -p "$staging"
 
     if [ -n "${SITE_A_SSH_HOST:-}" ]; then
+      # shellcheck disable=SC2153 # not a typo: SITE_A_WP_PATH is assigned in bin/sitegraft or a sourced profile, not in this file (cross-file, same as SC2034 below)
       run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${SITE_A_WP_PATH}/${rel_dir}/" "${staging}/"
     elif [ -n "$(graft_local_prefix a)" ]; then
       graft_pull_dir a "${SITE_A_WP_PATH}/${rel_dir}" "$staging"
@@ -778,6 +780,7 @@ graft_remap_featured_images() {
   # matching that sibling function's own check precisely.
   [ -s "$id_map_tsv" ] || return 0
   local old_id new_id post_type
+  # shellcheck disable=SC2094 # false positive for both this loop's own read (3<) and the awk call inside it below: id_map_tsv is only ever READ in this loop, never written
   while IFS=$'\t' read -r old_id new_id post_type <&3; do
     [ "$post_type" != "attachment" ] || continue
     local current_thumb

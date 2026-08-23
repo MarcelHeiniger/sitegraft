@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034 # this file sets variables read by OTHER sourced files in the same bash process (lib/*.sh sourced together by bin/sitegraft / lib/modules.sh); shellcheck lints each file in isolation and can't see that cross-file usage
 # lib/backup.sh — phases: backup, restore. Full DB + wp-content export of B,
 # pulled to the orchestrator, plus a normalized checksum snapshot of protected
 # data and a genuinely self-contained restore.sh (design doc §6.3/§6.7, review

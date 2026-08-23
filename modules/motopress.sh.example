@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034 # state_dir (one of this hook's 3 documented parameters) is genuinely unused in this deliberately minimal worked example — the other 4 SC2034 directives in this repo are for the real cross-file-sourcing blind spot, this one is just an unused example param kept for contract fidelity
 # modules/motopress.sh.example — worked example: a hypothetical future module.
 # Copy to modules/motopress.sh (drop the .example suffix) to activate it for real.
 # MotoPress Hotel Booking is NOT implemented in v1 — this file exists purely to show
@@ -52,6 +53,7 @@ motopress_post_import() {
   # "related_room_id" postmeta pointing at another migrated post.
   while IFS=$'\t' read -r old_id new_id post_type; do
     [ "$post_type" = "mphb_room_type" ] || continue
+    # shellcheck disable=SC2086 # intentionally unquoted: wp_cmd_b may be a multi-word wrapper (e.g. ddev exec ... wp) and must word-split, same pattern as the other 4 documented run_or_echo call sites in this repo
     $wp_cmd_b post list --post_type=mphb_booking --meta_key=related_room_id \
       --meta_value="$old_id" --field=ID | while read -r booking_id; do
         # shellcheck disable=SC2086 # intentionally unquoted: wp_cmd_b may be a multi-word wrapper (e.g. ddev exec ... wp) and must word-split

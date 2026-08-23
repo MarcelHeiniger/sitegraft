@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034 # this file sets variables read by OTHER sourced files in the same bash process (lib/*.sh sourced together by bin/sitegraft / lib/modules.sh); shellcheck lints each file in isolation and can't see that cross-file usage
 # lib/inventory.sh — read-only site introspection (phase: scan).
 
 # Known "snippet" plugins whose mere active presence is itself a custom-code
@@ -25,6 +26,7 @@ SITEGRAFT_SNIPPET_PLUGIN_SLUGS='["code-snippets","wpcode","insert-headers-and-fo
 sq() {
   local s="$1"
   local q="'"
+  # shellcheck disable=SC1003 # not an unfinished escape: bq deliberately holds one literal backslash character as data (see the comment above sq() for why)
   local bq='\'
   s="${s//$q/${q}${bq}${q}${q}}"
   printf "'%s'" "$s"

@@ -1,17 +1,16 @@
 # shellcheck config for CI (.github/workflows/ci.yml).
 #
 # Every code below is disabled repo-wide because it is a systemic false
-# positive for sitegraft's architecture, not a masked real problem. Anything
-# NOT listed here still fails CI at shellcheck's default (style) severity.
-# One-off, narrower cases (e.g. the 4 intentionally-unquoted SC2086 sites in
-# the run_or_echo pattern) are disabled inline at the call site instead of
-# here, so SC2086 stays fully active everywhere else.
-
-# SC2034 (appears unused): lib/*.sh and modules/*.sh are all sourced into
-# one bash process (by bin/sitegraft / lib/modules.sh); a variable set in
-# one file is routinely read in another. shellcheck lints each file in
-# isolation and cannot see that cross-file usage.
-disable=SC2034
+# positive for sitegraft's architecture, not a masked real problem — it
+# recurs (or would recur on any future file following the same pattern)
+# across many sites, and reviewers (Viktor, Kimi) measured that each one
+# is a wide, structural blind spot rather than a couple of one-off calls.
+# Anything NOT listed here still fails CI at shellcheck's default (style)
+# severity. Narrow, few-site cases (SC2153, SC2094, SC1003, SC2086, and
+# per-file SC2034) are disabled inline/per-file at the exact site instead
+# of here, precisely so a REAL future instance of the same code — e.g. a
+# typo'd env var, or a genuine read+write of the same file — still fails
+# CI instead of being silently waved through by a blanket exclusion.
 
 # SC1091 (not following sourced file): lib/<phase>.sh and modules/*.sh are
 # sourced by a path computed at runtime (require_lib, the module loop in
@@ -29,19 +28,3 @@ disable=SC2012
 # single-quotes PHP source handed to `wp eval` / `wp db query`, so bash must
 # NOT expand $vars inside it.
 disable=SC2016
-
-# SC2094 (read/write same file in pipeline): false positive in the
-# id-remap loop (lib/graft.sh) — the awk call only reads id_map_tsv, it
-# never writes it; the loop's own read of the same file is via a separate
-# fd (3<), not the same pipeline.
-disable=SC2094
-
-# SC2153 (possible misspelling): SITE_A_WP_PATH / SITE_B_WP_PATH and
-# friends are assigned in bin/sitegraft or a sourced profile, not in the
-# file being checked — same cross-file blind spot as SC2034 above.
-disable=SC2153
-
-# SC1003 (escape single quote): lib/inventory.sh's sq() deliberately holds
-# a literal backslash character as data (bq='\') to build a quoting helper
-# without a wall of escaping — see the comment above sq() for why.
-disable=SC1003

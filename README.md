@@ -145,6 +145,16 @@ bats tests/unit/                 # pure lib/ functions, no external dependencies
 tests/integration/ddev-harness.sh  # 2 disposable DDEV sites, full scan→graft→verify run
 ```
 
+Shell lint (same check + config CI runs — see `.shellcheckrc` for the repo's
+documented exceptions):
+
+```sh
+shellcheck bin/sitegraft
+shellcheck lib/*.sh
+shellcheck modules/*.sh modules/*.sh.example
+shellcheck tests/integration/*.sh tests/integration/fixtures/*.sh
+```
+
 The integration harness is the actual proof this tool is safe: it spins up a fake
 "site A" with simulated Etch content and a fake "site B" with a fake protected plugin
 (its own CPT, its own SQL table, its own options), runs a full graft, and asserts the

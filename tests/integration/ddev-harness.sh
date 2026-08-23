@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034 # this file sets variables read by OTHER sourced files in the same bash process (lib/*.sh sourced together by bin/sitegraft / lib/modules.sh); shellcheck lints each file in isolation and can't see that cross-file usage
 # tests/integration/ddev-harness.sh — the real safety proof of sitegraft.
 # Grows incrementally as each phase lands (design doc §10, review finding C1).
 # Spins up two disposable DDEV sites, seeds fixtures, and tears down unconditionally.
