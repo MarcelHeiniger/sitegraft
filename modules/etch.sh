@@ -129,12 +129,97 @@ EOF
 # have to be wrapped, see modules/motopress.sh.example).
 etch_post_import() {
   local run_dir="$1" id_map_tsv="$2" wp_cmd_b="$3"
+
   local ai_key
   ai_key=$($wp_cmd_b option get etch_settings --format=json 2>/dev/null \
     | jq -r '.ai_api_key // ""' 2>/dev/null || true)
   if [ -n "$ai_key" ]; then
     log_warn "etch post_import: B's etch_settings now carries a non-empty ai_api_key, copied from A along with the rest of the option. If B must not hold A's credential, clear it from Etch's settings on B."
   fi
+
+  # Remap Etch's own component references.
+  #
+  # Etch templates and components point at each other BY POST ID, in a block
+  # attribute of the form:
+  #
+  #     <!-- wp:etch/component {"ref":14468,"attributes":[]} -->
+  #
+  # Those ids change on import. graft's generic content remap
+  # (lib/php/content-remap-functions.php) only rewrites `"id":<old>` and
+  # `wp-image-<old>`, and only for attachments, so a component reference
+  # travels to B still holding A's id.
+  #
+  # A single dangling reference is not a cosmetic defect: it takes the whole
+  # template down. Observed on a real graft — one component out of three
+  # landed on a new id, its two referring templates kept pointing at the old
+  # one, and every page on B rendered as HTTP 200 with an EMPTY body while
+  # the 404 template (which references no component) rendered perfectly.
+  # `verify` reported PASS throughout.
+  #
+  # SCOPE: only the posts THIS run imported. B's pre-existing content is
+  # protected by default-deny and is not this hook's to rewrite, even when it
+  # holds a reference to an id that moved — that case is B's own content
+  # being stale, a different problem with a different answer. Concretely, on
+  # the run this was found on, that means fixing the imported `page` template
+  # and deliberately NOT touching the `index` template that already existed
+  # on B.
+  #
+  # Attachment rows are excluded from the map: `"ref"` addresses blocks, and
+  # feeding attachment ids in would only create opportunities for a numeric
+  # coincidence to rewrite something it shouldn't.
+  [ -s "$id_map_tsv" ] || return 0
+
+  local map_json ids_json
+  map_json=$(awk -F'\t' '$3 != "attachment" && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { printf "%s %s\n", $1, $2 }' "$id_map_tsv" \
+    | jq -R -s -c 'split("\n") | map(select(length > 0) | split(" ")) | map({(.[0]): (.[1] | tonumber)}) | add // {}')
+  ids_json=$(awk -F'\t' '$3 != "attachment" && $2 ~ /^[0-9]+$/ { print $2 }' "$id_map_tsv" \
+    | jq -R -s -c 'split("\n") | map(select(length > 0) | tonumber) | unique')
+
+  if [ "$(printf '%s' "$map_json" | jq 'length')" = "0" ]; then
+    log_info "etch post_import: no non-attachment id mappings in this run — no component references to remap"
+    return 0
+  fi
+
+  # Two passes through a sentinel, for the same reason
+  # sitegraft_remap_attachment_refs uses one: with a single pass, a mapping
+  # that rewrites 16 -> 173 followed by one that rewrites 173 -> 200 would
+  # rewrite what the first pass had just produced. The sentinel form is
+  # invalid JSON on purpose, and only ever exists in memory between the two
+  # passes — nothing half-transformed is ever written back.
+  #
+  # $wpdb->update rather than wp_update_post: this is a mechanical id
+  # substitution, and running B's content back through the save filters
+  # (block re-parsing, kses, slashing) would be a second, unrequested
+  # transformation. clean_post_cache keeps the object cache honest afterwards.
+  local php
+  php=$(cat <<PHP
+global \$wpdb;
+\$map = json_decode('${map_json}', true);
+\$ids = json_decode('${ids_json}', true);
+if ( ! is_array( \$map ) || ! is_array( \$ids ) ) { echo "0"; return; }
+\$changed = 0;
+foreach ( \$ids as \$pid ) {
+	\$content = get_post_field( 'post_content', \$pid );
+	if ( ! is_string( \$content ) || '' === \$content ) { continue; }
+	\$before = \$content;
+	foreach ( \$map as \$old => \$new ) {
+		\$content = preg_replace( '/"ref":' . \$old . '(?!\d)/', '"ref":@@' . \$old . '@@', \$content );
+	}
+	foreach ( \$map as \$old => \$new ) {
+		\$content = str_replace( '"ref":@@' . \$old . '@@', '"ref":' . \$new, \$content );
+	}
+	if ( \$content !== \$before ) {
+		\$wpdb->update( \$wpdb->posts, array( 'post_content' => \$content ), array( 'ID' => \$pid ) );
+		clean_post_cache( \$pid );
+		\$changed++;
+	}
+}
+echo \$changed;
+PHP
+)
+
+  log_info "etch post_import: remapping Etch component references across $(printf '%s' "$ids_json" | jq 'length') migrated post(s)..."
+  run_or_echo $wp_cmd_b eval "$php"
 }
 
 # design doc §12: Etch is one of the three rendering-stack components whose
