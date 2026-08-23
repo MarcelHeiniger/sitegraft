@@ -93,10 +93,10 @@ EOF
   SITE_A_SSH_HOST="user@host-a.example.com"
   SITE_A_WP_PATH="/var/www/html"
   SITE_A_WP_CMD="wp"
-  SITE_A_SSH_KEY="/home/marcel/.ssh/id_ed25519_site_a"
+  SITE_A_SSH_KEY="/home/user/.ssh/id_ed25519_site_a"
   SITEGRAFT_DRY_RUN=1
   run wp_remote a option get siteurl
-  [ "$output" = "[dry-run] ssh -i /home/marcel/.ssh/id_ed25519_site_a -- user@host-a.example.com wp --path='/var/www/html' 'option' 'get' 'siteurl'" ]
+  [ "$output" = "[dry-run] ssh -i /home/user/.ssh/id_ed25519_site_a -- user@host-a.example.com wp --path='/var/www/html' 'option' 'get' 'siteurl'" ]
 }
 
 @test "wp_remote never passes -i when SITE_<ALIAS>_SSH_KEY is unset — falls back to ssh's own default identity resolution" {
@@ -308,6 +308,7 @@ _assert_alias() {
   # This failure is a wrong path or a wrong wp command, not a container:
   # the message must send the reader to those two settings.
   [[ "$output" == *"WP_PATH"* ]] || false
+  [[ "$output" == *"WP_CMD"* ]] || false
 }
 
 @test "inventory_check_path_topology accepts a wrapper behind SSH whose paths agree (sudo -u www-data wp)" {
