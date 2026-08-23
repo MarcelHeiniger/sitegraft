@@ -104,6 +104,15 @@ EOF
 etch_post_types_dynamic() {
   local scan_json="$1" raw declared registered slug kept=""
 
+  # Same fail-closed treatment as core_wp_option_keys_dynamic, and for the
+  # same reason: with no options list, "this site declares no custom post
+  # types" and "nobody looked" are indistinguishable, and only one of them is
+  # safe to act on.
+  if ! jq -e 'has("options") and (.options | type == "array")' "$scan_json" >/dev/null 2>&1; then
+    log_error "etch: ${scan_json} has no options list, so whether this site declares custom post types through etch_cpts cannot be determined — refusing to read that as 'it declares none' (re-run 'sitegraft scan')"
+    return 1
+  fi
+
   raw=$(jq -c '[.options[]? | select(.option_name == "etch_cpts") | .option_value][0]' "$scan_json" 2>/dev/null) \
     || { log_error "etch: could not read ${scan_json} while looking for the etch_cpts option — refusing to guess (re-run 'sitegraft scan')"; return 1; }
   [ -n "$raw" ] || raw=null

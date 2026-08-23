@@ -153,6 +153,14 @@ EOF
   [[ "$output" == *"etch_cpts"* ]] || false
 }
 
+@test "etch_post_types_dynamic fails closed on a scan with no options list, rather than reporting 'nothing declared'" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  echo '{"post_types":[{"name":"page"}]}' > "$scan"
+  run etch_post_types_dynamic "$scan"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"options"* ]] || false
+}
+
 @test "etch_post_types_dynamic fails closed when the scan has no post-type list to check declarations against" {
   local scan="$BATS_TEST_TMPDIR/scan.json"
   echo '{"options":[{"option_name":"etch_cpts","option_value":[{"slug":"fotos"}]}]}' > "$scan"
