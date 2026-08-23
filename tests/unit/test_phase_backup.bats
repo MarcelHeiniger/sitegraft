@@ -118,6 +118,48 @@ EOF
   [[ "$backup_output" == *"to restore this backup"* ]] || false
 }
 
+# issue #14: the wp-content manifest is what lets restore.sh put a
+# containerized B back to exactly its pre-graft state. Without it the
+# generated restore.sh refuses to remove anything at all, so a phase_backup
+# that quietly stopped writing it would turn every future restore back into
+# the overwrite-only behavior the issue was about — silently, and only
+# visible on a real container.
+@test "phase_backup records a wp-content manifest listing what the archive contains (issue #14)" {
+  run phase_backup --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  [ -s "${RUN_DIR}/backup/b-wp-content.manifest" ]
+  local entries
+  entries=$(tr '\0' '\n' < "${RUN_DIR}/backup/b-wp-content.manifest" | LC_ALL=C sort | tr '\n' '|')
+  [ "$entries" = "./themes|./themes/dummy-theme.txt|" ]
+  local mode
+  mode=$(stat -c '%a' "${RUN_DIR}/backup/b-wp-content.manifest" 2>/dev/null || stat -f '%Lp' "${RUN_DIR}/backup/b-wp-content.manifest" 2>/dev/null)
+  [ "$mode" = "600" ]
+}
+
+# A backup that could not record its manifest is not a backup this tool can
+# restore from on a containerized target — it must fail, not leave a
+# backup.complete marker behind that `graft` will happily accept.
+@test "phase_backup FAILS and writes no completion marker when the wp-content manifest cannot be recorded" {
+  backup_write_wp_content_manifest() { return 1; }
+  run phase_backup --profile t --run "$RUN_DIR"
+  [ "$status" -ne 0 ]
+  [ ! -f "${RUN_DIR}/backup.complete" ]
+}
+
+@test "phase_backup FAILS when the wp-content manifest is written but comes out empty (verified, not assumed)" {
+  backup_write_wp_content_manifest() { : > "$2"; return 0; }
+  run phase_backup --profile t --run "$RUN_DIR"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"manifest"* ]] || false
+  [ ! -f "${RUN_DIR}/backup.complete" ]
+}
+
+@test "phase_backup --dry-run writes no wp-content manifest (a dry run must not look like a restorable backup)" {
+  run phase_backup --profile t --run "$RUN_DIR" --dry-run
+  [ "$status" -eq 0 ]
+  [ ! -e "${RUN_DIR}/backup/b-wp-content.manifest" ]
+}
+
 @test "phase_backup's checksum loop skips a protect module with no tables (plan bug fix, empty --tables=)" {
   phase_backup --profile t --run "$RUN_DIR"
   run jq -e '.checksums_protected_pre_graft | has("_unclaimed") | not' "${RUN_DIR}/manifest.json"

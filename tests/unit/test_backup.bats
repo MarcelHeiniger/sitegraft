@@ -342,3 +342,440 @@ _fake_dump_rows() {
   run backup_compute_protected_checksums b "$manifest"
   [ "$status" -eq 1 ]
 }
+
+# --- issue #14: exact-state restore on a wrapped-local target ---------------
+# `restore` used to leave behind, on a wrapped-local B, every file a graft had
+# added to wp-content: the copied theme, the copied plugins, new uploads. The
+# database came back; the filesystem did not. The obstacle was never deletion
+# itself but the *wipe*: `rm -rf wp-content` fails with "Device or resource
+# busy" when a container sync (DDEV's Mutagen) mounts a subdirectory of it.
+#
+# The fix records, at backup time, a manifest of what wp-content contained,
+# and removes on restore exactly the paths that manifest does not list — no
+# wiping, only the removal of known additions, which is compatible with a
+# directory that cannot be removed.
+#
+# These tests execute the wrapped-local branch FOR REAL, against real files on
+# this machine, by giving it a "container wrapper" that is a genuine no-op
+# passthrough (`env --`). `_backup_local_exec_prefix` derives its prefix from
+# WP_CMD's documented shape, so `env -- wp` produces the prefix `env --` and
+# every wrapped command the generator bakes (`<prefix> find ...`,
+# `<prefix> tar ...`, `<prefix> xargs ...`) runs locally, unchanged. That makes
+# the deletion path testable without a container — the thing that let it ship
+# untested in the first place.
+
+# _wrapped_fixture [wrapper-word] — builds a live wp-content, a real backup of
+# it (archive + manifest + a plausible db dump), and the generated restore.sh.
+# Sets B_ROOT and RUN_DIR for the caller.
+_wrapped_fixture() {
+  local wrapper="${1:-env --}"
+  B_ROOT="$BATS_TEST_TMPDIR/site-b"
+  RUN_DIR="$BATS_TEST_TMPDIR/run"
+  mkdir -p "${B_ROOT}/wp-content/themes/t" "${B_ROOT}/wp-content/plugins" "${RUN_DIR}/backup"
+  printf 'original\n' > "${B_ROOT}/wp-content/themes/t/style.css"
+  printf 'index\n' > "${B_ROOT}/wp-content/index.php"
+
+  SITE_B_SSH_HOST=""
+  SITE_B_WP_PATH="$B_ROOT"
+  SITE_B_WP_CMD="${wrapper} wp"
+
+  # A stub `wp` on PATH: restore.sh's db-import step is not what these tests
+  # are about (it has its own coverage above and in the DDEV harness), and no
+  # real wp-cli/database exists here.
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/wp" <<'STUB'
+#!/usr/bin/env bash
+cat > /dev/null
+echo "stub wp ran"
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/wp"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+
+  backup_wp_content "${RUN_DIR}/backup/b-wp-content" >/dev/null
+  backup_write_wp_content_manifest "${RUN_DIR}/backup/b-wp-content" "${RUN_DIR}/backup/b-wp-content.manifest"
+  _fake_dump_rows 50 | gzip > "${RUN_DIR}/backup/b-db.sql.gz"
+  backup_generate_restore_script "$RUN_DIR"
+}
+
+# _wrapper_shim <name> <body> — writes an executable that stands in for a
+# container wrapper, so a specific misbehavior of one (swallowing output,
+# dropping stdin, returning a path from somewhere else entirely) can be
+# reproduced without a container.
+_wrapper_shim() {
+  mkdir -p "$BATS_TEST_TMPDIR/shim"
+  printf '#!/usr/bin/env bash\n%s\n' "$2" > "$BATS_TEST_TMPDIR/shim/$1"
+  chmod +x "$BATS_TEST_TMPDIR/shim/$1"
+  printf '%s' "$BATS_TEST_TMPDIR/shim/$1"
+}
+
+# --- backup_write_wp_content_manifest ---
+
+@test "backup_write_wp_content_manifest records every path in the backup, relative and NUL-delimited" {
+  mkdir -p "$BATS_TEST_TMPDIR/src/themes/t"
+  touch "$BATS_TEST_TMPDIR/src/themes/t/a.css"
+  run backup_write_wp_content_manifest "$BATS_TEST_TMPDIR/src" "$BATS_TEST_TMPDIR/m"
+  [ "$status" -eq 0 ]
+  local entries
+  entries=$(tr '\0' '\n' < "$BATS_TEST_TMPDIR/m" | LC_ALL=C sort | tr '\n' '|')
+  [ "$entries" = "./themes|./themes/t|./themes/t/a.css|" ]
+}
+
+@test "backup_write_wp_content_manifest keeps a filename containing a space intact (NUL-delimited, not whitespace-split)" {
+  mkdir -p "$BATS_TEST_TMPDIR/src2"
+  touch "$BATS_TEST_TMPDIR/src2/two words.css"
+  backup_write_wp_content_manifest "$BATS_TEST_TMPDIR/src2" "$BATS_TEST_TMPDIR/m2"
+  local count
+  count=$(tr -dc '\0' < "$BATS_TEST_TMPDIR/m2" | wc -c | tr -d ' ')
+  [ "$count" -eq 1 ]
+  [ "$(tr '\0' '\n' < "$BATS_TEST_TMPDIR/m2")" = "./two words.css" ]
+}
+
+@test "backup_write_wp_content_manifest fails closed when the archived wp-content does not exist" {
+  run backup_write_wp_content_manifest "$BATS_TEST_TMPDIR/no-such-dir" "$BATS_TEST_TMPDIR/m3"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"does not exist"* ]] || false
+  [ ! -s "$BATS_TEST_TMPDIR/m3" ]
+}
+
+# An empty manifest is the single most dangerous artifact this feature can
+# produce: it means "the backup contained nothing", which on restore reads as
+# "delete every file in wp-content". Refused at both ends — here at writing
+# time, and again in the generated restore.sh.
+@test "backup_write_wp_content_manifest refuses to write an EMPTY manifest (an empty keep-list would delete everything)" {
+  mkdir -p "$BATS_TEST_TMPDIR/empty-src"
+  run backup_write_wp_content_manifest "$BATS_TEST_TMPDIR/empty-src" "$BATS_TEST_TMPDIR/m4"
+  [ "$status" -eq 1 ]
+  [ ! -s "$BATS_TEST_TMPDIR/m4" ]
+}
+
+@test "backup_write_wp_content_manifest writes nothing under --dry-run and still succeeds" {
+  mkdir -p "$BATS_TEST_TMPDIR/src5/themes"
+  touch "$BATS_TEST_TMPDIR/src5/themes/a.css"
+  SITEGRAFT_DRY_RUN=1 run backup_write_wp_content_manifest "$BATS_TEST_TMPDIR/src5" "$BATS_TEST_TMPDIR/m5"
+  [ "$status" -eq 0 ]
+  [ ! -e "$BATS_TEST_TMPDIR/m5" ]
+}
+
+@test "backup_write_wp_content_manifest is owner-only (it lists a real site's file tree)" {
+  mkdir -p "$BATS_TEST_TMPDIR/src6"
+  touch "$BATS_TEST_TMPDIR/src6/a"
+  backup_write_wp_content_manifest "$BATS_TEST_TMPDIR/src6" "$BATS_TEST_TMPDIR/m6"
+  local mode
+  mode=$(stat -c '%a' "$BATS_TEST_TMPDIR/m6" 2>/dev/null || stat -f '%Lp' "$BATS_TEST_TMPDIR/m6" 2>/dev/null)
+  [ "$mode" = "600" ]
+}
+
+# --- the generated restore.sh says what it provides ---
+
+@test "the generated restore.sh states its own restore semantics at RUN time, not only in the backup log (issue #14)" {
+  _wrapped_fixture
+  run "${RUN_DIR}/restore.sh" --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Restore semantics:"* ]] || false
+  [[ "$output" == *"exact-state"* ]] || false
+}
+
+@test "the generated ssh-remote restore.sh also states its semantics and still uses rsync --delete" {
+  SITE_B_SSH_HOST="user@host-b.example.com"
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="wp"
+  local run_dir="$BATS_TEST_TMPDIR/run-ssh-sem"
+  mkdir -p "$run_dir"
+  backup_generate_restore_script "$run_dir"
+  run grep -c 'RESTORE_SEMANTICS=' "${run_dir}/restore.sh"
+  [ "$output" = "1" ]
+  run grep -c 'rsync -avz --delete' "${run_dir}/restore.sh"
+  [ "$output" = "1" ]
+}
+
+# --- the acceptance criterion of issue #14 ---
+
+@test "the generated wrapped-local restore.sh removes files added to wp-content since the backup (issue #14 acceptance)" {
+  _wrapped_fixture
+  printf 'grafted\n' > "${B_ROOT}/wp-content/themes/GRAFTED.css"
+  mkdir -p "${B_ROOT}/wp-content/plugins/grafted-plugin"
+  printf 'x\n' > "${B_ROOT}/wp-content/plugins/grafted-plugin/main.php"
+  printf 'mutated\n' > "${B_ROOT}/wp-content/themes/t/style.css"
+
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -eq 0 ]
+  # the additions are gone ...
+  [ ! -e "${B_ROOT}/wp-content/themes/GRAFTED.css" ]
+  [ ! -e "${B_ROOT}/wp-content/plugins/grafted-plugin" ]
+  # ... the overwrite still happened ...
+  [ "$(cat "${B_ROOT}/wp-content/themes/t/style.css")" = "original" ]
+  # ... and nothing the backup contained was removed.
+  [ -f "${B_ROOT}/wp-content/index.php" ]
+  [ -d "${B_ROOT}/wp-content/plugins" ]
+}
+
+@test "the generated wrapped-local restore.sh LISTS what it will remove before removing it" {
+  _wrapped_fixture
+  printf 'grafted\n' > "${B_ROOT}/wp-content/themes/GRAFTED.css"
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"will be REMOVED"* ]] || false
+  [[ "$output" == *"GRAFTED.css"* ]] || false
+}
+
+@test "the generated wrapped-local restore.sh never wipes wp-content itself (the un-removable-mount constraint)" {
+  _wrapped_fixture
+  run grep -E "rm -rf '?${B_ROOT}/wp-content'?( |$)" "${RUN_DIR}/restore.sh"
+  [ "$status" -ne 0 ]
+}
+
+@test "the generated wrapped-local restore.sh removes added paths whose names contain spaces, quotes and glob characters" {
+  _wrapped_fixture
+  touch "${B_ROOT}/wp-content/themes/a file with spaces & 'quotes'.css"
+  touch "${B_ROOT}/wp-content/themes/*.css"
+  touch "${B_ROOT}/wp-content/themes/-dash-leading.css"
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -eq 0 ]
+  [ ! -e "${B_ROOT}/wp-content/themes/a file with spaces & 'quotes'.css" ]
+  [ ! -e "${B_ROOT}/wp-content/themes/*.css" ]
+  [ ! -e "${B_ROOT}/wp-content/themes/-dash-leading.css" ]
+  [ -f "${B_ROOT}/wp-content/themes/t/style.css" ]
+}
+
+# The real danger of this issue: code that deletes, driven by a list of paths.
+# An added symlink is removed as a symlink — the thing it points at, outside
+# wp-content, is never followed and never touched.
+@test "the generated wrapped-local restore.sh removes an added symlink without following it out of wp-content" {
+  _wrapped_fixture
+  mkdir -p "$BATS_TEST_TMPDIR/outside"
+  printf 'precious\n' > "$BATS_TEST_TMPDIR/outside/keep.txt"
+  ln -s "$BATS_TEST_TMPDIR/outside" "${B_ROOT}/wp-content/escape"
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -eq 0 ]
+  [ ! -e "${B_ROOT}/wp-content/escape" ]
+  [ -f "$BATS_TEST_TMPDIR/outside/keep.txt" ]
+  [ -d "$BATS_TEST_TMPDIR/outside" ]
+}
+
+# --- --dry-run on the path that deletes ---
+
+@test "the generated wrapped-local restore.sh --dry-run lists what it would remove and removes NOTHING" {
+  _wrapped_fixture
+  printf 'grafted\n' > "${B_ROOT}/wp-content/themes/GRAFTED.css"
+  printf 'mutated\n' > "${B_ROOT}/wp-content/themes/t/style.css"
+  run "${RUN_DIR}/restore.sh" --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"GRAFTED.css"* ]] || false
+  [ -f "${B_ROOT}/wp-content/themes/GRAFTED.css" ]
+  [ "$(cat "${B_ROOT}/wp-content/themes/t/style.css")" = "mutated" ]
+}
+
+# _wrapped_profile — writes a profile matching _wrapped_fixture's site B, so
+# phase_restore (which loads a profile) can be driven end-to-end against the
+# same real directory.
+_wrapped_profile() {
+  load '../../lib/profile.sh'
+  export SITEGRAFT_PROFILES_DIR="$BATS_TEST_TMPDIR/profiles"
+  mkdir -p "$SITEGRAFT_PROFILES_DIR"
+  cat > "${SITEGRAFT_PROFILES_DIR}/w.conf" <<EOF
+SITE_A_ALIAS="a"
+SITE_A_WP_PATH="/var/www/a"
+SITE_B_ALIAS="b"
+SITE_B_WP_PATH="${B_ROOT}"
+SITE_B_WP_CMD="env -- wp"
+SITEGRAFT_STATE_DIR="${BATS_TEST_TMPDIR}/state"
+EOF
+}
+
+# `sitegraft restore --dry-run` used to print the path of restore.sh and stop,
+# which said nothing about what a restore would do. The removal list is the one
+# thing worth previewing, so a dry run now runs restore.sh's own dry-run mode
+# for real: it reads B, reports, and writes nothing.
+@test "phase_restore --dry-run runs the generated restore.sh in ITS dry-run mode, so the removal list is actually previewed" {
+  _wrapped_fixture
+  _wrapped_profile
+  printf 'grafted\n' > "${B_ROOT}/wp-content/themes/GRAFTED.css"
+  printf 'mutated\n' > "${B_ROOT}/wp-content/themes/t/style.css"
+  run phase_restore --profile w --run "$RUN_DIR" --yes --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"will be REMOVED"* ]] || false
+  [[ "$output" == *"GRAFTED.css"* ]] || false
+  # ... and it really was a preview
+  [ -f "${B_ROOT}/wp-content/themes/GRAFTED.css" ]
+  [ "$(cat "${B_ROOT}/wp-content/themes/t/style.css")" = "mutated" ]
+  # the pre-restore snapshot was simulated, not taken (phase_restore still
+  # creates the empty directory under dry-run — pre-existing behavior — but
+  # no artifact is written into it)
+  [ -z "$(ls "${RUN_DIR}"/pre-restore-*/backup/b-db.sql.gz 2>/dev/null)" ]
+}
+
+# A restore.sh generated before that mode existed ignores unknown arguments —
+# handing it --dry-run would run a REAL restore. It is printed, never executed.
+@test "phase_restore --dry-run REFUSES to execute a restore.sh that predates dry-run support, and says why" {
+  _wrapped_fixture
+  _wrapped_profile
+  cat > "${RUN_DIR}/restore.sh" <<'OLD'
+#!/usr/bin/env bash
+echo "OLD RESTORE RAN FOR REAL"
+OLD
+  chmod +x "${RUN_DIR}/restore.sh"
+  run phase_restore --profile w --run "$RUN_DIR" --yes --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"OLD RESTORE RAN FOR REAL"* ]] || false
+  [[ "$output" == *"before restore.sh grew its own --dry-run mode"* ]] || false
+}
+
+# "Even a restore has to stay reversible" has to mean reversible to the same
+# standard. Without a manifest of its own, rolling the restore back on a
+# wrapped-local B would (correctly) refuse to remove anything, and the safety
+# net would be weaker than the thing it is a net for.
+@test "phase_restore's pre-restore safety snapshot gets its own wp-content manifest" {
+  _wrapped_fixture
+  _wrapped_profile
+  printf 'grafted\n' > "${B_ROOT}/wp-content/themes/GRAFTED.css"
+  run phase_restore --profile w --run "$RUN_DIR" --yes
+  [ "$status" -eq 0 ]
+  local snap
+  snap=$(ls -dt "${RUN_DIR}"/pre-restore-* | head -1)
+  [ -s "${snap}/backup/b-wp-content.manifest" ]
+  # the snapshot describes B as it was BEFORE the restore — additions included
+  tr '\0' '\n' < "${snap}/backup/b-wp-content.manifest" | grep -q 'GRAFTED.css'
+  [ -x "${snap}/restore.sh" ]
+  # ... and the restore it was a net for really did remove that addition
+  [ ! -e "${B_ROOT}/wp-content/themes/GRAFTED.css" ]
+}
+
+@test "phase_restore --dry-run fails when the restore.sh preview itself fails (a preview that cannot run is not a green light)" {
+  _wrapped_fixture
+  _wrapped_profile
+  rm -f "${RUN_DIR}/backup/b-wp-content.manifest"
+  run phase_restore --profile w --run "$RUN_DIR" --yes --dry-run
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"manifest"* ]] || false
+}
+
+# --- fail closed: no manifest, no deletion, and no silent downgrade ---
+
+@test "the generated wrapped-local restore.sh REFUSES to restore at all when the manifest is missing (no silent overwrite-only)" {
+  _wrapped_fixture
+  rm -f "${RUN_DIR}/backup/b-wp-content.manifest"
+  printf 'grafted\n' > "${B_ROOT}/wp-content/themes/GRAFTED.css"
+  printf 'mutated\n' > "${B_ROOT}/wp-content/themes/t/style.css"
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -ne 0 ]
+  # the refusal is its own diagnosis, not bash tripping over a missing file
+  [[ "$output" == *"has no wp-content manifest"* ]] || false
+  [[ "$output" == *"quietly downgrading to overwrite-only"* ]] || false
+  # it did not quietly fall back to overwriting either
+  [ "$(cat "${B_ROOT}/wp-content/themes/t/style.css")" = "mutated" ]
+  [ -f "${B_ROOT}/wp-content/themes/GRAFTED.css" ]
+}
+
+@test "the generated wrapped-local restore.sh REFUSES when the manifest is empty (an empty keep-list must never mean 'delete everything')" {
+  _wrapped_fixture
+  : > "${RUN_DIR}/backup/b-wp-content.manifest"
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"manifest"*"is empty"* ]] || false
+  # the whole point: an unguarded empty manifest deletes every file in wp-content
+  [ -f "${B_ROOT}/wp-content/index.php" ]
+  [ -f "${B_ROOT}/wp-content/themes/t/style.css" ]
+}
+
+@test "the generated wrapped-local restore.sh REFUSES when the manifest is unreadable" {
+  _wrapped_fixture
+  chmod 000 "${RUN_DIR}/backup/b-wp-content.manifest"
+  run "${RUN_DIR}/restore.sh"
+  local st="$status" out="$output"
+  chmod 600 "${RUN_DIR}/backup/b-wp-content.manifest"
+  [ "$st" -ne 0 ]
+  [[ "$out" == *"is not readable"* ]] || false
+}
+
+@test "the generated wrapped-local restore.sh REFUSES when the manifest holds a path that escapes wp-content" {
+  _wrapped_fixture
+  printf './themes\0../../../etc\0' > "${RUN_DIR}/backup/b-wp-content.manifest"
+  printf 'mutated\n' > "${B_ROOT}/wp-content/themes/t/style.css"
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"safe relative path"* ]] || false
+  [ "$(cat "${B_ROOT}/wp-content/themes/t/style.css")" = "mutated" ]
+}
+
+@test "the generated wrapped-local restore.sh REFUSES when the manifest holds an absolute path" {
+  _wrapped_fixture
+  printf './themes\0/etc/passwd\0' > "${RUN_DIR}/backup/b-wp-content.manifest"
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"safe relative path"* ]] || false
+}
+
+# --- fail closed: a listing that cannot be trusted is not "nothing to do" ---
+
+@test "the generated wrapped-local restore.sh REFUSES when listing B's wp-content comes back empty (could-not-verify is not 'nothing to remove')" {
+  local shim
+  shim=$(_wrapper_shim silentfind 'if [ "$1" = "find" ]; then exit 0; fi
+exec "$@"')
+  _wrapped_fixture "$shim"
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"zero entries"* ]] || false
+}
+
+@test "the generated wrapped-local restore.sh REFUSES when listing B returns a path outside wp-content" {
+  local shim
+  shim=$(_wrapper_shim evilfind 'if [ "$1" = "find" ]; then printf "%s\0" /etc/passwd; exit 0; fi
+exec "$@"')
+  _wrapped_fixture "$shim"
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"outside"* ]] || false
+  [ -f /etc/passwd ]
+}
+
+@test "the generated wrapped-local restore.sh REFUSES when listing B returns a path with a '..' component" {
+  local shim
+  shim=$(_wrapper_shim dotdotfind 'if [ "$1" = "find" ]; then printf "%s\0" "$2/../../escape"; exit 0; fi
+exec "$@"')
+  _wrapped_fixture "$shim"
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unsafe path"* ]] || false
+}
+
+# --- never report a deletion that did not happen ---
+# The exact shape of the worst bug this codebase has already hit twice: a
+# wrapper that reports success while silently swallowing what it was given
+# (`ddev exec --raw` dropping piped stdin). A removal command that deletes
+# nothing and exits 0 must not be reported as an exact-state restore.
+@test "the generated wrapped-local restore.sh FAILS LOUDLY when the wrapper swallows the removal list and deletes nothing" {
+  local shim
+  shim=$(_wrapper_shim nostdin 'if [ "$1" = "xargs" ]; then exec "$@" < /dev/null; fi
+exec "$@"')
+  _wrapped_fixture "$shim"
+  printf 'grafted\n' > "${B_ROOT}/wp-content/themes/GRAFTED.css"
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"still present"* ]] || false
+  [ -f "${B_ROOT}/wp-content/themes/GRAFTED.css" ]
+}
+
+@test "the generated wrapped-local restore.sh FAILS LOUDLY when the removal command itself errors" {
+  local shim
+  shim=$(_wrapper_shim failingrm 'if [ "$1" = "xargs" ]; then exit 7; fi
+exec "$@"')
+  _wrapped_fixture "$shim"
+  printf 'grafted\n' > "${B_ROOT}/wp-content/themes/GRAFTED.css"
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"FAILED"* ]] || false
+}
+
+@test "the generated wrapped-local restore.sh reports 'nothing will be removed' (and succeeds) when B has no extra file" {
+  _wrapped_fixture
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"nothing will be removed"* ]] || false
+  [ -f "${B_ROOT}/wp-content/index.php" ]
+}
+
+@test "the generated restore.sh stays self-contained: the prune logic adds no sitegraft function or lib reference" {
+  _wrapped_fixture
+  run grep -Ei 'wp_remote|sitegraft_|backup_checksum|backup_write_wp_content_manifest|phase_backup|phase_restore|^[[:space:]]*\.[[:space:]]+.*lib/|^[[:space:]]*source[[:space:]]+.*lib/' "${RUN_DIR}/restore.sh"
+  [ "$status" -ne 0 ]
+}

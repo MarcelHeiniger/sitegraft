@@ -202,6 +202,11 @@ echo "==> asserting the backup is complete and its artifacts are present"
 [ -d "${RUN_DIR}/backup/b-wp-content" ] && [ -n "$(ls -A "${RUN_DIR}/backup/b-wp-content")" ]
 [ -x "${RUN_DIR}/restore.sh" ]
 [ -f "${RUN_DIR}/backup.complete" ]
+# issue #14: the manifest of what wp-content held at backup time. Without it
+# the wrapped-local restore below refuses to remove anything at all, so its
+# absence would turn the deletion assertions further down into a false red —
+# assert it here, where the diagnosis is obvious.
+[ -s "${RUN_DIR}/backup/b-wp-content.manifest" ]
 jq -e 'has("checksums_protected_pre_graft")' "${RUN_DIR}/manifest.json" >/dev/null
 
 echo "==> asserting restore.sh is genuinely self-contained (no sitegraft function/lib reference, review finding A2)"
@@ -285,6 +290,43 @@ ddev exec --raw -p "$PROJECT_B" -- wp option update sitegraft_test_marker "POST_
 MARKER_BEFORE_RESTORE=$(ddev exec --raw -p "$PROJECT_B" -- wp option get sitegraft_test_marker)
 [ "$MARKER_BEFORE_RESTORE" = "POST_BACKUP_MUTATED_VALUE" ]
 
+# issue #14, on the target shape the issue was actually about. B here IS a
+# wrapped-local site (SITE_B_WP_CMD is a ddev wrapper), so the run's own
+# restore.sh takes the manifest-based prune path — the one that used to be
+# overwrite-only and left every file a graft added behind. Files added to
+# wp-content after the backup stand in for exactly that: the copied theme, the
+# copied plugins, the new uploads.
+#
+# Created through the container, not on the host directory: DDEV's Mutagen
+# sync is asynchronous, so a host-side touch is not necessarily visible to the
+# container (nor a container-side removal immediately visible to the host) at
+# the moment the assertion runs. Everything about this check therefore happens
+# on the container's side of the sync.
+echo "==> adding a file and a directory to B's wp-content after the backup (issue #14 regression setup)"
+ddev exec --raw -p "$PROJECT_B" -- touch /var/www/html/wp-content/sitegraft-added-after-backup.txt
+ddev exec --raw -p "$PROJECT_B" -- mkdir -p /var/www/html/wp-content/plugins/sitegraft-added-plugin
+ddev exec --raw -p "$PROJECT_B" -- touch /var/www/html/wp-content/plugins/sitegraft-added-plugin/main.php
+ddev exec --raw -p "$PROJECT_B" -- test -f /var/www/html/wp-content/sitegraft-added-after-backup.txt
+
+# --dry-run on the phase that deletes: it must report what it would remove and
+# remove nothing. Asserted against a real container, because "lists it" and
+# "leaves it alone" are two different claims and only one of them is provable
+# by reading the script.
+echo "==> asserting 'sitegraft restore --dry-run' previews the removal and touches nothing"
+"${ROOT}/bin/sitegraft" restore --profile ddev-test --run "$RUN_DIR" --yes --dry-run 2>&1 | tee "${RUN_DIR}/restore-dryrun.log"
+if ! grep -q 'sitegraft-added-after-backup.txt' "${RUN_DIR}/restore-dryrun.log"; then
+  echo "'restore --dry-run' did not report the file added since the backup — the preview does not actually preview (issue #14) — aborting"
+  exit 1
+fi
+ddev exec --raw -p "$PROJECT_B" -- test -f /var/www/html/wp-content/sitegraft-added-after-backup.txt
+# Captured, not piped into `grep -q`: under `set -o pipefail` an early-exiting
+# grep can SIGPIPE the still-writing producer and make the whole pipeline
+# report failure — the size-dependent trap already documented at length in
+# lib/backup.sh's backup_verify_db_export.
+MARKER_AFTER_DRY_RUN=$(ddev exec --raw -p "$PROJECT_B" -- wp option get sitegraft_test_marker)
+[ "$MARKER_AFTER_DRY_RUN" = "POST_BACKUP_MUTATED_VALUE" ]
+echo "==> confirmed: --dry-run listed the removal and wrote nothing to B"
+
 # Recommended addition beyond Task 3.2's literal scope (nightshift mandate:
 # prefer the safer/more-thorough option): a live restore round-trip is the
 # strongest available proof that restore.sh's self-containment claim is
@@ -292,7 +334,33 @@ MARKER_BEFORE_RESTORE=$(ddev exec --raw -p "$PROJECT_B" -- wp option get sitegra
 # against a real WordPress install, and B's protected data must come back
 # byte-identical (same normalized checksum) afterward.
 echo "==> running restore (--yes, non-interactive) and asserting it succeeds"
-"${ROOT}/bin/sitegraft" restore --profile ddev-test --run "$RUN_DIR" --yes
+"${ROOT}/bin/sitegraft" restore --profile ddev-test --run "$RUN_DIR" --yes 2>&1 | tee "${RUN_DIR}/restore.log"
+
+# issue #14 acceptance: "restoring a wrapped-local target after a graft leaves
+# no file that the backup did not contain."
+echo "==> asserting the restore removed what was added to wp-content after the backup (issue #14 acceptance, wrapped-local target)"
+if ddev exec --raw -p "$PROJECT_B" -- test -e /var/www/html/wp-content/sitegraft-added-after-backup.txt; then
+  echo "restore left behind a file added to B's wp-content after the backup — the wrapped-local restore is not exact-state (issue #14) — aborting"
+  exit 1
+fi
+if ddev exec --raw -p "$PROJECT_B" -- test -e /var/www/html/wp-content/plugins/sitegraft-added-plugin; then
+  echo "restore left behind a DIRECTORY added to B's wp-content after the backup (what a grafted plugin/theme looks like) — aborting"
+  exit 1
+fi
+# ... while everything the backup DID contain is still there: this restore
+# removes known additions, it does not wipe and rebuild.
+ddev exec --raw -p "$PROJECT_B" -- test -d /var/www/html/wp-content/plugins
+ddev exec --raw -p "$PROJECT_B" -- test -f /var/www/html/wp-content/mu-plugins/fake-plugin.php
+# ... and the script said so itself, rather than the harness inferring it.
+if ! grep -q 'Restore semantics:' "${RUN_DIR}/restore.log"; then
+  echo "restore.sh did not state its own restore semantics when it ran (issue #14) — aborting"
+  exit 1
+fi
+if ! grep -q 'wp-content now holds exactly what this backup holds' "${RUN_DIR}/restore.log"; then
+  echo "restore.sh did not confirm, by re-listing B, that the removal actually happened — aborting"
+  exit 1
+fi
+echo "==> confirmed: the wrapped-local restore is exact-state (issue #14)"
 
 echo "==> asserting restore took a pre-restore safety snapshot of B's CURRENT state (db AND wp-content) before touching anything, and that the snapshot itself is turnkey-reversible"
 PRE_RESTORE_DIR=$(ls -dt "${RUN_DIR}"/pre-restore-* 2>/dev/null | head -1)
