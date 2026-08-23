@@ -24,8 +24,9 @@ Full brainstorming session with Marcel, 2026-08-19. Summarized here for the reco
    (fallback `fzf`), result = a frozen manifest.
 7. Backup built into the tool, host-agnostic, with a generated `restore.sh`.
 8. Old→new ID mapping via a temporary mu-plugin on B, hooked into wordpress-importer.
-9. Two credential paths (per-profile file OR interactive prompt); profiles are
-   committable with no secrets.
+9. Two credential paths (per-profile file OR interactive prompt); profiles hold
+   no secrets, but they do hold real hosts and paths, so they are local-only
+   and gitignored (issue #18).
 10. Bash portability, minimal dependencies, never `scp`.
 11. Etch specifics: templates live in the database only (no file fallback);
     navigation is often a dynamic `wp:page-list` block — verify per site in `scan`,
@@ -172,34 +173,39 @@ For a module with prefix `<mod>` (e.g. `core_wp`, `etch`, `acss`, `motopress`):
 | `<mod>_name` | yes | `<mod>_name` → stdout: human-readable name | Name shown in `gum choose` prompts |
 | `<mod>_detect` | yes | `<mod>_detect <scan_json_path>` → exit 0/1 | Is this plugin/domain present on the scanned site? |
 | `<mod>_post_types` | no* | `<mod>_post_types` → stdout: one post_type per line | Post types owned by this module |
+| `<mod>_post_types_dynamic` | no* | `<mod>_post_types_dynamic <scan_json>` → stdout: one post_type per line | Post types computed from the scan (names only knowable after `scan`) |
 | `<mod>_option_keys` | no* | `<mod>_option_keys` → stdout: one `wp_options` key per line | Options owned by this module |
-| `<mod>_option_keys_exclude` | no | `<mod>_option_keys_exclude` → stdout: one glob pattern per line | **NOT WIRED — see status note directly below.** Originally: exclusions within a broad prefix (e.g. licenses, DB versions). |
+| `<mod>_option_keys_dynamic` | no* | `<mod>_option_keys_dynamic <scan_json>` → stdout: one key per line | Options computed from the scan |
+| `<mod>_option_keys_exclude` | no | `<mod>_option_keys_exclude` → stdout: one glob pattern per line | Exclusions within a broad prefix (e.g. licenses, DB versions), applied to the static AND dynamic option keys |
 | `<mod>_tables` | no* | `<mod>_tables` → stdout: one table suffix per line (without `$table_prefix`) | Plugin-owned SQL tables, outside WXR content |
+| `<mod>_tables_dynamic` | no* | `<mod>_tables_dynamic <scan_json>` → stdout: one table suffix per line | Plugin-owned tables computed from the scan |
 | `<mod>_post_import` | no | `<mod>_post_import <state_dir> <id_map_tsv> <wp_cmd_b>` | Hook run after WXR import + generic remaps, for module-specific fixups |
 | `<mod>_stack_candidates` | no | `<mod>_stack_candidates` → stdout: one candidate plugin slug per line, most-preferred first | Declares this module's plugin for §12's stack-sync — **detection only**, see below and §3.4 |
 
-\* At least ONE of the three functions `_post_types` / `_option_keys` / `_tables`
-must exist — a module that declares nothing has no reason to exist.
+\* At least ONE of the six `_post_types` / `_option_keys` / `_tables` functions,
+static or `_dynamic`, must exist — a module that declares nothing has no reason to
+exist. `_option_keys_exclude` does not count: an exclusion narrows a claim, it
+never makes one.
 
-> **v1 status (Step 6 self-review, review fix-pack, 2026-08-20):
-> `<mod>_option_keys_exclude` is declared in the contract and implemented by
-> `modules/etch.sh` (also shown in `modules/_template.sh`'s stub), but IS NOT
-> READ ANYWHERE — no code in `lib/` or `bin/` ever calls
-> `module_has_fn "$mod" option_keys_exclude` or consumes its output. It is
-> currently inert. Harmless for `etch` specifically, because
-> `etch_option_keys` is already a complete, explicit allowlist that never
-> includes a license/DB-version key in the first place — there is nothing
-> for the exclusion to actually do there. It would NOT be harmless for a
-> future module that returns a broad prefix from `_option_keys` (e.g.
-> `"my_plugin_*"` instead of an explicit list) while counting on
-> `_option_keys_exclude` to carve license/secret keys back out — those keys
-> would migrate anyway, silently. Until this is wired (or removed), every
-> module's `_option_keys` MUST already be a complete, explicit allowlist —
-> never rely on `_option_keys_exclude` for anything.** Deliberately left
-> unimplemented rather than added in this fix-pack (no existing caller
-> needs prefix expansion, and wiring a mechanism nothing uses is exactly the
-> YAGNI this codebase otherwise avoids) — see `docs/todo.md` if this needs
-> to change.
+> **Status update (2026-08-23, issues #13/#15/#16 —
+> `docs/decisions/0007-module-dynamic-selections.md` is now the authority for
+> this section):** `<mod>_option_keys_exclude` **is wired.** The note that
+> stood here said it was declared but read nowhere, and told module authors
+> never to rely on it; that is no longer true. `module_selection`
+> (`lib/modules.sh`) calls it, and `plan_defaults` expands every module claim
+> through `module_selection`, so exclusions are applied to the static and
+> dynamic option keys alike before anything reaches the manifest — and the
+> manifest is the only thing `graft`/`verify` read. Returning a broad prefix
+> from `_option_keys`/`_option_keys_dynamic` and carving the secrets back out
+> with `_option_keys_exclude` is now a supported way to write a module.
+>
+> The same change added the `_dynamic` counterparts above, for claims whose
+> NAMES are only knowable after `scan` (`theme_mods_<active-theme>`; post types
+> a plugin declares in its own settings). A `_dynamic` function takes the scan
+> path, works from that file alone, and its exit status is part of its answer:
+> zero with no output means "nothing claimed here", non-zero means "could not
+> tell" and stops the run. Same rule for `_option_keys_exclude`. See ADR 0007
+> for the full contract.
 
 **`<mod>_post_import` and `--dry-run` (added in Step 6's dry-run audit, which
 found and fixed a real violation of this in `modules/core-wp.sh`):**
@@ -267,9 +273,11 @@ etch_styles
 EOF
 }
 
-# NOT WIRED in v1 — see §3.2's status note. etch_option_keys above is
-# already a complete explicit allowlist, so this is harmless here, but
-# nothing in lib/ or bin/ ever reads this function's output.
+# WIRED as of issue #13 — see docs/decisions/0007-module-dynamic-selections.md.
+# module_selection (lib/modules.sh) calls this and drops every matching name
+# from the static and dynamic option keys alike, before anything reaches the
+# manifest. (§3.2's old "not wired" status note, which this used to point at,
+# was replaced by that ADR.)
 etch_option_keys_exclude() {
   cat <<'EOF'
 etch_license_*
@@ -311,9 +319,9 @@ automatic_css_generated_inventory
 EOF
 }
 
-# NOT WIRED in v1 — see §3.2's status note (not that it matters here: this
-# whole module is unshipped, see the status note further below in this
-# section).
+# WIRED as of issue #13 — see docs/decisions/0007-module-dynamic-selections.md.
+# (This block also predates modules/acss.sh, which now ships for real; the
+# "unshipped" status note further below in this section is stale too.)
 acss_option_keys_exclude() {
   cat <<'EOF'
 automatic_css_license_*
@@ -546,10 +554,12 @@ Validation rules (`lib/manifest.sh :: manifest_validate`):
 
 ## 5. Profile + credentials format
 
-### 5.1 Profile — `profiles/<name>.conf` (committable, zero secrets)
+### 5.1 Profile — `profiles/<name>.conf` (local-only and gitignored, zero secrets)
 
 ```sh
-# profiles/example.conf — sitegraft profile. No secrets here — safe to commit.
+# profiles/example.conf — sitegraft profile template. No secrets here, but a
+# real profile holds real hosts, paths and site URLs, so profiles/*.conf are
+# gitignored and only this example is tracked. Copy it; never commit the copy.
 
 SITE_A_ALIAS="a"
 SITE_A_SSH_HOST="user@host-a.example.com"

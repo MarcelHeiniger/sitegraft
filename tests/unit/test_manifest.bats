@@ -113,3 +113,46 @@ setup() {
   [ "$status" -eq 1 ]
   [[ "$output" != *'"frozen":true'* ]]
 }
+
+# --- B4 (third review round, second reviewer): one enforcement point is elegant and
+# fragile. module_selection rejects a name carrying a comma or whitespace,
+# but it only ever runs on the plan_defaults path. A SITEGRAFT_MANIFEST_
+# PREFILLED or hand-edited manifest — a documented workflow for repairing or
+# resuming a run — reaches graft without passing through it, and
+# manifest_validate used to check nothing but migrate/protect overlap. Such
+# an option key then survived into graft_migrate_options' word-splitting and
+# became `wp option update` calls against names nobody planned, on B's live
+# database. Same rule, second entry point.
+
+@test "manifest_validate rejects an option key carrying whitespace, which graft cannot address unambiguously (B4)" {
+  local m='{"migrate":{"demo":{"option_keys":["demo_settings","two words"]}},"protect":{}}'
+  run manifest_validate "$m"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"two words"* ]] || false
+}
+
+@test "manifest_validate rejects a post type carrying a comma (B4)" {
+  local m='{"migrate":{"demo":{"post_types":["good_cpt","bad,cpt"]}},"protect":{}}'
+  run manifest_validate "$m"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"bad,cpt"* ]] || false
+}
+
+@test "manifest_validate applies the rule to the protect bucket and to tables too (B4)" {
+  local m='{"migrate":{},"protect":{"demo":{"tables":["demo_ok","demo bad"]}}}'
+  run manifest_validate "$m"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"demo bad"* ]] || false
+}
+
+@test "manifest_validate still accepts every legitimate name shape, including hyphens and theme_mods slugs (B4)" {
+  local m='{"migrate":{"core-wp":{"post_types":["page","wp_global_styles"],"option_keys":["theme_mods_etch-theme-child","blogname"]}},"protect":{"x":{"tables":["amelia_appointments"]}}}'
+  run manifest_validate "$m"
+  [ "$status" -eq 0 ]
+}
+
+@test "manifest_freeze refuses to freeze a manifest carrying such a name (B4, the path phase_plan actually uses)" {
+  local m='{"migrate":{"demo":{"option_keys":["two words"]}},"protect":{}}'
+  run manifest_freeze "$m"
+  [ "$status" -ne 0 ]
+}

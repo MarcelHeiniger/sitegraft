@@ -72,10 +72,11 @@ content domain, in `modules/`. Adding support for a new plugin tomorrow is one n
 file; the core never changes. See [`docs/usage.md`](docs/usage.md#5-the-module-system)
 for the exact contract and how to write one.
 
-Modules shipped in v1: `core-wp` (pages, posts, the front-page option trio) and
-`etch` (Etch's custom post types and options). `acss` (Automatic.css) is
-deliberately not shipped yet — see `docs/usage.md` for why. A `_template.sh` and a
-complete worked example (`motopress.sh.example`) are provided for writing new ones.
+Modules shipped in v1: `core-wp` (pages, posts, the front-page option trio and the
+active theme's `theme_mods_<slug>`), `etch` (Etch's post types and options) and
+`acss` (Automatic.css's framework configuration, plus the stack-sync candidates for
+both plugin-folder names it has shipped under). A `_template.sh` and a complete
+worked example (`motopress.sh.example`) are provided for writing new ones.
 
 ## Requirements
 
@@ -128,10 +129,11 @@ sitegraft restore --profile my-migration --run <run-id>           # only if you 
 
 `<profile>` is a file at `profiles/<name>.conf` describing the A/B pair (hosts,
 paths, wrapper commands) — see `profiles/example.conf`. Profiles never contain
-secrets; an optional credentials file at `~/.config/sitegraft/<profile>.creds`
-(chmod 600, never committed) can pin a specific SSH key per site — without one,
-sitegraft falls back to your ssh-agent/default identity, which is enough for most
-setups.
+secrets, but they do hold real infrastructure details, so they're gitignored by
+default (only `profiles/example.conf` is tracked); an optional credentials file
+at `~/.config/sitegraft/<profile>.creds` (chmod 600, never committed) can pin a
+specific SSH key per site — without one, sitegraft falls back to your
+ssh-agent/default identity, which is enough for most setups.
 
 **Full usage guide:** [`docs/usage.md`](docs/usage.md) — every flag, the exact
 contract for writing a new module, and the full security model (non-contamination,

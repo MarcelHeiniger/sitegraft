@@ -743,6 +743,19 @@ grep -q "protected data unchanged" "$VERIFY_REPORT"
 grep -q "migrated options match A's values on B" "$VERIFY_REPORT"
 grep -q "page_on_front resolves to the correctly remapped page" "$VERIFY_REPORT"
 grep -q "A's domain string is absent from the content graft imported" "$VERIFY_REPORT"
+# ...and that it says HOW MUCH it examined, with a non-zero count on both
+# surfaces. A tick alone is not proof: the check can loop over an empty
+# post_ids/option_keys payload and report "absent" having read nothing at
+# all (Viktor's re-review of PR #26, B1) — on a real graft with real
+# migrated posts and options, both counts must be greater than zero.
+DOMAIN_SCOPE_LINE=$(grep "A's domain string is absent from the content graft imported" "$VERIFY_REPORT")
+DOMAIN_SCANNED_POSTS=$(printf '%s' "$DOMAIN_SCOPE_LINE" | sed -n 's/.*(\([0-9][0-9]*\) migrated post(s).*/\1/p')
+DOMAIN_SCANNED_OPTIONS=$(printf '%s' "$DOMAIN_SCOPE_LINE" | sed -n 's/.* + \([0-9][0-9]*\) migrated option(s) scanned).*/\1/p')
+if [ -z "$DOMAIN_SCANNED_POSTS" ] || [ -z "$DOMAIN_SCANNED_OPTIONS" ] || [ "$DOMAIN_SCANNED_POSTS" -lt 1 ] || [ "$DOMAIN_SCANNED_OPTIONS" -lt 1 ]; then
+  echo "FAIL: the domain-absence line ticked its box without naming a non-zero scope on a real graft: ${DOMAIN_SCOPE_LINE}" >&2
+  exit 1
+fi
+echo "==> confirmed: the domain-absence check reports the real scope it examined (${DOMAIN_SCANNED_POSTS} post(s) + ${DOMAIN_SCANNED_OPTIONS} option(s)), not a bare tick"
 grep -q "no orphan post_parent references" "$VERIFY_REPORT"
 grep -q "expected navigation is present" "$VERIFY_REPORT"
 grep -q "Result: PASS" "$VERIFY_REPORT"

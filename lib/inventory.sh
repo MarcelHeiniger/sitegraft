@@ -235,7 +235,29 @@ inventory_scan_site() {
   log_info "scanning site '${alias_lc}' -> ${out_json}"
   local post_types options tables plugins active_theme menus
   post_types=$(wp_remote "$alias_lc" post-type list --format=json)
-  options=$(wp_remote "$alias_lc" option list --format=json)
+  # `--unserialize` (B1, third review round): WITHOUT it, wp-cli returns each
+  # option_value exactly as the database holds it, so a PHP array arrives as
+  # the serialized STRING `a:1:{...}` rather than as a structure. Verified
+  # live against WP-CLI 2.12.0 on a real WordPress install, not assumed:
+  #
+  #   stored bytes                     without            with
+  #   a:2:{i:0;s:5:"fotos";...}        "a:2:{i:0;s:5:..."  ["fotos","news"]
+  #   a:0:{}                           "a:0:{}"            []
+  #   a:1:{s:5:"fotos";a:1:{...}}      "a:1:{s:5:\"fot..."  {"fotos":{...}}
+  #   [{"slug":"fotos"}]  (a string)   unchanged           unchanged
+  #   hello / 42                       unchanged           unchanged
+  #
+  # modules/etch.sh's etch_cpts reader is the only consumer of this field and
+  # cannot read a serialized string — so on the storage shape a WordPress
+  # array is MOST likely to have, including the wholly benign empty `a:0:{}`,
+  # `plan` used to stop dead. The flag has been part of `wp option list` since
+  # 2018 (wp-cli/entity-command, "Add --unserialize flag to 'option list'
+  # command"), so it predates every wp-cli 2.x this tool can run against.
+  # One behavior worth knowing: a CORRUPT serialized value unserializes to
+  # PHP `false` and is recorded as JSON `false` (observed live), where the
+  # raw string used to come through — a module reading it still cannot make
+  # sense of it, which is the same answer, reached one step earlier.
+  options=$(wp_remote "$alias_lc" option list --unserialize --format=json)
   # `wp db tables` has no --format=json (only "list" or "csv", verified against
   # a real wp-cli install) — request the default newline-separated list and
   # build the JSON array ourselves.

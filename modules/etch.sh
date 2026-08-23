@@ -46,11 +46,14 @@
 # identifies. In core-wp they would be offered on every migration, including
 # classic-theme pairs where they are empty noise.
 #
-# KNOWN GAP, not fixable inside this module: the active theme's
-# `theme_mods_<slug>` option (theme_mods_etch-theme-child on the reference
-# site) also belongs with a migrated design, but its NAME depends on the
-# site's active theme slug and the module contract only accepts a static
-# list. Declaring it needs a contract change, not a line here.
+# The active theme's `theme_mods_<slug>` option (theme_mods_etch-theme-child
+# on the reference site) also belongs with a migrated design, but its NAME
+# depends on the site's active theme slug. That was a known gap here until
+# the module contract gained scan-computed selections (issue #15,
+# docs/decisions/0007-module-dynamic-selections.md); it is now claimed by
+# modules/core-wp.sh's `core_wp_option_keys_dynamic`, since `theme_mods_` is
+# core's own option for whatever theme is active, block or classic — see that
+# function's comment for why it belongs there rather than here.
 
 etch_name() { echo "Etch"; }
 
@@ -67,12 +70,151 @@ wp_global_styles
 EOF
 }
 
-# Explicit allowlist, never a broad `etch_*` prefix — the same reasoning as
-# modules/acss.sh: `<mod>_option_keys_exclude` is documented but inert, so a
-# prefix would ship etch_license_key, etch_license_status,
-# etch_license_options and etchtheme_license_options straight to B. Also
-# deliberately left out, being schema state rather than design:
-# etch_db_version, etch_migrations, etch_svg_version.
+# Issue #16, closed through the extended module contract
+# (docs/decisions/0007-module-dynamic-selections.md). `etch_cpts` DEFINES
+# post types, and etch_option_keys above migrates that definition — so B
+# used to receive the registration and none of the posts, leaving the type
+# registered and empty. The names live in the site's own option data and are
+# only knowable after `scan`, which is exactly what a `_dynamic` selection is
+# for. Each name lands in the manifest individually, so `plan`'s interactive
+# selection lists and toggles it like any other post type.
+#
+# WHAT SHAPES ARE ACCEPTED, and why this is written defensively rather than
+# against one known layout: `etch_cpts` has been seen on a real site, but its
+# internal structure has NOT been verified field by field here, and the scan
+# records whatever `wp option list --format=json` produced — which may hand
+# this function a decoded array/object or a JSON string, depending on the
+# wp-cli version's own unserialization. Three shapes are read:
+#   [ "fotos", ... ]                       a plain list of names
+#   [ {"slug":"fotos", ...}, ... ]         a list of definitions (slug, else
+#                                          post_type, else name, else key)
+#   { "fotos": {...}, ... }                a map keyed by name
+# — each also accepted as a JSON string holding the same.
+#
+# ANYTHING ELSE IS WARNED ABOUT, LOUDLY, and claims nothing. This used to
+# abort, and the abort was the defect (B1, third review round): it traded
+# "this run migrates less than it could" for "this tool does not run at all",
+# on the strength of one module failing to read one option — and it fired on
+# `a:0:{}`, an empty array, as readily as on anything else. `scan` now asks
+# wp-cli to unserialize (lib/inventory.sh), which removes the shape that made
+# this common in the first place; what is left is genuinely unusual, and a
+# warning naming the option and the consequence satisfies CLAUDE.md's "a
+# skipped step is visible" without putting `plan` on the floor. The two
+# fail-closed cases below (a scan with no options list, a scan with no
+# post-type list) are NOT the same thing and still abort: those say the SCAN
+# cannot be reasoned from at all, not that one value is odd.
+#
+# STILL UNVERIFIED, and worth saying plainly: nobody has yet read a real
+# `etch_cpts` row off a live Etch install that uses the feature. The shapes
+# below are plausible, not confirmed. The definitive answer is one query on
+# a real site, and until someone runs it this function is defensive by
+# necessity rather than by design.
+#
+# A declared name the scanned site does not actually register is DROPPED,
+# with a warning — never offered. CLAUDE.md's first rule in its original
+# form: `plan` once offered post types that did not exist, `graft` exported
+# an empty WXR, and `verify` reported PASS.
+etch_post_types_dynamic() {
+  local scan_json="$1" raw declared registered slug kept=""
+
+  # Same fail-closed treatment as core_wp_option_keys_dynamic, and for the
+  # same reason: with no options list, "this site declares no custom post
+  # types" and "nobody looked" are indistinguishable, and only one of them is
+  # safe to act on.
+  if ! jq -e 'has("options") and (.options | type == "array")' "$scan_json" >/dev/null 2>&1; then
+    log_error "etch: ${scan_json} has no options list, so whether this site declares custom post types through etch_cpts cannot be determined — refusing to read that as 'it declares none' (re-run 'sitegraft scan')"
+    return 1
+  fi
+
+  raw=$(jq -c '[.options[]? | select(.option_name == "etch_cpts") | .option_value][0]' "$scan_json" 2>/dev/null) \
+    || { log_error "etch: could not read ${scan_json} while looking for the etch_cpts option — refusing to guess (re-run 'sitegraft scan')"; return 1; }
+  [ -n "$raw" ] || raw=null
+
+  # Kept as a single-quoted jq program on purpose (.shellcheckrc's SC2016
+  # note): nothing in it is a shell variable.
+  local prog='
+    def decoded:
+      if type != "string" then .
+      elif test("^\\s*$") then null
+      else (try fromjson catch error("etch_cpts is not JSON and could not be decoded")) end;
+    def name_of:
+      if type == "string" then .
+      elif type == "object" then (.slug // .post_type // .name // error("an etch_cpts entry carries no slug/post_type/name"))
+      else error("an etch_cpts entry is neither a name nor a definition object") end;
+    decoded
+    | if . == null then []
+      elif type == "array" then map(name_of)
+      elif type == "object" then
+        # N1: a SINGLE definition object -- {"slug":"fotos","label":"Fotos"} --
+        # is a fourth shape, and `else .key` used to swallow it: it read the
+        # FIELD NAMES ("slug", "label") as post-type names and exited 0. A map
+        # of post types has an object on every value; a definition object does
+        # not. Requiring that tells the two apart instead of guessing.
+        (if (to_entries | all(.value | type == "object"))
+         then (to_entries | map(.value.slug // .value.post_type // .key))
+         else error("etch_cpts looks like a single definition object, not a map of post types")
+         end)
+      else error("etch_cpts is neither a list nor a map") end'
+
+  if ! declared=$(printf '%s' "$raw" | jq -c "$prog" 2>&1); then
+    # A value that is STILL a PHP-serialized string at this point means the
+    # scan was taken before `sitegraft scan` started passing --unserialize to
+    # wp-cli, or that the row is double-serialized. Worth saying by name: it
+    # is the one diagnosis with a one-command fix. `a:`/`O:`/`s:`/`i:`/`b:`/
+    # `d:`/`N:` are PHP's serialization type prefixes.
+    local raw_str="" hint=""
+    raw_str=$(printf '%s' "$raw" | jq -r 'if type == "string" then . else "" end' 2>/dev/null) || raw_str=""
+    case "$raw_str" in
+      [aOsibdN]:*) hint="The recorded value is still PHP-serialized, so this scan predates sitegraft passing --unserialize to 'wp option list' (or the row is doubly serialized) — re-run 'sitegraft scan' first. " ;;
+    esac
+    log_warn "etch: could not read the etch_cpts option recorded in ${scan_json} (${declared}) — claiming NO post types from it, and continuing. ${hint}If this site really does declare custom post types through etch_cpts, they will NOT be migrated, while etch_option_keys still carries the DEFINITION to B — which is issue #16's registered-but-empty post type, out loud this time. Fix or extend etch_post_types_dynamic for this site's shape, or name the post types by hand in a SITEGRAFT_MANIFEST_PREFILLED manifest."
+    return 0
+  fi
+
+  [ "$(printf '%s' "$declared" | jq 'length')" != "0" ] || return 0
+
+  if ! jq -e 'has("post_types") and (.post_types | type == "array")' "$scan_json" >/dev/null 2>&1; then
+    log_error "etch: ${scan_json} lists no post types, so a name declared by etch_cpts cannot be confirmed to exist on that site — refusing to offer post types that may not be there (re-run 'sitegraft scan')"
+    return 1
+  fi
+  registered=$(jq -c '[.post_types[]?.name]' "$scan_json")
+
+  while IFS= read -r slug <&3; do
+    [ -n "$slug" ] || continue
+    # WordPress caps a post-type name at 20 characters and allows only
+    # lowercase letters, digits, underscore and hyphen. A name outside that
+    # is not a post type, so it is a defect in the data, not something to
+    # quietly skip.
+    case "$slug" in
+      *[!a-z0-9_-]*)
+        log_error "etch: etch_cpts in ${scan_json} declares '${slug}', which is not a valid WordPress post-type name — refusing to plan a migration around it"
+        return 1
+        ;;
+    esac
+    if [ "${#slug}" -gt 20 ]; then
+      log_error "etch: etch_cpts in ${scan_json} declares '${slug}', longer than WordPress's 20-character post-type limit — refusing to plan a migration around it"
+      return 1
+    fi
+    if ! printf '%s' "$registered" | jq -e --arg s "$slug" 'index($s) != null' >/dev/null 2>&1; then
+      log_warn "etch: etch_cpts declares post type '${slug}', but ${scan_json} shows it is not registered on that site — leaving it out of the plan rather than offering a post type whose export would come back empty"
+      continue
+    fi
+    kept="${kept}${slug}"$'\n'
+  done 3<<< "$(printf '%s' "$declared" | jq -r '.[]')"
+
+  printf '%s' "$kept"
+}
+
+# Explicit allowlist rather than a broad `etch_*` prefix. This predates issue
+# #13's fix and is KEPT on purpose now that `etch_option_keys_exclude` below
+# is genuinely applied (docs/decisions/0007-module-dynamic-selections.md): a
+# prefix plus exclusions is now safe, but an allowlist and an exclusion list
+# fail in opposite directions, and for a plugin with this few options the
+# allowlist's failure mode (a new Etch option is not migrated until someone
+# adds it here) is the better one — the exclusion list's is that a new
+# `etch_something_secret` ships to B until someone notices. Also deliberately
+# left out, being schema state rather than design: etch_db_version,
+# etch_migrations, etch_svg_version.
 # `etch_cfs` and `etch_cpts` deserve a note. The original version of this
 # module declared those two names as POST TYPES, and no such post type exists
 # on any real site — that was the headline error. But the names themselves
@@ -82,12 +224,13 @@ EOF
 # earlier conclusion ("these names are fiction") look safe. Right names,
 # wrong kind.
 #
-# KNOWN CONSEQUENCE, not solved here: `etch_cpts` DEFINES post types, so a
-# site using it stores real content under names only that option knows
-# (`fotos`, on the site this was found on). Migrating the definition without
-# migrating the posts it describes leaves B with a registered-but-empty post
-# type. A static post_types list cannot express "whatever etch_cpts happens
-# to declare" — closing that needs a contract change, not another line here.
+# `etch_cpts` DEFINES post types, so a site using it stores real content
+# under names only that option knows (`fotos`, on the site this was found
+# on). Migrating the definition without migrating the posts it describes left
+# B with a registered-but-empty post type — a static post_types list cannot
+# express "whatever etch_cpts happens to declare". Closed by issue #16's
+# contract change: etch_post_types_dynamic above reads this option and claims
+# the types it declares.
 etch_option_keys() {
   cat <<'EOF'
 etch_cfs
@@ -100,11 +243,13 @@ etch_styles
 EOF
 }
 
-# Declared for contract completeness. Inert today — nothing in lib/ or bin/
-# ever calls module_has_fn "$mod" option_keys_exclude, so this function's
-# return value is never read. It is documented in docs/usage.md §5 as the way
-# to carve secrets out of a broad prefix, which is exactly the thing not to
-# rely on: etch_option_keys above is an explicit allowlist for that reason.
+# Applied for real as of issue #13's fix: module_selection (lib/modules.sh)
+# calls this and drops every matching name from etch_option_keys above and
+# from any dynamic option key, before anything reaches the manifest. It is a
+# second line of defence rather than the only one — etch_option_keys is an
+# explicit allowlist that never names a license key in the first place — but
+# it is no longer decorative, and a name added here now genuinely cannot
+# migrate.
 etch_option_keys_exclude() {
   cat <<'EOF'
 etch_license_*

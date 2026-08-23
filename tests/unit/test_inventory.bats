@@ -93,10 +93,10 @@ EOF
   SITE_A_SSH_HOST="user@host-a.example.com"
   SITE_A_WP_PATH="/var/www/html"
   SITE_A_WP_CMD="wp"
-  SITE_A_SSH_KEY="/home/marcel/.ssh/id_ed25519_site_a"
+  SITE_A_SSH_KEY="/home/user/.ssh/id_ed25519_site_a"
   SITEGRAFT_DRY_RUN=1
   run wp_remote a option get siteurl
-  [ "$output" = "[dry-run] ssh -i /home/marcel/.ssh/id_ed25519_site_a -- user@host-a.example.com wp --path='/var/www/html' 'option' 'get' 'siteurl'" ]
+  [ "$output" = "[dry-run] ssh -i /home/user/.ssh/id_ed25519_site_a -- user@host-a.example.com wp --path='/var/www/html' 'option' 'get' 'siteurl'" ]
 }
 
 @test "wp_remote never passes -i when SITE_<ALIAS>_SSH_KEY is unset — falls back to ssh's own default identity resolution" {
@@ -231,7 +231,7 @@ EOF
     local alias_lc="$1"; shift
     case "$*" in
       "post-type list --format=json") echo '[]' ;;
-      "option list --format=json") echo '[]' ;;
+      "option list --unserialize --format=json") echo '[]' ;;
       "db tables --format=list --all-tables-with-prefix") echo 'wp_options' ;;
       "plugin list --format=json") echo '[]' ;;
       "theme list --status=active --format=json") echo '[{"name":"twentytwentyfive","status":"active","version":"1.5"}]' ;;
@@ -243,4 +243,146 @@ EOF
   inventory_scan_site a "$out"
   run jq -e '.active_theme.name == "twentytwentyfive" and .active_theme.stylesheet == "twentytwentyfive"' "$out"
   [ "$status" -eq 0 ]
+}
+
+# B1 (third review round). `wp option list --format=json` WITHOUT
+# --unserialize hands back each option_value exactly as the database holds
+# it, so a PHP array arrives as the serialized STRING `a:1:{...}`. Verified
+# live against WP-CLI 2.12.0 on a real WordPress install rather than
+# reasoned about:
+#
+#   stored bytes                    without --unserialize   with --unserialize
+#   a:2:{i:0;s:5:"fotos";...}       "a:2:{i:0;s:5:\"fo..."  ["fotos","news"]
+#   a:0:{}                          "a:0:{}"                []
+#   a:1:{s:5:"fotos";a:1:{...}}     "a:1:{s:5:\"fotos\";..." {"fotos":{...}}
+#   [{"slug":"fotos"}]  (a string)  "[{\"slug\":\"fotos\"}]" "[{\"slug\":\"fotos\"}]"
+#   hello / 42                      "hello" / "42"          "hello" / "42"
+#
+# modules/etch.sh's etch_cpts reader is the ONLY consumer of .option_value in
+# this codebase, and a serialized string is a shape it cannot read — which
+# means `plan` used to stop on the storage form a WordPress array is MOST
+# likely to have, including an empty one. Asking wp-cli to unserialize is
+# what makes the scan record a structure rather than a string. The flag has
+# been part of `wp option list` since 2018 (wp-cli/entity-command, "Add
+# --unserialize flag to 'option list' command"), so it predates every wp-cli
+# 2.x this tool can run against.
+@test "inventory_scan_site asks wp-cli to unserialize option values, so an array option is scanned as a structure and not as a serialized string" {
+  local calls="$BATS_TEST_TMPDIR/calls.log"
+  : > "$calls"
+  wp_remote() {
+    local alias_lc="$1"; shift
+    echo "$*" >> "$calls"
+    case "$*" in
+      *"option list"*) echo '[{"option_name":"etch_cpts","option_value":[{"slug":"fotos"}]}]' ;;
+      "db tables --format=list --all-tables-with-prefix") echo 'wp_options' ;;
+      "theme list --status=active --format=json") echo '[{"name":"t"}]' ;;
+      *) echo '[]' ;;
+    esac
+  }
+  local out="$BATS_TEST_TMPDIR/scan-unser.json"
+  inventory_scan_site a "$out"
+  run grep -F -- 'option list --unserialize --format=json' "$calls"
+  [ "$status" -eq 0 ]
+  # And the recorded value really is a structure, not a string.
+  run jq -e '.options[0].option_value | type == "array"' "$out"
+  [ "$status" -eq 0 ]
+}
+
+# --- inventory_check_path_topology -----------------------------------------
+#
+# The one site shape sitegraft cannot drive: reachable over SSH, with wp-cli
+# running inside a container on the far end. Left undetected it does not fail
+# usefully — `wp export --dir=/tmp/...` writes inside the container while the
+# pull reads the SSH host's /tmp, so the export comes back empty and the graft
+# reports success having moved nothing.
+#
+# The guard tests the invariant (is WP_PATH visible to BOTH wp-cli and the SSH
+# host's filesystem?) rather than the shape of the profile, and the last test
+# below is what pins that difference: `sudo -u www-data wp` behind SSH is a
+# wrapper whose paths match, and must be accepted.
+
+# A stub that ignores its arguments keeps passing after the function it
+# stands in for changes how it is called, so the test quietly stops testing
+# anything. These stubs assert the alias they were handed instead: if
+# inventory_check_path_topology ever stops passing the alias first, the test
+# says so loudly rather than staying green on a signature that no longer
+# exists.
+_assert_alias() {
+  local want="$1"; shift
+  [ "${1:-}" = "$want" ] || {
+    echo "stub called with unexpected first argument: '${1:-}' (wanted '${want}')" >&2
+    return 99
+  }
+}
+
+@test "inventory_check_path_topology skips a site with no SSH_HOST (local+wrapper is supported)" {
+  SITE_B_SSH_HOST=""
+  SITE_B_WP_PATH="/var/www/html"
+  SITE_B_WP_CMD="ddev wp"
+  wp_remote() { _assert_alias b "$@"; return 1; }   # would fail if it were consulted at all
+  ssh() { return 1; }
+  run inventory_check_path_topology b
+  [ "$status" -eq 0 ]
+}
+
+@test "inventory_check_path_topology refuses when wp-cli sees the path but the SSH host does not" {
+  SITE_B_SSH_HOST="user@host"
+  SITE_B_WP_PATH="/var/www/html"
+  wp_remote() { _assert_alias b "$@"; return 0; }   # wp-cli answers: the container sees the path
+  ssh() { return 1; }         # the host itself has no such directory
+  run inventory_check_path_topology b
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"running inside a container"* ]] || false
+  # The actionable half of the message is the part an operator needs most,
+  # and nothing else pins it: name the workaround and the issue that
+  # documents it, so a rewrite cannot quietly drop them.
+  [[ "$output" == *"SITE_B_SSH_HOST empty"* ]] || false
+  [[ "$output" == *"issue #19"* ]] || false
+}
+
+@test "inventory_check_path_topology refuses when wp-cli does not answer at all" {
+  SITE_B_SSH_HOST="user@host"
+  SITE_B_WP_PATH="/wrong/path"
+  wp_remote() { _assert_alias b "$@"; return 1; }
+  ssh() { return 0; }
+  run inventory_check_path_topology b
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"did not answer"* ]] || false
+  # This failure is a wrong path or a wrong wp command, not a container:
+  # the message must send the reader to those two settings.
+  [[ "$output" == *"WP_PATH"* ]] || false
+  [[ "$output" == *"WP_CMD"* ]] || false
+}
+
+@test "inventory_check_path_topology accepts a wrapper behind SSH whose paths agree (sudo -u www-data wp)" {
+  SITE_B_SSH_HOST="user@host"
+  SITE_B_WP_PATH="/var/www/site/htdocs"
+  SITE_B_WP_CMD="sudo -u www-data wp"
+  wp_remote() { _assert_alias b "$@"; return 0; }
+  ssh() { return 0; }
+  run inventory_check_path_topology b
+  [ "$status" -eq 0 ]
+}
+
+@test "inventory_check_path_topology passes -i <SSH_KEY> to its own direct ssh path-existence probe when SITE_<ALIAS>_SSH_KEY is set" {
+  # The guard's own ssh probe (distinct from wp_remote's) has to carry the
+  # key too, or a keyed site refuses every graft with a bogus "container"
+  # verdict the moment SITE_<ALIAS>_SSH_KEY is set — wp-cli would answer via
+  # wp_remote's own -i handling, but this guard's direct `ssh -- "$host" test
+  # -d ...` probe would fall back to ssh's default identity and could fail
+  # the host_ok half of the invariant for a reason that has nothing to do
+  # with the topology being checked.
+  SITE_B_SSH_HOST="user@host"
+  SITE_B_WP_PATH="/var/www/site/htdocs"
+  SITE_B_WP_CMD="wp"
+  SITE_B_SSH_KEY="/home/user/.ssh/id_ed25519_b"
+  wp_remote() { _assert_alias b "$@"; return 0; }
+  ssh() {
+    printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/ssh-calls.log"
+    return 0
+  }
+  run inventory_check_path_topology b
+  [ "$status" -eq 0 ]
+  run cat "$BATS_TEST_TMPDIR/ssh-calls.log"
+  [[ "$output" == "-i /home/user/.ssh/id_ed25519_b --"* ]] || false
 }

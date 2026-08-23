@@ -42,22 +42,30 @@ acss_detect() {
 }
 
 # EXPLICIT ALLOWLIST, deliberately not the broad `automatic_css_*` prefix the
-# option names invite. `<mod>_option_keys_exclude` is documented in
-# docs/usage.md §5 as the way to carve license keys back out of a broad
-# prefix — but that function is inert: nothing in lib/ or bin/ ever reads it
-# (see the note in modules/etch.sh). A prefix here would therefore ship
-# automatic_css_license_key to B for real. One name, listed on purpose.
+# option names invite. That was originally forced: `<mod>_option_keys_exclude`
+# was documented as the way to carve license keys back out of a prefix, and
+# nothing ever called it, so a prefix here would have shipped
+# automatic_css_license_key to B for real (issue #13).
+#
+# The exclusion is applied now (docs/decisions/0007-module-dynamic-selections.md),
+# so a prefix would be safe — and this stays an allowlist anyway. Exactly ONE
+# of this plugin's options carries configuration worth migrating; the rest are
+# a license pair, a schema marker, and a cache ACSS rebuilds from the
+# settings. A prefix would have to exclude everything except one name, which
+# is an allowlist written backwards, with the worse failure mode: a future
+# `automatic_css_<something-secret>` would migrate until someone noticed.
 acss_option_keys() {
   cat <<'EOF'
 automatic_css_settings
 EOF
 }
 
-# Declared for contract completeness and to document intent, even though the
-# core never calls it today (same inert-function caveat as above). If that
-# gets wired, this must keep excluding both the licence pair and the schema
-# marker — and acss_option_keys above must STILL stay an explicit allowlist,
-# not be widened to a prefix on the strength of it.
+# Applied for real as of issue #13's fix — module_selection (lib/modules.sh)
+# calls this and drops every match from acss_option_keys above. Redundant
+# today, since that allowlist names only `automatic_css_settings` and nothing
+# here can match it; kept as the second line of defence it was always meant
+# to be, and as the thing that keeps the license pair and the schema marker
+# out should the allowlist ever be widened.
 acss_option_keys_exclude() {
   cat <<'EOF'
 automatic_css_license_*
