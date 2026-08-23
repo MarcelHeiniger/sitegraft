@@ -245,84 +245,92 @@ EOF
   [ "$status" -eq 0 ]
 }
 
-# --- inventory_check_path_topology (issue #19: refuse a remote+containerized
-# site instead of the silent-empty-export failure) ---------------------------
+# --- inventory_check_path_topology -----------------------------------------
 #
-# The guard tests the INVARIANT (does wp-cli's own --path agree with what the
-# SSH host's filesystem can see?) rather than the SHAPE of the profile (is
-# there an SSH host AND a wrapper command?). That distinction is the whole
-# point: a shape-based "SSH plus a wrapper means refuse" heuristic would
-# reject a perfectly ordinary setup like `sudo -u www-data wp` behind SSH,
-# where the paths genuinely agree. So both directions get a test — refuse
-# when the invariant actually breaks, and pass when it holds even with a
-# wrapper present — because a false positive here breaks every legitimate
-# SSH+wrapper user, not just the one bad case the guard exists for.
+# The one site shape sitegraft cannot drive: reachable over SSH, with wp-cli
+# running inside a container on the far end. Left undetected it does not fail
+# usefully — `wp export --dir=/tmp/...` writes inside the container while the
+# pull reads the SSH host's /tmp, so the export comes back empty and the graft
+# reports success having moved nothing.
+#
+# The guard tests the invariant (is WP_PATH visible to BOTH wp-cli and the SSH
+# host's filesystem?) rather than the shape of the profile, and the last test
+# below is what pins that difference: `sudo -u www-data wp` behind SSH is a
+# wrapper whose paths match, and must be accepted.
 
-@test "inventory_check_path_topology skips the probe entirely when SSH_HOST is unset (local-with-wrapper topology, always supported)" {
-  unset SITE_A_SSH_HOST
-  SITE_A_WP_PATH="/var/www/html"
-  SITE_A_WP_CMD="ddev exec --raw -p demo -- wp"
-  # Neither wp_remote nor ssh should even be called for this alias — stub
-  # both to fail loudly if they are, so the test would catch a regression
-  # that starts probing a site that was never supposed to be probed.
-  wp_remote() { echo "wp_remote SHOULD NOT BE CALLED" >&2; return 1; }
-  ssh() { echo "ssh SHOULD NOT BE CALLED" >&2; return 1; }
-  run inventory_check_path_topology a
-  [ "$status" -eq 0 ]
-  [[ "$output" != *"SHOULD NOT BE CALLED"* ]]
+# A stub that ignores its arguments keeps passing after the function it
+# stands in for changes how it is called, so the test quietly stops testing
+# anything. These stubs assert the alias they were handed instead: if
+# inventory_check_path_topology ever stops passing the alias first, the test
+# says so loudly rather than staying green on a signature that no longer
+# exists.
+_assert_alias() {
+  local want="$1"; shift
+  [ "${1:-}" = "$want" ] || {
+    echo "stub called with unexpected first argument: '${1:-}' (wanted '${want}')" >&2
+    return 99
+  }
 }
 
-@test "inventory_check_path_topology refuses when wp-cli answers but the SSH host cannot see WP_PATH (the remote+containerized signature)" {
-  SITE_A_SSH_HOST="user@host.example.com"
-  SITE_A_WP_PATH="/var/www/html"
-  SITE_A_WP_CMD="wp"
-  # wp-cli answers (as it would, running inside the container) ...
-  wp_remote() { return 0; }
-  # ... but the host's own filesystem has no such directory (the container
-  # path is invisible on the far end) — this is the invariant mismatch.
+@test "inventory_check_path_topology skips a site with no SSH_HOST (local+wrapper is supported)" {
+  SITE_B_SSH_HOST=""
+  SITE_B_WP_PATH="/var/www/html"
+  SITE_B_WP_CMD="ddev wp"
+  wp_remote() { _assert_alias b "$@"; return 1; }   # would fail if it were consulted at all
   ssh() { return 1; }
-  run inventory_check_path_topology a
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"container"* ]]
-  [[ "$output" == *"issue #19"* ]]
-  [[ "$output" == *"SITE_A_SSH_HOST empty"* ]]
+  run inventory_check_path_topology b
+  [ "$status" -eq 0 ]
 }
 
-@test "inventory_check_path_topology refuses when wp-cli itself does not answer (wrong WP_PATH/WP_CMD, a different failure than the container case)" {
-  SITE_A_SSH_HOST="user@host.example.com"
-  SITE_A_WP_PATH="/var/www/html"
-  SITE_A_WP_CMD="wp"
-  wp_remote() { return 1; }
-  ssh() { return 0; }
-  run inventory_check_path_topology a
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"did not answer"* ]]
-  [[ "$output" == *"WP_PATH"* ]]
+@test "inventory_check_path_topology refuses when wp-cli sees the path but the SSH host does not" {
+  SITE_B_SSH_HOST="user@host"
+  SITE_B_WP_PATH="/var/www/html"
+  wp_remote() { _assert_alias b "$@"; return 0; }   # wp-cli answers: the container sees the path
+  ssh() { return 1; }         # the host itself has no such directory
+  run inventory_check_path_topology b
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"running inside a container"* ]] || false
 }
 
-@test "inventory_check_path_topology passes a site reachable over SSH whose wp-cli path matches the host's (e.g. 'sudo -u www-data wp' behind SSH) — the false-positive case a shape heuristic would wrongly reject" {
-  SITE_A_SSH_HOST="user@host.example.com"
-  SITE_A_WP_PATH="/var/www/site-a/htdocs"
-  SITE_A_WP_CMD="sudo -u www-data wp"
-  # Both probes agree: wp-cli sees the path, and so does the SSH host itself.
-  wp_remote() { return 0; }
+@test "inventory_check_path_topology refuses when wp-cli does not answer at all" {
+  SITE_B_SSH_HOST="user@host"
+  SITE_B_WP_PATH="/wrong/path"
+  wp_remote() { _assert_alias b "$@"; return 1; }
   ssh() { return 0; }
-  run inventory_check_path_topology a
+  run inventory_check_path_topology b
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"did not answer"* ]] || false
+}
+
+@test "inventory_check_path_topology accepts a wrapper behind SSH whose paths agree (sudo -u www-data wp)" {
+  SITE_B_SSH_HOST="user@host"
+  SITE_B_WP_PATH="/var/www/site/htdocs"
+  SITE_B_WP_CMD="sudo -u www-data wp"
+  wp_remote() { _assert_alias b "$@"; return 0; }
+  ssh() { return 0; }
+  run inventory_check_path_topology b
   [ "$status" -eq 0 ]
 }
 
 @test "inventory_check_path_topology passes -i <SSH_KEY> to its own direct ssh path-existence probe when SITE_<ALIAS>_SSH_KEY is set" {
-  SITE_A_SSH_HOST="user@host.example.com"
-  SITE_A_WP_PATH="/var/www/html"
-  SITE_A_WP_CMD="wp"
-  SITE_A_SSH_KEY="/home/user/.ssh/id_ed25519_a"
-  wp_remote() { return 0; }
+  # The guard's own ssh probe (distinct from wp_remote's) has to carry the
+  # key too, or a keyed site refuses every graft with a bogus "container"
+  # verdict the moment SITE_<ALIAS>_SSH_KEY is set — wp-cli would answer via
+  # wp_remote's own -i handling, but this guard's direct `ssh -- "$host" test
+  # -d ...` probe would fall back to ssh's default identity and could fail
+  # the host_ok half of the invariant for a reason that has nothing to do
+  # with the topology being checked.
+  SITE_B_SSH_HOST="user@host"
+  SITE_B_WP_PATH="/var/www/site/htdocs"
+  SITE_B_WP_CMD="wp"
+  SITE_B_SSH_KEY="/home/user/.ssh/id_ed25519_b"
+  wp_remote() { _assert_alias b "$@"; return 0; }
   ssh() {
     printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/ssh-calls.log"
     return 0
   }
-  run inventory_check_path_topology a
+  run inventory_check_path_topology b
   [ "$status" -eq 0 ]
   run cat "$BATS_TEST_TMPDIR/ssh-calls.log"
-  [[ "$output" == "-i /home/user/.ssh/id_ed25519_a --"* ]]
+  [[ "$output" == "-i /home/user/.ssh/id_ed25519_b --"* ]] || false
 }

@@ -223,7 +223,16 @@ manifest_compute_unclaimed() {
          | ($t | if startswith($p) then .[($p | length):] else . end) as $suffix
          | select(($claimed | index($suffix)) | not)
          | select(($core    | index($suffix)) | not)
-         | $t ]' 2>/dev/null || echo '[]')
+         | $t ]') || {
+      # Fail closed. `2>/dev/null || echo '[]'` — the shape this line was first
+      # written in — turns any jq error into "no unclaimed tables", which is
+      # indistinguishable from a site that genuinely has none. That silently
+      # reinstates the exact defect this function was changed to fix: an empty
+      # list means backup takes no checksum for anything outside a module, and
+      # verify then reports "protected data unchanged" having compared nothing.
+      log_error "could not compute the unclaimed table list from scan-b.json — refusing to write a manifest whose _unclaimed.tables would be silently empty"
+      return 1
+    }
   fi
 
   echo "$manifest" | jq --argjson u "$unclaimed_pt" --argjson uo "$unclaimed_ok" --argjson ut "$unclaimed_tb" \
