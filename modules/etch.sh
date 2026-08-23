@@ -46,11 +46,14 @@
 # identifies. In core-wp they would be offered on every migration, including
 # classic-theme pairs where they are empty noise.
 #
-# KNOWN GAP, not fixable inside this module: the active theme's
-# `theme_mods_<slug>` option (theme_mods_etch-theme-child on the reference
-# site) also belongs with a migrated design, but its NAME depends on the
-# site's active theme slug and the module contract only accepts a static
-# list. Declaring it needs a contract change, not a line here.
+# The active theme's `theme_mods_<slug>` option (theme_mods_etch-theme-child
+# on the reference site) also belongs with a migrated design, but its NAME
+# depends on the site's active theme slug. That was a known gap here until
+# the module contract gained scan-computed selections (issue #15,
+# docs/decisions/0007-module-dynamic-selections.md); it is now claimed by
+# modules/core-wp.sh's `core_wp_option_keys_dynamic`, since `theme_mods_` is
+# core's own option for whatever theme is active, block or classic — see that
+# function's comment for why it belongs there rather than here.
 
 etch_name() { echo "Etch"; }
 
@@ -161,12 +164,16 @@ etch_post_types_dynamic() {
   printf '%s' "$kept"
 }
 
-# Explicit allowlist, never a broad `etch_*` prefix — the same reasoning as
-# modules/acss.sh: `<mod>_option_keys_exclude` is documented but inert, so a
-# prefix would ship etch_license_key, etch_license_status,
-# etch_license_options and etchtheme_license_options straight to B. Also
-# deliberately left out, being schema state rather than design:
-# etch_db_version, etch_migrations, etch_svg_version.
+# Explicit allowlist rather than a broad `etch_*` prefix. This predates issue
+# #13's fix and is KEPT on purpose now that `etch_option_keys_exclude` below
+# is genuinely applied (docs/decisions/0007-module-dynamic-selections.md): a
+# prefix plus exclusions is now safe, but an allowlist and an exclusion list
+# fail in opposite directions, and for a plugin with this few options the
+# allowlist's failure mode (a new Etch option is not migrated until someone
+# adds it here) is the better one — the exclusion list's is that a new
+# `etch_something_secret` ships to B until someone notices. Also deliberately
+# left out, being schema state rather than design: etch_db_version,
+# etch_migrations, etch_svg_version.
 # `etch_cfs` and `etch_cpts` deserve a note. The original version of this
 # module declared those two names as POST TYPES, and no such post type exists
 # on any real site — that was the headline error. But the names themselves
@@ -176,12 +183,13 @@ etch_post_types_dynamic() {
 # earlier conclusion ("these names are fiction") look safe. Right names,
 # wrong kind.
 #
-# KNOWN CONSEQUENCE, not solved here: `etch_cpts` DEFINES post types, so a
-# site using it stores real content under names only that option knows
-# (`fotos`, on the site this was found on). Migrating the definition without
-# migrating the posts it describes leaves B with a registered-but-empty post
-# type. A static post_types list cannot express "whatever etch_cpts happens
-# to declare" — closing that needs a contract change, not another line here.
+# `etch_cpts` DEFINES post types, so a site using it stores real content
+# under names only that option knows (`fotos`, on the site this was found
+# on). Migrating the definition without migrating the posts it describes left
+# B with a registered-but-empty post type — a static post_types list cannot
+# express "whatever etch_cpts happens to declare". Closed by issue #16's
+# contract change: etch_post_types_dynamic above reads this option and claims
+# the types it declares.
 etch_option_keys() {
   cat <<'EOF'
 etch_cfs
@@ -194,11 +202,13 @@ etch_styles
 EOF
 }
 
-# Declared for contract completeness. Inert today — nothing in lib/ or bin/
-# ever calls module_has_fn "$mod" option_keys_exclude, so this function's
-# return value is never read. It is documented in docs/usage.md §5 as the way
-# to carve secrets out of a broad prefix, which is exactly the thing not to
-# rely on: etch_option_keys above is an explicit allowlist for that reason.
+# Applied for real as of issue #13's fix: module_selection (lib/modules.sh)
+# calls this and drops every matching name from etch_option_keys above and
+# from any dynamic option key, before anything reaches the manifest. It is a
+# second line of defence rather than the only one — etch_option_keys is an
+# explicit allowlist that never names a license key in the first place — but
+# it is no longer decorative, and a name added here now genuinely cannot
+# migrate.
 etch_option_keys_exclude() {
   cat <<'EOF'
 etch_license_*

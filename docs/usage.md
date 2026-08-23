@@ -302,24 +302,24 @@ pluggable **graft modules** — one file per WordPress plugin or content domain,
 plugin; you add one file.
 
 Shipped in this repo:
-- **`core-wp`** (`modules/core-wp.sh`) — WordPress core content: pages, posts, and
-  the front-page option trio (`show_on_front`/`page_on_front`/`page_for_posts`,
-  correctly remapped through the ID map rather than blindly copied).
-- **`etch`** (`modules/etch.sh`) — Etch's custom post types (CFS, CPTs, loops) and
-  options (settings, styles, global stylesheets, CSS toolbar values).
+- **`core-wp`** (`modules/core-wp.sh`) — WordPress core content: pages, posts, the
+  front-page option trio (`show_on_front`/`page_on_front`/`page_for_posts`,
+  correctly remapped through the ID map rather than blindly copied), and the
+  active theme's `theme_mods_<slug>` customizer settings, resolved from the scan.
+- **`etch`** (`modules/etch.sh`) — the WordPress post types Etch actually stores
+  content in (`wp_block`, `wp_template`, `wp_global_styles`), its options
+  (settings, styles, global stylesheets, CSS toolbar values, CFS/CPT definitions),
+  the post types `etch_cpts` declares on the scanned site, and a post-import hook
+  that remaps Etch's own component references.
+- **`acss`** (`modules/acss.sh`) — Automatic.css's framework configuration, plus
+  the stack-sync candidates for both plugin-folder names the plugin has shipped
+  under (the pre-4.0 → 4.0 rename).
 - `modules/_template.sh` — a documented skeleton, copy it to get started.
 - `modules/motopress.sh.example` — a complete worked example for a hypothetical
   future module (MotoPress Hotel Booking), showing every part of the contract
   including a plugin-owned table and a post-import remap hook. Not loaded by
   default (the `.example` suffix keeps it out of module discovery) — drop the
   suffix to activate it for real.
-
-**Not shipped: Automatic.css (`acss`).** It's fully spec'd in the design doc (§3.4),
-but the module needs to declare Automatic.css's pre-v4 plugin-folder name as a
-detection candidate, and that legacy name has never been verified against a real
-pre-4.0 install — shipping a guess would risk silently failing to detect (or
-mis-detecting) a real site's ACSS install. If you can verify that folder name, a
-real `modules/acss.sh` PR is very welcome.
 
 ### Writing your own module
 
@@ -331,12 +331,70 @@ Copy [`modules/_template.sh`](../modules/_template.sh) to `modules/<your-plugin>
 |---|:---:|---|
 | `<mod>_name` | yes | Human-readable name shown in prompts. |
 | `<mod>_detect <scan_json>` | yes | Exit 0/1 — is this plugin present on the scanned site? |
-| `<mod>_post_types` | at least one of these three | Post types this module owns, one per line. |
+| `<mod>_post_types` | at least one of these six | Post types this module owns, one per line. |
+| `<mod>_post_types_dynamic <scan_json>` | | Same, but computed from the scan — for names only knowable after `scan`. |
 | `<mod>_option_keys` | | `wp_options` keys this module owns, one per line. |
+| `<mod>_option_keys_dynamic <scan_json>` | | Same, but computed from the scan. |
 | `<mod>_tables` | | Plugin-owned SQL table suffixes (without the live `$table_prefix`), one per line. |
-| `<mod>_option_keys_exclude` | no | Glob patterns to exclude within a broad option-key prefix (e.g. license keys, DB version markers). |
+| `<mod>_tables_dynamic <scan_json>` | | Same, but computed from the scan. |
+| `<mod>_option_keys_exclude` | no | Glob patterns to exclude within a broad option-key prefix (e.g. license keys, DB version markers). Applied to both the static and the dynamic option keys. |
 | `<mod>_post_import <state_dir> <id_map_tsv> <wp_cmd_b>` | no | Hook run after WXR import + generic remaps, for module-specific fixups (e.g. remapping an internal ID reference in postmeta). |
 | `<mod>_stack_candidates` | no | If this plugin also needs to be *present and matching* on B for migrated content to render (like Etch or ACSS), one candidate plugin-folder slug per line, most-preferred/current first. |
+
+### Selections computed from the scan
+
+Some names cannot be written down in advance, because they depend on the site.
+The active theme's customizer settings live in `theme_mods_<stylesheet>`, and Etch
+lets a site declare its own post types in the `etch_cpts` option — in both cases
+the *name* is only knowable once `scan` has run. That is what the `_dynamic`
+functions are for. Each receives one argument, the path to a `scan-*.json`, and
+prints names one per line just like its static counterpart:
+
+```sh
+# The active theme's customizer settings — modules/core-wp.sh does this for real.
+my_plugin_option_keys_dynamic() {
+  jq -r '"theme_mods_" + .active_theme.stylesheet' "$1"
+}
+```
+
+The two lists are merged, so a module can have both; every name — static or
+dynamic — appears individually in `plan`'s selection prompt and can be
+deselected there.
+
+A `_dynamic` function must work from the scan file alone. `plan` never touches the
+live sites, so calling `wp` or `ssh` from one is not supported.
+
+**Exiting non-zero means "I could not tell", and stops the run.** Printing nothing
+and exiting 0 means "this module claims nothing here", and is fine. Those are
+different answers and sitegraft treats them differently: a `_dynamic` function that
+fails aborts `plan` with a message naming the function, rather than quietly
+planning a smaller migration. (If you need to get a run through while a module is
+broken, `SITEGRAFT_MANIFEST_PREFILLED` skips module defaults entirely — see §4.)
+
+The same applies to `<mod>_option_keys_exclude`: if it fails, `plan` refuses,
+because continuing would migrate exactly the keys it was there to hold back.
+
+**Keeping secrets out of a broad prefix.** `_option_keys_exclude` is applied to the
+static and dynamic option keys alike, before anything is written to the manifest —
+and the manifest is the only thing `graft` and `verify` ever read, so an excluded
+key is excluded everywhere. That makes "return the whole prefix, exclude the
+secrets" a safe way to write a module:
+
+```sh
+my_plugin_option_keys_dynamic() {
+  jq -r '.options[]?.option_name | select(startswith("my_plugin_"))' "$1"
+}
+my_plugin_option_keys_exclude() {
+  printf 'my_plugin_license_*\nmy_plugin_*_api_key\n'
+}
+```
+
+Names containing a comma or whitespace are rejected: they cannot survive `graft`'s
+post-type CSV or its option-key word splitting, and would silently be read as two
+different names.
+
+See [`docs/decisions/0007-module-dynamic-selections.md`](decisions/0007-module-dynamic-selections.md)
+for the full contract and the reasoning behind each rule.
 
 **If your `post_import` hook writes to B, wrap every such call in `run_or_echo`**
 (from `lib/core.sh`, already sourced by the time any hook runs) — hooks are called
