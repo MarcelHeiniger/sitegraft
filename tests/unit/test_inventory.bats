@@ -93,10 +93,10 @@ EOF
   SITE_A_SSH_HOST="user@host-a.example.com"
   SITE_A_WP_PATH="/var/www/html"
   SITE_A_WP_CMD="wp"
-  SITE_A_SSH_KEY="/home/marcel/.ssh/id_ed25519_site_a"
+  SITE_A_SSH_KEY="/home/user/.ssh/id_ed25519_site_a"
   SITEGRAFT_DRY_RUN=1
   run wp_remote a option get siteurl
-  [ "$output" = "[dry-run] ssh -i /home/marcel/.ssh/id_ed25519_site_a -- user@host-a.example.com wp --path='/var/www/html' 'option' 'get' 'siteurl'" ]
+  [ "$output" = "[dry-run] ssh -i /home/user/.ssh/id_ed25519_site_a -- user@host-a.example.com wp --path='/var/www/html' 'option' 'get' 'siteurl'" ]
 }
 
 @test "wp_remote never passes -i when SITE_<ALIAS>_SSH_KEY is unset — falls back to ssh's own default identity resolution" {
@@ -290,6 +290,11 @@ _assert_alias() {
   run inventory_check_path_topology b
   [ "$status" -ne 0 ]
   [[ "$output" == *"running inside a container"* ]] || false
+  # The actionable half of the message is the part an operator needs most,
+  # and nothing else pins it: name the workaround and the issue that
+  # documents it, so a rewrite cannot quietly drop them.
+  [[ "$output" == *"SITE_B_SSH_HOST empty"* ]] || false
+  [[ "$output" == *"issue #19"* ]] || false
 }
 
 @test "inventory_check_path_topology refuses when wp-cli does not answer at all" {
@@ -300,6 +305,10 @@ _assert_alias() {
   run inventory_check_path_topology b
   [ "$status" -ne 0 ]
   [[ "$output" == *"did not answer"* ]] || false
+  # This failure is a wrong path or a wrong wp command, not a container:
+  # the message must send the reader to those two settings.
+  [[ "$output" == *"WP_PATH"* ]] || false
+  [[ "$output" == *"WP_CMD"* ]] || false
 }
 
 @test "inventory_check_path_topology accepts a wrapper behind SSH whose paths agree (sudo -u www-data wp)" {
@@ -310,4 +319,27 @@ _assert_alias() {
   ssh() { return 0; }
   run inventory_check_path_topology b
   [ "$status" -eq 0 ]
+}
+
+@test "inventory_check_path_topology passes -i <SSH_KEY> to its own direct ssh path-existence probe when SITE_<ALIAS>_SSH_KEY is set" {
+  # The guard's own ssh probe (distinct from wp_remote's) has to carry the
+  # key too, or a keyed site refuses every graft with a bogus "container"
+  # verdict the moment SITE_<ALIAS>_SSH_KEY is set — wp-cli would answer via
+  # wp_remote's own -i handling, but this guard's direct `ssh -- "$host" test
+  # -d ...` probe would fall back to ssh's default identity and could fail
+  # the host_ok half of the invariant for a reason that has nothing to do
+  # with the topology being checked.
+  SITE_B_SSH_HOST="user@host"
+  SITE_B_WP_PATH="/var/www/site/htdocs"
+  SITE_B_WP_CMD="wp"
+  SITE_B_SSH_KEY="/home/user/.ssh/id_ed25519_b"
+  wp_remote() { _assert_alias b "$@"; return 0; }
+  ssh() {
+    printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/ssh-calls.log"
+    return 0
+  }
+  run inventory_check_path_topology b
+  [ "$status" -eq 0 ]
+  run cat "$BATS_TEST_TMPDIR/ssh-calls.log"
+  [[ "$output" == "-i /home/user/.ssh/id_ed25519_b --"* ]] || false
 }

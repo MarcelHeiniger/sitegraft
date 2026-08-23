@@ -31,7 +31,8 @@ sitegraft is **not hosted** — it's a tool you run from any machine (the
 | Site B | Live target WordPress site, reachable via SSH+wp-cli or local DDEV | Written only during the `graft` phase, after backup |
 
 Each real A↔B pair (hosts, paths, SSH aliases) is declared in a profile file
-`profiles/<name>.conf` — committable, no secrets (variable names only).
+`profiles/<name>.conf` — local-only and gitignored: no secrets, but real
+hosts, paths and site URLs. Only `profiles/example.conf` is tracked.
 Credentials (SSH key, an optional password) live either in
 `~/.config/sitegraft/<profile>.creds` (chmod 600, gitignored) or are entered
 interactively. See design doc §5 for the exact format of both.

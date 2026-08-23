@@ -128,10 +128,11 @@ sitegraft restore --profile my-migration --run <run-id>           # only if you 
 
 `<profile>` is a file at `profiles/<name>.conf` describing the A/B pair (hosts,
 paths, wrapper commands) — see `profiles/example.conf`. Profiles never contain
-secrets; an optional credentials file at `~/.config/sitegraft/<profile>.creds`
-(chmod 600, never committed) can pin a specific SSH key per site — without one,
-sitegraft falls back to your ssh-agent/default identity, which is enough for most
-setups.
+secrets, but they do hold real infrastructure details, so they're gitignored by
+default (only `profiles/example.conf` is tracked); an optional credentials file
+at `~/.config/sitegraft/<profile>.creds` (chmod 600, never committed) can pin a
+specific SSH key per site — without one, sitegraft falls back to your
+ssh-agent/default identity, which is enough for most setups.
 
 **Full usage guide:** [`docs/usage.md`](docs/usage.md) — every flag, the exact
 contract for writing a new module, and the full security model (non-contamination,
