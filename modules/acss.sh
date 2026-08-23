@@ -86,17 +86,29 @@ EOF
 # SAME "Text Domain: automatic-css" in both headers — the directory and main
 # file were renamed onto the text domain the plugin already used.
 #
-# The rename happened at ACSS 4.0: that is the documented behaviour of the
-# plugin, not an inference drawn from these two installs. The two sites above
-# are simply the confirmation that both names occur in the wild, and they
-# bracket the change (a 4.0 release candidate still carrying the old
-# directory, a 4.0.1 carrying the new one).
+# The rename happened at ACSS 4.0, announced by the plugin's author — this
+# is the plugin's documented behaviour, not an inference drawn from these two
+# installs. The sites above merely confirm both names occur in the wild, on
+# versions that bracket the change.
 #
-# Consequence for ordering: `automatic-css` is what every current install
-# has, so it goes first; `automaticcss-plugin` is the legacy name and stays
-# as the fallback. A site running an older ACSS still resolves correctly,
-# and a site with both folders present (an upgrade that left the old
-# directory behind) resolves to the current one rather than the stale copy.
+# The part that matters here, and that is easy to get wrong: 4.0 is NOT
+# backward compatible, and the author deliberately made the two packagings
+# installable and ACTIVATABLE SIDE BY SIDE so that a site can transition at
+# its own pace. Two ACSS directories on one site is therefore a supported,
+# intentional configuration — NOT the leftovers of a botched upgrade.
+#
+# KNOWN GAP this module cannot close on its own. `_stack_candidates` feeds
+# inventory_resolve_slug, which returns exactly ONE slug: the first candidate
+# it finds. On a site running both packagings at once, graft would copy only
+# that one to B, and anything on B that depended on the other would render
+# unstyled — the failure this whole §12 stack precondition exists to prevent,
+# reintroduced one level down. Expressing "both, when both are present" needs
+# a change to the module contract, not another line in this file.
+#
+# Until then the order below is the least-bad default: `automatic-css` is
+# what a current install runs, so a single-packaging site (every site seen so
+# far) always resolves correctly, and a dual-packaging site resolves to the
+# 4.x one rather than the legacy one. That is a choice, not a solution.
 acss_stack_candidates() {
   cat <<'EOF'
 automatic-css
