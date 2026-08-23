@@ -490,6 +490,50 @@ backup_compute_protected_checksums() {
     local tables_csv
     tables_csv=$(echo "$manifest" | jq -r --arg m "$mod" '.protect[$m].tables // [] | join(",")')
     [ -n "$tables_csv" ] || continue
+
+    # `_unclaimed` is checksummed ONE TABLE AT A TIME, under keys of the form
+    # "_unclaimed:<table>". Every other module keeps a single aggregate
+    # checksum over all the tables it declares.
+    #
+    # The difference is about what a mismatch can tell the operator. A module
+    # declares a handful of tables it owns, so "this module's data changed"
+    # is already actionable. `_unclaimed` is everything else on B — often
+    # ninety-odd tables — and one aggregate over that says only "something,
+    # somewhere, moved", which nobody can act on and everybody learns to
+    # ignore. Named per table, the same information becomes a short, precise
+    # list.
+    #
+    # It also lets verify treat the two differently: a declared table that
+    # changed is a hard failure, an unclaimed one is reported. That
+    # distinction is the whole reason this list can be populated at all —
+    # tables like the action scheduler's are written continuously by
+    # WordPress itself, and would otherwise fail every run.
+    #
+    # Cost: one `wp db export` per unclaimed table instead of one for the
+    # set. Real, and worth it — these run on a site that is meant to be
+    # quiescent for the duration anyway.
+    if [ "$mod" = "_unclaimed" ]; then
+      # Read on fd 3, not stdin. wp_remote runs inside this loop, and a
+      # wrapper of the form `docker run -i` (or an ssh) consumes the loop's
+      # own fd0 — the first table would be checksummed and every table after
+      # it silently skipped. lib/graft.sh already guards its id-map loops the
+      # same way, for the same reason; caught here by a test that expected
+      # two checksums and got one.
+      local tbl
+      while IFS= read -r tbl <&3; do
+        [ -n "$tbl" ] || continue
+        # NOT run through backup_prefix_tables_csv: `_unclaimed.tables` holds
+        # FULL table names as scan read them off the site, where a module's
+        # `_tables` holds bare suffixes for sitegraft to prefix. Prefixing
+        # these a second time would ask for `wpfn_wpfn_...`.
+        local one_content one_sum
+        one_content=$(wp_remote "$alias_lc" db export - --tables="$tbl" 2>/dev/null || echo "")
+        one_sum=$(backup_checksum "$one_content")
+        checksums=$(echo "$checksums" | jq --arg m "_unclaimed:${tbl}" --arg s "sha256:${one_sum}" '.[$m] = $s')
+      done 3<<< "$(echo "$manifest" | jq -r --arg m "$mod" '.protect[$m].tables // [] | .[]')"
+      continue
+    fi
+
     local prefixed_tables_csv tables_content sum
     prefixed_tables_csv=$(backup_prefix_tables_csv "$prefix" "$tables_csv")
     tables_content=$(wp_remote "$alias_lc" db export - --tables="$prefixed_tables_csv" 2>/dev/null || echo "")

@@ -250,6 +250,18 @@ inventory_scan_site() {
   # step is now checked. Each --slurpfile binding is an ARRAY of the file's
   # JSON values, hence the [0] on each reference below. The three small
   # scalars stay on --argjson — they are two booleans and a boolean-or-null.
+  # Recorded here so `plan` can match module-declared table SUFFIXES against
+  # the prefixed table names in `.tables` without a live call. That missing
+  # piece is half of why manifest_compute_unclaimed left its tables list
+  # empty: the prefix was only obtainable from the site itself, and plan is
+  # deliberately offline (it reads scanned JSON, never the sites). Putting it
+  # in the scan keeps that property intact.
+  local table_prefix
+  table_prefix=$(inventory_table_prefix "$alias_lc" 2>/dev/null | tr -d '\r\n' || true)
+  if [ -z "$table_prefix" ]; then
+    log_warn "could not read site ${alias_lc}'s table prefix — recording it as empty; plan will not be able to identify unclaimed tables for this site"
+  fi
+
   local payload_dir
   payload_dir=$(mktemp -d) || { log_error "could not create a temp dir for scan payloads"; return 1; }
 
@@ -283,10 +295,12 @@ inventory_scan_site() {
     --argjson menus_unknown "$menus_unknown" \
     --argjson custom_code_detected "$custom_code_detected" \
     --argjson nav_uses_dynamic_page_list "$nav_dynamic" \
+    --arg table_prefix "$table_prefix" \
     '{
       post_types: $post_types[0],
       options: $options[0],
       tables: $tables[0],
+      table_prefix: $table_prefix,
       plugins: $plugins[0],
       active_theme: $active_theme[0],
       classic_menus_detected: (($menus_unknown == true) or ([$menus[0][]? | select((.count // 0) > 0)] | length > 0)),
