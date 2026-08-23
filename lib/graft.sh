@@ -64,8 +64,50 @@ graft_push_dir() {
   local prefix; prefix=$(graft_local_prefix "$alias_lc")
   if [ -n "$prefix" ]; then
     local untar_opts="-x -z -f -"
-    [ "$mode" = "--keep-existing" ] && untar_opts="-x -z -k -f -"
-    run_or_echo bash -c "${prefix} mkdir -p '${dest_dir}' && tar -c -z -f - -C '${host_src_dir}' . | ${prefix} tar ${untar_opts} -C '${dest_dir}'"
+    local tolerate_exit=""
+    if [ "$mode" = "--keep-existing" ]; then
+      # `-k` does NOT mean "skip files that already exist" — it means "treat
+      # an existing file as an ERROR, refuse to touch it, and exit non-zero".
+      # The rsync branch below uses --ignore-existing, which skips silently;
+      # the two branches were not implementing the same thing.
+      #
+      # It aborted the first real graft outright. A and B were both clones of
+      # the same production site, so nearly every file in A's uploads already
+      # existed on B: tar emitted "Cannot open: File exists" for each one,
+      # ended with "Exiting with failure status due to previous errors", and
+      # `set -e` killed the run right after the media step — before the WXR
+      # export had even started. The DDEV harness never saw it because its
+      # two fixture sites share no media at all, so nothing ever collides.
+      #
+      # GNU tar's `--skip-old-files` is the flag that actually means what was
+      # intended: skip, no diagnostic, exit 0. It is not in BSD/macOS tar, so
+      # support is probed rather than assumed — and the probe runs through
+      # the same wrapper the extraction will, since what matters is the tar
+      # INSIDE the container, not the orchestrator's own.
+      #
+      # The probe's output is captured FIRST and matched from a here-string.
+      # Written as `$prefix tar --help | grep -q ...` it fell into the very
+      # trap this file already documents twice: grep -q exits on the first
+      # match, SIGPIPEs the still-writing tar, and `set -o pipefail` turns
+      # the successful match into a failed pipeline — so the probe answered
+      # "unsupported" on a tar that supports it perfectly well, and every
+      # real run silently took the degraded fallback below. Observed live.
+      local tar_help
+      tar_help=$($prefix tar --help 2>/dev/null || true)
+      if grep -q -- '--skip-old-files' <<< "$tar_help"; then
+        untar_opts="-x -z --skip-old-files -f -"
+      else
+        # Fallback for a tar without it: keep `-k`, but stop its
+        # existing-file diagnostics from failing the whole graft. The cost is
+        # explicit — on this path tar's exit status no longer distinguishes
+        # "skipped files that were already there" from a genuine extraction
+        # failure, so it is warned about rather than done quietly.
+        untar_opts="-x -z -k -f -"
+        tolerate_exit=" || true"
+        log_warn "the tar reachable through this site's wrapper has no --skip-old-files; falling back to -k, whose exit status cannot distinguish an already-present file from a real extraction error. Check the transferred tree by hand if this run behaves oddly."
+      fi
+    fi
+    run_or_echo bash -c "${prefix} mkdir -p '${dest_dir}' && { tar -c -z -f - -C '${host_src_dir}' . | ${prefix} tar ${untar_opts} -C '${dest_dir}'; }${tolerate_exit}"
   else
     run_or_echo mkdir -p "$dest_dir"
     if [ "$mode" = "--keep-existing" ]; then
@@ -423,7 +465,26 @@ graft_integrity_gate() {
   # actually catches a leaked post_type, not merely that it "runs"). Binding
   # the element with `as $x` so index searches for the right thing. Same trap
   # as manifest_compute_unclaimed's own fix (lib/manifest.sh).
-  leaked=$(jq -n --argjson found "$found_types" --argjson allowed "$allowed_json" \
+  # WordPress's own exporter unions the attachments of every exported post
+  # into the WXR — export_wp() adds `post_parent IN (<exported ids>) AND
+  # post_type = 'attachment'` regardless of what --post_type asked for. So a
+  # WXR taken from any site whose posts have attached media always contains
+  # `attachment` items, no matter how narrow the export request was.
+  #
+  # sitegraft migrates media deliberately OUTSIDE the WXR (graft_media_sync
+  # copies the files, then re-registers and remaps each one), and
+  # graft_import_wxr passes `--skip=attachment`, so not a single one of those
+  # entries is ever imported. Without this exemption the gate rejects every
+  # real export: the first real graft died here, after three hours of media
+  # work had already completed successfully.
+  #
+  # Exempted BY NAME rather than by widening $allowed_json, because the
+  # reason is specific and does not generalize: `attachment` is tolerated in
+  # the file only because the importer is known to skip it. Any other
+  # unexpected post type must still fail this gate.
+  local allowed_plus_skipped
+  allowed_plus_skipped=$(jq -n --argjson a "$allowed_json" '($a + ["attachment"]) | unique')
+  leaked=$(jq -n --argjson found "$found_types" --argjson allowed "$allowed_plus_skipped" \
     '[$found[] as $x | select(($allowed | index($x)) | not) | $x]')
   if [ "$(echo "$leaked" | jq 'length')" != "0" ]; then
     log_error "WXR contains post_type(s) outside the manifest allowlist: $(echo "$leaked" | jq -r 'join(", ")')"
@@ -576,7 +637,25 @@ graft_import_wxr() {
   else
     local prefix; prefix=$(graft_local_prefix b)
     if [ -n "$prefix" ]; then
-      local container_dir="/tmp/sitegraft-import-$$"
+      # Staged under wp-content, NOT under /tmp. A wrapper of the form
+      # `docker run --rm ...` starts a brand-new container for every single
+      # invocation, so anything written outside a mounted volume is gone the
+      # moment that container exits: the `mkdir -p` of a /tmp path happened
+      # in one container and the `tar -x` into it ran in another, which had
+      # never seen it ("tar: /tmp/sitegraft-import-<pid>: Cannot open: No
+      # such file or directory"). Only the site tree, mounted in via
+      # --volumes-from, is common to all of them.
+      #
+      # It worked on the source side because that wrapper is a `docker exec`
+      # into a long-lived container, where /tmp does persist between calls —
+      # the code's implicit assumption was that a wrapper always enters a
+      # container that stays alive. It does not have to.
+      #
+      # wp-content is the right place regardless: graft already stages its
+      # id-remap and domain-remap payloads there for exactly this reason, and
+      # it is by definition writable and visible to wp-cli on any B. The
+      # directory is removed by graft_remove_dir right after the import.
+      local container_dir="${SITE_B_WP_PATH}/wp-content/sitegraft-import-$$"
       graft_push_dir b "$staging" "$container_dir"
       for f in "${staging}"/*.xml; do
         [ -e "$f" ] || continue
