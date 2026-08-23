@@ -44,6 +44,50 @@ anything else) and drive sitegraft from that shell. The orchestrator only needs 
 dependencies above — it doesn't need to be site A or B itself, it just needs SSH
 reach to both.
 
+### Sites that are remote AND containerized
+
+sitegraft drives a site in one of two ways, and they are the only two:
+
+- **over SSH** — it runs `wp` on the SSH host, and assumes wp-cli sees the same
+  filesystem paths that `rsync` does;
+- **locally through a wrapper** — the site runs in a container on the machine
+  sitegraft itself runs on, and the container-path indirection is handled
+  explicitly.
+
+A site that is **both** — reachable over SSH, with wp-cli running inside a
+container on the far end — fits neither, and `scan` now refuses it rather than
+letting it fail later and quietly. It would otherwise pass files to paths the
+container cannot see, and `wp export --dir=/tmp/...` would write inside the
+container while the pull read the SSH host's `/tmp`: an empty export, reported
+as a successful graft.
+
+**The workaround is to move the orchestrator, not the site.** Install and run
+sitegraft *on that server*, and leave its `SITE_*_SSH_HOST` empty so the site
+takes the supported local+wrapper path above. Two things to get right when you
+do:
+
+- `SITE_*_WP_PATH` becomes the **container** path (typically
+  `/var/www/html`), not the host path;
+- `SITE_*_WP_CMD` must end in ` wp`, so any `--path` baked into a container
+  command has to move out into `SITE_*_WP_PATH` — sitegraft appends its own.
+
+For example, for a site served from a `docker run` wrapper:
+
+```sh
+SITE_B_SSH_HOST=""
+SITE_B_WP_PATH="/var/www/html"
+SITE_B_WP_CMD="docker run --rm -i --volumes-from <container> -u 33:33 -e HOME=/tmp wordpress:cli wp"
+```
+
+The `-i` matters: without it the container gets no stdin, and the `tar` streams
+sitegraft uses for file transfer arrive empty.
+
+Two limits worth knowing before you rely on this. The backup then lives on the
+same machine as the target rather than on a separate orchestrator, which is
+weaker than the design intends. And it is simply unavailable when A and B are
+containerized on two *different* remote hosts — you cannot be local to both.
+Making that case work properly is tracked as issue #19.
+
 ### Local sites and DDEV
 
 If A or B is a local DDEV site (common for a freshly built A), point that site's

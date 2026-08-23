@@ -24,9 +24,33 @@ verify_compare_checksums() {
   local diffs
   diffs=$(jq -n --argjson pre "$(echo "$manifest" | jq '.checksums_protected_pre_graft')" --argjson post "$recomputed" \
     '[$pre | keys[] as $k | select($pre[$k] != $post[$k]) | $k]')
-  if [ "$(echo "$diffs" | jq 'length')" != "0" ]; then
-    log_error "protected data changed for: $(echo "$diffs" | jq -r 'join(", ")')"
-    echo "$diffs"
+
+  # Two regimes, on purpose.
+  #
+  # A key a MODULE declared is a hard failure: an operator named that data as
+  # something graft must not touch, and it moved. Nothing else to discuss.
+  #
+  # A key under `_unclaimed:<table>` is reported, not failed. Those are B's
+  # tables that no module covers — everything from a booking plugin's data to
+  # WordPress's own action scheduler, which writes to itself continuously and
+  # would turn every single run red. Failing on them would make the check
+  # meaningless within a week; saying nothing about them is what made verify
+  # able to print "protected data unchanged" while having compared nothing.
+  # Naming them is the useful middle: the operator sees exactly which tables
+  # moved and decides whether that was expected — and if a given plugin's
+  # data must be guaranteed rather than observed, the answer is to write a
+  # module for it, which promotes it to the hard regime above.
+  local hard soft
+  hard=$(echo "$diffs" | jq -c '[.[] | select(startswith("_unclaimed:") | not)]')
+  soft=$(echo "$diffs" | jq -c '[.[] | select(startswith("_unclaimed:"))] | map(sub("^_unclaimed:"; ""))')
+
+  if [ "$(echo "$soft" | jq 'length')" != "0" ]; then
+    log_warn "unclaimed table(s) on B changed during this run: $(echo "$soft" | jq -r 'join(", ")') — no module declares them, so this is reported rather than failed. Expected for tables WordPress writes on its own (the action scheduler, sessions, usermeta after a login). If any of these hold data that must be guaranteed untouched, write a module declaring them."
+  fi
+
+  if [ "$(echo "$hard" | jq 'length')" != "0" ]; then
+    log_error "protected data changed for: $(echo "$hard" | jq -r 'join(", ")')"
+    echo "$hard"
     return 1
   fi
 }
@@ -384,7 +408,7 @@ phase_verify() {
 
   profile_load "$profile" || return 1
 
-  [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1)
+  [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1 || true)
   [ -n "$run_dir" ] || {
     log_error "no scan/plan run found for profile ${profile} — run 'sitegraft scan' and 'sitegraft plan' first"
     return 1

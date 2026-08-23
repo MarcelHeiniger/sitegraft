@@ -180,7 +180,53 @@ manifest_compute_unclaimed() {
   unclaimed_ok=$(jq -n --argjson all "$all_ok" --argjson claimed "$claimed_ok" \
     '[$all[] as $x | select(($claimed | index($x)) | not) | $x]')
 
-  echo "$manifest" | jq --argjson u "$unclaimed_pt" --argjson uo "$unclaimed_ok" \
-    '.protect._unclaimed = {post_types: $u, tables: [], option_keys: $uo,
-      note: "found on B, unclaimed by any module — protected by default-deny. tables intentionally left [] here — see the code comment above manifest_compute_unclaimed for why, and design doc §3.6 for the tracked note."}'
+  # Tables. This list used to be left empty on purpose, for two stated
+  # reasons: the prefix needed to match a module's SUFFIX against a scanned,
+  # prefixed table name was only obtainable from the live site, and no
+  # core-wp module existed to claim WordPress's own tables, so filling the
+  # list would have flooded it with wp_posts/wp_options and mislabelled them
+  # as "protected".
+  #
+  # Both are now addressed: scan records `table_prefix` (lib/inventory.sh),
+  # so the match is a plain string operation on already-scanned data and plan
+  # stays offline; and the tables graft genuinely writes are excluded by name
+  # below rather than pretended away.
+  #
+  # It matters because "protected" and "provably untouched" were not the same
+  # thing. graft only ever writes what the manifest names, so an empty list
+  # was never a protection hole — but backup_compute_protected_checksums
+  # iterates `.protect[].tables`, so an empty list meant NO checksum was
+  # taken for anything outside a module, and verify then reported "protected
+  # data unchanged" having compared nothing at all. On a real run that came
+  # out as a green PASS covering a WooCommerce, a booking plugin and a
+  # multilingual stack, none of which had been looked at.
+  #
+  # EXCLUDED, because graft writes them by design and a checksum over them
+  # would fail on every single run: the content and taxonomy tables reached
+  # by the WXR import, and the options table. Everything else — every plugin
+  # table, users, comments — stays in. A change there is worth surfacing.
+  # Note that usermeta legitimately moves whenever anyone logs in; verify
+  # reports unclaimed changes as information, not as an accusation.
+  local prefix core_suffixes claimed_tb all_tb unclaimed_tb
+  prefix=$(echo "$scan_b" | jq -r '.table_prefix // ""')
+  core_suffixes='["posts","postmeta","options","terms","termmeta","term_taxonomy","term_relationships"]'
+  claimed_tb=$(echo "$manifest" | jq -c '[.migrate[]?.tables[]?, .protect[]?.tables[]?] | unique')
+  all_tb=$(echo "$scan_b" | jq -c '[.tables[]?]')
+
+  if [ -z "$prefix" ]; then
+    log_warn "scan-b.json has no table_prefix — cannot tell a plugin table from a core one, so unclaimed tables are left unlisted (re-run 'sitegraft scan' with a current sitegraft to populate it)"
+    unclaimed_tb='[]'
+  else
+    unclaimed_tb=$(jq -n --argjson all "$all_tb" --argjson claimed "$claimed_tb" \
+      --argjson core "$core_suffixes" --arg p "$prefix" \
+      '[ $all[] as $t
+         | ($t | if startswith($p) then .[($p | length):] else . end) as $suffix
+         | select(($claimed | index($suffix)) | not)
+         | select(($core    | index($suffix)) | not)
+         | $t ]' 2>/dev/null || echo '[]')
+  fi
+
+  echo "$manifest" | jq --argjson u "$unclaimed_pt" --argjson uo "$unclaimed_ok" --argjson ut "$unclaimed_tb" \
+    '.protect._unclaimed = {post_types: $u, tables: $ut, option_keys: $uo,
+      note: "found on B, unclaimed by any module — protected by default-deny. Tables listed here are checksummed and reported by verify as information; a hard failure is reserved for tables a module explicitly declares."}'
 }

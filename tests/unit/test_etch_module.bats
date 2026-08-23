@@ -29,8 +29,29 @@ setup() {
   [ "$status" -ne 0 ]
 }
 
-@test "etch_post_types declares etch_cfs, etch_cpts, and etch_loops" {
+# This test used to assert etch_cfs/etch_cpts/etch_loops as POST TYPES, taken
+# from the design doc. None of the three exists on a real Etch install —
+# verified by querying wp_posts directly, which is independent of whether a
+# plugin registers its types in a CLI context. Etch keeps its content in
+# WordPress's own types, and `etch_cfs`/`etch_cpts` are real but are OPTIONS
+# (asserted below). The old expectation was the reason plan offered three
+# phantom types, graft exported an empty WXR, and verify still reported PASS.
+@test "etch_post_types declares the WordPress types Etch actually stores content in" {
   run etch_post_types
+  [[ "$output" == *"wp_block"* ]] || false
+  [[ "$output" == *"wp_template"* ]] || false
+  [[ "$output" == *"wp_global_styles"* ]] || false
+}
+
+@test "etch_post_types declares none of the three types that do not exist" {
+  run etch_post_types
+  [[ "$output" != *"etch_cfs"* ]] || false
+  [[ "$output" != *"etch_cpts"* ]] || false
+  [[ "$output" != *"etch_loops"* ]] || false
+}
+
+@test "etch_option_keys declares etch_cfs, etch_cpts and etch_loops, which are options" {
+  run etch_option_keys
   [[ "$output" == *"etch_cfs"* ]] || false
   [[ "$output" == *"etch_cpts"* ]] || false
   [[ "$output" == *"etch_loops"* ]] || false

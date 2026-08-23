@@ -6,7 +6,13 @@
 # inside a jq program string, which is fragile to quote from the shell side
 # (Kimi's review note) and harder to extend (adding one is a one-line change
 # here instead of hunting for the jq filter that embeds it).
-SITEGRAFT_SNIPPET_PLUGIN_SLUGS='["code-snippets","wpcode","insert-headers-and-footers"]'
+# `wpcodebox2` added after a real target site was found running WPCodeBox 2
+# with this list not matching it: scan recorded snippet_plugins_detected as
+# [] on a site where a snippet manager was active. §14's gate still fired
+# there, but only because that site independently had mu-plugins — on a B
+# whose sole custom-code signal is WPCodeBox, plan would have frozen a
+# manifest with no warning at all.
+SITEGRAFT_SNIPPET_PLUGIN_SLUGS='["code-snippets","wpcode","insert-headers-and-footers","wpcodebox2"]'
 
 # sq <string> — single-quote a string safely for embedding in a shell command
 # line that will be re-parsed by another shell (e.g. the far end of an ssh
@@ -163,6 +169,67 @@ echo json_encode($dynamic);
 '
 }
 
+# inventory_check_path_topology <alias: a|b> — refuse, at scan time, the one
+# site shape sitegraft cannot drive: reachable over SSH, but with wp-cli
+# running inside a container on the far end.
+#
+# wp_remote supports exactly two shapes — SSH (wp-cli on the SSH host, same
+# paths rsync uses) and local-with-wrapper (container path indirection handled
+# explicitly). A remote containerized site is neither, and it does not fail
+# usefully: `wp export --dir=/tmp/...` writes inside the container while the
+# pull reads the SSH host's /tmp, so the export comes back EMPTY and the graft
+# reports success having moved nothing. For a tool people run against their
+# clients' sites, that silent version is the real defect — worse than the
+# missing topology itself.
+#
+# Detected by testing the INVARIANT rather than the shape of the profile: is
+# SITE_<A>_WP_PATH visible both to wp-cli and to the SSH host's own
+# filesystem? A profile-shape heuristic ("SSH plus a wrapper means refuse")
+# would reject a perfectly valid setup — `sudo -u www-data wp` behind SSH is
+# a wrapper whose paths match just fine.
+#
+#   wp-cli answers, host cannot see the path  -> containerized far end, refuse
+#   wp-cli does not answer                    -> the path is wrong, refuse
+#   both agree                                -> supported, proceed
+#
+# Sites with no SSH_HOST are the local-with-wrapper case, which IS supported,
+# and are skipped.
+inventory_check_path_topology() {
+  local alias_lc="$1"
+  local alias_uc; alias_uc=$(printf '%s' "$alias_lc" | tr '[:lower:]' '[:upper:]')
+  local host_var="SITE_${alias_uc}_SSH_HOST"
+  local path_var="SITE_${alias_uc}_WP_PATH"
+  local key_var="SITE_${alias_uc}_SSH_KEY"
+  local host="${!host_var:-}" path="${!path_var:-}" ssh_key="${!key_var:-}"
+
+  [ -n "$host" ] || return 0
+
+  # Both probes are reads and must really run, including under --dry-run:
+  # routed through run_or_echo they would return the literal "[dry-run] ..."
+  # text and the check would pass on nothing. Same treatment, and the same
+  # save/restore discipline, as graft_sync_theme_parent.
+  local saved_dry_run="${SITEGRAFT_DRY_RUN:-0}"
+  SITEGRAFT_DRY_RUN=0
+  local wp_ok=0 host_ok=0
+  wp_remote "$alias_lc" option get siteurl >/dev/null 2>&1 && wp_ok=1
+  if [ -n "$ssh_key" ]; then
+    ssh -i "$ssh_key" -- "$host" "test -d $(sq "$path")" >/dev/null 2>&1 && host_ok=1
+  else
+    ssh -- "$host" "test -d $(sq "$path")" >/dev/null 2>&1 && host_ok=1
+  fi
+  SITEGRAFT_DRY_RUN="$saved_dry_run"
+
+  if [ "$wp_ok" = "0" ]; then
+    log_error "site '${alias_lc}': wp-cli on ${host} did not answer with --path=${path}. Check SITE_${alias_uc}_WP_PATH and SITE_${alias_uc}_WP_CMD before going further — every later phase builds on this path."
+    return 1
+  fi
+
+  if [ "$host_ok" = "0" ]; then
+    log_error "site '${alias_lc}': wp-cli answers with --path=${path}, but ${host} has no such directory on its own filesystem. That means wp-cli is running inside a container on the far end, and sitegraft cannot drive that shape: it would copy files to paths the container cannot see, and 'wp export --dir=/tmp/...' would write inside the container while the pull read the host's /tmp — an EMPTY export, reported as a successful graft. Refusing here instead. Workaround: install and run sitegraft ON ${host} itself, leaving SITE_${alias_uc}_SSH_HOST empty so this site takes the supported local+wrapper path (note SITE_${alias_uc}_WP_PATH must then be the CONTAINER path, and SITE_${alias_uc}_WP_CMD must end in ' wp'). Tracked as issue #19."
+    return 1
+  fi
+}
+
 inventory_scan_site() {
   local alias_lc="$1" out_json="$2"
   log_info "scanning site '${alias_lc}' -> ${out_json}"
@@ -227,31 +294,99 @@ inventory_scan_site() {
     esac
   fi
 
-  jq -n \
-    --argjson post_types "$post_types" \
-    --argjson options "$options" \
-    --argjson tables "$tables" \
-    --argjson plugins "$plugins" \
-    --argjson active_theme "$active_theme" \
-    --argjson menus "$menus" \
+  # Every large payload below used to reach jq as a command-line argument via
+  # --argjson. Found on the first real A/B pair: on a genuine site, `wp option
+  # list --format=json` alone is megabytes — a WooCommerce + multilingual +
+  # booking stack pushes the combined argv straight past ARG_MAX and jq dies
+  # with "Argument list too long". The DDEV harness's two sites are orders of
+  # magnitude too small to ever reach that limit, so this was invisible until
+  # a real site was scanned.
+  #
+  # The silent-failure half was worse than the crash: jq's non-zero exit left
+  # `> "$out_json"` holding a 0-BYTE file, inventory_scan_site returned that
+  # status into a caller that ignored it, and the phase moved on to the next
+  # site announcing it as if nothing had happened. Two empty scan files, exit
+  # 0. `plan` would then read them as two empty sites rather than refusing to
+  # run.
+  #
+  # Fixed on both counts: the large payloads go through FILES (--slurpfile
+  # reads the file itself, bounded by disk rather than by argv), and every
+  # step is now checked. Each --slurpfile binding is an ARRAY of the file's
+  # JSON values, hence the [0] on each reference below. The three small
+  # scalars stay on --argjson — they are two booleans and a boolean-or-null.
+  # Recorded here so `plan` can match module-declared table SUFFIXES against
+  # the prefixed table names in `.tables` without a live call. That missing
+  # piece is half of why manifest_compute_unclaimed left its tables list
+  # empty: the prefix was only obtainable from the site itself, and plan is
+  # deliberately offline (it reads scanned JSON, never the sites). Putting it
+  # in the scan keeps that property intact.
+  local table_prefix
+  table_prefix=$(inventory_table_prefix "$alias_lc" 2>/dev/null | tr -d '\r\n' || true)
+  if [ -z "$table_prefix" ]; then
+    log_warn "could not read site ${alias_lc}'s table prefix — recording it as empty; plan will not be able to identify unclaimed tables for this site"
+  fi
+
+  local payload_dir
+  payload_dir=$(mktemp -d) || { log_error "could not create a temp dir for scan payloads"; return 1; }
+
+  printf '%s' "$post_types"          > "${payload_dir}/post_types.json"
+  printf '%s' "$options"             > "${payload_dir}/options.json"
+  printf '%s' "$tables"              > "${payload_dir}/tables.json"
+  printf '%s' "$plugins"             > "${payload_dir}/plugins.json"
+  printf '%s' "$active_theme"        > "${payload_dir}/active_theme.json"
+  printf '%s' "$menus"               > "${payload_dir}/menus.json"
+  printf '%s' "$custom_code_signals" > "${payload_dir}/custom_code_signals.json"
+
+  # Fail CLOSED on a query that came back empty or garbled, rather than
+  # embedding a null for it and writing a scan file that looks complete.
+  local pf
+  for pf in post_types options tables plugins active_theme menus custom_code_signals; do
+    if ! jq -e . "${payload_dir}/${pf}.json" >/dev/null 2>&1; then
+      log_error "site '${alias_lc}': the '${pf}' query returned empty or invalid JSON — refusing to write a partial scan file"
+      rm -rf "$payload_dir"
+      return 1
+    fi
+  done
+
+  if ! jq -n \
+    --slurpfile post_types "${payload_dir}/post_types.json" \
+    --slurpfile options "${payload_dir}/options.json" \
+    --slurpfile tables "${payload_dir}/tables.json" \
+    --slurpfile plugins "${payload_dir}/plugins.json" \
+    --slurpfile active_theme "${payload_dir}/active_theme.json" \
+    --slurpfile menus "${payload_dir}/menus.json" \
+    --slurpfile custom_code_signals "${payload_dir}/custom_code_signals.json" \
     --argjson menus_unknown "$menus_unknown" \
-    --argjson custom_code_signals "$custom_code_signals" \
     --argjson custom_code_detected "$custom_code_detected" \
     --argjson nav_uses_dynamic_page_list "$nav_dynamic" \
+    --arg table_prefix "$table_prefix" \
     '{
-      post_types: $post_types,
-      options: $options,
-      tables: $tables,
-      plugins: $plugins,
-      active_theme: $active_theme,
-      classic_menus_detected: (($menus_unknown == true) or ([$menus[]? | select((.count // 0) > 0)] | length > 0)),
+      post_types: $post_types[0],
+      options: $options[0],
+      tables: $tables[0],
+      table_prefix: $table_prefix,
+      plugins: $plugins[0],
+      active_theme: $active_theme[0],
+      classic_menus_detected: (($menus_unknown == true) or ([$menus[0][]? | select((.count // 0) > 0)] | length > 0)),
       classic_menus_unknown: $menus_unknown,
-      classic_menu_names: [$menus[]? | select((.count // 0) > 0) | .name],
-      custom_code_signals: $custom_code_signals,
+      classic_menu_names: [$menus[0][]? | select((.count // 0) > 0) | .name],
+      custom_code_signals: $custom_code_signals[0],
       custom_code_detected: $custom_code_detected,
       nav_uses_dynamic_page_list: $nav_uses_dynamic_page_list
     }' \
-    > "$out_json"
+    > "$out_json"; then
+    rm -rf "$payload_dir"
+    log_error "could not assemble ${out_json} — the scan of site '${alias_lc}' did NOT succeed"
+    return 1
+  fi
+  rm -rf "$payload_dir"
+
+  # Never leave a 0-byte or malformed scan file behind while reporting
+  # success — that is precisely what this function used to do.
+  if ! jq -e . "$out_json" >/dev/null 2>&1; then
+    log_error "the scan of site '${alias_lc}' produced empty or invalid JSON at ${out_json}"
+    return 1
+  fi
 }
 
 # design doc §3.2's rule: the ONLY function allowed to turn a module's
@@ -522,14 +657,23 @@ phase_scan() {
   # it is restored on the parent shell whether this block succeeds or a
   # scan step fails partway through, without needing a manual save/restore
   # that a failure could skip over.
+  # Every step needs its own `|| exit 1`. A subshell's exit status is simply
+  # that of its LAST command — here the trailing chmod, which succeeds as
+  # long as the files exist at all, even at 0 bytes. So both scans could fail
+  # and `( ... ) || return 1` would still see a clean exit 0: that is exactly
+  # how a run whose two scan files were empty went on to report success.
   (
     umask 077
-    mkdir -p "$run_dir"
-    chmod 700 "$run_dir"
-    inventory_scan_site a "${run_dir}/scan-a.json"
-    inventory_scan_site b "${run_dir}/scan-b.json"
-    chmod 600 "${run_dir}/scan-a.json" "${run_dir}/scan-b.json"
-  ) || return 1
+    mkdir -p "$run_dir" || exit 1
+    chmod 700 "$run_dir" || exit 1
+    # Both topologies checked BEFORE either site is read: an unusable profile
+    # should be rejected in seconds, not after a full scan of the other site.
+    inventory_check_path_topology a || exit 1
+    inventory_check_path_topology b || exit 1
+    inventory_scan_site a "${run_dir}/scan-a.json" || exit 1
+    inventory_scan_site b "${run_dir}/scan-b.json" || exit 1
+    chmod 600 "${run_dir}/scan-a.json" "${run_dir}/scan-b.json" || exit 1
+  ) || { log_error "scan failed (see the error above) — no usable run directory was produced at ${run_dir}"; return 1; }
 
   if jq -e '.classic_menus_unknown == true' "${run_dir}/scan-a.json" >/dev/null 2>&1; then
     log_warn "could not verify whether site A has classic nav menu(s) with items (the wp-cli query failed) — treat as unverified, not as clean (design doc §13)"

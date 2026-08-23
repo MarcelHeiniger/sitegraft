@@ -237,9 +237,29 @@ backup_verify_db_export() {
   # in CREATE TABLE statements with backticks, and grep -F needs the exact
   # literal to search for.
   local bt='`'
-  local table
+  local table found
   for table in "${table_prefix}options" "${table_prefix}posts"; do
-    if ! gunzip -c "$gz_file" 2>/dev/null | grep -qF "CREATE TABLE ${bt}${table}${bt}"; then
+    # `grep -q` exits the instant it finds a match. That closes the pipe on
+    # the still-writing `gunzip`, which is killed by SIGPIPE and exits 141 —
+    # and under bin/sitegraft's `set -o pipefail` (line 3) the PIPELINE then
+    # reports 141, i.e. a failure, even though the table was found.
+    #
+    # It is size-dependent, which is why it stayed hidden: on a dump small
+    # enough that gunzip finishes writing before grep exits, no signal is
+    # ever delivered and the check passes. Every DDEV-harness backup is that
+    # small. The first real target's 73 MB database was rejected with both
+    # of its tables plainly present in the file — and since `graft`
+    # structurally refuses to run without the `backup.complete` marker this
+    # check gates, it made the tool unable to finish a backup against any
+    # genuine site.
+    #
+    # `grep -c` consumes the whole stream rather than exiting early, so no
+    # SIGPIPE is ever delivered. The `|| true` keeps a legitimate zero-match
+    # result (grep exits 1 when it matches nothing) from tripping `set -e`
+    # before the count below can be tested — the two cases must stay
+    # distinguishable, which is exactly what the previous version lost.
+    found=$(gunzip -c "$gz_file" 2>/dev/null | grep -cF "CREATE TABLE ${bt}${table}${bt}" || true)
+    if [ "${found:-0}" -eq 0 ]; then
       log_error "backup verification failed: expected table '${table}' not found in ${gz_file}"
       return 1
     fi
@@ -470,6 +490,50 @@ backup_compute_protected_checksums() {
     local tables_csv
     tables_csv=$(echo "$manifest" | jq -r --arg m "$mod" '.protect[$m].tables // [] | join(",")')
     [ -n "$tables_csv" ] || continue
+
+    # `_unclaimed` is checksummed ONE TABLE AT A TIME, under keys of the form
+    # "_unclaimed:<table>". Every other module keeps a single aggregate
+    # checksum over all the tables it declares.
+    #
+    # The difference is about what a mismatch can tell the operator. A module
+    # declares a handful of tables it owns, so "this module's data changed"
+    # is already actionable. `_unclaimed` is everything else on B — often
+    # ninety-odd tables — and one aggregate over that says only "something,
+    # somewhere, moved", which nobody can act on and everybody learns to
+    # ignore. Named per table, the same information becomes a short, precise
+    # list.
+    #
+    # It also lets verify treat the two differently: a declared table that
+    # changed is a hard failure, an unclaimed one is reported. That
+    # distinction is the whole reason this list can be populated at all —
+    # tables like the action scheduler's are written continuously by
+    # WordPress itself, and would otherwise fail every run.
+    #
+    # Cost: one `wp db export` per unclaimed table instead of one for the
+    # set. Real, and worth it — these run on a site that is meant to be
+    # quiescent for the duration anyway.
+    if [ "$mod" = "_unclaimed" ]; then
+      # Read on fd 3, not stdin. wp_remote runs inside this loop, and a
+      # wrapper of the form `docker run -i` (or an ssh) consumes the loop's
+      # own fd0 — the first table would be checksummed and every table after
+      # it silently skipped. lib/graft.sh already guards its id-map loops the
+      # same way, for the same reason; caught here by a test that expected
+      # two checksums and got one.
+      local tbl
+      while IFS= read -r tbl <&3; do
+        [ -n "$tbl" ] || continue
+        # NOT run through backup_prefix_tables_csv: `_unclaimed.tables` holds
+        # FULL table names as scan read them off the site, where a module's
+        # `_tables` holds bare suffixes for sitegraft to prefix. Prefixing
+        # these a second time would ask for `wpfn_wpfn_...`.
+        local one_content one_sum
+        one_content=$(wp_remote "$alias_lc" db export - --tables="$tbl" 2>/dev/null || echo "")
+        one_sum=$(backup_checksum "$one_content")
+        checksums=$(echo "$checksums" | jq --arg m "_unclaimed:${tbl}" --arg s "sha256:${one_sum}" '.[$m] = $s')
+      done 3<<< "$(echo "$manifest" | jq -r --arg m "$mod" '.protect[$m].tables // [] | .[]')"
+      continue
+    fi
+
     local prefixed_tables_csv tables_content sum
     prefixed_tables_csv=$(backup_prefix_tables_csv "$prefix" "$tables_csv")
     tables_content=$(wp_remote "$alias_lc" db export - --tables="$prefixed_tables_csv" 2>/dev/null || echo "")
@@ -496,7 +560,7 @@ phase_backup() {
   [ -n "$profile" ] || { log_error "backup requires --profile <name>"; return 1; }
   profile_load "$profile" || return 1
 
-  [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1)
+  [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1 || true)
   [ -n "$run_dir" ] || {
     log_error "no scan/plan run found for profile ${profile} — run 'sitegraft scan' and 'sitegraft plan' first"
     return 1

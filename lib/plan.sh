@@ -28,18 +28,48 @@ plan_defaults() {
     "$(jq -r '.site_url // "unknown"' "$scan_b_json" 2>/dev/null || echo unknown)" \
     "$profile" "${SITE_A_ALIAS:-a}" "${SITE_B_ALIAS:-b}")
 
+  # A module found on A was classified `migrate`, and only a module found
+  # ONLY on B (the `elif`) was classified `protect`. "Present on A" is a
+  # reasonable proxy for "this is what we are bringing over" — right up until
+  # A is itself a clone of B's production site, which is the normal way these
+  # redesigns get built. Then the target's own business plugin is present on
+  # BOTH sides, wins the first test, and lands in `migrate`: graft would
+  # overwrite B's live bookings/orders with A's copy, stale since the fork.
+  # Exactly the outcome this tool exists to make impossible, reachable by
+  # doing nothing more exotic than enabling a shipped module.
+  #
+  # Swapping the two tests is NOT the fix, and looks like it is. `core-wp`
+  # detects the `page` post type and `etch` detects the Etch plugin — both are
+  # present on A and B in any real redesign, so a plain B-first rule sends
+  # them to `protect` and the run migrates nothing at all. A silent no-op
+  # instead of a data loss: still a broken tool.
+  #
+  # The missing distinction is what KIND of module it is, and the contract has
+  # no field for it — but it does have a reliable proxy already. Migration
+  # never copies tables: manifest_add_migrate does not even take a tables
+  # argument, by design (design doc §3.2, plugin-owned tables are a
+  # protection concern). So a module that declares `_tables` can only be
+  # describing data to protect. Those modules, and only those, are tested
+  # against B first.
+  #
+  # Everything else keeps the old order exactly: core-wp, etch and acss
+  # declare no tables, so they still go to `migrate` when present on A, and
+  # to `protect` when found only on B.
   local mod
   for mod in $SITEGRAFT_MODULES; do
-    if module_call "$mod" detect "$scan_a_json"; then
-      local pt ok
-      pt=$(module_has_fn "$mod" post_types && module_call "$mod" post_types | jq -R -s -c 'split("\n") | map(select(length > 0))' || echo '[]')
-      ok=$(module_has_fn "$mod" option_keys && module_call "$mod" option_keys | jq -R -s -c 'split("\n") | map(select(length > 0))' || echo '[]')
+    local pt tb ok
+    pt=$(module_has_fn "$mod" post_types && module_call "$mod" post_types | jq -R -s -c 'split("\n") | map(select(length > 0))' || echo '[]')
+    tb=$(module_has_fn "$mod" tables && module_call "$mod" tables | jq -R -s -c 'split("\n") | map(select(length > 0))' || echo '[]')
+    ok=$(module_has_fn "$mod" option_keys && module_call "$mod" option_keys | jq -R -s -c 'split("\n") | map(select(length > 0))' || echo '[]')
+
+    local owns_tables=0
+    [ "$(printf '%s' "$tb" | jq 'length')" != "0" ] && owns_tables=1
+
+    if [ "$owns_tables" = "1" ] && module_call "$mod" detect "$scan_b_json"; then
+      manifest=$(manifest_add_protect "$manifest" "$mod" "$pt" "$tb" "$ok")
+    elif module_call "$mod" detect "$scan_a_json"; then
       manifest=$(manifest_add_migrate "$manifest" "$mod" "$pt" "$ok")
     elif module_call "$mod" detect "$scan_b_json"; then
-      local pt tb ok
-      pt=$(module_has_fn "$mod" post_types && module_call "$mod" post_types | jq -R -s -c 'split("\n") | map(select(length > 0))' || echo '[]')
-      tb=$(module_has_fn "$mod" tables && module_call "$mod" tables | jq -R -s -c 'split("\n") | map(select(length > 0))' || echo '[]')
-      ok=$(module_has_fn "$mod" option_keys && module_call "$mod" option_keys | jq -R -s -c 'split("\n") | map(select(length > 0))' || echo '[]')
       manifest=$(manifest_add_protect "$manifest" "$mod" "$pt" "$tb" "$ok")
     fi
   done
@@ -401,7 +431,7 @@ phase_plan() {
   # established this exact pattern (lib/inventory.sh) — the plan's own Task
   # 2.3 pseudocode for phase_plan omitted it, an inconsistency fixed here.
   profile_load "$profile" || return 1
-  [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1)
+  [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1 || true)
   [ -n "$run_dir" ] || { log_error "no scan run found for profile ${profile} — run 'sitegraft scan' first"; return 1; }
 
   modules_discover

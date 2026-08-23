@@ -64,8 +64,50 @@ graft_push_dir() {
   local prefix; prefix=$(graft_local_prefix "$alias_lc")
   if [ -n "$prefix" ]; then
     local untar_opts="-x -z -f -"
-    [ "$mode" = "--keep-existing" ] && untar_opts="-x -z -k -f -"
-    run_or_echo bash -c "${prefix} mkdir -p '${dest_dir}' && tar -c -z -f - -C '${host_src_dir}' . | ${prefix} tar ${untar_opts} -C '${dest_dir}'"
+    local tolerate_exit=""
+    if [ "$mode" = "--keep-existing" ]; then
+      # `-k` does NOT mean "skip files that already exist" — it means "treat
+      # an existing file as an ERROR, refuse to touch it, and exit non-zero".
+      # The rsync branch below uses --ignore-existing, which skips silently;
+      # the two branches were not implementing the same thing.
+      #
+      # It aborted the first real graft outright. A and B were both clones of
+      # the same production site, so nearly every file in A's uploads already
+      # existed on B: tar emitted "Cannot open: File exists" for each one,
+      # ended with "Exiting with failure status due to previous errors", and
+      # `set -e` killed the run right after the media step — before the WXR
+      # export had even started. The DDEV harness never saw it because its
+      # two fixture sites share no media at all, so nothing ever collides.
+      #
+      # GNU tar's `--skip-old-files` is the flag that actually means what was
+      # intended: skip, no diagnostic, exit 0. It is not in BSD/macOS tar, so
+      # support is probed rather than assumed — and the probe runs through
+      # the same wrapper the extraction will, since what matters is the tar
+      # INSIDE the container, not the orchestrator's own.
+      #
+      # The probe's output is captured FIRST and matched from a here-string.
+      # Written as `$prefix tar --help | grep -q ...` it fell into the very
+      # trap this file already documents twice: grep -q exits on the first
+      # match, SIGPIPEs the still-writing tar, and `set -o pipefail` turns
+      # the successful match into a failed pipeline — so the probe answered
+      # "unsupported" on a tar that supports it perfectly well, and every
+      # real run silently took the degraded fallback below. Observed live.
+      local tar_help
+      tar_help=$($prefix tar --help 2>/dev/null || true)
+      if grep -q -- '--skip-old-files' <<< "$tar_help"; then
+        untar_opts="-x -z --skip-old-files -f -"
+      else
+        # Fallback for a tar without it: keep `-k`, but stop its
+        # existing-file diagnostics from failing the whole graft. The cost is
+        # explicit — on this path tar's exit status no longer distinguishes
+        # "skipped files that were already there" from a genuine extraction
+        # failure, so it is warned about rather than done quietly.
+        untar_opts="-x -z -k -f -"
+        tolerate_exit=" || true"
+        log_warn "the tar reachable through this site's wrapper has no --skip-old-files; falling back to -k, whose exit status cannot distinguish an already-present file from a real extraction error. Check the transferred tree by hand if this run behaves oddly."
+      fi
+    fi
+    run_or_echo bash -c "${prefix} mkdir -p '${dest_dir}' && { tar -c -z -f - -C '${host_src_dir}' . | ${prefix} tar ${untar_opts} -C '${dest_dir}'; }${tolerate_exit}"
   else
     run_or_echo mkdir -p "$dest_dir"
     if [ "$mode" = "--keep-existing" ]; then
@@ -151,32 +193,109 @@ graft_sync_stack() {
       rel_dir="wp-content/plugins/${slug}"
     fi
     log_info "syncing stack component '${component}' (resolved slug: ${slug}) from A to B (design doc §12)..."
-    local staging="${run_dir}/stack-staging/${component}"
-    mkdir -p "$staging"
-
-    if [ -n "${SITE_A_SSH_HOST:-}" ]; then
-      # shellcheck disable=SC2153 # not a typo: SITE_A_WP_PATH is assigned in bin/sitegraft or a sourced profile, not in this file (cross-file, same as SC2034 below)
-      run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${SITE_A_WP_PATH}/${rel_dir}/" "${staging}/"
-    elif [ -n "$(graft_local_prefix a)" ]; then
-      graft_pull_dir a "${SITE_A_WP_PATH}/${rel_dir}" "$staging"
-    else
-      run_or_echo rsync -avz "${SITE_A_WP_PATH}/${rel_dir}/" "${staging}/"
-    fi
-
-    if [ -n "${SITE_B_SSH_HOST:-}" ]; then
-      run_or_echo rsync -avz "${staging}/" "${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/${rel_dir}/"
-    elif [ -n "$(graft_local_prefix b)" ]; then
-      graft_push_dir b "$staging" "${SITE_B_WP_PATH}/${rel_dir}"
-    else
-      run_or_echo rsync -avz "${staging}/" "${SITE_B_WP_PATH}/${rel_dir}/"
-    fi
+    graft_copy_wp_content_dir "$rel_dir" "${run_dir}/stack-staging/${component}"
 
     if [ "$component" = "theme" ]; then
+      graft_sync_theme_parent "$slug" "$run_dir"
       run_or_echo wp_remote b theme activate "$slug"
     else
       run_or_echo wp_remote b plugin activate "$slug"
     fi
   done
+}
+
+# graft_copy_wp_content_dir <rel_dir> <staging> — copy one wp-content
+# subdirectory from A to B, through whichever transport each side needs.
+# Extracted out of graft_sync_stack so the parent-theme copy below reuses
+# this exact three-branch logic instead of carrying a second copy of it that
+# would drift.
+graft_copy_wp_content_dir() {
+  local rel_dir="$1" staging="$2"
+  mkdir -p "$staging"
+
+  if [ -n "${SITE_A_SSH_HOST:-}" ]; then
+    # shellcheck disable=SC2153 # not a typo: SITE_A_WP_PATH is assigned in bin/sitegraft or a sourced profile, not in this file (cross-file, same blind spot as this file's SC2034 disables)
+    run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${SITE_A_WP_PATH}/${rel_dir}/" "${staging}/"
+  elif [ -n "$(graft_local_prefix a)" ]; then
+    graft_pull_dir a "${SITE_A_WP_PATH}/${rel_dir}" "$staging"
+  else
+    run_or_echo rsync -avz "${SITE_A_WP_PATH}/${rel_dir}/" "${staging}/"
+  fi
+
+  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
+    run_or_echo rsync -avz "${staging}/" "${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/${rel_dir}/"
+  elif [ -n "$(graft_local_prefix b)" ]; then
+    graft_push_dir b "$staging" "${SITE_B_WP_PATH}/${rel_dir}"
+  else
+    run_or_echo rsync -avz "${staging}/" "${SITE_B_WP_PATH}/${rel_dir}/"
+  fi
+}
+
+# graft_sync_theme_parent <child_slug> <run_dir> — a child theme cannot be
+# activated without its parent, and graft_sync_stack only ever copied the
+# ACTIVE theme. A child theme on A therefore landed on a B holding no parent
+# for it, and the `wp theme activate` right after produced a broken site.
+#
+# Found on the first real pair, whose A runs a child theme: it worked there
+# only because B happened to already carry the exact parent at the exact same
+# version. That is luck. The next target — a B on an unrelated theme — has no
+# reason to carry it at all.
+#
+# The parent is resolved with get_template(), which returns the parent's
+# DIRECTORY slug (and, for a theme that is not a child, the theme's own
+# slug — hence the equality check). `wp theme get --field=parent_theme`
+# deliberately not used: it returns the parent's display Name, which is not a
+# path.
+#
+# The parent is copied but never activated — a parent theme is activated
+# through its child, not on its own.
+graft_sync_theme_parent() {
+  local child_slug="$1" run_dir="$2"
+
+  # The two queries below are READS, and they have to run for real even under
+  # --dry-run, because every decision this function makes depends on their
+  # answers. wp_remote routes everything through run_or_echo, which under
+  # --dry-run returns the literal string "[dry-run] <command>" instead of the
+  # value — so without this, $parent becomes "[dry-run] docker exec ...
+  # get_template();" and the copy path below is built out of that text.
+  # Observed on this function's very first dry run. It is the same defect
+  # docs/status.md records for `verify --dry-run`, which read "[dry-run] ..."
+  # as though it were B's data and hard-failed a graft that had in fact
+  # succeeded.
+  #
+  # The flag is saved, cleared for the two reads, and restored IMMEDIATELY
+  # afterwards — before any branch below can return early. verify's original
+  # version of this same manoeuvre cleared the flag and never restored it;
+  # keeping the restore unconditional and in one place is what stops that
+  # from happening again. The directory copy further down stays under
+  # run_or_echo, as it must: that one is a write, and a dry run has to
+  # simulate it.
+  local saved_dry_run="${SITEGRAFT_DRY_RUN:-0}"
+  local parent b_themes
+  SITEGRAFT_DRY_RUN=0
+  parent=$(wp_remote a eval "echo wp_get_theme('${child_slug}')->get_template();" 2>/dev/null || true)
+  b_themes=$(wp_remote b theme list --field=name 2>/dev/null || true)
+  SITEGRAFT_DRY_RUN="$saved_dry_run"
+
+  parent=$(printf '%s' "$parent" | tr -d '\r' | tr -d '\n')
+  b_themes=$(printf '%s' "$b_themes" | tr -d '\r')
+
+  case "$parent" in
+    ''|"$child_slug") return 0 ;;
+  esac
+
+  # Matched from a here-string rather than `... | grep -qx`: grep -q exits at
+  # the first match and SIGPIPEs whatever is still writing upstream, which
+  # under bin/sitegraft's `set -o pipefail` turns a successful match into a
+  # failed pipeline (exit 141) — the same defect that made
+  # backup_verify_dump reject every valid real-site backup.
+  if grep -qx "$parent" <<< "$b_themes"; then
+    log_info "parent theme '${parent}' is already present on B — not copying it"
+    return 0
+  fi
+
+  log_info "active theme '${child_slug}' is a child of '${parent}', which B does not have — copying the parent from A as well (never activated on its own)"
+  graft_copy_wp_content_dir "wp-content/themes/${parent}" "${run_dir}/stack-staging/theme-parent"
 }
 
 # design doc §6.4 step 0b (Marcel's revision of finding B1): a hard precondition
@@ -347,7 +466,26 @@ graft_integrity_gate() {
   # actually catches a leaked post_type, not merely that it "runs"). Binding
   # the element with `as $x` so index searches for the right thing. Same trap
   # as manifest_compute_unclaimed's own fix (lib/manifest.sh).
-  leaked=$(jq -n --argjson found "$found_types" --argjson allowed "$allowed_json" \
+  # WordPress's own exporter unions the attachments of every exported post
+  # into the WXR — export_wp() adds `post_parent IN (<exported ids>) AND
+  # post_type = 'attachment'` regardless of what --post_type asked for. So a
+  # WXR taken from any site whose posts have attached media always contains
+  # `attachment` items, no matter how narrow the export request was.
+  #
+  # sitegraft migrates media deliberately OUTSIDE the WXR (graft_media_sync
+  # copies the files, then re-registers and remaps each one), and
+  # graft_import_wxr passes `--skip=attachment`, so not a single one of those
+  # entries is ever imported. Without this exemption the gate rejects every
+  # real export: the first real graft died here, after three hours of media
+  # work had already completed successfully.
+  #
+  # Exempted BY NAME rather than by widening $allowed_json, because the
+  # reason is specific and does not generalize: `attachment` is tolerated in
+  # the file only because the importer is known to skip it. Any other
+  # unexpected post type must still fail this gate.
+  local allowed_plus_skipped
+  allowed_plus_skipped=$(jq -n --argjson a "$allowed_json" '($a + ["attachment"]) | unique')
+  leaked=$(jq -n --argjson found "$found_types" --argjson allowed "$allowed_plus_skipped" \
     '[$found[] as $x | select(($allowed | index($x)) | not) | $x]')
   if [ "$(echo "$leaked" | jq 'length')" != "0" ]; then
     log_error "WXR contains post_type(s) outside the manifest allowlist: $(echo "$leaked" | jq -r 'join(", ")')"
@@ -501,7 +639,25 @@ graft_import_wxr() {
   else
     local prefix; prefix=$(graft_local_prefix b)
     if [ -n "$prefix" ]; then
-      local container_dir="/tmp/sitegraft-import-$$"
+      # Staged under wp-content, NOT under /tmp. A wrapper of the form
+      # `docker run --rm ...` starts a brand-new container for every single
+      # invocation, so anything written outside a mounted volume is gone the
+      # moment that container exits: the `mkdir -p` of a /tmp path happened
+      # in one container and the `tar -x` into it ran in another, which had
+      # never seen it ("tar: /tmp/sitegraft-import-<pid>: Cannot open: No
+      # such file or directory"). Only the site tree, mounted in via
+      # --volumes-from, is common to all of them.
+      #
+      # It worked on the source side because that wrapper is a `docker exec`
+      # into a long-lived container, where /tmp does persist between calls —
+      # the code's implicit assumption was that a wrapper always enters a
+      # container that stays alive. It does not have to.
+      #
+      # wp-content is the right place regardless: graft already stages its
+      # id-remap and domain-remap payloads there for exactly this reason, and
+      # it is by definition writable and visible to wp-cli on any B. The
+      # directory is removed by graft_remove_dir right after the import.
+      local container_dir="${SITE_B_WP_PATH}/wp-content/sitegraft-import-$$"
       graft_push_dir b "$staging" "$container_dir"
       for f in "${staging}"/*.xml; do
         [ -e "$f" ] || continue
@@ -573,13 +729,13 @@ graft_fetch_id_map() {
     local prefix; prefix=$(graft_local_prefix b)
     if [ -n "$prefix" ]; then
       if ! is_dry_run && ! $prefix test -f "$src" >/dev/null 2>&1; then
-        log_warn "no id-map.log found on B (no posts/terms were imported via WXR?) — id-map.tsv left as-is"
+        log_warn "no id-map.log found on B — id-map.tsv left as-is. This is legitimate only if the WXR import inserted NOTHING (every item already existed on B). If it did import posts, the mapping mu-plugin was not running, and EVERY remap that follows is now a no-op against an incomplete map: attachment ids inside content, featured images, page_on_front, and every module post_import hook. Check the import output above before trusting this run."
         return 0
       fi
       run_or_echo bash -c "${prefix} cat '${src}' > '${tmp}'"
     else
       if ! is_dry_run && [ ! -f "$src" ]; then
-        log_warn "no id-map.log found on B (no posts/terms were imported via WXR?) — id-map.tsv left as-is"
+        log_warn "no id-map.log found on B — id-map.tsv left as-is. This is legitimate only if the WXR import inserted NOTHING (every item already existed on B). If it did import posts, the mapping mu-plugin was not running, and EVERY remap that follows is now a no-op against an incomplete map: attachment ids inside content, featured images, page_on_front, and every module post_import hook. Check the import output above before trusting this run."
         return 0
       fi
       run_or_echo rsync -avz "$src" "$tmp"
@@ -1039,7 +1195,25 @@ _graft_exit_trap() {
   if [ -n "$rd" ] && graft_step_done "$rd" mu_plugin 2>/dev/null && ! graft_step_done "$rd" mu_cleanup 2>/dev/null; then
     log_warn "graft interrupted or failed — removing the mapping mu-plugin from B before exiting (never left running unattended)"
     graft_remove_mu_plugin 2>/dev/null || true
-    graft_mark_step "$rd" mu_cleanup 2>/dev/null || true
+    # CLEAR the deploy marker rather than marking cleanup done. The mu-plugin
+    # has just been taken off B while the run is INCOMPLETE, so the resumable
+    # state has to read "not deployed" — the previous version left
+    # graft.mu_plugin.done in place, so the next `sitegraft graft` skipped
+    # redeploying it and ran the WXR import with NO mapper at all.
+    #
+    # Nothing about that is loud. The import succeeds,
+    # wp-content/sitegraft-id-map.log is simply never written,
+    # graft_fetch_id_map only warns, and every downstream remap then runs
+    # against an id-map holding whatever the media step put there and nothing
+    # else: attachment ids inside content, featured images, page_on_front,
+    # and every module post_import hook are all skipped. Seen live — a graft
+    # resumed twice after two unrelated failures ran to completion, reported
+    # success, and left B's front page pointing at an unremapped id, with the
+    # only clue a single warning in the middle of the log.
+    #
+    # mu_cleanup is cleared too, for coherence: the pair means "deployed" /
+    # "removed after being used", and after this branch neither is true.
+    rm -f "${rd}/graft.mu_plugin.done" "${rd}/graft.mu_cleanup.done" 2>/dev/null || true
   fi
   # NIT-3 (review, Viktor): graft_remove_file for the id-remap/domain-remap
   # JSON payload and the pushed content-remap-functions.php only ever runs
@@ -1085,7 +1259,7 @@ phase_graft() {
   done
   [ -n "$profile" ] || { log_error "graft requires --profile <name>"; return 1; }
   profile_load "$profile" || return 1
-  [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1)
+  [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1 || true)
   [ -n "$run_dir" ] || { log_error "no scan/plan run found for profile ${profile} — run 'sitegraft scan' and 'sitegraft plan' first"; return 1; }
   [ -f "${run_dir}/backup.complete" ] || {
     log_error "no backup.complete marker for this run — refusing to graft without a backup"

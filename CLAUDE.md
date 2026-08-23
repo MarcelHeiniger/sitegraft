@@ -34,6 +34,31 @@ that runs it (see `docs/infrastructure.md`).
 
 ## Conventions
 
+- **Never report success you have not earned.** This is the first rule, because
+  breaking it is the single most common defect this codebase has produced. Eight
+  separate findings from the first real-site run were the same mistake wearing
+  different clothes: `scan` wrote two 0-byte files and exited 0; `plan` offered
+  post types that do not exist, so `graft` exported an empty WXR and `verify`
+  said PASS; the importer skipped 113 items and `verify` said PASS; the
+  front-page check ticked its own box *because* the remap it was meant to
+  confirm had not happened; a resumed `graft` ran the whole import with its ID
+  mapper missing and said nothing; `verify` printed "protected data unchanged"
+  having compared nothing at all; and the repo's own example module matched a
+  field that does not exist, so it detected nothing, silently.
+  In every one of those the safety mechanism itself worked — its bookkeeping
+  lied. Concretely:
+  - **Fail closed.** A step that could not do its job returns non-zero and says
+    why. Never `|| true` over a real failure, never leave an empty artifact
+    behind and continue.
+  - **A check must distinguish "verified true" from "could not verify".** A
+    condition of the form "X is correct *or* X was never configured" is not a
+    check — it passes hardest exactly when something is wrong. Where the two
+    cases are genuinely indistinguishable, report unknown, never OK.
+  - **A skipped step is visible.** Resumability markers, `--dry-run`, and
+    cleanup paths must not combine into a run that quietly does less than it
+    claims.
+  - **Prove the check can fail.** A test that only asserts "it ran" ratifies a
+    check that always passes. Assert that it catches the thing it exists for.
 - **Versioning**: bump the version in `bin/sitegraft` (the `SITEGRAFT_VERSION`
   variable) on every user-visible behavior change.
 - **Never raw SQL filtered by hand for content.** Content = WXR (`wp export`/
