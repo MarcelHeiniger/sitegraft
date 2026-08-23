@@ -186,9 +186,12 @@ setup() {
 # The shared query behind verify's "no orphan post_parent references" check.
 # Every test that touches it replaces it with a stub — they exercise how
 # phase_verify reacts to its RESULT, never whether the function itself does
-# what it claims. Neutralising its body entirely (`return 0` as the first
-# statement) left all 330 tests green: the check could silently become a
-# no-op, verify would tick its box, and nothing would say otherwise.
+# what it claims. Neutralizing its body entirely (`return 0` as the first
+# statement) left the whole unit suite green: no test in it would see the
+# check silently become a no-op while verify ticks its box. The DDEV harness
+# does catch it (tests/integration/ddev-harness.sh:754-767, NEGATIVE CASE 3,
+# which injects a real orphan and asserts verify reports it) — but that is
+# no substitute for a unit test that runs on every commit.
 #
 # The third test pins the query's shape rather than only its plumbing. A
 # check whose SQL quietly stops matching — a typo, a schema change — returns

@@ -261,6 +261,7 @@ EOF
 @test "inventory_check_path_topology skips a site with no SSH_HOST (local+wrapper is supported)" {
   SITE_B_SSH_HOST=""
   SITE_B_WP_PATH="/var/www/html"
+  SITE_B_WP_CMD="ddev wp"
   wp_remote() { return 1; }   # would fail if it were consulted at all
   ssh() { return 1; }
   run inventory_check_path_topology b
@@ -290,6 +291,7 @@ EOF
 @test "inventory_check_path_topology accepts a wrapper behind SSH whose paths agree (sudo -u www-data wp)" {
   SITE_B_SSH_HOST="user@host"
   SITE_B_WP_PATH="/var/www/site/htdocs"
+  SITE_B_WP_CMD="sudo -u www-data wp"
   wp_remote() { return 0; }
   ssh() { return 0; }
   run inventory_check_path_topology b

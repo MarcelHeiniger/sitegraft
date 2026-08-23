@@ -118,8 +118,13 @@ _etch_capture_eval() {
   grep -q '"14468":15506' "$BATS_TEST_TMPDIR/php.txt"
   grep -q '"14279":15505' "$BATS_TEST_TMPDIR/php.txt"
   # `"ref"` addresses blocks; feeding attachment ids in would only give a
-  # numeric coincidence something to match.
-  ! grep -q '"900"' "$BATS_TEST_TMPDIR/php.txt"
+  # numeric coincidence something to match. Written as an explicit if/return
+  # (SC2314) rather than `! grep -q ... || false` as the test's last
+  # statement — that shape is only load-bearing because nothing follows it;
+  # an assertion appended after it would silently stop being checked.
+  if grep -q '"900"' "$BATS_TEST_TMPDIR/php.txt"; then
+    echo "attachment id leaked into the ref map" >&2; return 1
+  fi
 }
 
 @test "etch_post_import scopes the rewrite to the posts this run imported" {
