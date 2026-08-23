@@ -103,6 +103,31 @@ setup() {
   echo "$output" | awk '/^\{/{f=1} f' | jq -e '.protect._unclaimed.tables == []' >/dev/null
 }
 
+# Fail closed when the table list itself cannot be computed. Written first as
+# `2>/dev/null || echo '[]'`, which turns any jq error into "no unclaimed
+# tables" -- indistinguishable from a site that genuinely has none, and it
+# silently reinstates the very gap this function was changed to close.
+@test "manifest_compute_unclaimed fails rather than returning an empty table list it could not compute" {
+  local manifest='{"migrate":{},"protect":{}}'
+  local scan_b='{"table_prefix":"wp_","tables":["wp_amelia_appointments"],"post_types":[],"options":[]}'
+  # Fail only the one jq call that computes the table list -- it is the only
+  # one passed `--argjson core`. Malformed INPUT cannot be used to trigger
+  # this: the jq program guards its iterations with `?`, so a `.tables` that
+  # is a string yields an empty list instead of an error. The failure being
+  # guarded against is jq itself failing, so that is what is simulated. It
+  # matters because without this guard, a jq error would silently become an
+  # empty unclaimed list, and `backup` would checksum nothing against it.
+  jq() {
+    case "$*" in
+      *--argjson\ core\ *) return 5 ;;
+      *) command jq "$@" ;;
+    esac
+  }
+  run manifest_compute_unclaimed "$manifest" "$scan_b"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"refusing to write a manifest"* ]] || false
+}
+
 @test "plan_warn_scope_gaps warns about A's classic menus but never about B's, and always exits 0" {
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
   echo '{"classic_menus_detected":true,"classic_menu_names":["Main Menu"]}' > "$a"
@@ -316,4 +341,41 @@ EOF
   echo '{"plugins":[{"name":"present"}],"post_types":[],"options":[],"tables":[]}' > "$b"
   run plan_defaults "$a" "$b"
   [ "$status" -ne 0 ]
+}
+
+# --- plan_defaults: protect wins over migrate for a table-owning module -----
+#
+# The pair of tests below pins both halves of a rule that is easy to get
+# half-right. "Present on A" used to mean "migrate", which is fine until A is
+# a clone of B's production site — then the target's own business plugin is on
+# both sides, wins that test, and graft overwrites live data with A's stale
+# copy.
+#
+# The obvious repair, testing B first, silently breaks everything else: core-wp
+# and etch are present on A and B in any real redesign, so they would land in
+# protect and the run would migrate nothing. The second test exists to catch
+# exactly that, and it fails against a naive swap.
+@test "plan_defaults protects a table-owning module present on BOTH sites, never migrates it" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  # fake-booking installed on A as well: the normal shape when A was built
+  # from a clone of B's production site.
+  echo '{"plugins":[{"name":"etch"},{"name":"fake-booking"}],"post_types":[],"options":[],"tables":[]}' > "$a"
+  echo '{"plugins":[{"name":"fake-booking"}],"post_types":[{"name":"fake_reservation"}],"options":[],"tables":["fakebooking_reservations"]}' > "$b"
+  run plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.protect.fakebooking.tables == ["fakebooking_reservations"]' >/dev/null
+  echo "$output" | jq -e '.migrate.fakebooking == null' >/dev/null
+}
+
+@test "plan_defaults still migrates a module present on BOTH sites when it owns no tables" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  # etch declares no tables and is installed on both, as it is on any real pair.
+  echo '{"plugins":[{"name":"etch"}],"post_types":[],"options":[],"tables":[]}' > "$a"
+  echo '{"plugins":[{"name":"etch"}],"post_types":[],"options":[],"tables":[]}' > "$b"
+  run plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.migrate.etch.option_keys == ["etch_settings"]' >/dev/null
+  echo "$output" | jq -e '.protect.etch == null' >/dev/null
 }

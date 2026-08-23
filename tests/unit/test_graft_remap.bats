@@ -180,3 +180,40 @@ setup() {
   [ "$status" -eq 0 ]
   [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }
+
+# --- graft_check_orphan_parents --------------------------------------------
+#
+# The shared query behind verify's "no orphan post_parent references" check.
+# Every test that touches it replaces it with a stub — they exercise how
+# phase_verify reacts to its RESULT, never whether the function itself does
+# what it claims. Neutralizing its body entirely (`return 0` as the first
+# statement) left the whole unit suite green: no test in it would see the
+# check silently become a no-op while verify ticks its box. The DDEV harness
+# does catch it (tests/integration/ddev-harness.sh:754-767, NEGATIVE CASE 3,
+# which injects a real orphan and asserts verify reports it) — but that is
+# no substitute for a unit test that runs on every commit.
+#
+# The third test pins the query's shape rather than only its plumbing. A
+# check whose SQL quietly stops matching — a typo, a schema change — returns
+# an empty result, which is indistinguishable from "no orphans found".
+
+@test "graft_check_orphan_parents returns the ids the query reports" {
+  wp_remote() { printf '12\n13\n'; }
+  run graft_check_orphan_parents
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"12"* ]] || false
+  [[ "$output" == *"13"* ]] || false
+}
+
+@test "graft_check_orphan_parents propagates a failed query rather than reporting no orphans" {
+  wp_remote() { return 3; }
+  run graft_check_orphan_parents
+  [ "$status" -ne 0 ]
+}
+
+@test "graft_check_orphan_parents asks for posts whose post_parent points at nothing" {
+  wp_remote() { shift 2; printf '%s' "$*" > "$BATS_TEST_TMPDIR/q.sql"; }
+  run graft_check_orphan_parents
+  grep -q "post_parent" "$BATS_TEST_TMPDIR/q.sql"
+  grep -q "NOT EXISTS" "$BATS_TEST_TMPDIR/q.sql"
+}
