@@ -272,9 +272,11 @@ etch_styles
 EOF
 }
 
-# NOT WIRED in v1 — see §3.2's status note. etch_option_keys above is
-# already a complete explicit allowlist, so this is harmless here, but
-# nothing in lib/ or bin/ ever reads this function's output.
+# WIRED as of issue #13 — see docs/decisions/0007-module-dynamic-selections.md.
+# module_selection (lib/modules.sh) calls this and drops every matching name
+# from the static and dynamic option keys alike, before anything reaches the
+# manifest. (§3.2's old "not wired" status note, which this used to point at,
+# was replaced by that ADR.)
 etch_option_keys_exclude() {
   cat <<'EOF'
 etch_license_*
@@ -316,9 +318,9 @@ automatic_css_generated_inventory
 EOF
 }
 
-# NOT WIRED in v1 — see §3.2's status note (not that it matters here: this
-# whole module is unshipped, see the status note further below in this
-# section).
+# WIRED as of issue #13 — see docs/decisions/0007-module-dynamic-selections.md.
+# (This block also predates modules/acss.sh, which now ships for real; the
+# "unshipped" status note further below in this section is stale too.)
 acss_option_keys_exclude() {
   cat <<'EOF'
 automatic_css_license_*

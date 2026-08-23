@@ -272,3 +272,48 @@ EOF
   [ "$status" -ne 0 ]
   [[ "$output" == *"demo_post_types_dynamic"* ]] || false
 }
+
+# N5 (third review round). `tables` used to be expanded for EVERY
+# discovered module before detection ran, because the expanded list was what
+# decided which side the module got tested against first. So a module present
+# on neither site could still abort the whole run through a failing
+# `_tables_dynamic` — while the identical bug in a `_post_types_dynamic` of an
+# undetected module was harmless, because that expansion happens after
+# detection. Deciding the bucket from whether the module DECLARES a tables
+# function (which is the claim of kind the ordering rule is actually about)
+# removes the asymmetry.
+@test "plan_defaults is not taken down by a broken _tables_dynamic in a module present on NEITHER site (N5)" {
+  export SITEGRAFT_MODULES_DIR="$BATS_TEST_TMPDIR/modules"
+  mkdir -p "$SITEGRAFT_MODULES_DIR"
+  cat > "$SITEGRAFT_MODULES_DIR/absent.sh" <<'EOF'
+absent_name() { echo "Absent"; }
+absent_detect() { return 1; }
+absent_tables_dynamic() { echo "boom" >&2; return 9; }
+EOF
+  modules_discover
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[]}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[]}' > "$b"
+  run plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.migrate == {} and .protect == {}' >/dev/null
+}
+
+# The counterpart: a module that IS detected and whose tables claim is what
+# the manifest needs must still fail the run when it cannot produce it. The
+# fix above must not turn fail-closed into fail-open.
+@test "plan_defaults still fails when a DETECTED module's _tables_dynamic cannot answer (N5, the opposite direction)" {
+  export SITEGRAFT_MODULES_DIR="$BATS_TEST_TMPDIR/modules"
+  mkdir -p "$SITEGRAFT_MODULES_DIR"
+  cat > "$SITEGRAFT_MODULES_DIR/present.sh" <<'EOF'
+present_name() { echo "Present"; }
+present_detect() { jq -e '.plugins[]? | select(.name == "present")' "$1" >/dev/null 2>&1; }
+present_tables_dynamic() { echo "boom" >&2; return 9; }
+EOF
+  modules_discover
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[]}' > "$a"
+  echo '{"plugins":[{"name":"present"}],"post_types":[],"options":[],"tables":[]}' > "$b"
+  run plan_defaults "$a" "$b"
+  [ "$status" -ne 0 ]
+}

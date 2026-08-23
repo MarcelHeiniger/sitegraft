@@ -200,6 +200,12 @@ EOF
   run module_selection demo option_keys "$SCAN"
   [ "$status" -ne 0 ]
   [[ "$output" == *"demo_option_keys_dynamic"* ]] || false
+  # B3 (third review round): the message used to say "exited 0" for
+  # EVERY failure, because `rc=$?` sat inside an `if ! cmd; then` body and so
+  # read the status of the `!`, not of the function. A message that reports a
+  # failure and names exit 0 as its cause is the bookkeeping lie CLAUDE.md's
+  # first rule is about, and no test caught it. This one asserts the number.
+  [[ "$output" == *"exited 3"* ]] || false
 }
 
 @test "module_selection fails loudly when the static function exits non-zero" {
@@ -212,6 +218,7 @@ EOF
   run module_selection demo option_keys "$SCAN"
   [ "$status" -ne 0 ]
   [[ "$output" == *"demo_option_keys"* ]] || false
+  [[ "$output" == *"exited 4"* ]] || false
 }
 
 @test "module_selection fails loudly when the exclusion function itself exits non-zero, rather than migrating unfiltered keys" {
@@ -226,6 +233,7 @@ EOF
   [ "$status" -ne 0 ]
   [[ "$output" != *"demo_license_key"* ]] || false
   [[ "$output" == *"demo_option_keys_exclude"* ]] || false
+  [[ "$output" == *"exited 5"* ]] || false
 }
 
 @test "module_selection rejects a name carrying a comma or whitespace, which downstream CSV/word-splitting cannot represent" {

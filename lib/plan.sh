@@ -75,12 +75,29 @@ plan_defaults() {
   # only ever be about B.
   local mod
   for mod in $SITEGRAFT_MODULES; do
-    local tb_lines tb
-    tb_lines=$(module_selection "$mod" tables "$scan_b_json") || return 1
-    tb=$(_plan_lines_to_json "$tb_lines")
-
+    # N5: whether a module OWNS tables is decided from whether it DECLARES a
+    # tables function, not from expanding one. The expansion used to come
+    # first, for every discovered module, so a `_tables_dynamic` that failed
+    # took the whole run down even for a module present on NEITHER site —
+    # while the identical failure in a `_post_types_dynamic` was harmless,
+    # because that expansion already happened after detection. The asymmetry
+    # was an accident of ordering, not a rule anyone chose.
+    #
+    # Declaring the function is the claim of kind this ordering rule is
+    # actually about ("a module that declares `_tables` can only be
+    # describing data to protect"), so reading the declaration is if anything
+    # closer to the rule's own wording than counting the expanded list was.
+    # One behavior does change: a module that declares a tables function which
+    # legitimately returns nothing for THIS site is now tested against B
+    # first, where it used to be treated as tableless. That is the same
+    # answer for every shipped module (core-wp, etch and acss declare no
+    # tables at all) and the safer direction for any other: a module that
+    # says it owns tables is describing data to protect even on a site where
+    # it currently owns none.
     local owns_tables=0
-    [ "$(printf '%s' "$tb" | jq 'length')" != "0" ] && owns_tables=1
+    if module_has_fn "$mod" tables || module_has_fn "$mod" tables_dynamic; then
+      owns_tables=1
+    fi
 
     local bucket="" target_scan=""
     if [ "$owns_tables" = "1" ] && module_call "$mod" detect "$scan_b_json"; then
@@ -102,6 +119,15 @@ plan_defaults() {
     if [ "$bucket" = migrate ]; then
       manifest=$(manifest_add_migrate "$manifest" "$mod" "$pt" "$ok")
     else
+      # Expanded HERE, and only here: `manifest_add_migrate` takes no tables
+      # argument by design, so the list is needed for the protect bucket and
+      # nowhere else. Narrowing the expansion to the one place its result is
+      # used is what removes the "aborts on a module nobody detected" case,
+      # while keeping it fail-closed for the module whose manifest entry
+      # actually depends on it.
+      local tb_lines tb
+      tb_lines=$(module_selection "$mod" tables "$scan_b_json") || return 1
+      tb=$(_plan_lines_to_json "$tb_lines")
       manifest=$(manifest_add_protect "$manifest" "$mod" "$pt" "$tb" "$ok")
     fi
   done
@@ -472,6 +498,36 @@ phase_plan() {
   profile_load "$profile" || return 1
   [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1 || true)
   [ -n "$run_dir" ] || { log_error "no scan run found for profile ${profile} — run 'sitegraft scan' first"; return 1; }
+
+  # N6: every failure below leaves through one place, so the stale-manifest
+  # warning is stated once and can never be forgotten on a path added later.
+  local rc=0
+  _phase_plan_build "$profile" "$run_dir" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    _plan_warn_stale_manifest "$run_dir"
+  fi
+  return "$rc"
+}
+
+# _plan_warn_stale_manifest <run_dir> — N6 (third review round). "no manifest
+# will be frozen from this run" is true and misleading in the same breath: a
+# manifest.json left by an EARLIER, successful plan is still sitting in the
+# run directory, still `frozen: true`, and `sitegraft graft` reads that file
+# and nothing else. An operator who fixes nothing and simply runs `graft`
+# gets the old plan, silently — which is CLAUDE.md's "a skipped step is
+# visible", applied to a step that was skipped by failing.
+#
+# Deliberately NOT deleted: removing an operator's frozen plan on a failure
+# path is destructive, and the old plan may be exactly what they intend to
+# run. Named instead, together with what would happen if they ran graft.
+_plan_warn_stale_manifest() {
+  local run_dir="$1"
+  [ -f "${run_dir}/manifest.json" ] || return 0
+  log_warn "a manifest from an earlier run is still present: ${run_dir}/manifest.json — this run froze nothing, but 'sitegraft graft' reads that file and would run the EARLIER plan. Delete it, or re-run 'sitegraft plan' successfully, before grafting."
+}
+
+_phase_plan_build() {
+  local profile="$1" run_dir="$2"
 
   modules_discover
   plan_warn_scope_gaps "${run_dir}/scan-a.json" "${run_dir}/scan-b.json"

@@ -91,11 +91,24 @@ EOF
 #   { "fotos": {...}, ... }                a map keyed by name
 # — each also accepted as a JSON string holding the same.
 #
-# ANYTHING ELSE IS AN ERROR, not an empty list. A value this function cannot
-# read means it cannot tell "this site declares no CPTs" from "this site
-# declares CPTs I failed to parse", and only one of those is safe to act on:
-# the second silently reproduces the exact defect this closes. `plan` stops
-# and says so (see module_selection in lib/modules.sh).
+# ANYTHING ELSE IS WARNED ABOUT, LOUDLY, and claims nothing. This used to
+# abort, and the abort was the defect (B1, third review round): it traded
+# "this run migrates less than it could" for "this tool does not run at all",
+# on the strength of one module failing to read one option — and it fired on
+# `a:0:{}`, an empty array, as readily as on anything else. `scan` now asks
+# wp-cli to unserialize (lib/inventory.sh), which removes the shape that made
+# this common in the first place; what is left is genuinely unusual, and a
+# warning naming the option and the consequence satisfies CLAUDE.md's "a
+# skipped step is visible" without putting `plan` on the floor. The two
+# fail-closed cases below (a scan with no options list, a scan with no
+# post-type list) are NOT the same thing and still abort: those say the SCAN
+# cannot be reasoned from at all, not that one value is odd.
+#
+# STILL UNVERIFIED, and worth saying plainly: nobody has yet read a real
+# `etch_cpts` row off a live Etch install that uses the feature. The shapes
+# below are plausible, not confirmed. The definitive answer is one query on
+# a real site, and until someone runs it this function is defensive by
+# necessity rather than by design.
 #
 # A declared name the scanned site does not actually register is DROPPED,
 # with a warning — never offered. CLAUDE.md's first rule in its original
@@ -131,12 +144,31 @@ etch_post_types_dynamic() {
     decoded
     | if . == null then []
       elif type == "array" then map(name_of)
-      elif type == "object" then (to_entries | map(if (.value | type) == "object" then (.value.slug // .value.post_type // .key) else .key end))
+      elif type == "object" then
+        # N1: a SINGLE definition object -- {"slug":"fotos","label":"Fotos"} --
+        # is a fourth shape, and `else .key` used to swallow it: it read the
+        # FIELD NAMES ("slug", "label") as post-type names and exited 0. A map
+        # of post types has an object on every value; a definition object does
+        # not. Requiring that tells the two apart instead of guessing.
+        (if (to_entries | all(.value | type == "object"))
+         then (to_entries | map(.value.slug // .value.post_type // .key))
+         else error("etch_cpts looks like a single definition object, not a map of post types")
+         end)
       else error("etch_cpts is neither a list nor a map") end'
 
   if ! declared=$(printf '%s' "$raw" | jq -c "$prog" 2>&1); then
-    log_error "etch: cannot read the etch_cpts option recorded in ${scan_json} (${declared}). Refusing to continue: an unreadable value cannot be told apart from 'this site declares no custom post types', and treating it as the latter is what carries Etch's post-type definitions to B while leaving their content behind (issue #16). Fix or extend etch_post_types_dynamic for this site's shape, or drive the run from a SITEGRAFT_MANIFEST_PREFILLED manifest."
-    return 1
+    # A value that is STILL a PHP-serialized string at this point means the
+    # scan was taken before `sitegraft scan` started passing --unserialize to
+    # wp-cli, or that the row is double-serialized. Worth saying by name: it
+    # is the one diagnosis with a one-command fix. `a:`/`O:`/`s:`/`i:`/`b:`/
+    # `d:`/`N:` are PHP's serialization type prefixes.
+    local raw_str="" hint=""
+    raw_str=$(printf '%s' "$raw" | jq -r 'if type == "string" then . else "" end' 2>/dev/null) || raw_str=""
+    case "$raw_str" in
+      [aOsibdN]:*) hint="The recorded value is still PHP-serialized, so this scan predates sitegraft passing --unserialize to 'wp option list' (or the row is doubly serialized) — re-run 'sitegraft scan' first. " ;;
+    esac
+    log_warn "etch: could not read the etch_cpts option recorded in ${scan_json} (${declared}) — claiming NO post types from it, and continuing. ${hint}If this site really does declare custom post types through etch_cpts, they will NOT be migrated, while etch_option_keys still carries the DEFINITION to B — which is issue #16's registered-but-empty post type, out loud this time. Fix or extend etch_post_types_dynamic for this site's shape, or name the post types by hand in a SITEGRAFT_MANIFEST_PREFILLED manifest."
+    return 0
   fi
 
   [ "$(printf '%s' "$declared" | jq 'length')" != "0" ] || return 0

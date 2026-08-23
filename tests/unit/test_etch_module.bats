@@ -142,15 +142,85 @@ EOF
   [[ "$stderr" == *"not registered"* ]] || false
 }
 
-@test "etch_post_types_dynamic fails closed on an etch_cpts value it cannot read, rather than silently claiming nothing" {
+# B1 (third review round). This test used to RATIFY an abort here,
+# and the abort was the defect: with the scan now recording unserialized
+# option values (lib/inventory.sh passes --unserialize), a residual PHP
+# serialized string is an oddity, but taking `plan` down over one module's
+# unreadable option trades "an incomplete migration" for "an unusable tool"
+# — including for the wholly benign empty array `a:0:{}`. A loud warning
+# plus an empty claim satisfies CLAUDE.md's "a skipped step is visible"
+# without stopping the run, and the operator still sees, by name, exactly
+# what was not claimed.
+@test "etch_post_types_dynamic warns loudly and claims nothing on an etch_cpts value it cannot read, instead of taking plan down" {
   local scan="$BATS_TEST_TMPDIR/scan.json"
   cat > "$scan" <<'EOF'
 {"post_types":[{"name":"fotos"}],
  "options":[{"option_name":"etch_cpts","option_value":"a:1:{i:0;a:1:{s:4:\"slug\";s:5:\"fotos\";}}"}]}
 EOF
+  run --separate-stderr etch_post_types_dynamic "$scan"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [[ "$stderr" == *"etch_cpts"* ]] || false
+  # The residual-serialization case is named as such, not reported as some
+  # generic parse failure — that is the one hint that tells an operator
+  # their scan predates --unserialize.
+  [[ "$stderr" == *"PHP-serialized"* ]] || false
+}
+
+@test "etch_post_types_dynamic does not abort on an empty PHP-serialized array, the most harmless value there is" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  cat > "$scan" <<'EOF'
+{"post_types":[{"name":"fotos"}],
+ "options":[{"option_name":"etch_cpts","option_value":"a:0:{}"}]}
+EOF
+  run --separate-stderr etch_post_types_dynamic "$scan"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [[ "$stderr" == *"etch_cpts"* ]] || false
+}
+
+# N1 (third review round): a SINGLE definition object
+# {"slug":"fotos","label":"Fotos"} is a fourth shape, and the map branch used
+# to swallow it — reading its FIELD NAMES ("slug", "label") as post-type
+# names and exiting 0. Silently wrong beats loudly wrong here, so the map
+# branch now requires every value to be an object.
+@test "etch_post_types_dynamic refuses a single etch_cpts definition object instead of reading its field names as post types (N1)" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  cat > "$scan" <<'EOF'
+{"post_types":[{"name":"fotos"},{"name":"slug"},{"name":"label"}],
+ "options":[{"option_name":"etch_cpts","option_value":{"slug":"fotos","label":"Fotos"}}]}
+EOF
+  run --separate-stderr etch_post_types_dynamic "$scan"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  [[ "$stderr" == *"single definition object"* ]] || false
+}
+
+# N2 (third review round): neutralising either name guard used to
+# leave this file green, so neither was actually proven to catch anything.
+@test "etch_post_types_dynamic refuses a declared name carrying an uppercase letter, which no WordPress post type may (N2)" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  cat > "$scan" <<'EOF'
+{"post_types":[{"name":"Fotos"}],
+ "options":[{"option_name":"etch_cpts","option_value":["Fotos"]}]}
+EOF
   run etch_post_types_dynamic "$scan"
   [ "$status" -ne 0 ]
-  [[ "$output" == *"etch_cpts"* ]] || false
+  [[ "$output" == *"Fotos"* ]] || false
+  [[ "$output" == *"not a valid WordPress post-type name"* ]] || false
+}
+
+@test "etch_post_types_dynamic refuses a declared name longer than WordPress's 20-character limit (N2)" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  # 21 characters exactly — one past the limit, so the guard's boundary is
+  # what is under test, not merely "something very long".
+  cat > "$scan" <<'EOF'
+{"post_types":[{"name":"abcdefghijklmnopqrstu"}],
+ "options":[{"option_name":"etch_cpts","option_value":["abcdefghijklmnopqrstu"]}]}
+EOF
+  run etch_post_types_dynamic "$scan"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"20-character"* ]] || false
 }
 
 @test "etch_post_types_dynamic fails closed on a scan with no options list, rather than reporting 'nothing declared'" {

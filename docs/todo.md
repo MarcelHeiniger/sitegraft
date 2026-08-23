@@ -1,14 +1,14 @@
 # Todo — sitegraft
 
 > Current backlog. Prioritized. Reflects the live state after Step 6 (polish).
-> **Last sync: 2026-08-20**
+> **Last sync: 2026-08-23**
 
 ## Next steps (priority)
 
 - [ ] **Pre-`1.0.0` gate:** a real dry run against a staging copy of a genuine A/B
       pair, closing design doc §0.2's R2/R4 — see `docs/definition-of-done.md`.
       Not satisfiable by more DDEV-only testing. This is the one thing standing
-      between the current `1.0.0-rc2` tag and a plain `1.0.0` — Marcel's call, on
+      between the current `1.0.0-rc4` tag and a plain `1.0.0` — Marcel's call, on
       a real pair, not something Step 6 (or any DDEV-only work) can close.
 - [ ] Review/merge the Step 6 PR (dry-run + stack-override audit, EOF durcissement
       on the plain selection fallback, `docs/usage.md`, LICENSE/README already in
@@ -17,13 +17,12 @@
 
 ## Backlog
 
-- [ ] **`modules/acss.sh` (Automatic.css) — not shipped.** Spec'd in full in the
-      design doc §3.4, but its own `TODO_VERIFY_LEGACY_ACSS_SLUG` blocker (the
-      pre-4.0 Automatic.css plugin folder name) has never been checked against a
-      real install — shipping a guessed slug would violate that section's own
-      explicit instruction. Needs someone with a real pre-4.0 ACSS site to confirm
-      the folder name, then the module is otherwise ready to create verbatim from
-      the design doc.
+- [ ] **Read a real `etch_cpts` row off a live Etch install that uses the
+      feature.** `etch_post_types_dynamic` accepts three plausible shapes and now
+      warns rather than aborts on anything else, but nobody has yet confirmed
+      which shape Etch actually writes. One query on a real site settles it and
+      lets the guesswork come out of that function. Blocks nothing; makes the
+      module honest.
 - [ ] **Interactive credentials prompt (design doc §5.2, option (b)) — not
       implemented.** `lib/profile.sh` only supports the file-based credentials path
       today; a missing `.creds` file logs a warning and proceeds without
@@ -65,6 +64,11 @@
 
 ## Done
 
+- [x] **`modules/acss.sh` (Automatic.css) — shipped.** The
+      `TODO_VERIFY_LEGACY_ACSS_SLUG` blocker (the pre-4.0 plugin folder name) is
+      closed: both folder names have now been observed on real installs on
+      versions that bracket the rename — see `modules/acss.sh`'s own header for
+      the evidence and for why the current name is ordered first.
 - [x] Steps 1-5 (core/profiles/scan, manifest/plan, backup/restore, graft, verify)
       — merged to `main` as PRs #1-#5. See `git log --oneline` and each step's own
       commit/PR for detail; the full finding-by-finding history of the pre-Step-1

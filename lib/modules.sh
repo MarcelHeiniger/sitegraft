@@ -103,28 +103,35 @@ module_selection() {
   local prefix="$1" kind="$2" scan_json="$3"
   local static_lines="" dynamic_lines="" exclude_lines="" rc
 
+  # `cmd || { rc=$?; ... }`, never `if ! cmd; then rc=$?`. B3 (third review
+  # round): inside an `if ! ...` body, `$?` is the status of the `!`, which is
+  # always 0 — so all three messages below used to report "exited 0" while the
+  # module had actually exited 7, 3 or 9. A message that says a function
+  # failed and names 0 as its exit code is exactly the bookkeeping lie
+  # CLAUDE.md's first rule is about, and it was the one number an operator
+  # would have taken to the module author.
   if module_has_fn "$prefix" "$kind"; then
-    if ! static_lines=$("${prefix}_${kind}"); then
+    static_lines=$("${prefix}_${kind}") || {
       rc=$?
       log_error "module '${prefix}': ${prefix}_${kind}() exited ${rc} — refusing to build a plan from a claim this module could not produce (an error is not an empty list)"
       return 1
-    fi
+    }
   fi
 
   if module_has_fn "$prefix" "${kind}_dynamic"; then
-    if ! dynamic_lines=$("${prefix}_${kind}_dynamic" "$scan_json"); then
+    dynamic_lines=$("${prefix}_${kind}_dynamic" "$scan_json") || {
       rc=$?
       log_error "module '${prefix}': ${prefix}_${kind}_dynamic() exited ${rc} against ${scan_json} — refusing to continue with an incomplete ${kind} selection (an error is not an empty list). Fix the module, re-run 'sitegraft scan' if the scan is stale, or drive this run from a SITEGRAFT_MANIFEST_PREFILLED manifest."
       return 1
-    fi
+    }
   fi
 
   if [ "$kind" = "option_keys" ] && module_has_fn "$prefix" option_keys_exclude; then
-    if ! exclude_lines=$("${prefix}_option_keys_exclude"); then
+    exclude_lines=$("${prefix}_option_keys_exclude") || {
       rc=$?
       log_error "module '${prefix}': ${prefix}_option_keys_exclude() exited ${rc} — refusing to migrate this module's option keys unfiltered, since the exclusions are exactly what keeps license/secret keys out"
       return 1
-    fi
+    }
   fi
 
   local combined nl seen="" out="" line

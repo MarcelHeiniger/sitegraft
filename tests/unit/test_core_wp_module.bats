@@ -206,3 +206,102 @@ EOF
   [ "$status" -eq 0 ]
   [[ "$output" == *"[dry-run] wp_cmd_b_stub option update page_on_front 105"* ]] || false
 }
+
+# --- B2 (third review round): theme_mods_<slug> is FULL of A's own
+# local IDs, and this PR is what started migrating it.
+#
+# core_wp_option_keys_dynamic added `theme_mods_<active-theme>` to migrate.
+# graft_migrate_options then pushes that option to B verbatim — and every
+# theme_mods_ row carries `custom_logo` (an ATTACHMENT id), plus
+# `nav_menu_locations` (TERM ids) and `custom_css_post_id` (a POST id).
+# graft_remap_attachment_ids only ever rewrites post_content/post_excerpt,
+# never an option value, so A's numbers land on B unchanged.
+#
+# The failure mode is the bad one: if B happens to own an attachment with
+# that number, B's logo silently becomes a DIFFERENT, WRONG image — not a
+# missing one. This hook is the existing answer for exactly this shape of
+# problem (it is why page_on_front is remapped rather than copied), and it
+# already runs after both the import and graft_migrate_options.
+#
+# nav_menu_locations and custom_css_post_id are REMOVED rather than remapped:
+# sitegraft v1 migrates neither classic menus (design doc §13) nor
+# `custom_css`, so there is nothing on B for those ids to point at, and a
+# remap would have nothing to remap through.
+
+@test "core_wp_post_import remaps theme_mods' custom_logo through id-map.tsv instead of carrying A's attachment id to B (B2)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '%s' '{"custom_logo":42,"other_setting":"keep-me"}' > "${run_dir}/option-theme_mods_etch-child.value"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '42\t907\tattachment\n' > "$tsv"
+  wp_cmd_b_stub() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  run cat "$BATS_TEST_TMPDIR/calls.log"
+  [[ "$output" == *"option update theme_mods_etch-child"* ]] || false
+  local pushed
+  pushed=$(grep -F 'option update theme_mods_etch-child' "$BATS_TEST_TMPDIR/calls.log" \
+    | sed 's/^option update theme_mods_etch-child //; s/ --format=json$//')
+  run jq -e '.custom_logo == 907 and .other_setting == "keep-me"' <<< "$pushed"
+  [ "$status" -eq 0 ]
+}
+
+@test "core_wp_post_import drops theme_mods' custom_logo, out loud, when id-map.tsv has no entry for it (never guesses) (B2)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '%s' '{"custom_logo":42,"other_setting":"keep-me"}' > "${run_dir}/option-theme_mods_etch-child.value"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '7\t107\tpage\n' > "$tsv"
+  wp_cmd_b_stub() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  run --separate-stderr core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
+  [[ "$stderr" == *"custom_logo"* ]] || false
+  local pushed
+  pushed=$(grep -F 'option update theme_mods_etch-child' "$BATS_TEST_TMPDIR/calls.log" \
+    | sed 's/^option update theme_mods_etch-child //; s/ --format=json$//')
+  run jq -e 'has("custom_logo") | not' <<< "$pushed"
+  [ "$status" -eq 0 ]
+}
+
+@test "core_wp_post_import strips nav_menu_locations and custom_css_post_id from theme_mods, naming both (B2)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '%s' '{"nav_menu_locations":{"primary":9},"custom_css_post_id":31,"other_setting":"keep-me"}' \
+    > "${run_dir}/option-theme_mods_etch-child.value"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '9\t109\tterm:nav_menu\n' > "$tsv"
+  wp_cmd_b_stub() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  run --separate-stderr core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
+  [[ "$stderr" == *"nav_menu_locations"* ]] || false
+  [[ "$stderr" == *"custom_css_post_id"* ]] || false
+  local pushed
+  pushed=$(grep -F 'option update theme_mods_etch-child' "$BATS_TEST_TMPDIR/calls.log" \
+    | sed 's/^option update theme_mods_etch-child //; s/ --format=json$//')
+  run jq -e 'has("nav_menu_locations") == false and has("custom_css_post_id") == false and .other_setting == "keep-me"' <<< "$pushed"
+  [ "$status" -eq 0 ]
+}
+
+@test "core_wp_post_import leaves a theme_mods value alone when it holds none of the id-bearing keys (B2)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '%s' '{"other_setting":"keep-me"}' > "${run_dir}/option-theme_mods_etch-child.value"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '7\t107\tpage\n' > "$tsv"
+  wp_cmd_b_stub() { printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  run core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
+  [ ! -f "$BATS_TEST_TMPDIR/calls.log" ]
+}
+
+@test "core_wp_post_import does NOT write B's theme_mods for real under SITEGRAFT_DRY_RUN=1 (B2)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '%s' '{"custom_logo":42}' > "${run_dir}/option-theme_mods_etch-child.value"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '42\t907\tattachment\n' > "$tsv"
+  wp_cmd_b_stub() { printf '%s\n' "REALLY-RAN $*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  SITEGRAFT_DRY_RUN=1 run core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
+  [ ! -f "$BATS_TEST_TMPDIR/calls.log" ]
+  [[ "$output" == *"[dry-run]"* ]] || false
+}

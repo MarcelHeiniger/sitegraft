@@ -305,7 +305,12 @@ Shipped in this repo:
 - **`core-wp`** (`modules/core-wp.sh`) — WordPress core content: pages, posts, the
   front-page option trio (`show_on_front`/`page_on_front`/`page_for_posts`,
   correctly remapped through the ID map rather than blindly copied), and the
-  active theme's `theme_mods_<slug>` customizer settings, resolved from the scan.
+  active theme's `theme_mods_<slug>` customizer settings, resolved from the scan
+  and rewritten before they land on B — `custom_logo` is remapped through the ID
+  map (A's attachment number would otherwise point at whatever image B happens to
+  give that number), and `nav_menu_locations`/`custom_css_post_id` are removed,
+  since sitegraft migrates neither classic menus nor `custom_css` and B has no
+  counterpart for those IDs.
 - **`etch`** (`modules/etch.sh`) — the WordPress post types Etch actually stores
   content in (`wp_block`, `wp_template`, `wp_global_styles`), its options
   (settings, styles, global stylesheets, CSS toolbar values, CFS/CPT definitions),
@@ -337,7 +342,7 @@ Copy [`modules/_template.sh`](../modules/_template.sh) to `modules/<your-plugin>
 | `<mod>_option_keys_dynamic <scan_json>` | | Same, but computed from the scan. |
 | `<mod>_tables` | | Plugin-owned SQL table suffixes (without the live `$table_prefix`), one per line. |
 | `<mod>_tables_dynamic <scan_json>` | | Same, but computed from the scan. |
-| `<mod>_option_keys_exclude` | no | Glob patterns to exclude within a broad option-key prefix (e.g. license keys, DB version markers). Applied to both the static and the dynamic option keys. |
+| `<mod>_option_keys_exclude` | no | Glob patterns removed from the option keys this module claims (e.g. license keys, DB version markers). Applied to both the static and the dynamic lists. Note it filters *names your module returned*; sitegraft never expands a pattern into keys, so a broad claim has to be enumerated from the scan by `_option_keys_dynamic` — see below. |
 | `<mod>_post_import <state_dir> <id_map_tsv> <wp_cmd_b>` | no | Hook run after WXR import + generic remaps, for module-specific fixups (e.g. remapping an internal ID reference in postmeta). |
 | `<mod>_stack_candidates` | no | If this plugin also needs to be *present and matching* on B for migrated content to render (like Etch or ACSS), one candidate plugin-folder slug per line, most-preferred/current first. |
 
@@ -374,7 +379,12 @@ broken, `SITEGRAFT_MANIFEST_PREFILLED` skips module defaults entirely — see §
 The same applies to `<mod>_option_keys_exclude`: if it fails, `plan` refuses,
 because continuing would migrate exactly the keys it was there to hold back.
 
-**Keeping secrets out of a broad prefix.** `_option_keys_exclude` is applied to the
+**Keeping secrets out of a broad prefix.** A "prefix" is never a wildcard sitegraft
+resolves for you: `graft_migrate_options` runs `wp option get <key>` on the literal
+string in the manifest, so returning `my_plugin_*` from the static `_option_keys`
+would end up running `wp option update 'my_plugin_*'` on B. Enumerate the prefix
+from the scan with `_option_keys_dynamic`, as below, and let
+`_option_keys_exclude` carve the secrets back out. It is applied to the
 static and dynamic option keys alike, before anything is written to the manifest —
 and the manifest is the only thing `graft` and `verify` ever read, so an excluded
 key is excluded everywhere. That makes "return the whole prefix, exclude the

@@ -231,7 +231,7 @@ EOF
     local alias_lc="$1"; shift
     case "$*" in
       "post-type list --format=json") echo '[]' ;;
-      "option list --format=json") echo '[]' ;;
+      "option list --unserialize --format=json") echo '[]' ;;
       "db tables --format=list --all-tables-with-prefix") echo 'wp_options' ;;
       "plugin list --format=json") echo '[]' ;;
       "theme list --status=active --format=json") echo '[{"name":"twentytwentyfive","status":"active","version":"1.5"}]' ;;
@@ -242,5 +242,48 @@ EOF
   local out="$BATS_TEST_TMPDIR/scan-a.json"
   inventory_scan_site a "$out"
   run jq -e '.active_theme.name == "twentytwentyfive" and .active_theme.stylesheet == "twentytwentyfive"' "$out"
+  [ "$status" -eq 0 ]
+}
+
+# B1 (third review round). `wp option list --format=json` WITHOUT
+# --unserialize hands back each option_value exactly as the database holds
+# it, so a PHP array arrives as the serialized STRING `a:1:{...}`. Verified
+# live against WP-CLI 2.12.0 on a real WordPress install rather than
+# reasoned about:
+#
+#   stored bytes                    without --unserialize   with --unserialize
+#   a:2:{i:0;s:5:"fotos";...}       "a:2:{i:0;s:5:\"fo..."  ["fotos","news"]
+#   a:0:{}                          "a:0:{}"                []
+#   a:1:{s:5:"fotos";a:1:{...}}     "a:1:{s:5:\"fotos\";..." {"fotos":{...}}
+#   [{"slug":"fotos"}]  (a string)  "[{\"slug\":\"fotos\"}]" "[{\"slug\":\"fotos\"}]"
+#   hello / 42                      "hello" / "42"          "hello" / "42"
+#
+# modules/etch.sh's etch_cpts reader is the ONLY consumer of .option_value in
+# this codebase, and a serialized string is a shape it cannot read — which
+# means `plan` used to stop on the storage form a WordPress array is MOST
+# likely to have, including an empty one. Asking wp-cli to unserialize is
+# what makes the scan record a structure rather than a string. The flag has
+# been part of `wp option list` since 2018 (wp-cli/entity-command, "Add
+# --unserialize flag to 'option list' command"), so it predates every wp-cli
+# 2.x this tool can run against.
+@test "inventory_scan_site asks wp-cli to unserialize option values, so an array option is scanned as a structure and not as a serialized string" {
+  local calls="$BATS_TEST_TMPDIR/calls.log"
+  : > "$calls"
+  wp_remote() {
+    local alias_lc="$1"; shift
+    echo "$*" >> "$calls"
+    case "$*" in
+      *"option list"*) echo '[{"option_name":"etch_cpts","option_value":[{"slug":"fotos"}]}]' ;;
+      "db tables --format=list --all-tables-with-prefix") echo 'wp_options' ;;
+      "theme list --status=active --format=json") echo '[{"name":"t"}]' ;;
+      *) echo '[]' ;;
+    esac
+  }
+  local out="$BATS_TEST_TMPDIR/scan-unser.json"
+  inventory_scan_site a "$out"
+  run grep -F -- 'option list --unserialize --format=json' "$calls"
+  [ "$status" -eq 0 ]
+  # And the recorded value really is a structure, not a string.
+  run jq -e '.options[0].option_value | type == "array"' "$out"
   [ "$status" -eq 0 ]
 }
