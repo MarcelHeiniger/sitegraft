@@ -118,6 +118,7 @@ sitegraft_cleanup() {
   if [ -n "$SITEGRAFT_TMP_REGISTRY" ] && [ -f "$SITEGRAFT_TMP_REGISTRY" ]; then
     while IFS= read -r dir; do
       [ -n "$dir" ] || continue
+      # shellcheck disable=SC2015 # best-effort cleanup: the right-hand `true` is a deliberate no-op, so the classic A&&B||C footgun doesn't apply
       [ -d "$dir" ] && rm -rf "$dir" 2>/dev/null || true
     done < "$SITEGRAFT_TMP_REGISTRY"
     rm -f "$SITEGRAFT_TMP_REGISTRY" 2>/dev/null || true

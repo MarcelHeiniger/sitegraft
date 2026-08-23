@@ -102,8 +102,8 @@ EOF
   phase_restore --profile t --run "$RUN_DIR" --yes
   local snap_dir dir_mode db_mode
   snap_dir=$(ls -dt "${RUN_DIR}"/pre-restore-* | head -1)
-  dir_mode=$(stat -f '%Lp' "$snap_dir" 2>/dev/null || stat -c '%a' "$snap_dir")
-  db_mode=$(stat -f '%Lp' "${snap_dir}/backup/b-db.sql.gz" 2>/dev/null || stat -c '%a' "${snap_dir}/backup/b-db.sql.gz")
+  dir_mode=$(stat -c '%a' "$snap_dir" 2>/dev/null || stat -f '%Lp' "$snap_dir" 2>/dev/null)
+  db_mode=$(stat -c '%a' "${snap_dir}/backup/b-db.sql.gz" 2>/dev/null || stat -f '%Lp' "${snap_dir}/backup/b-db.sql.gz" 2>/dev/null)
   [ "$dir_mode" = "700" ]
   [ "$db_mode" = "600" ]
 }

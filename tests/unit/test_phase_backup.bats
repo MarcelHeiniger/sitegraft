@@ -127,10 +127,10 @@ EOF
 @test "phase_backup writes the backup dir/files and manifest.json as owner-only" {
   phase_backup --profile t --run "$RUN_DIR"
   local dir_mode db_mode manifest_mode complete_mode
-  dir_mode=$(stat -f '%Lp' "${RUN_DIR}/backup" 2>/dev/null || stat -c '%a' "${RUN_DIR}/backup")
-  db_mode=$(stat -f '%Lp' "${RUN_DIR}/backup/b-db.sql.gz" 2>/dev/null || stat -c '%a' "${RUN_DIR}/backup/b-db.sql.gz")
-  manifest_mode=$(stat -f '%Lp' "${RUN_DIR}/manifest.json" 2>/dev/null || stat -c '%a' "${RUN_DIR}/manifest.json")
-  complete_mode=$(stat -f '%Lp' "${RUN_DIR}/backup.complete" 2>/dev/null || stat -c '%a' "${RUN_DIR}/backup.complete")
+  dir_mode=$(stat -c '%a' "${RUN_DIR}/backup" 2>/dev/null || stat -f '%Lp' "${RUN_DIR}/backup" 2>/dev/null)
+  db_mode=$(stat -c '%a' "${RUN_DIR}/backup/b-db.sql.gz" 2>/dev/null || stat -f '%Lp' "${RUN_DIR}/backup/b-db.sql.gz" 2>/dev/null)
+  manifest_mode=$(stat -c '%a' "${RUN_DIR}/manifest.json" 2>/dev/null || stat -f '%Lp' "${RUN_DIR}/manifest.json" 2>/dev/null)
+  complete_mode=$(stat -c '%a' "${RUN_DIR}/backup.complete" 2>/dev/null || stat -f '%Lp' "${RUN_DIR}/backup.complete" 2>/dev/null)
   [ "$dir_mode" = "700" ]
   [ "$db_mode" = "600" ]
   [ "$manifest_mode" = "600" ]

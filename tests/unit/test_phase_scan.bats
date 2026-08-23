@@ -82,8 +82,8 @@ EOF
   local run_dir
   run_dir=$(ls -dt "$BATS_TEST_TMPDIR"/runs/demo-* | head -1)
   local dir_mode file_mode
-  dir_mode=$(stat -f '%Lp' "$run_dir" 2>/dev/null || stat -c '%a' "$run_dir" 2>/dev/null)
-  file_mode=$(stat -f '%Lp' "${run_dir}/scan-a.json" 2>/dev/null || stat -c '%a' "${run_dir}/scan-a.json" 2>/dev/null)
+  dir_mode=$(stat -c '%a' "$run_dir" 2>/dev/null || stat -f '%Lp' "$run_dir" 2>/dev/null)
+  file_mode=$(stat -c '%a' "${run_dir}/scan-a.json" 2>/dev/null || stat -f '%Lp' "${run_dir}/scan-a.json" 2>/dev/null)
   [ "$dir_mode" = "700" ]
   [ "$file_mode" = "600" ]
 }

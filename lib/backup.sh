@@ -600,10 +600,10 @@ phase_restore() {
       *) log_error "unknown flag for restore: $1"; return 1 ;;
     esac
   done
-  [ -n "$profile" ] && [ -n "$run_dir" ] || {
+  if [ -z "$profile" ] || [ -z "$run_dir" ]; then
     log_error "restore requires --profile <name> --run <run-dir>"
     return 1
-  }
+  fi
   profile_load "$profile" || return 1
   [ -x "${run_dir}/restore.sh" ] || { log_error "no restore.sh found for run: ${run_dir}"; return 1; }
 

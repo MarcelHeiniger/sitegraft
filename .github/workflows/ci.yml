@@ -43,8 +43,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install bats
-        run: sudo apt-get update && sudo apt-get install -y bats
+      - name: Install bats and sitegraft's runtime dependencies
+        # The unit suite exercises bin/sitegraft's real require_cmd checks
+        # (jq, rsync, gzip, shasum, ssh), so those need to be present too —
+        # installed explicitly rather than relying on the runner image
+        # happening to already have them. gzip is always in base Ubuntu;
+        # shasum ships in the `perl` package; ssh is `openssh-client`.
+        run: sudo apt-get update && sudo apt-get install -y bats jq rsync perl openssh-client curl
 
       - name: bats tests/unit/
         # Canonical run command per CLAUDE.md. Integration tests

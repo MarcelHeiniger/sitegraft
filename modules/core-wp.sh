@@ -81,7 +81,7 @@ core_wp_post_import() {
     # just being true whenever bats' non-set-e test context happened to
     # mask the crash.
     [ -f "${run_dir}/option-${key}.value" ] || continue
-    old_id=$(cat "${run_dir}/option-${key}.value" 2>/dev/null | tr -d '"')
+    old_id=$(tr -d '"' 2>/dev/null < "${run_dir}/option-${key}.value")
     case "$old_id" in
       ''|null|false|0) continue ;;
     esac

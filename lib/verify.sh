@@ -256,7 +256,7 @@ verify_domain_absent() {
 verify_page_on_front() {
   local run_dir="$1" id_map_tsv="$2"
   local old_front_id
-  old_front_id=$(cat "${run_dir}/option-page_on_front.value" 2>/dev/null | tr -d '"')
+  old_front_id=$(tr -d '"' 2>/dev/null < "${run_dir}/option-page_on_front.value")
   case "$old_front_id" in
     ''|null|false|0) return 0 ;; # A never had a front page configured — nothing to check
   esac

@@ -109,7 +109,14 @@ profile_parse_file() {
 # BSD stat (macOS) and GNU stat (Linux CI/servers).
 profile_check_creds_permissions() {
   local file="$1" mode
-  mode=$(stat -f '%Lp' "$file" 2>/dev/null || stat -c '%a' "$file" 2>/dev/null)
+  # GNU stat first: on Linux, `stat -f` isn't "not found", it's a DIFFERENT
+  # flag (filesystem info, not file mode) that dumps unrelated garbage to
+  # stdout before failing — so probing `-f` first and falling back to `-c`
+  # on error corrupts $mode with that garbage on real Linux instead of
+  # cleanly falling through. `stat -c` first is safe on macOS: BSD stat
+  # rejects the unknown `-c` flag with nothing on stdout, so the fallback
+  # to `-f '%Lp'` (BSD's actual mode format) still runs cleanly there.
+  mode=$(stat -c '%a' "$file" 2>/dev/null || stat -f '%Lp' "$file" 2>/dev/null)
   case "$mode" in
     600|400)
       return 0

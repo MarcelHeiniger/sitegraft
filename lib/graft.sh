@@ -82,7 +82,7 @@ graft_push_file() {
   local alias_lc="$1" host_file="$2" dest_dir="$3" dest_name="$4"
   local prefix; prefix=$(graft_local_prefix "$alias_lc")
   if [ -n "$prefix" ]; then
-    run_or_echo bash -c "${prefix} mkdir -p '${dest_dir}' && cat '${host_file}' | ${prefix} tee '${dest_dir}/${dest_name}' >/dev/null"
+    run_or_echo bash -c "${prefix} mkdir -p '${dest_dir}' && ${prefix} tee '${dest_dir}/${dest_name}' >/dev/null < '${host_file}'"
   else
     run_or_echo mkdir -p "$dest_dir"
     run_or_echo rsync -avz "$host_file" "${dest_dir}/${dest_name}"
@@ -931,7 +931,9 @@ graft_migrate_options() {
 # — see that function's own domain-rewrite step.
 graft_search_replace_domain() {
   local from="$1" to="$2" id_map_tsv="$3" run_dir="$4"
-  [ -n "$from" ] && [ -s "$id_map_tsv" ] || return 0
+  if [ -z "$from" ] || [ ! -s "$id_map_tsv" ]; then
+    return 0
+  fi
 
   local post_ids_json payload_json remote_path lib_path
   post_ids_json=$(graft_migrated_post_ids_json "$id_map_tsv")
