@@ -232,16 +232,28 @@ Syncs whatever the plan approved for the rendering stack, then hard-refuses if
 anything is still mismatched — pass `--allow-stack-mismatch` to override, which
 itself requires a second, louder confirmation than anything else in this tool
 (`plan`'s own copy-offer already gives you a way to avoid ever needing this flag).
-Then: media sync, WXR export/import of the selected content, ID remapping
-(attachments, featured images, `page_on_front`/`page_for_posts`), domain
-search-replace scoped to migrated content only, options migration, and any
-module-specific post-import hooks.
+Then: media sync (files copied to B's uploads directory), attachment import (every
+attachment on A registered as a WordPress attachment on B), WXR export/import of the
+selected content, ID remapping (attachments, featured images,
+`page_on_front`/`page_for_posts`), domain search-replace scoped to migrated content
+only, options migration, and any module-specific post-import hooks.
+
+Attachment import is batched, not one container invocation per attachment: a single
+`wp eval` on A collects every attachment's metadata, and a single `wp eval` on B
+imports and remaps all of them in one WordPress bootstrap. On a site with a few
+hundred attachments this completes in minutes rather than the hours a per-attachment
+loop would take. The step end-of-run report always states how many attachments were
+**actually** imported and remapped — never how many were merely requested — and the
+step fails outright (non-zero exit, listing which attachments) if it cannot account
+for every one of them, rather than silently reporting fewer as a success.
 
 `--dry-run` prints every command it would run instead of running it — nothing on B
 is touched. Every step is also individually idempotent (tracked via marker files in
 the run directory), so a `graft` that's interrupted partway through can simply be
 re-run and picks up where it left off, rather than starting over or duplicating
-content.
+content — the attachment-import step specifically re-checks, per attachment, what B
+already has before importing anything, so a resumed run neither re-imports an
+attachment already there nor skips one that's still missing.
 
 ### 4.5 `verify` — confirm the graft actually worked
 
