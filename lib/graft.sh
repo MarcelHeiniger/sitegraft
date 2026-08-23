@@ -727,13 +727,13 @@ graft_fetch_id_map() {
     local prefix; prefix=$(graft_local_prefix b)
     if [ -n "$prefix" ]; then
       if ! is_dry_run && ! $prefix test -f "$src" >/dev/null 2>&1; then
-        log_warn "no id-map.log found on B (no posts/terms were imported via WXR?) — id-map.tsv left as-is"
+        log_warn "no id-map.log found on B — id-map.tsv left as-is. This is legitimate only if the WXR import inserted NOTHING (every item already existed on B). If it did import posts, the mapping mu-plugin was not running, and EVERY remap that follows is now a no-op against an incomplete map: attachment ids inside content, featured images, page_on_front, and every module post_import hook. Check the import output above before trusting this run."
         return 0
       fi
       run_or_echo bash -c "${prefix} cat '${src}' > '${tmp}'"
     else
       if ! is_dry_run && [ ! -f "$src" ]; then
-        log_warn "no id-map.log found on B (no posts/terms were imported via WXR?) — id-map.tsv left as-is"
+        log_warn "no id-map.log found on B — id-map.tsv left as-is. This is legitimate only if the WXR import inserted NOTHING (every item already existed on B). If it did import posts, the mapping mu-plugin was not running, and EVERY remap that follows is now a no-op against an incomplete map: attachment ids inside content, featured images, page_on_front, and every module post_import hook. Check the import output above before trusting this run."
         return 0
       fi
       run_or_echo rsync -avz "$src" "$tmp"
@@ -1190,7 +1190,25 @@ _graft_exit_trap() {
   if [ -n "$rd" ] && graft_step_done "$rd" mu_plugin 2>/dev/null && ! graft_step_done "$rd" mu_cleanup 2>/dev/null; then
     log_warn "graft interrupted or failed — removing the mapping mu-plugin from B before exiting (never left running unattended)"
     graft_remove_mu_plugin 2>/dev/null || true
-    graft_mark_step "$rd" mu_cleanup 2>/dev/null || true
+    # CLEAR the deploy marker rather than marking cleanup done. The mu-plugin
+    # has just been taken off B while the run is INCOMPLETE, so the resumable
+    # state has to read "not deployed" — the previous version left
+    # graft.mu_plugin.done in place, so the next `sitegraft graft` skipped
+    # redeploying it and ran the WXR import with NO mapper at all.
+    #
+    # Nothing about that is loud. The import succeeds,
+    # wp-content/sitegraft-id-map.log is simply never written,
+    # graft_fetch_id_map only warns, and every downstream remap then runs
+    # against an id-map holding whatever the media step put there and nothing
+    # else: attachment ids inside content, featured images, page_on_front,
+    # and every module post_import hook are all skipped. Seen live — a graft
+    # resumed twice after two unrelated failures ran to completion, reported
+    # success, and left B's front page pointing at an unremapped id, with the
+    # only clue a single warning in the middle of the log.
+    #
+    # mu_cleanup is cleared too, for coherence: the pair means "deployed" /
+    # "removed after being used", and after this branch neither is true.
+    rm -f "${rd}/graft.mu_plugin.done" "${rd}/graft.mu_cleanup.done" 2>/dev/null || true
   fi
   # NIT-3 (review, Viktor): graft_remove_file for the id-remap/domain-remap
   # JSON payload and the pushed content-remap-functions.php only ever runs
