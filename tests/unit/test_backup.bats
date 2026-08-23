@@ -728,6 +728,25 @@ exec "$@"')
   [ -f /etc/passwd ]
 }
 
+# A newline in a filename is legal and rare. The set difference below is
+# line-oriented, so such a path cannot be told apart from two paths — and two
+# paths that match nothing in the manifest are two extra deletions. Refusing
+# the whole listing is the only honest answer; guessing is how this kind of
+# code removes the wrong thing.
+@test "the generated wrapped-local restore.sh REFUSES rather than guess when a real filename contains a newline" {
+  _wrapped_fixture
+  local weird="${B_ROOT}/wp-content/themes/new"$'\n'"line.css"
+  touch "$weird"
+  printf 'mutated\n' > "${B_ROOT}/wp-content/themes/t/style.css"
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unsafe path"* ]] || false
+  [[ "$output" == *"newline"* ]] || false
+  # nothing removed, nothing overwritten
+  [ -e "$weird" ]
+  [ "$(cat "${B_ROOT}/wp-content/themes/t/style.css")" = "mutated" ]
+}
+
 @test "the generated wrapped-local restore.sh REFUSES when listing B returns a path with a '..' component" {
   local shim
   shim=$(_wrapper_shim dotdotfind 'if [ "$1" = "find" ]; then printf "%s\0" "$2/../../escape"; exit 0; fi

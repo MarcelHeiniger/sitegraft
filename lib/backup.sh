@@ -570,7 +570,7 @@ _sg_scan_prune() {
       *) _sg_die "refusing to remove anything from B: listing B's wp-content returned a path outside ${B_WP_CONTENT_ROOT} ([${abs}])" ;;
     esac
     rel=".${abs#"${B_WP_CONTENT_ROOT}"}"
-    _sg_check_rel "$rel" || _sg_die "refusing to remove anything from B: listing B's wp-content returned an unsafe path ([${abs}])"
+    _sg_check_rel "$rel" || _sg_die "refusing to remove anything from B: listing B's wp-content returned an unsafe path ([${abs}]) — it is not a plain relative path under wp-content, or it carries a '..' component, or its name contains a newline. A newline in a filename is legal and rare; this script cannot tell such a path apart from two paths, so it refuses to act on the whole listing rather than risk removing the wrong thing. Rename or remove that file by hand, then re-run."
     printf '%s\n' "$rel"
   done < "$SG_TMP/live.raw" > "$SG_TMP/live.txt"
 
