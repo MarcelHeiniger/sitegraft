@@ -290,6 +290,11 @@ _assert_alias() {
   run inventory_check_path_topology b
   [ "$status" -ne 0 ]
   [[ "$output" == *"running inside a container"* ]] || false
+  # The actionable half of the message is the part an operator needs most,
+  # and nothing else pins it: name the workaround and the issue that
+  # documents it, so a rewrite cannot quietly drop them.
+  [[ "$output" == *"SITE_B_SSH_HOST empty"* ]] || false
+  [[ "$output" == *"issue #19"* ]] || false
 }
 
 @test "inventory_check_path_topology refuses when wp-cli does not answer at all" {
@@ -300,6 +305,9 @@ _assert_alias() {
   run inventory_check_path_topology b
   [ "$status" -ne 0 ]
   [[ "$output" == *"did not answer"* ]] || false
+  # This failure is a wrong path or a wrong wp command, not a container:
+  # the message must send the reader to those two settings.
+  [[ "$output" == *"WP_PATH"* ]] || false
 }
 
 @test "inventory_check_path_topology accepts a wrapper behind SSH whose paths agree (sudo -u www-data wp)" {
