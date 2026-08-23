@@ -76,7 +76,17 @@ verify_compare_checksums() {
 # A key with no "${run_dir}/option-<key>.value" file at all is also skipped,
 # not a failure: any key graft never actually reached (an interrupted run
 # resumed past this step) is not this function's job to invent an opinion
-# about.
+# about. It IS this function's job to say how many it skipped, though
+# (issue #23): a caller comparing 0 of 12 selected keys must be able to tell
+# that apart from comparing 12 of 12 — this function alone knows both
+# numbers, the loop already counts them for free, so it reports them on its
+# last stdout line as "OPTIONS_COMPARED:<compared>:<total>" (machine-
+# parseable, deliberately never mixed into the human-facing log_error text
+# above it) regardless of whether it ultimately passes or hard-fails.
+# phase_verify (below) is the one that turns that count into report wording
+# — this function's own return code keeps meaning exactly what it always
+# meant: 0 unless a KNOWN mismatch was found, since "nothing was available
+# to compare" was never this function's failure to claim (see above).
 #
 # Security-review fix-pack (Kimi, MAJOR, missed by the first review pass —
 # CRITICAL for any DACH/FR site, which is this tool's primary use case):
@@ -101,12 +111,14 @@ verify_compare_checksums() {
 # something is still better than aborting the whole check on one bad key).
 verify_options_match() {
   local run_dir="$1" manifest="$2"
-  local key mismatched=""
+  local key mismatched="" compared=0 total=0
   for key in $(echo "$manifest" | jq -r '[.migrate[].option_keys[]?] | unique[]'); do
     case "$key" in
       page_on_front|page_for_posts) continue ;;
     esac
+    total=$((total + 1))
     [ -f "${run_dir}/option-${key}.value" ] || continue
+    compared=$((compared + 1))
     local expected actual expected_canon actual_canon
     expected=$(cat "${run_dir}/option-${key}.value")
     actual=$(wp_remote b option get "$key" --format=json 2>/dev/null || echo 'null')
@@ -114,6 +126,7 @@ verify_options_match() {
     actual_canon=$(printf '%s' "$actual" | jq -c . 2>/dev/null) || actual_canon="$actual"
     [ "$expected_canon" = "$actual_canon" ] || mismatched="${mismatched}${key} "
   done
+  echo "OPTIONS_COMPARED:${compared}:${total}"
   if [ -n "$mismatched" ]; then
     log_error "migrated option value(s) do not match A's on B: ${mismatched}"
     return 1
@@ -270,15 +283,38 @@ verify_domain_absent() {
   esac
 }
 
-# verify_page_on_front <run_dir> <id_map_tsv> — design doc §9.3/§6.5/review
-# finding B3: NOT merely "does page_on_front resolve to SOME existing page"
-# (a check that would pass even if it pointed at a random unrelated page) —
-# resolves A's own recorded page_on_front value (the file
+# verify_page_on_front <run_dir> <id_map_tsv> <manifest_json> — design doc
+# §9.3/§6.5/review finding B3: NOT merely "does page_on_front resolve to SOME
+# existing page" (a check that would pass even if it pointed at a random
+# unrelated page) — resolves A's own recorded page_on_front value (the file
 # core_wp_post_import, modules/core-wp.sh, reads from) through id-map.tsv the
 # exact same way that hook does, and requires B's LIVE page_on_front to equal
 # that specific remapped ID.
+#
+# Issue #12 fix: the ORIGINAL version of the "no id-map.tsv entry" branch
+# below read `[ -n "$expected_new_id" ] || return 0` with the comment "A's
+# front page wasn't part of this run's migrate selection" — but that was a
+# GUESS, not something this function had verified. A missing id-map.tsv
+# entry is ALSO exactly what a FAILED remap looks like (core_wp_post_import
+# warns and leaves B's page_on_front unchanged when A's front page has no
+# entry in id-map.tsv, modules/core-wp.sh) — and on the first real graft,
+# that is exactly what happened: this check ticked its own box *because* the
+# remap it exists to confirm had not happened.
+# The manifest is what actually distinguishes the two cases: it says whether
+# page_on_front was PART OF THIS RUN'S migrate selection at all (checked
+# first, below — mirrors the same `.migrate[].option_keys[]?` selection test
+# verify_options_match uses). If it was NOT selected, this run made no
+# promise about page_on_front and there is genuinely nothing to check — a
+# stale option-page_on_front.value/id-map.tsv pair left over in run_dir from
+# an EARLIER run that DID select it must not be misread as this run's
+# failure. If it WAS selected and A's own recorded value shows a real page
+# (not the empty/null/false/0 "A never configured one" case just below), a
+# missing id-map.tsv entry is no longer ambiguous — it can only mean the
+# remap did not happen, and this now fails.
 verify_page_on_front() {
-  local run_dir="$1" id_map_tsv="$2"
+  local run_dir="$1" id_map_tsv="$2" manifest="$3"
+  echo "$manifest" | jq -e '[.migrate[].option_keys[]?] | index("page_on_front") != null' >/dev/null 2>&1 \
+    || return 0 # page_on_front was not part of this run's migrate selection — nothing to check
   local old_front_id
   # A missing file here fails the `<` redirect itself (bash-level error, not
   # tr's), which would abort under `set -e` on its own — safe only because
@@ -290,7 +326,10 @@ verify_page_on_front() {
   esac
   local expected_new_id
   expected_new_id=$(awk -F'\t' -v old="$old_front_id" '$1==old{print $2}' "$id_map_tsv" 2>/dev/null)
-  [ -n "$expected_new_id" ] || return 0 # A's front page wasn't part of this run's migrate selection — core_wp_post_import left B's value alone, nothing to verify against
+  if [ -z "$expected_new_id" ]; then
+    log_error "A's page_on_front (page ${old_front_id}) has no corresponding entry in id-map.tsv — the remap did not happen (or the ID mapper was missing, or the imported post silently failed), so B's page_on_front cannot be verified against it"
+    return 1
+  fi
 
   local live_front_id
   live_front_id=$(wp_remote b option get page_on_front 2>/dev/null || echo "")
@@ -444,31 +483,64 @@ phase_verify() {
     hard_fail=1
   fi
 
-  # --- migrated option values (finding B3) ----------------------------------
-  if verify_options_match "$run_dir" "$manifest" 2>>"$report"; then
-    echo "- [x] migrated options match A's values on B" >> "$report"
-  else
+  # --- migrated option values (finding B3; count-vs-selected reporting is
+  # issue #23 — "migrated options match" must never be ticked plain having
+  # compared zero of N selected keys, the same defect PR #9 already fixed
+  # for "protected data unchanged") -------------------------------------------
+  local options_output options_result=0
+  options_output=$(verify_options_match "$run_dir" "$manifest" 2>>"$report") || options_result=1
+  local options_compared=0 options_total=0
+  case "$options_output" in
+    *OPTIONS_COMPARED:*)
+      local options_summary="${options_output##*OPTIONS_COMPARED:}"
+      options_compared="${options_summary%%:*}"
+      options_total="${options_summary##*:}"
+      ;;
+  esac
+  if [ "$options_result" -ne 0 ]; then
     echo "- [ ] **HARD FAIL: migrated option value mismatch** — see above" >> "$report"
     hard_fail=1
+  elif [ "$options_total" -eq 0 ]; then
+    echo "- [x] migrated options match A's values on B (0 of 0 compared — no options were selected for migration)" >> "$report"
+  elif [ "$options_compared" -eq 0 ]; then
+    # total > 0 but nothing was actually compared: the exact "0 of N" shape
+    # issue #23 describes (an interrupted run resumed past migrate_options).
+    # verify_options_match's own return code stays 0 here on purpose (see
+    # its header comment — a key graft never reached is not ITS job to fail
+    # on), but the report must not read as a plain pass either.
+    echo "- [ ] migrated options match A's values on B: **UNVERIFIED — 0 of ${options_total} selected option(s) could be compared** (not written to disk this run — see lib/verify.sh's verify_options_match; not a hard fail on its own, but not a pass)" >> "$report"
+  else
+    echo "- [x] migrated options match A's values on B (${options_compared} of ${options_total} compared)" >> "$report"
   fi
 
   # --- A's domain absent from the content graft imported (finding B3,
   # rescoped and rebuilt in the security-review fix-pack — see
-  # verify_domain_absent's own comment for why) ------------------------------
+  # verify_domain_absent's own comment for why).
+  #
+  # Issue #22 fix: this used to be wrapped in `if [ -n "$domain" ]` with
+  # NOTHING written to the report at all when it was false — no [x], no
+  # [ ], no warning, and "Result: PASS" printed regardless. A reader could
+  # not tell "A's domain is confirmed absent" from "that was never looked
+  # at". The check must now be accounted for in every run: either genuinely
+  # verified, or explicitly marked not applicable — never silently missing.
+  # ---------------------------------------------------------------------------
   local domain; domain=$(echo "$manifest" | jq -r '.options.search_replace.from // ""')
   [ "$domain" = "null" ] && domain=""
-  if [ -n "$domain" ]; then
-    if verify_domain_absent "$run_dir" "$id_map_tsv" "$manifest" "$domain" 2>>"$report"; then
-      echo "- [x] A's domain string is absent from the content graft imported (migrated posts + migrated options)" >> "$report"
-    else
-      echo "- [ ] **HARD FAIL: A's domain string is still present in content graft imported, or the check could not be verified** — see above" >> "$report"
-      hard_fail=1
-    fi
+  if [ -z "$domain" ]; then
+    echo "- [x] A's domain string is absent from the content graft imported (not applicable — no domain was configured for this migration)" >> "$report"
+  elif verify_domain_absent "$run_dir" "$id_map_tsv" "$manifest" "$domain" 2>>"$report"; then
+    echo "- [x] A's domain string is absent from the content graft imported (migrated posts + migrated options)" >> "$report"
+  else
+    echo "- [ ] **HARD FAIL: A's domain string is still present in content graft imported, or the check could not be verified** — see above" >> "$report"
+    hard_fail=1
   fi
 
-  # --- page_on_front resolves to the CORRECT remapped page (finding B3) ----
+  # --- page_on_front resolves to the CORRECT remapped page (finding B3;
+  # issue #12 — the manifest is what lets verify_page_on_front tell "wasn't
+  # part of this run" apart from "was selected but the remap didn't happen",
+  # see that function's own header comment) ----------------------------------
   local front_result=0
-  verify_page_on_front "$run_dir" "$id_map_tsv" 2>>"$report" || front_result=1
+  verify_page_on_front "$run_dir" "$id_map_tsv" "$manifest" 2>>"$report" || front_result=1
   if [ "$front_result" -eq 0 ]; then
     echo "- [x] page_on_front resolves to the correctly remapped page (or A never configured one)" >> "$report"
   else

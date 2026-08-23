@@ -256,6 +256,21 @@ page, A's domain string is absent from B's migrated content, and (if configured)
 HTTP smoke check that B's front page actually renders with an expected marker.
 Writes a report into the run directory and exits non-zero on any hard failure.
 
+Every check in the report is accounted for on every run — verified, explicitly not
+applicable, or explicitly unverifiable — never silently absent while `Result: PASS`
+still prints. Concretely:
+- The migrated-options line names how many of the selected keys were actually
+  compared, e.g. `migrated options match A's values on B (12 of 12 compared)`. If
+  some were selected but none had a value to compare against (a run interrupted
+  before the options step and later resumed), that is reported as unverified —
+  never as a plain, uncounted pass.
+- The domain-absence check always prints a line, even when no domain is configured
+  for the migration — marked not applicable rather than simply missing.
+- `page_on_front` fails verify if A had a front page selected for migration and
+  `graft` could not resolve it through `id-map.tsv` — that used to be read as "A
+  never configured one" and passed silently; a missing remap is now a hard failure,
+  not an exemption.
+
 `--dry-run` is accepted here too, but `verify` is already read-only against B by
 construction — there is nothing for it to simulate, so it just runs the real checks
 either way. This is deliberate, not an oversight: an earlier version of this phase

@@ -304,6 +304,11 @@ setup() {
 }
 
 # --- verify_page_on_front ----------------------------------------------------
+# Issue #12: verify_page_on_front now also takes the manifest, so it can tell
+# apart "page_on_front wasn't part of this run's migrate selection" (no
+# opinion to have) from "it WAS selected and A had one configured, but
+# id-map.tsv has no entry for it" (the remap did not happen — a hard
+# failure, not the exemption the old trailing clause granted it).
 
 @test "verify_page_on_front passes when B's front page resolves to the correctly remapped page" {
   local run_dir="$BATS_TEST_TMPDIR/run"
@@ -316,7 +321,7 @@ setup() {
     if [ "$1" = "option" ]; then echo "105";
     elif [ "$1" = "post" ]; then return 0; fi
   }
-  run verify_page_on_front "$run_dir" "$tsv"
+  run verify_page_on_front "$run_dir" "$tsv" '{"migrate":{"core-wp":{"option_keys":["page_on_front"]}}}'
   [ "$status" -eq 0 ]
 }
 
@@ -331,20 +336,57 @@ setup() {
     if [ "$1" = "option" ]; then echo "999"; # some OTHER existing page, not the remap
     elif [ "$1" = "post" ]; then return 0; fi
   }
-  run verify_page_on_front "$run_dir" "$tsv"
+  run verify_page_on_front "$run_dir" "$tsv" '{"migrate":{"core-wp":{"option_keys":["page_on_front"]}}}'
   [ "$status" -eq 1 ]
   [[ "$output" == *"999"* ]] || false
   [[ "$output" == *"105"* ]] || false
 }
 
-@test "verify_page_on_front is a no-op when A never had a front page configured" {
+@test "verify_page_on_front is a no-op when A never had a front page configured (page_on_front selected, but A's own value is 0)" {
   local run_dir="$BATS_TEST_TMPDIR/run"
   mkdir -p "$run_dir"
+  printf '"0"' > "${run_dir}/option-page_on_front.value"
   local tsv="${run_dir}/id-map.tsv"
   : > "$tsv"
   wp_remote() { echo "SHOULD NOT BE CALLED"; }
-  run verify_page_on_front "$run_dir" "$tsv"
+  run verify_page_on_front "$run_dir" "$tsv" '{"migrate":{"core-wp":{"option_keys":["page_on_front"]}}}'
   [ "$status" -eq 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
+@test "verify_page_on_front is a no-op when page_on_front was not part of this run's migrate selection" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  # A stale option-page_on_front.value + id-map.tsv from a PRIOR run that DID
+  # select it, still sitting in run_dir — this run's manifest does not select
+  # it. Must not be treated as a failed remap of THIS run.
+  printf '"5"' > "${run_dir}/option-page_on_front.value"
+  local tsv="${run_dir}/id-map.tsv"
+  : > "$tsv" # no mapping — would be a hard fail if this run had selected page_on_front
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  local manifest='{"migrate":{"core-wp":{"option_keys":["page"]}}}'
+  run verify_page_on_front "$run_dir" "$tsv" "$manifest"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
+# --- Issue #12: the core defect — the remap not happening was treated as an
+# exemption ("A never configured one") instead of a failure. A configured
+# front page IS on disk (a real page ID, not 0/null/empty) and page_on_front
+# WAS part of this run's migrate selection, but id-map.tsv has no entry for
+# that page ID — core_wp_post_import's remap did not happen (or the ID
+# mapper was missing, or the imported post silently failed). This must be a
+# hard failure, not a pass.
+@test "verify_page_on_front fails when A had a front page configured and selected, but id-map.tsv has no entry for it (the remap did not happen)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '"16"' > "${run_dir}/option-page_on_front.value" # A's front page: page 16
+  local tsv="${run_dir}/id-map.tsv"
+  printf '99\t199\tpage\n' > "$tsv" # some OTHER page's mapping — nothing for 16
+  wp_remote() { echo "SHOULD NOT BE CALLED — no live lookup should happen once the remap itself is known to have failed"; }
+  run verify_page_on_front "$run_dir" "$tsv" '{"migrate":{"core-wp":{"option_keys":["page_on_front"]}}}'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"16"* ]] || false
   [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }
 
@@ -729,4 +771,142 @@ EOF
   [ "$status" -eq 0 ]
   grep -q "REMINDER" "${RUN_DIR}/verify-report.md"
   grep -q "etch" "${RUN_DIR}/verify-report.md"
+}
+
+# --- Issue #22: the domain check vanishes from the report when no domain is
+# configured ------------------------------------------------------------------
+#
+# phase_verify used to wrap the domain check in `if [ -n "$domain" ]`. With no
+# domain configured the check was skipped AND NOTHING WAS WRITTEN TO THE
+# REPORT — no [x], no [ ], no warning. The reader could not tell a check was
+# skipped, and "Result: PASS" printed regardless.
+#
+# The page_on_front check at least prints a line carrying its own caveat.
+# This one left no trace at all. Note the shared fixture's manifest already
+# sets "from": "" — so the existing suite has been exercising the skipped
+# path all along, green, without ever asserting the report says anything
+# about it.
+@test "phase_verify records the domain check even when no domain is configured" {
+  setup_phase_verify_fixture
+  local pre_sum; pre_sum=$(backup_checksum "IDENTICAL PROTECTED CONTENT")
+  cat > "${RUN_DIR}/manifest.json" <<EOF
+{
+  "frozen": true,
+  "checksums_protected_pre_graft": {"fakebooking": "sha256:${pre_sum}"},
+  "migrate": {},
+  "protect": {"fakebooking": {"tables": ["fakebooking_reservations"]}},
+  "stack": {},
+  "options": {"search_replace": {"from": "", "to": ""}}
+}
+EOF
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      eval) echo "wp_" ;;
+      db) echo "IDENTICAL PROTECTED CONTENT" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  # Whatever the outcome, the report must account for the domain check —
+  # not silently drop it while still printing Result: PASS.
+  grep -qi "domain" "${RUN_DIR}/verify-report.md"
+}
+
+@test "phase_verify's domain line explicitly marks the check not applicable when no domain is configured (not indistinguishable from a real pass)" {
+  setup_phase_verify_fixture
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  local domain_line
+  domain_line=$(grep -i "domain" "${RUN_DIR}/verify-report.md")
+  [[ "$domain_line" == *"not applicable"* ]] || false
+}
+
+# --- Issue #23: "migrated options match" is ticked having compared nothing --
+#
+# verify_options_match skips any key with no "option-<key>.value" file
+# (lib/verify.sh) — deliberate, and correct: a key graft never reached is not
+# this function's job to have an opinion about. But the REPORT did not carry
+# that nuance: it printed a plain
+#   - [x] migrated options match A's values on B
+# even when zero options were actually compared — exactly what a run
+# interrupted before the options step and then resumed produces. A green
+# tick for a check that checked nothing is the same defect PR #9 already
+# fixed for "protected data unchanged".
+@test "phase_verify does not claim migrated options match when none could be compared" {
+  setup_phase_verify_fixture
+  local pre_sum; pre_sum=$(backup_checksum "IDENTICAL PROTECTED CONTENT")
+  cat > "${RUN_DIR}/manifest.json" <<EOF
+{
+  "frozen": true,
+  "checksums_protected_pre_graft": {"fakebooking": "sha256:${pre_sum}"},
+  "migrate": {"etch": {"option_keys": ["etch_settings", "etch_styles"]}},
+  "protect": {"fakebooking": {"tables": ["fakebooking_reservations"]}},
+  "stack": {},
+  "options": {"search_replace": {"from": "https://a.example.com", "to": "https://b.example.com"}}
+}
+EOF
+  # No option-*.value files exist in RUN_DIR: graft never reached that step
+  # (a run interrupted before migrate_options and then resumed past it).
+  rm -f "${RUN_DIR}"/option-*.value
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      eval) echo "wp_" ;;
+      db) echo "IDENTICAL PROTECTED CONTENT" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  verify_domain_absent() { return 0; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  ! grep -qx -- "- \[x\] migrated options match A's values on B" "${RUN_DIR}/verify-report.md"
+}
+
+@test "phase_verify reports the exact compared-vs-selected count when migrated options genuinely all match" {
+  setup_phase_verify_fixture
+  cat > "${RUN_DIR}/manifest.json" <<'EOF'
+{
+  "frozen": true,
+  "checksums_protected_pre_graft": {},
+  "migrate": {"etch": {"option_keys": ["etch_settings", "etch_styles"]}},
+  "protect": {"_unclaimed": {"tables": []}},
+  "stack": {},
+  "options": {"search_replace": {"from": "", "to": ""}}
+}
+EOF
+  printf '{"a":1}' > "${RUN_DIR}/option-etch_settings.value"
+  printf '{"b":2}' > "${RUN_DIR}/option-etch_styles.value"
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;;
+      option)
+        # $1=option $2=get $3=<key> $4=--format=json — differentiate by key.
+        if [ "$3" = "etch_settings" ]; then echo '{"a":1}';
+        elif [ "$3" = "etch_styles" ]; then echo '{"b":2}';
+        else echo "105"; fi ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  grep -q "migrated options match A's values on B (2 of 2 compared)" "${RUN_DIR}/verify-report.md"
 }
