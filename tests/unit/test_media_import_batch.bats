@@ -310,3 +310,71 @@ php_run() {
   [[ "$output" == *'"no_local_file":[13]'* ]] || false
   [[ "$output" == *'"failed_count":1'* ]] || false
 }
+
+# --- F1: the confinement guard's own trailing slash --------------------------
+
+# The guard compares against $uploads_base . '/', not against $uploads_base.
+# That single character is the whole guard: without it a SIBLING directory
+# whose name merely starts with the uploads path passes the prefix test.
+# Measured with the slash removed:
+#   uploads = .../probe/uploads , rel_path = "../uploads-evil/secret.php"
+#   real code -> failed "resolves outside", inserts 0
+#   mutant    -> {"imported":[1],"map":{"1":1000}}
+# A file from a sibling directory registered as an attachment on B — and
+# graft_prune_previous_run's `wp post delete --force` would delete it from
+# disk on the NEXT graft. Nothing pinned this before.
+@test "sitegraft_media_import_batch refuses a sibling directory whose name merely starts with the uploads path" {
+  local evil="${UPLOADS}-evil"
+  mkdir -p "$evil"
+  printf 'pretend this is wp-config' > "${evil}/secret.php"
+  run php_run '
+    $r = sitegraft_media_import_batch([["old" => 77, "rel_path" => "../'"$(basename "$evil")"'/secret.php", "title" => "X"]]);
+    echo json_encode([
+      "failed"   => $r["failed"],
+      "imported" => $r["imported"],
+      "inserts"  => wpstub_insert_count(),
+    ]);
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"resolves outside B's uploads directory"* ]] || false
+  [[ "$output" == *'"imported":[]'* ]] || false
+  [[ "$output" == *'"inserts":0'* ]] || false
+  [ -f "${evil}/secret.php" ]
+}
+
+# --- F2: the resume query's own result cap -----------------------------------
+
+# get_posts() defaults numberposts to 5 and copies it into posts_per_page
+# whenever posts_per_page is empty, so `'posts_per_page' => -1` is what makes
+# the resume query see the WHOLE of B rather than its five most recent
+# attachments. Delete it and a re-run on any site with more than five media
+# items re-imports everything past the fifth as a DUPLICATE — word for word
+# the bug the resumability design exists to prevent.
+#
+# This went undetected because the stub used to ignore posts_per_page
+# entirely: the mutant stayed green at 471/471. Six attachments, one past
+# the default cap, is the smallest case that bites.
+@test "sitegraft_media_import_batch sees every already-present attachment on resume, past get_posts' default five-row cap" {
+  run php_run '
+    $req = [];
+    for ($old = 1; $old <= 6; $old++) {
+      wpstub_add_existing(900 + $old, $old);
+      $req[] = ["old" => $old, "rel_path" => "2024/01/a.jpg", "title" => "A"];
+    }
+    $r = sitegraft_media_import_batch($req);
+    echo json_encode([
+      "imported"     => $r["imported"],
+      "already"      => count($r["already_present"]),
+      "map_size"     => count((array) $r["map"]),
+      "inserts"      => wpstub_insert_count(),
+      "ok"           => $r["ok"],
+    ]);
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"imported":[]'* ]] || false
+  [[ "$output" == *'"already":6'* ]] || false
+  [[ "$output" == *'"map_size":6'* ]] || false
+  # The one that matters: nothing was re-imported as a duplicate.
+  [[ "$output" == *'"inserts":0'* ]] || false
+  [[ "$output" == *'"ok":true'* ]] || false
+}

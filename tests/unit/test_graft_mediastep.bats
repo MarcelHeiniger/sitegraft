@@ -163,15 +163,27 @@ _capture_b_eval() {
   [[ "$(cat "$captured_eval")" == *"post_title"* ]] || false
 }
 
-# N2: get_the_title() runs the post title through the `the_title` filter,
-# on which WordPress core itself hangs wptexturize, convert_chars and trim,
-# and which prefixes "Protected: " for a password-protected attachment. A
-# graft must carry A's stored title to B byte for byte, so the collection
-# reads the raw column via get_post_field( 'post_title', $id ) instead.
-# tests/unit/fixtures/wpstub.php models that divergence with a loud
-# "FILTERED:" marker, so this is a behavioural assertion on the real
-# captured eval, not a grep for a function name.
-@test "graft_collect_attachment_metadata_json reads A's stored post_title verbatim, never the filtered get_the_title()" {
+# N2, and the third stub-fidelity finding on top of it. Two different
+# lossy reads have to be excluded here, and the stub models both with loud
+# markers so this is a behavioural assertion on the real captured eval, not
+# a grep for a function name:
+#
+#   FILTERED:         get_the_title(), which core runs through the
+#                     `the_title` filter (wptexturize, convert_chars, trim,
+#                     and a "Protected: " prefix on password-protected
+#                     posts). Verified in wp-includes/default-filters.php.
+#   DISPLAYFILTERED:  get_post_field( 'post_title', $id ) WITHOUT a third
+#                     argument, whose $context defaults to "display" and
+#                     therefore runs `apply_filters( "post_title", ... )`.
+#                     Stock core hangs nothing there, so on a clean install
+#                     this looks identical to raw -- but any plugin on A can
+#                     hook it, and a graft must carry A's stored bytes, not
+#                     what A's plugins render.
+#
+# Only get_post_field( ..., "raw" ) short-circuits sanitize_post_field
+# before any filter. The stub used to ignore $context entirely, which is
+# what made the imprecise two-argument call pass.
+@test "graft_collect_attachment_metadata_json reads A's stored post_title raw, past both the the_title and post_title display filters" {
   [ -f "$WP_STUB" ] || skip "tests/unit/fixtures/wpstub.php not found"
   command -v php >/dev/null 2>&1 || skip "php CLI not available in this environment"
   local captured_eval="$BATS_TEST_TMPDIR/captured_eval.txt"
@@ -183,6 +195,27 @@ _capture_b_eval() {
   run jq -r '.[0].title' <<<"$output"
   [ "$status" -eq 0 ]
   [ "$output" = "Sunset over the lake -- 2024" ]
+}
+
+# F3, A side, same defect class as the batch's resume query. get_posts()
+# defaults numberposts to 5 and copies it into posts_per_page whenever
+# posts_per_page is empty, so `"posts_per_page" => -1` is the only thing
+# making this eval return EVERY attachment on A rather than its five most
+# recent. Lose it and the collection silently truncates — the graft would
+# then migrate five media items off a site with hundreds and report
+# complete success, because every one of the five it asked about did land.
+# Six attachments is the smallest case past the default cap.
+@test "graft_collect_attachment_metadata_json collects every attachment on A, past get_posts' default five-row cap" {
+  [ -f "$WP_STUB" ] || skip "tests/unit/fixtures/wpstub.php not found"
+  command -v php >/dev/null 2>&1 || skip "php CLI not available in this environment"
+  local captured_eval="$BATS_TEST_TMPDIR/captured_eval.txt"
+  wp_remote() { printf '%s' "$3" > "$captured_eval"; echo '[]'; }
+  graft_collect_attachment_metadata_json a >/dev/null
+  run php_eval_captured "$captured_eval" \
+    'for ($i = 1; $i <= 6; $i++) { wpstub_add_attachment(10 + $i, "title " . $i, "2024/01/" . $i . ".jpg"); }'
+  [ "$status" -eq 0 ]
+  run jq -e 'length == 6' <<<"$output"
+  [ "$status" -eq 0 ]
 }
 
 # BLOCKER 2, A side. A latin1 byte in a post title is routine on the
@@ -204,6 +237,36 @@ _capture_b_eval() {
   [ "$status" -eq 0 ]
   run jq -e 'type == "array" and length == 2 and .[1].title == "plain ascii"' <<<"$output"
   [ "$status" -eq 0 ]
+}
+
+# N-a. JSON_INVALID_UTF8_SUBSTITUTE landed in PHP 7.2 and NOTHING in this
+# repo declares a PHP floor -- README states no PHP requirement at all. The
+# sites this substitution exists for (old, latin1-titled WordPress) are the
+# ones most likely to predate 7.2, where naming the bare constant is a
+# fatal error: it would turn a step that merely handled non-UTF-8 badly
+# into one that cannot run at all, i.e. a regression on the exact
+# population the fix targets. Behind defined() it falls back to 0, which is
+# byte-for-byte the pre-fix call.
+#
+# This is a SHAPE assertion, deliberately: the fallback branch cannot be
+# executed on a PHP 7.2+ CLI (a constant cannot be undefined), so what is
+# pinned is that neither eval names the constant outside a defined() guard.
+# Removing either guard turns this red.
+@test "neither eval names JSON_INVALID_UTF8_SUBSTITUTE without a defined() guard, so a pre-7.2 PHP on A or B still runs" {
+  local captured_a="$BATS_TEST_TMPDIR/captured_a.txt"
+  wp_remote() { printf '%s' "$3" > "$captured_a"; echo '[]'; }
+  graft_collect_attachment_metadata_json a >/dev/null
+  local captured_b; captured_b=$(_capture_b_eval)
+  local f code_mentions
+  for f in "$captured_a" "$captured_b"; do
+    # The guarded expression is present...
+    grep -q 'defined( "JSON_INVALID_UTF8_SUBSTITUTE" ) ? JSON_INVALID_UTF8_SUBSTITUTE : 0' "$f"
+    # ...and no CODE line mentions the constant outside a defined() test.
+    # PHP comment lines inside the eval are excluded, since naming the
+    # constant in prose is not what would fatal on PHP 7.1.
+    code_mentions=$(grep 'JSON_INVALID_UTF8_SUBSTITUTE' "$f" | grep -v '^[[:space:]]*//' | grep -cv 'defined(' || true)
+    [ "$code_mentions" -eq 0 ]
+  done
 }
 
 @test "graft_import_attachments pushes the full attachment list as the payload and requires the media-import library" {
@@ -578,4 +641,32 @@ _capture_b_eval() {
   [[ "$output" == *"/site-b/wp-content/sitegraft-media-import-payload.json"* ]] || false
   [[ "$output" == *"/site-b/wp-content/sitegraft-media-import-functions.php"* ]] || false
   [[ "$output" == *"sitegraft_media_import_batch"* ]] || false
+}
+
+# On a total failure this list holds one object per attachment — 518 of them
+# on the reference pair — and a single log line carrying all of them is not
+# something a human reads at 3am, which is exactly when this message gets
+# read. The count is always stated in full; only the dump is capped.
+@test "graft_import_attachments caps the failed-attachment dump and says it capped it" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  wp_remote() {
+    if [ "$1" = "a" ]; then
+      jq -n -c '[range(1;26) | {old: ., rel_path: "2024/01/x.jpg", title: "T"}]'
+    else
+      jq -n -c '{ok: true, requested: 25, accounted_for: 25, imported: [], already_present: [],
+                 no_local_file: [], map: {},
+                 failed: [range(1;26) | {old: ., error: "file not found on B"}]}'
+    fi
+  }
+  graft_push_remap_payload() { echo "/fake/remote/payload.json"; }
+  graft_push_media_import_lib() { echo "/fake/remote/lib.php"; }
+  graft_remove_file() { :; }
+  run graft_import_attachments "$run_dir"
+  [ "$status" -ne 0 ]
+  # The full count is never hidden.
+  [[ "$output" == *"failed to import 25 of 25 attachment(s)"* ]] || false
+  [[ "$output" == *"(first 20 of 25 shown)"* ]] || false
+  # Attachment 20 is inside the window, 21 is past it.
+  [[ "$output" == *'{"old":20,'* ]] || false
+  [[ "$output" != *'{"old":21,'* ]] || false
 }

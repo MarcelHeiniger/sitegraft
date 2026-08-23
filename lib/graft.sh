@@ -562,22 +562,37 @@ graft_integrity_gate() {
 # SINGLE-quoted, so an apostrophe anywhere in it silently ends the string
 # and breaks the script.
 #
-#   - get_post_field( "post_title" ), never get_the_title(). The latter
-#     runs the title through the `the_title` filter, on which WordPress
-#     core itself hangs wptexturize, convert_chars and trim, and which
-#     prefixes "Protected: " for a password-protected attachment. A graft
-#     has to carry the stored title to B byte for byte; the pre-batch loop
-#     read the raw column (`post get --field=post_title`) and so does this.
+#   - get_post_field( "post_title", $id, "raw" ), never get_the_title(),
+#     and never get_post_field's own two-argument form. Verified against
+#     wp-includes/post.php and default-filters.php rather than assumed:
+#     core hangs wptexturize, convert_chars and trim on `the_title`, so
+#     get_the_title() is definitely lossy (and prefixes "Protected: " for a
+#     password-protected attachment). get_post_field defaults $context to
+#     "display", which runs sanitize_post_field, which returns early ONLY
+#     for "raw" and otherwise applies `apply_filters( "post_title", ... )`.
+#     Stock core hangs nothing on `post_title`, so on a clean install the
+#     two forms look identical -- but any plugin on A can hook it, and a
+#     graft must carry A's STORED bytes, not what A's plugins render. The
+#     pre-batch loop read the raw column (`post get --field=post_title`);
+#     "raw" is how this keeps that guarantee.
 #
-#   - JSON_INVALID_UTF8_SUBSTITUTE (PHP 7.2+, i.e. the whole WordPress
-#     baseline this tool supports). A title holding latin1 bytes is routine
-#     on the elderly installs a graft tool exists to migrate, and plain
-#     json_encode returns false on one ("Malformed UTF-8 characters").
-#     false echoes as the empty string, so the eval would print NOTHING and
-#     the step would die on "could not read the attachment list" --
-#     fail-closed, but undiagnosable, and with no way forward short of
-#     hand-editing the source database. Substituting the bad bytes keeps
-#     the payload parseable and keeps every other attachment in the list.
+#   - JSON_INVALID_UTF8_SUBSTITUTE, behind a defined() guard. A title
+#     holding latin1 bytes is routine on the elderly installs a graft tool
+#     exists to migrate, and plain json_encode returns false on one
+#     ("Malformed UTF-8 characters"). false echoes as the empty string, so
+#     the eval would print NOTHING and the step would die on "could not
+#     read the attachment list" -- fail-closed, but undiagnosable.
+#
+#     The guard is not decoration. The constant landed in PHP 7.2, and
+#     NOTHING in this repo declares a PHP floor -- README states no PHP
+#     requirement at all. The sites this substitution exists for (old,
+#     latin1-titled WordPress) are exactly the ones most likely to be
+#     running something older, where naming the bare constant is a fatal
+#     error: it would turn a step that merely handled non-UTF-8 badly into
+#     one that cannot run at all. Falling back to 0 is precisely the
+#     pre-fix behaviour, so on PHP < 7.2 nothing gets worse and on 7.2+ the
+#     bug is fixed. Chosen over declaring "PHP 7.2+ required", which would
+#     exclude the population this tool exists to migrate.
 graft_collect_attachment_metadata_json() {
   local alias_lc="$1"
   wp_remote "$alias_lc" eval '
@@ -594,10 +609,10 @@ graft_collect_attachment_metadata_json() {
       $out[] = array(
         "old"      => (int) $id,
         "rel_path" => (string) get_post_meta( $id, "_wp_attached_file", true ),
-        "title"    => (string) get_post_field( "post_title", $id ),
+        "title"    => (string) get_post_field( "post_title", $id, "raw" ),
       );
     }
-    echo json_encode( $out, JSON_INVALID_UTF8_SUBSTITUTE );
+    echo json_encode( $out, defined( "JSON_INVALID_UTF8_SUBSTITUTE" ) ? JSON_INVALID_UTF8_SUBSTITUTE : 0 );
   '
 }
 
@@ -682,9 +697,10 @@ graft_import_attachments() {
       echo json_encode( array( "ok" => false, "error" => "no media-import payload found or unreadable: " . json_last_error_msg() ) );
       return;
     }
-    // JSON_INVALID_UTF8_SUBSTITUTE (PHP 7.2+) for the same reason as the
-    // A-side collection above, but the stakes here are higher: by this
-    // point the batch has ALREADY done all the work — every post inserted,
+    // The same UTF-8 substitution as the A-side collection, behind the
+    // same defined() guard (see that docblock for why the guard is load-
+    // bearing rather than decoration), but the stakes here are higher: by
+    // this point the batch has ALREADY done all the work — every post inserted,
     // every _sitegraft_source_id written. A single non-UTF-8 byte anywhere
     // in the report (a filename, a WordPress error message built from a
     // path) made plain json_encode return false, which echoes as the empty
@@ -693,7 +709,7 @@ graft_import_attachments() {
     // found everything already_present and failed to encode again: a
     // permanently stuck step. The pre-batch loop never had this failure
     // mode, because it passed titles through argv and never through JSON.
-    $encoded = json_encode( sitegraft_media_import_batch( $payload ), JSON_INVALID_UTF8_SUBSTITUTE );
+    $encoded = json_encode( sitegraft_media_import_batch( $payload ), defined( "JSON_INVALID_UTF8_SUBSTITUTE" ) ? JSON_INVALID_UTF8_SUBSTITUTE : 0 );
     if ( $encoded === false ) {
       // Belt and braces, and not reachable by anything this file can
       // produce: with SUBSTITUTE the only remaining json_encode failures
@@ -810,7 +826,16 @@ graft_import_attachments() {
   # escape hatch, and it is the one that ends with the media actually
   # migrated.
   if [ "$failed_count" -gt 0 ]; then
-    log_error "failed to import ${failed_count} of ${requested_count} attachment(s) onto B: $(echo "$result_json" | jq -c '.failed') — refusing to report success; re-run to retry only the ones that failed"
+    # Capped at 20. On a total failure this list holds one object per
+    # attachment -- 518 of them on the reference pair -- and dumping all of
+    # them onto a single line produces something nobody reads at 3am, which
+    # is exactly when this message gets read. The count is already stated,
+    # and the full set is one `jq` away in the batch result.
+    local failed_sample failed_suffix
+    failed_sample=$(echo "$result_json" | jq -c '.failed[0:20]')
+    failed_suffix=""
+    [ "$failed_count" -gt 20 ] && failed_suffix=" (first 20 of ${failed_count} shown)"
+    log_error "failed to import ${failed_count} of ${requested_count} attachment(s) onto B: ${failed_sample}${failed_suffix} — refusing to report success; re-run to retry only the ones that failed"
     return 1
   fi
 }

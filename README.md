@@ -87,6 +87,15 @@ worked example (`motopress.sh.example`) are provided for writing new ones.
 - `jq` — manifest parsing
 - `gum` (falls back to `fzf`, falls back to plain text prompts) — interactive selection
 
+No minimum PHP version is required on either site: sitegraft runs on whatever
+PHP the WordPress install already runs, deliberately, because the old installs
+this tool exists to migrate are often the oldest ones. One capability does
+depend on the version — attachment titles holding bytes that are not valid
+UTF-8 (routine on pre-UTF-8 WordPress) are only substituted rather than
+rejected when PHP is 7.2 or newer, where `JSON_INVALID_UTF8_SUBSTITUTE`
+exists. Below 7.2 the attachment step behaves as it did before that handling
+was added: it fails closed rather than importing something wrong.
+
 Test-only: `bats-core` for unit tests, `ddev` for the integration test harness.
 
 ```sh

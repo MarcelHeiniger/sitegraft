@@ -283,7 +283,7 @@ function sitegraft_media_import_batch( array $requested ) {
 	// "cannot confine" -> refuse, never as "confinement passes".
 	$uploads_base_raw = rtrim( $upload_dir['basedir'], '/' );
 	$uploads_base     = realpath( $uploads_base_raw );
-	
+
 	$imported_map  = array();
 	$no_local_file = array();
 	$failed        = array();
@@ -296,7 +296,7 @@ function sitegraft_media_import_batch( array $requested ) {
 			continue;
 		}
 		$abs_path = $uploads_base_raw . '/' . ltrim( $rel_path, '/' );
-		
+
 		// Path confinement (review N1, both reviewers). ltrim( $rel_path, '/' )
 		// strips leading slashes and nothing else -- it does not stop a
 		// rel_path of "../../wp-config.php". Measured before this guard:
@@ -318,6 +318,18 @@ function sitegraft_media_import_batch( array $requested ) {
 		// tree gets the escape message. A non-existent path (escaping or not)
 		// falls through to sitegraft_media_import_one's own "file not found
 		// on B" report -- nothing was reachable, so nothing was confined out.
+		//
+		// The `$uploads_base === false` half is belt and braces, and knowingly
+		// unreachable: realpath() needs every component of a path to exist, so
+		// if realpath(basedir) failed then realpath() of any descendant of
+		// basedir fails too and $real_path is already false (checked live with
+		// both an absent basedir and a broken symlink). It is kept rather than
+		// dropped because dropping it is actively wrong, not merely redundant:
+		// with $uploads_base false, `$uploads_base . '/'` is the string "/",
+		// and strpos( $real_path, '/' ) === 0 for every absolute path -- so the
+		// guard would ACCEPT everything the moment it could no longer confine.
+		// "Cannot confine -> refuse" has to stay written down. Not counted as
+		// covered.
 		$real_path = realpath( $abs_path );
 		if ( $real_path !== false && ( $uploads_base === false || strpos( $real_path, $uploads_base . '/' ) !== 0 ) ) {
 			$failed[] = array(
@@ -326,7 +338,7 @@ function sitegraft_media_import_batch( array $requested ) {
 			);
 			continue;
 		}
-		
+
 		$title    = isset( $row['title'] ) ? (string) $row['title'] : '';
 		try {
 			$result = sitegraft_media_import_one( $old_id, $abs_path, $title );
