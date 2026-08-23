@@ -128,6 +128,7 @@ EOF
 # (hooks run unconditionally, including under --dry-run — a write here would
 # have to be wrapped, see modules/motopress.sh.example).
 etch_post_import() {
+  # shellcheck disable=SC2034 # run_dir (one of this hook's 3 documented parameters, design doc Sec3.2) is genuinely unused by this implementation -- same pattern as modules/motopress.sh.example's state_dir, kept for contract fidelity, not a real cross-file case
   local run_dir="$1" id_map_tsv="$2" wp_cmd_b="$3"
 
   local ai_key
@@ -219,6 +220,7 @@ PHP
 )
 
   log_info "etch post_import: remapping Etch component references across $(printf '%s' "$ids_json" | jq 'length') migrated post(s)..."
+  # shellcheck disable=SC2086 # intentionally unquoted: wp_cmd_b may be a multi-word wrapper (e.g. ddev exec ... wp) and must word-split, same pattern as this repo's other documented run_or_echo call sites
   run_or_echo $wp_cmd_b eval "$php"
 }
 

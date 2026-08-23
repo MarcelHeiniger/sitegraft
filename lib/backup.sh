@@ -660,14 +660,18 @@ phase_restore() {
       --yes) yes=1; shift ;;
       # MINOR found by review (Viktor): the DoD lists --dry-run for every
       # phase that writes, including restore — this was missing entirely.
-      --dry-run) SITEGRAFT_DRY_RUN=1; shift ;;
+      --dry-run)
+        # shellcheck disable=SC2034 # read via lib/core.sh's is_dry_run(), a different sourced file in the same bash process, not in this one -- a directive can't precede a one-line case branch (`pattern) cmd ;;`), only a plain command, hence the split
+        SITEGRAFT_DRY_RUN=1
+        shift
+        ;;
       *) log_error "unknown flag for restore: $1"; return 1 ;;
     esac
   done
-  [ -n "$profile" ] && [ -n "$run_dir" ] || {
+  if [ -z "$profile" ] || [ -z "$run_dir" ]; then
     log_error "restore requires --profile <name> --run <run-dir>"
     return 1
-  }
+  fi
   profile_load "$profile" || return 1
   [ -x "${run_dir}/restore.sh" ] || { log_error "no restore.sh found for run: ${run_dir}"; return 1; }
 
@@ -721,7 +725,8 @@ phase_restore() {
   # restore.sh of its own isn't actually turnkey — recovering it today would
   # mean hand-reconstructing the right ssh/rsync/wp-cli commands under
   # pressure, exactly the situation a generated restore.sh exists to avoid.
-  local pre_restore_dir="${run_dir}/pre-restore-$(date +%Y%m%dT%H%M%S)"
+  local pre_restore_dir
+  pre_restore_dir="${run_dir}/pre-restore-$(date +%Y%m%dT%H%M%S)"
   log_info "snapshotting B's current state before restoring (safety net)..."
   # MAJOR bug found by review (Viktor), same root cause and same fix as
   # phase_backup's own subshell above — see that comment for the full

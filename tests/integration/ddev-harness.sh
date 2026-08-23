@@ -172,7 +172,7 @@ jq -e '.custom_code_review.acknowledged == true' "${RUN_DIR}/manifest.json" >/de
 # default, nothing silently dropped.
 jq -e '.protect._unclaimed.post_types | index("fake_reservation") != null' "${RUN_DIR}/manifest.json" >/dev/null
 jq -e '.protect._unclaimed.post_types | index("page") != null' "${RUN_DIR}/manifest.json" >/dev/null
-MANIFEST_MODE=$(stat -f '%Lp' "${RUN_DIR}/manifest.json" 2>/dev/null || stat -c '%a' "${RUN_DIR}/manifest.json")
+MANIFEST_MODE=$(stat -c '%a' "${RUN_DIR}/manifest.json" 2>/dev/null || stat -f '%Lp' "${RUN_DIR}/manifest.json" 2>/dev/null)
 [ "$MANIFEST_MODE" = "600" ] || { echo "manifest.json is not chmod 600 (got ${MANIFEST_MODE}) — aborting"; exit 1; }
 
 if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "plan" ]; then
@@ -352,7 +352,9 @@ echo "==> asserting deletion semantics on the bare-local restore path (DoD recon
 BARE_TEST_DIR=$(mktemp -d)
 (
   unset SITE_B_SSH_HOST
+  # shellcheck disable=SC2034 # read via lib/backup.sh's backup_wp_content, sourced separately below, not in this file
   SITE_B_WP_PATH="/tmp/${PROJECT_B}"
+  # shellcheck disable=SC2034 # same as above: read via lib/backup.sh's backup_wp_content, not in this file
   SITE_B_WP_CMD="wp"
   mkdir -p "${BARE_TEST_DIR}/backup"
   backup_wp_content "${BARE_TEST_DIR}/backup/b-wp-content" >/dev/null

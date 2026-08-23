@@ -124,7 +124,7 @@ graft_push_file() {
   local alias_lc="$1" host_file="$2" dest_dir="$3" dest_name="$4"
   local prefix; prefix=$(graft_local_prefix "$alias_lc")
   if [ -n "$prefix" ]; then
-    run_or_echo bash -c "${prefix} mkdir -p '${dest_dir}' && cat '${host_file}' | ${prefix} tee '${dest_dir}/${dest_name}' >/dev/null"
+    run_or_echo bash -c "${prefix} mkdir -p '${dest_dir}' && ${prefix} tee '${dest_dir}/${dest_name}' >/dev/null < '${host_file}'"
   else
     run_or_echo mkdir -p "$dest_dir"
     run_or_echo rsync -avz "$host_file" "${dest_dir}/${dest_name}"
@@ -214,6 +214,7 @@ graft_copy_wp_content_dir() {
   mkdir -p "$staging"
 
   if [ -n "${SITE_A_SSH_HOST:-}" ]; then
+    # shellcheck disable=SC2153 # not a typo: SITE_A_WP_PATH is assigned in bin/sitegraft or a sourced profile, not in this file (cross-file, same blind spot as this file's SC2034 disables)
     run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${SITE_A_WP_PATH}/${rel_dir}/" "${staging}/"
   elif [ -n "$(graft_local_prefix a)" ]; then
     graft_pull_dir a "${SITE_A_WP_PATH}/${rel_dir}" "$staging"
@@ -595,6 +596,7 @@ graft_export_wxr() {
     local prefix; prefix=$(graft_local_prefix a)
     if [ -n "$prefix" ]; then
       local container_dir="/tmp/sitegraft-export-$$"
+      # shellcheck disable=SC2086 # intentionally unquoted: prefix may be a multi-word wrapper (e.g. ddev exec ... wp) and must word-split
       run_or_echo $prefix mkdir -p "$container_dir"
       run_or_echo wp_remote a export --post_type="$post_types_csv" --dir="$container_dir"
       graft_pull_dir a "$container_dir" "$staging"
@@ -933,6 +935,7 @@ graft_remap_featured_images() {
   # matching that sibling function's own check precisely.
   [ -s "$id_map_tsv" ] || return 0
   local old_id new_id post_type
+  # shellcheck disable=SC2094 # false positive for both this loop's own read (3<) and the awk call inside it below: id_map_tsv is only ever READ in this loop, never written. NOTE: this directive scopes to the WHOLE while/done block below (21 lines), not just this one line -- a directive can't precede a bare `done`, only a complete compound command, so it has to sit here instead of right above the awk call it's really about.
   while IFS=$'\t' read -r old_id new_id post_type <&3; do
     [ "$post_type" != "attachment" ] || continue
     local current_thumb
@@ -1086,7 +1089,9 @@ graft_migrate_options() {
 # — see that function's own domain-rewrite step.
 graft_search_replace_domain() {
   local from="$1" to="$2" id_map_tsv="$3" run_dir="$4"
-  [ -n "$from" ] && [ -s "$id_map_tsv" ] || return 0
+  if [ -z "$from" ] || [ ! -s "$id_map_tsv" ]; then
+    return 0
+  fi
 
   local post_ids_json payload_json remote_path lib_path
   post_ids_json=$(graft_migrated_post_ids_json "$id_map_tsv")
@@ -1244,7 +1249,11 @@ phase_graft() {
       --profile) profile="$2"; shift 2 ;;
       --run) run_dir="$2"; shift 2 ;;
       --allow-stack-mismatch) allow_mismatch=1; shift ;;
-      --dry-run) SITEGRAFT_DRY_RUN=1; shift ;;
+      --dry-run)
+        # shellcheck disable=SC2034 # read via lib/core.sh's is_dry_run(), a different sourced file in the same bash process, not in this one -- a directive can't precede a one-line case branch (`pattern) cmd ;;`), only a plain command, hence the split
+        SITEGRAFT_DRY_RUN=1
+        shift
+        ;;
       *) log_error "unknown flag for graft: $1"; return 1 ;;
     esac
   done

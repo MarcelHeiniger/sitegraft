@@ -1,0 +1,95 @@
+name: CI
+
+# GitHub-hosted runners only (ubuntu-latest). This repo is PUBLIC — a
+# self-hosted runner here would execute arbitrary code from fork PRs on
+# Marcel's own compute. Actions is free/unlimited on public repos, so
+# there's no reason to trade that safety away.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Read-only by default; no job needs to write anything back to the repo.
+permissions:
+  contents: read
+
+# On a PR, github.ref is refs/pull/N/merge -- unique per PR, so cancelling
+# an in-flight run when a newer push supersedes it is safe and desirable
+# (stops two full job sets racing and the checks list flapping). On a push
+# to main, github.ref is refs/heads/main -- THE SAME for every merge, so
+# unconditional cancel-in-progress would cancel a previous merge commit's
+# still-running CI (conclusion: cancelled, not failure) the moment a next
+# merge lands close behind it, silently losing that commit's CI signal.
+# Two merges 10s apart did exactly this on 2026-08-15. Only cancel on PR
+# runs; every push-to-main run gets to finish and report for itself.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  shellcheck:
+    name: Shell lint (shellcheck)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # actions/checkout v5, pinned by commit SHA (the only third-party
+      # action this workflow uses).
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: shellcheck
+        # Config lives in .shellcheckrc at repo root (auto-discovered): it
+        # disables 3 codes repo-wide (SC1091, SC2012, SC2016) that are wide,
+        # structural false positives for this codebase (dynamically-sourced
+        # module paths, sitegraft's own timestamp-named dirs, PHP source
+        # deliberately single-quoted for wp-cli/eval). Everything else stays
+        # at shellcheck's default severity — narrower false positives are
+        # disabled inline/per-file at their exact site instead (see
+        # .shellcheckrc's own header for why).
+        run: |
+          shellcheck bin/sitegraft
+          shellcheck lib/*.sh
+          shellcheck modules/*.sh modules/*.sh.example
+          shellcheck tests/integration/*.sh tests/integration/fixtures/*.sh
+
+  unit-tests:
+    name: Unit tests (bats)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install bats and sitegraft's runtime dependencies
+        # The unit suite exercises bin/sitegraft's real require_cmd checks
+        # (jq, rsync, gzip, shasum, ssh), so those need to be present too —
+        # installed explicitly rather than relying on the runner image
+        # happening to already have them. gzip is always in base Ubuntu;
+        # shasum ships in the `perl` package; ssh is `openssh-client`.
+        run: sudo apt-get update && sudo apt-get install -y bats jq rsync perl openssh-client curl
+
+      - name: bats tests/unit/
+        # Canonical run command per CLAUDE.md. Integration tests
+        # (tests/integration/ddev-harness.sh) are intentionally NOT run
+        # here — they need a real DDEV/Docker harness with two live WP
+        # sites, which this runner doesn't have.
+        run: bats tests/unit/
+
+  php-lint:
+    name: PHP lint (php -l)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install php-cli
+        run: sudo apt-get update && sudo apt-get install -y php-cli
+
+      - name: php -l on every .php file
+        run: |
+          set -euo pipefail
+          find . -path ./.git -prune -o -name '*.php' -print0 \
+            | xargs -0 -n1 php -l

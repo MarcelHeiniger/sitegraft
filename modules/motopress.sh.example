@@ -45,6 +45,7 @@ EOF
 # already sourced by the time any module hook runs; a future module never
 # needs its own dry-run check.
 motopress_post_import() {
+  # shellcheck disable=SC2034 # state_dir (one of this hook's 3 documented parameters) is genuinely unused in this deliberately minimal worked example -- the other 5 files' SC2034 directives in this repo (6 sites total, ddev-harness.sh has two) are for the real cross-file-sourcing blind spot; this one is just an unused example param kept for contract fidelity
   state_dir="$1"
   id_map_tsv="$2"
   wp_cmd_b="$3"
@@ -52,8 +53,10 @@ motopress_post_import() {
   # "related_room_id" postmeta pointing at another migrated post.
   while IFS=$'\t' read -r old_id new_id post_type; do
     [ "$post_type" = "mphb_room_type" ] || continue
+    # Not a shellcheck disable (shellcheck doesn't flag SC2086 in COMMAND-name position, only argument position, so there's no finding to suppress here) -- documented for symmetry with the other 5 sites: wp_cmd_b is intentionally unquoted because it may be a multi-word wrapper (e.g. ddev exec ... wp) and must word-split.
     $wp_cmd_b post list --post_type=mphb_booking --meta_key=related_room_id \
       --meta_value="$old_id" --field=ID | while read -r booking_id; do
+        # shellcheck disable=SC2086 # intentionally unquoted: wp_cmd_b may be a multi-word wrapper (e.g. ddev exec ... wp) and must word-split
         run_or_echo $wp_cmd_b post meta update "$booking_id" related_room_id "$new_id"
     done
   done < "$id_map_tsv"

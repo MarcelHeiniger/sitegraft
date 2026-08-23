@@ -1,0 +1,34 @@
+# shellcheck config for CI (.github/workflows/ci.yml).
+#
+# Every code below is disabled repo-wide because it is a systemic false
+# positive for sitegraft's architecture, not a masked real problem — it
+# recurs (or would recur on any future file following the same pattern)
+# across many sites, and reviewers (Viktor, Kimi) measured that each one
+# is a wide, structural blind spot rather than a couple of one-off calls.
+# Anything NOT listed here still fails CI at shellcheck's default (style)
+# severity. Narrow, few-site cases (SC2153, SC2094, SC1003, SC2086, and
+# SC2034) are disabled inline at the exact site instead of here — line
+# scope where shellcheck allows it, one exception (SC2094 in lib/graft.sh)
+# scoped to its whole enclosing loop only because shellcheck rejects a
+# directive placed directly before a bare `done` (see that site's own
+# comment). This is precisely so a REAL future instance of the same code
+# — e.g. a typo'd env var, or a genuine read+write of the same file —
+# still fails CI instead of being silently waved through by a blanket
+# exclusion.
+
+# SC1091 (not following sourced file): lib/<phase>.sh and modules/*.sh are
+# sourced by a path computed at runtime (require_lib, the module loop in
+# lib/modules.sh) — not statically resolvable. The one constant source
+# (bin/sitegraft -> lib/core.sh) already has its own `# shellcheck source=`.
+disable=SC1091
+
+# SC2012 (use find instead of ls -dt): the only inputs are sitegraft's own
+# timestamp-named run directories (<profile>-YYYYMMDDThhmmss) — no
+# untrusted/arbitrary filenames — and mtime ordering (-dt) is the actual
+# intent, which find can't express as directly.
+disable=SC2012
+
+# SC2016 (single quotes don't expand): every flagged instance intentionally
+# single-quotes PHP source handed to `wp eval` / `wp db query`, so bash must
+# NOT expand $vars inside it.
+disable=SC2016

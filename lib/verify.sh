@@ -280,7 +280,11 @@ verify_domain_absent() {
 verify_page_on_front() {
   local run_dir="$1" id_map_tsv="$2"
   local old_front_id
-  old_front_id=$(cat "${run_dir}/option-page_on_front.value" 2>/dev/null | tr -d '"')
+  # A missing file here fails the `<` redirect itself (bash-level error, not
+  # tr's), which would abort under `set -e` on its own — safe only because
+  # every caller of this function (verify.sh:447) invokes it as the LHS of
+  # `||`, which neutralizes `set -e` for the whole command per bash's rules.
+  old_front_id=$(tr -d '"' 2>/dev/null < "${run_dir}/option-page_on_front.value")
   case "$old_front_id" in
     ''|null|false|0) return 0 ;; # A never had a front page configured — nothing to check
   esac
@@ -398,6 +402,7 @@ phase_verify() {
 
   if is_dry_run; then
     log_info "verify is read-only against B (design doc §6.5) — --dry-run has nothing to simulate; running the real checks as usual"
+    # shellcheck disable=SC2034 # read via lib/core.sh's is_dry_run(), a different sourced file in the same bash process, not in this one
     SITEGRAFT_DRY_RUN=0
   fi
 

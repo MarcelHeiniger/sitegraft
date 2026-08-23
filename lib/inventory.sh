@@ -31,6 +31,7 @@ SITEGRAFT_SNIPPET_PLUGIN_SLUGS='["code-snippets","wpcode","insert-headers-and-fo
 sq() {
   local s="$1"
   local q="'"
+  # shellcheck disable=SC1003 # not an unfinished escape: bq deliberately holds one literal backslash character as data (see the comment above sq() for why)
   local bq='\'
   s="${s//$q/${q}${bq}${q}${q}}"
   printf "'%s'" "$s"
@@ -98,7 +99,8 @@ wp_remote() {
     # $wp_cmd itself is deliberately left UNQUOTED in the built string, same
     # as the local branch below: it may be a multi-word wrapper, and this is
     # meant to word-split remotely too.
-    local remote_cmd="${wp_cmd} --path=$(sq "$path")"
+    local remote_cmd
+    remote_cmd="${wp_cmd} --path=$(sq "$path")"
     local arg
     for arg in "$@"; do
       remote_cmd="${remote_cmd} $(sq "$arg")"
@@ -135,6 +137,7 @@ wp_remote() {
     # within a single word, so plain word-splitting is safe here. Unlike the
     # ssh branch, "$@" is passed as real, separate argv elements straight to
     # exec — no re-quoting needed, there is no second shell in between.
+    # shellcheck disable=SC2086 # intentionally unquoted: wp_cmd may be a multi-word wrapper and must word-split (see comment above)
     run_or_echo $wp_cmd --path="$path" "$@"
   fi
 }
@@ -619,6 +622,7 @@ phase_scan() {
     # real (harmless) read-only queries, rather than half-printing planned
     # commands and half-crashing on the jq step.
     log_info "scan is strictly read-only (design doc §6.1) — --dry-run has no writes to skip on A or B; running the real read-only queries as usual"
+    # shellcheck disable=SC2034 # read via lib/core.sh's is_dry_run(), a different sourced file in the same bash process, not in this one
     SITEGRAFT_DRY_RUN=0
   fi
 
@@ -639,7 +643,8 @@ phase_scan() {
     return 1
   fi
 
-  local run_dir="${SITEGRAFT_STATE_DIR}/${profile}-$(date +%Y%m%dT%H%M%S)"
+  local run_dir
+  run_dir="${SITEGRAFT_STATE_DIR}/${profile}-$(date +%Y%m%dT%H%M%S)"
 
   # M4: scan-*.json holds a full `wp option list` dump — this can include
   # license keys, SMTP tokens, or anything else a plugin stores as an
