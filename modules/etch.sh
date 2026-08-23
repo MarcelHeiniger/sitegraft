@@ -67,6 +67,100 @@ wp_global_styles
 EOF
 }
 
+# Issue #16, closed through the extended module contract
+# (docs/decisions/0007-module-dynamic-selections.md). `etch_cpts` DEFINES
+# post types, and etch_option_keys above migrates that definition — so B
+# used to receive the registration and none of the posts, leaving the type
+# registered and empty. The names live in the site's own option data and are
+# only knowable after `scan`, which is exactly what a `_dynamic` selection is
+# for. Each name lands in the manifest individually, so `plan`'s interactive
+# selection lists and toggles it like any other post type.
+#
+# WHAT SHAPES ARE ACCEPTED, and why this is written defensively rather than
+# against one known layout: `etch_cpts` has been seen on a real site, but its
+# internal structure has NOT been verified field by field here, and the scan
+# records whatever `wp option list --format=json` produced — which may hand
+# this function a decoded array/object or a JSON string, depending on the
+# wp-cli version's own unserialization. Three shapes are read:
+#   [ "fotos", ... ]                       a plain list of names
+#   [ {"slug":"fotos", ...}, ... ]         a list of definitions (slug, else
+#                                          post_type, else name, else key)
+#   { "fotos": {...}, ... }                a map keyed by name
+# — each also accepted as a JSON string holding the same.
+#
+# ANYTHING ELSE IS AN ERROR, not an empty list. A value this function cannot
+# read means it cannot tell "this site declares no CPTs" from "this site
+# declares CPTs I failed to parse", and only one of those is safe to act on:
+# the second silently reproduces the exact defect this closes. `plan` stops
+# and says so (see module_selection in lib/modules.sh).
+#
+# A declared name the scanned site does not actually register is DROPPED,
+# with a warning — never offered. CLAUDE.md's first rule in its original
+# form: `plan` once offered post types that did not exist, `graft` exported
+# an empty WXR, and `verify` reported PASS.
+etch_post_types_dynamic() {
+  local scan_json="$1" raw declared registered slug kept=""
+
+  raw=$(jq -c '[.options[]? | select(.option_name == "etch_cpts") | .option_value][0]' "$scan_json" 2>/dev/null) \
+    || { log_error "etch: could not read ${scan_json} while looking for the etch_cpts option — refusing to guess (re-run 'sitegraft scan')"; return 1; }
+  [ -n "$raw" ] || raw=null
+
+  # Kept as a single-quoted jq program on purpose (.shellcheckrc's SC2016
+  # note): nothing in it is a shell variable.
+  local prog='
+    def decoded:
+      if type != "string" then .
+      elif test("^\\s*$") then null
+      else (try fromjson catch error("etch_cpts is not JSON and could not be decoded")) end;
+    def name_of:
+      if type == "string" then .
+      elif type == "object" then (.slug // .post_type // .name // error("an etch_cpts entry carries no slug/post_type/name"))
+      else error("an etch_cpts entry is neither a name nor a definition object") end;
+    decoded
+    | if . == null then []
+      elif type == "array" then map(name_of)
+      elif type == "object" then (to_entries | map(if (.value | type) == "object" then (.value.slug // .value.post_type // .key) else .key end))
+      else error("etch_cpts is neither a list nor a map") end'
+
+  if ! declared=$(printf '%s' "$raw" | jq -c "$prog" 2>&1); then
+    log_error "etch: cannot read the etch_cpts option recorded in ${scan_json} (${declared}). Refusing to continue: an unreadable value cannot be told apart from 'this site declares no custom post types', and treating it as the latter is what carries Etch's post-type definitions to B while leaving their content behind (issue #16). Fix or extend etch_post_types_dynamic for this site's shape, or drive the run from a SITEGRAFT_MANIFEST_PREFILLED manifest."
+    return 1
+  fi
+
+  [ "$(printf '%s' "$declared" | jq 'length')" != "0" ] || return 0
+
+  if ! jq -e 'has("post_types") and (.post_types | type == "array")' "$scan_json" >/dev/null 2>&1; then
+    log_error "etch: ${scan_json} lists no post types, so a name declared by etch_cpts cannot be confirmed to exist on that site — refusing to offer post types that may not be there (re-run 'sitegraft scan')"
+    return 1
+  fi
+  registered=$(jq -c '[.post_types[]?.name]' "$scan_json")
+
+  while IFS= read -r slug <&3; do
+    [ -n "$slug" ] || continue
+    # WordPress caps a post-type name at 20 characters and allows only
+    # lowercase letters, digits, underscore and hyphen. A name outside that
+    # is not a post type, so it is a defect in the data, not something to
+    # quietly skip.
+    case "$slug" in
+      *[!a-z0-9_-]*)
+        log_error "etch: etch_cpts in ${scan_json} declares '${slug}', which is not a valid WordPress post-type name — refusing to plan a migration around it"
+        return 1
+        ;;
+    esac
+    if [ "${#slug}" -gt 20 ]; then
+      log_error "etch: etch_cpts in ${scan_json} declares '${slug}', longer than WordPress's 20-character post-type limit — refusing to plan a migration around it"
+      return 1
+    fi
+    if ! printf '%s' "$registered" | jq -e --arg s "$slug" 'index($s) != null' >/dev/null 2>&1; then
+      log_warn "etch: etch_cpts declares post type '${slug}', but ${scan_json} shows it is not registered on that site — leaving it out of the plan rather than offering a post type whose export would come back empty"
+      continue
+    fi
+    kept="${kept}${slug}"$'\n'
+  done 3<<< "$(printf '%s' "$declared" | jq -r '.[]')"
+
+  printf '%s' "$kept"
+}
+
 # Explicit allowlist, never a broad `etch_*` prefix — the same reasoning as
 # modules/acss.sh: `<mod>_option_keys_exclude` is documented but inert, so a
 # prefix would ship etch_license_key, etch_license_status,

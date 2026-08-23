@@ -46,6 +46,61 @@ setup() {
   [[ "$output" == *"show_on_front"* ]] || false
 }
 
+# --- core_wp_option_keys_dynamic: issue #15. `theme_mods_<stylesheet>` holds
+# the active theme's customizer settings and belongs with a migrated design,
+# but its KEY NAME depends on the site's active theme slug — unknowable until
+# `scan` has run, so a static _option_keys list can never express it. See
+# docs/decisions/0007-module-dynamic-selections.md.
+@test "core_wp_option_keys_dynamic derives theme_mods_<slug> from the scanned active theme (#15)" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  cat > "$scan" <<'EOF'
+{"active_theme":{"stylesheet":"etch-theme-child"},
+ "options":[{"option_name":"blogname"},{"option_name":"theme_mods_etch-theme-child"}]}
+EOF
+  run core_wp_option_keys_dynamic "$scan"
+  [ "$status" -eq 0 ]
+  [ "$output" = "theme_mods_etch-theme-child" ]
+}
+
+@test "core_wp_option_keys_dynamic follows whatever slug the scan actually shows, never a hardcoded one (#15)" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  cat > "$scan" <<'EOF'
+{"active_theme":{"stylesheet":"twentytwentyfive"},
+ "options":[{"option_name":"theme_mods_twentytwentyfive"}]}
+EOF
+  run core_wp_option_keys_dynamic "$scan"
+  [ "$status" -eq 0 ]
+  [ "$output" = "theme_mods_twentytwentyfive" ]
+}
+
+# graft_migrate_options (lib/graft.sh) falls back to the literal `null` when
+# `wp option get` finds nothing on A, and writes that to B. Offering a key A
+# does not have would therefore BLANK B's own theme_mods — the opposite of
+# what migrating a design is for.
+@test "core_wp_option_keys_dynamic claims nothing when the site never stored theme_mods for its active theme" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  echo '{"active_theme":{"stylesheet":"never-customized"},"options":[{"option_name":"blogname"}]}' > "$scan"
+  run core_wp_option_keys_dynamic "$scan"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "core_wp_option_keys_dynamic fails closed on a scan that records no active theme at all" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  echo '{"active_theme":{},"options":[]}' > "$scan"
+  run core_wp_option_keys_dynamic "$scan"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"active theme"* ]] || false
+}
+
+@test "core_wp_option_keys_dynamic fails closed on a scan with no options list, rather than reporting 'nothing to migrate'" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  echo '{"active_theme":{"stylesheet":"t"}}' > "$scan"
+  run core_wp_option_keys_dynamic "$scan"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"options"* ]] || false
+}
+
 @test "core_wp_post_import remaps page_on_front through id-map.tsv" {
   local run_dir="$BATS_TEST_TMPDIR/run"
   mkdir -p "$run_dir"

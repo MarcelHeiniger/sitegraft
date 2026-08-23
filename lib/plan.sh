@@ -55,26 +55,65 @@ plan_defaults() {
   # Everything else keeps the old order exactly: core-wp, etch and acss
   # declare no tables, so they still go to `migrate` when present on A, and
   # to `protect` when found only on B.
+  # Selections are resolved through module_selection (lib/modules.sh), never
+  # by calling a module's `_post_types`/`_option_keys` directly, so that the
+  # scan-computed `_dynamic` lists and the `_option_keys_exclude` globs are
+  # applied HERE — at the one point where a module's claim becomes manifest
+  # content. That placement is the whole reason issue #13's fix is complete
+  # rather than partial: graft and verify read the manifest and nothing else
+  # (graft_migrate_options, verify_*), so an option key excluded before the
+  # manifest is written is excluded everywhere downstream, with no second
+  # enforcement point to keep in sync. See
+  # docs/decisions/0007-module-dynamic-selections.md.
+  #
+  # WHICH scan a `_dynamic` function is resolved against follows the bucket
+  # the module is headed for, decided below: a module bound for `migrate`
+  # describes what leaves A, so it sees scan A; a module bound for `protect`
+  # describes what must not be touched on B, so it sees scan B. `tables` is
+  # always resolved against B — migration never copies tables by design
+  # (manifest_add_migrate takes no tables argument), so a table claim can
+  # only ever be about B.
   local mod
   for mod in $SITEGRAFT_MODULES; do
-    local pt tb ok
-    pt=$(module_has_fn "$mod" post_types && module_call "$mod" post_types | jq -R -s -c 'split("\n") | map(select(length > 0))' || echo '[]')
-    tb=$(module_has_fn "$mod" tables && module_call "$mod" tables | jq -R -s -c 'split("\n") | map(select(length > 0))' || echo '[]')
-    ok=$(module_has_fn "$mod" option_keys && module_call "$mod" option_keys | jq -R -s -c 'split("\n") | map(select(length > 0))' || echo '[]')
+    local tb_lines tb
+    tb_lines=$(module_selection "$mod" tables "$scan_b_json") || return 1
+    tb=$(_plan_lines_to_json "$tb_lines")
 
     local owns_tables=0
     [ "$(printf '%s' "$tb" | jq 'length')" != "0" ] && owns_tables=1
 
+    local bucket="" target_scan=""
     if [ "$owns_tables" = "1" ] && module_call "$mod" detect "$scan_b_json"; then
-      manifest=$(manifest_add_protect "$manifest" "$mod" "$pt" "$tb" "$ok")
+      bucket=protect; target_scan="$scan_b_json"
     elif module_call "$mod" detect "$scan_a_json"; then
-      manifest=$(manifest_add_migrate "$manifest" "$mod" "$pt" "$ok")
+      bucket=migrate; target_scan="$scan_a_json"
     elif module_call "$mod" detect "$scan_b_json"; then
+      bucket=protect; target_scan="$scan_b_json"
+    else
+      continue
+    fi
+
+    local pt_lines ok_lines pt ok
+    pt_lines=$(module_selection "$mod" post_types "$target_scan") || return 1
+    ok_lines=$(module_selection "$mod" option_keys "$target_scan") || return 1
+    pt=$(_plan_lines_to_json "$pt_lines")
+    ok=$(_plan_lines_to_json "$ok_lines")
+
+    if [ "$bucket" = migrate ]; then
+      manifest=$(manifest_add_migrate "$manifest" "$mod" "$pt" "$ok")
+    else
       manifest=$(manifest_add_protect "$manifest" "$mod" "$pt" "$tb" "$ok")
     fi
   done
 
   echo "$manifest"
+}
+
+# _plan_lines_to_json <newline_separated> — the one place the "one name per
+# line" module convention is turned into the JSON array the manifest stores.
+# Empty lines are dropped, so an empty input yields [] rather than [""].
+_plan_lines_to_json() {
+  printf '%s\n' "$1" | jq -R -s -c 'split("\n") | map(select(length > 0))'
 }
 
 # design doc §13 (review finding B2): plan only ever builds a manifest, it
@@ -438,7 +477,6 @@ phase_plan() {
   plan_warn_scope_gaps "${run_dir}/scan-a.json" "${run_dir}/scan-b.json"
 
   local manifest
-  manifest=$(plan_defaults "${run_dir}/scan-a.json" "${run_dir}/scan-b.json" "$profile")
 
   # design doc §14: runs before any step below — none of them should matter
   # until this is settled. Deviation from the plan's literal Task 2.5 wiring
@@ -454,9 +492,27 @@ phase_plan() {
     # acknowledgment AND stack decisions its scenario needs (design doc §12,
     # §14) — plan_resolve_stack's and plan_custom_code_gate's prompts are
     # skipped entirely here, same reasoning as plan_select_interactive below.
+    #
+    # plan_defaults is deliberately NOT called on this path (it used to be
+    # called unconditionally, above the branch, and its result discarded one
+    # line later). Two reasons, one cosmetic and one load-bearing: nothing
+    # here consumes module defaults, and module_selection's own failure
+    # message names SITEGRAFT_MANIFEST_PREFILLED as the way to get a run
+    # through while a module's dynamic selection is broken — which would
+    # have been a lie if a module failure still aborted this branch.
     manifest=$(cat "$SITEGRAFT_MANIFEST_PREFILLED")
     plan_custom_code_gate_check_prefilled "$manifest" "${run_dir}/scan-b.json" || return 1
   else
+    # `|| return 1`, explicit rather than left to the caller's `set -e` (the
+    # convention every other call in this function follows, and a real
+    # propagation path, not a defensive one): plan_defaults returns non-zero
+    # when a module's `_dynamic` selection function fails, and a plan built
+    # from a claim a module could not produce must never reach the freeze
+    # step (docs/decisions/0007-module-dynamic-selections.md).
+    manifest=$(plan_defaults "${run_dir}/scan-a.json" "${run_dir}/scan-b.json" "$profile") || {
+      log_error "could not build the default selections from the discovered modules — no manifest will be frozen from this run"
+      return 1
+    }
     manifest=$(plan_custom_code_gate "$manifest" "$(cat "${run_dir}/scan-b.json")") || return 1
     # `|| return 1` added to both calls below (Step 6 durcissement pass) for
     # the same reason plan_custom_code_gate already has it just above —

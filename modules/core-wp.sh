@@ -49,6 +49,54 @@ page_for_posts
 EOF
 }
 
+# Issue #15, closed through the extended module contract rather than by a
+# special case in `plan` (docs/decisions/0007-module-dynamic-selections.md).
+# The active theme's customizer settings live in `theme_mods_<stylesheet>`,
+# which belongs with a migrated design — but its KEY NAME depends on the
+# site's active theme slug, so no static list can name it. It is declared
+# here, resolved from the scan `plan` hands this function.
+#
+# WHY core-wp and not etch, where the gap was originally noted: `theme_mods_`
+# is written by WordPress core for whatever theme is active, on classic and
+# block themes alike. modules/etch.sh's own §-note explains why it keeps
+# wp_template/wp_global_styles (they are core post types that only carry a
+# design worth migrating when the target's theme is being replaced by a block
+# theme, which is what etch_detect identifies) — theme_mods_ has no such
+# condition attached, so it goes with the module that claims core's own
+# content. etch.sh's KNOWN GAP note now points here.
+#
+# The key name is correct for B as well as for A: graft's §12 stack
+# precondition refuses to run unless B's active theme matches A's, so the
+# option lands on B under the name B's own theme reads.
+#
+# Two fail-closed cases, deliberately distinguished from "nothing to claim":
+#   - the scan records no active theme  -> error. There is no such WordPress
+#     site; a scan saying otherwise cannot be reasoned from.
+#   - the scan has no options list      -> error, for the same reason. Its
+#     absence would otherwise be indistinguishable from "A never customized
+#     this theme", and those must not produce the same answer.
+# The genuine "A never customized this theme" case (an active theme with no
+# theme_mods_ row) returns nothing, successfully — and must: graft_migrate_
+# options (lib/graft.sh) falls back to the literal `null` when `wp option
+# get` finds nothing on A and writes that to B, so claiming a key A does not
+# have would BLANK B's own theme_mods.
+core_wp_option_keys_dynamic() {
+  local scan_json="$1" slug
+
+  if ! jq -e 'has("options") and (.options | type == "array")' "$scan_json" >/dev/null 2>&1; then
+    log_error "core-wp: ${scan_json} has no options list — cannot tell whether this site stored theme_mods for its active theme, so refusing to guess (re-run 'sitegraft scan')"
+    return 1
+  fi
+
+  slug=$(jq -r '.active_theme.stylesheet // .active_theme.name // ""' "$scan_json" 2>/dev/null) || slug=""
+  if [ -z "$slug" ] || [ "$slug" = "null" ]; then
+    log_error "core-wp: ${scan_json} records no active theme (active_theme.stylesheet) — every WordPress site has one, so this scan cannot be trusted to say which theme_mods_ option belongs to the design (re-run 'sitegraft scan')"
+    return 1
+  fi
+
+  jq -r --arg k "theme_mods_${slug}" '.options[]?.option_name | select(. == $k)' "$scan_json"
+}
+
 # design doc §9.3: page_on_front/page_for_posts on A hold A's OWN page IDs —
 # a plain `wp option update` would copy the wrong ID onto B. Remaps each
 # through id-map.tsv (Task 4.1's mu-plugin log, §7) after the WXR import has
