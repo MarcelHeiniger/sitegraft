@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2034 # this file sets variables read by OTHER sourced files in the same bash process (lib/*.sh sourced together by bin/sitegraft / lib/modules.sh); shellcheck lints each file in isolation and can't see that cross-file usage
 # tests/integration/ddev-harness.sh — the real safety proof of sitegraft.
 # Grows incrementally as each phase lands (design doc §10, review finding C1).
 # Spins up two disposable DDEV sites, seeds fixtures, and tears down unconditionally.
@@ -353,7 +352,9 @@ echo "==> asserting deletion semantics on the bare-local restore path (DoD recon
 BARE_TEST_DIR=$(mktemp -d)
 (
   unset SITE_B_SSH_HOST
+  # shellcheck disable=SC2034 # read via lib/backup.sh's backup_wp_content, sourced separately below, not in this file
   SITE_B_WP_PATH="/tmp/${PROJECT_B}"
+  # shellcheck disable=SC2034 # same as above: read via lib/backup.sh's backup_wp_content, not in this file
   SITE_B_WP_CMD="wp"
   mkdir -p "${BARE_TEST_DIR}/backup"
   backup_wp_content "${BARE_TEST_DIR}/backup/b-wp-content" >/dev/null

@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2034 # this file sets variables read by OTHER sourced files in the same bash process (lib/*.sh sourced together by bin/sitegraft / lib/modules.sh); shellcheck lints each file in isolation and can't see that cross-file usage
 # lib/backup.sh — phases: backup, restore. Full DB + wp-content export of B,
 # pulled to the orchestrator, plus a normalized checksum snapshot of protected
 # data and a genuinely self-contained restore.sh (design doc §6.3/§6.7, review
@@ -597,7 +596,11 @@ phase_restore() {
       --yes) yes=1; shift ;;
       # MINOR found by review (Viktor): the DoD lists --dry-run for every
       # phase that writes, including restore — this was missing entirely.
-      --dry-run) SITEGRAFT_DRY_RUN=1; shift ;;
+      --dry-run)
+        # shellcheck disable=SC2034 # read via lib/core.sh's is_dry_run(), a different sourced file in the same bash process, not in this one -- a directive can't precede a one-line case branch (`pattern) cmd ;;`), only a plain command, hence the split
+        SITEGRAFT_DRY_RUN=1
+        shift
+        ;;
       *) log_error "unknown flag for restore: $1"; return 1 ;;
     esac
   done

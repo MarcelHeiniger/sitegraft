@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2034 # this file sets variables read by OTHER sourced files in the same bash process (lib/*.sh sourced together by bin/sitegraft / lib/modules.sh); shellcheck lints each file in isolation and can't see that cross-file usage
 # lib/inventory.sh — read-only site introspection (phase: scan).
 
 # Known "snippet" plugins whose mere active presence is itself a custom-code
@@ -488,6 +487,7 @@ phase_scan() {
     # real (harmless) read-only queries, rather than half-printing planned
     # commands and half-crashing on the jq step.
     log_info "scan is strictly read-only (design doc §6.1) — --dry-run has no writes to skip on A or B; running the real read-only queries as usual"
+    # shellcheck disable=SC2034 # read via lib/core.sh's is_dry_run(), a different sourced file in the same bash process, not in this one
     SITEGRAFT_DRY_RUN=0
   fi
 

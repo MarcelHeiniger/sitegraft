@@ -7,10 +7,14 @@
 # is a wide, structural blind spot rather than a couple of one-off calls.
 # Anything NOT listed here still fails CI at shellcheck's default (style)
 # severity. Narrow, few-site cases (SC2153, SC2094, SC1003, SC2086, and
-# per-file SC2034) are disabled inline/per-file at the exact site instead
-# of here, precisely so a REAL future instance of the same code — e.g. a
-# typo'd env var, or a genuine read+write of the same file — still fails
-# CI instead of being silently waved through by a blanket exclusion.
+# SC2034) are disabled inline at the exact site instead of here — line
+# scope where shellcheck allows it, one exception (SC2094 in lib/graft.sh)
+# scoped to its whole enclosing loop only because shellcheck rejects a
+# directive placed directly before a bare `done` (see that site's own
+# comment). This is precisely so a REAL future instance of the same code
+# — e.g. a typo'd env var, or a genuine read+write of the same file —
+# still fails CI instead of being silently waved through by a blanket
+# exclusion.
 
 # SC1091 (not following sourced file): lib/<phase>.sh and modules/*.sh are
 # sourced by a path computed at runtime (require_lib, the module loop in

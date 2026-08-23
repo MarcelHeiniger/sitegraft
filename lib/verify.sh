@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2034 # this file sets variables read by OTHER sourced files in the same bash process (lib/*.sh sourced together by bin/sitegraft / lib/modules.sh); shellcheck lints each file in isolation and can't see that cross-file usage
 # lib/verify.sh — phase: verify (design doc §6.5, review finding B3). Read-only
 # smoke checks on B after a graft: catches the class of bug that "protected
 # data byte-identical" alone can never catch — a migration step that ran, or
@@ -259,7 +258,7 @@ verify_page_on_front() {
   local old_front_id
   # A missing file here fails the `<` redirect itself (bash-level error, not
   # tr's), which would abort under `set -e` on its own — safe only because
-  # every caller of this function (verify.sh:443) invokes it as the LHS of
+  # every caller of this function (verify.sh:447) invokes it as the LHS of
   # `||`, which neutralizes `set -e` for the whole command per bash's rules.
   old_front_id=$(tr -d '"' 2>/dev/null < "${run_dir}/option-page_on_front.value")
   case "$old_front_id" in
@@ -379,6 +378,7 @@ phase_verify() {
 
   if is_dry_run; then
     log_info "verify is read-only against B (design doc §6.5) — --dry-run has nothing to simulate; running the real checks as usual"
+    # shellcheck disable=SC2034 # read via lib/core.sh's is_dry_run(), a different sourced file in the same bash process, not in this one
     SITEGRAFT_DRY_RUN=0
   fi
 

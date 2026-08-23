@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2034 # this file sets variables read by OTHER sourced files in the same bash process (lib/*.sh sourced together by bin/sitegraft / lib/modules.sh); shellcheck lints each file in isolation and can't see that cross-file usage
 # lib/graft.sh — phase: graft. Rendering-stack sync/precondition, media sync,
 # WXR export/import, mu-plugin mapping, ID/domain remaps, options migration,
 # optional clean/idempotence pruning. See design doc §6.4, §9, §12.
@@ -780,7 +779,7 @@ graft_remap_featured_images() {
   # matching that sibling function's own check precisely.
   [ -s "$id_map_tsv" ] || return 0
   local old_id new_id post_type
-  # shellcheck disable=SC2094 # false positive for both this loop's own read (3<) and the awk call inside it below: id_map_tsv is only ever READ in this loop, never written
+  # shellcheck disable=SC2094 # false positive for both this loop's own read (3<) and the awk call inside it below: id_map_tsv is only ever READ in this loop, never written. NOTE: this directive scopes to the WHOLE while/done block below (21 lines), not just this one line -- a directive can't precede a bare `done`, only a complete compound command, so it has to sit here instead of right above the awk call it's really about.
   while IFS=$'\t' read -r old_id new_id post_type <&3; do
     [ "$post_type" != "attachment" ] || continue
     local current_thumb
@@ -1076,7 +1075,11 @@ phase_graft() {
       --profile) profile="$2"; shift 2 ;;
       --run) run_dir="$2"; shift 2 ;;
       --allow-stack-mismatch) allow_mismatch=1; shift ;;
-      --dry-run) SITEGRAFT_DRY_RUN=1; shift ;;
+      --dry-run)
+        # shellcheck disable=SC2034 # read via lib/core.sh's is_dry_run(), a different sourced file in the same bash process, not in this one -- a directive can't precede a one-line case branch (`pattern) cmd ;;`), only a plain command, hence the split
+        SITEGRAFT_DRY_RUN=1
+        shift
+        ;;
       *) log_error "unknown flag for graft: $1"; return 1 ;;
     esac
   done
