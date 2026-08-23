@@ -110,8 +110,14 @@ ln -s "$(pwd)/bin/sitegraft" /usr/local/bin/sitegraft
 ## 3. Set up a profile
 
 A profile is a file at `profiles/<name>.conf` describing the A/B site pair —
-hosts, WordPress install paths, and how to invoke `wp-cli` on each. Profiles are
-**safe to commit**: they never contain secrets.
+hosts, WordPress install paths, and how to invoke `wp-cli` on each. Profiles
+**never contain secrets** — but they do contain real infrastructure details:
+real hostnames, real filesystem paths, real site URLs, a real SSH user. That is
+exactly the material `CLAUDE.md` keeps out of this public repo, so profiles are
+**local-only, not committed** — `.gitignore` excludes every `profiles/*.conf`
+except `profiles/example.conf` itself, which holds only placeholders. A newly
+created profile is untracked by default; verify with `git status` before you
+ever `git add` one by hand.
 
 ```sh
 cp profiles/example.conf profiles/my-migration.conf
