@@ -457,6 +457,7 @@ graft_export_wxr() {
     local prefix; prefix=$(graft_local_prefix a)
     if [ -n "$prefix" ]; then
       local container_dir="/tmp/sitegraft-export-$$"
+      # shellcheck disable=SC2086 # intentionally unquoted: prefix may be a multi-word wrapper (e.g. ddev exec ... wp) and must word-split
       run_or_echo $prefix mkdir -p "$container_dir"
       run_or_echo wp_remote a export --post_type="$post_types_csv" --dir="$container_dir"
       graft_pull_dir a "$container_dir" "$staging"

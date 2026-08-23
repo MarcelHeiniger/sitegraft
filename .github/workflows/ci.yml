@@ -1,0 +1,69 @@
+name: CI
+
+# GitHub-hosted runners only (ubuntu-latest). This repo is PUBLIC — a
+# self-hosted runner here would execute arbitrary code from fork PRs on
+# Marcel's own compute. Actions is free/unlimited on public repos, so
+# there's no reason to trade that safety away.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Read-only by default; no job needs to write anything back to the repo.
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: Shell lint (shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: shellcheck
+        # Config lives in .shellcheckrc at repo root (auto-discovered):
+        # it disables a handful of codes that are systemic false positives
+        # for this codebase's architecture (lib/*.sh sourced together into
+        # one process, wp-cli wrapper strings intentionally word-split).
+        # Everything else stays at shellcheck's default severity.
+        run: |
+          shellcheck bin/sitegraft
+          shellcheck lib/*.sh
+          shellcheck modules/*.sh modules/*.sh.example
+          shellcheck tests/integration/*.sh
+
+  unit-tests:
+    name: Unit tests (bats)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bats
+        run: sudo apt-get update && sudo apt-get install -y bats
+
+      - name: bats tests/unit/
+        # Canonical run command per CLAUDE.md. Integration tests
+        # (tests/integration/ddev-harness.sh) are intentionally NOT run
+        # here — they need a real DDEV/Docker harness with two live WP
+        # sites, which this runner doesn't have.
+        run: bats tests/unit/
+
+  php-lint:
+    name: PHP lint (php -l)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install php-cli
+        run: sudo apt-get update && sudo apt-get install -y php-cli
+
+      - name: php -l on every .php file
+        run: |
+          set -euo pipefail
+          find . -path ./.git -prune -o -name '*.php' -print0 \
+            | xargs -0 -n1 php -l

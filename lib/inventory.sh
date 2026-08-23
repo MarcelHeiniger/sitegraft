@@ -92,7 +92,8 @@ wp_remote() {
     # $wp_cmd itself is deliberately left UNQUOTED in the built string, same
     # as the local branch below: it may be a multi-word wrapper, and this is
     # meant to word-split remotely too.
-    local remote_cmd="${wp_cmd} --path=$(sq "$path")"
+    local remote_cmd
+    remote_cmd="${wp_cmd} --path=$(sq "$path")"
     local arg
     for arg in "$@"; do
       remote_cmd="${remote_cmd} $(sq "$arg")"
@@ -129,6 +130,7 @@ wp_remote() {
     # within a single word, so plain word-splitting is safe here. Unlike the
     # ssh branch, "$@" is passed as real, separate argv elements straight to
     # exec — no re-quoting needed, there is no second shell in between.
+    # shellcheck disable=SC2086 # intentionally unquoted: wp_cmd may be a multi-word wrapper and must word-split (see comment above)
     run_or_echo $wp_cmd --path="$path" "$@"
   fi
 }
@@ -504,7 +506,8 @@ phase_scan() {
     return 1
   fi
 
-  local run_dir="${SITEGRAFT_STATE_DIR}/${profile}-$(date +%Y%m%dT%H%M%S)"
+  local run_dir
+  run_dir="${SITEGRAFT_STATE_DIR}/${profile}-$(date +%Y%m%dT%H%M%S)"
 
   # M4: scan-*.json holds a full `wp option list` dump — this can include
   # license keys, SMTP tokens, or anything else a plugin stores as an

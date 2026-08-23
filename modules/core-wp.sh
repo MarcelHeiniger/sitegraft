@@ -113,6 +113,7 @@ core_wp_post_import() {
       # while the run overall was believed dry. run_or_echo is already this
       # codebase's one standard for exactly this (see lib/core.sh) — used
       # here instead of a second, module-local dry-run check.
+      # shellcheck disable=SC2086 # intentionally unquoted: wp_cmd_b may be a multi-word wrapper (e.g. ddev exec ... wp) and must word-split
       run_or_echo $wp_cmd_b option update "$key" "$new_id"
     else
       log_warn "core-wp post_import: A's ${key} (page ${old_id}) has no corresponding entry in id-map.tsv — leaving B's ${key} unchanged (the page was likely not included in this run's migrate selection)"

@@ -657,7 +657,8 @@ phase_restore() {
   # restore.sh of its own isn't actually turnkey — recovering it today would
   # mean hand-reconstructing the right ssh/rsync/wp-cli commands under
   # pressure, exactly the situation a generated restore.sh exists to avoid.
-  local pre_restore_dir="${run_dir}/pre-restore-$(date +%Y%m%dT%H%M%S)"
+  local pre_restore_dir
+  pre_restore_dir="${run_dir}/pre-restore-$(date +%Y%m%dT%H%M%S)"
   log_info "snapshotting B's current state before restoring (safety net)..."
   # MAJOR bug found by review (Viktor), same root cause and same fix as
   # phase_backup's own subshell above — see that comment for the full
