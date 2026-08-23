@@ -258,11 +258,25 @@ EOF
 # below is what pins that difference: `sudo -u www-data wp` behind SSH is a
 # wrapper whose paths match, and must be accepted.
 
+# A stub that ignores its arguments keeps passing after the function it
+# stands in for changes how it is called, so the test quietly stops testing
+# anything. These stubs assert the alias they were handed instead: if
+# inventory_check_path_topology ever stops passing the alias first, the test
+# says so loudly rather than staying green on a signature that no longer
+# exists.
+_assert_alias() {
+  local want="$1"; shift
+  [ "${1:-}" = "$want" ] || {
+    echo "stub called with unexpected first argument: '${1:-}' (wanted '${want}')" >&2
+    return 99
+  }
+}
+
 @test "inventory_check_path_topology skips a site with no SSH_HOST (local+wrapper is supported)" {
   SITE_B_SSH_HOST=""
   SITE_B_WP_PATH="/var/www/html"
   SITE_B_WP_CMD="ddev wp"
-  wp_remote() { return 1; }   # would fail if it were consulted at all
+  wp_remote() { _assert_alias b "$@"; return 1; }   # would fail if it were consulted at all
   ssh() { return 1; }
   run inventory_check_path_topology b
   [ "$status" -eq 0 ]
@@ -271,7 +285,7 @@ EOF
 @test "inventory_check_path_topology refuses when wp-cli sees the path but the SSH host does not" {
   SITE_B_SSH_HOST="user@host"
   SITE_B_WP_PATH="/var/www/html"
-  wp_remote() { return 0; }   # wp-cli answers: the container sees the path
+  wp_remote() { _assert_alias b "$@"; return 0; }   # wp-cli answers: the container sees the path
   ssh() { return 1; }         # the host itself has no such directory
   run inventory_check_path_topology b
   [ "$status" -ne 0 ]
@@ -281,7 +295,7 @@ EOF
 @test "inventory_check_path_topology refuses when wp-cli does not answer at all" {
   SITE_B_SSH_HOST="user@host"
   SITE_B_WP_PATH="/wrong/path"
-  wp_remote() { return 1; }
+  wp_remote() { _assert_alias b "$@"; return 1; }
   ssh() { return 0; }
   run inventory_check_path_topology b
   [ "$status" -ne 0 ]
@@ -292,7 +306,7 @@ EOF
   SITE_B_SSH_HOST="user@host"
   SITE_B_WP_PATH="/var/www/site/htdocs"
   SITE_B_WP_CMD="sudo -u www-data wp"
-  wp_remote() { return 0; }
+  wp_remote() { _assert_alias b "$@"; return 0; }
   ssh() { return 0; }
   run inventory_check_path_topology b
   [ "$status" -eq 0 ]
