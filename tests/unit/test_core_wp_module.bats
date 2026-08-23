@@ -373,41 +373,74 @@ EOF
 # A whose header component referenced one. See modules/core-wp.sh's own
 # header comment on core_wp_post_types_dynamic for why this is dynamic
 # rather than a third name in core_wp_post_types above, and why it is gated
-# on nav_uses_dynamic_page_list specifically rather than on the post type
-# being registered (verified against WordPress core: wp_navigation is
-# registered unconditionally, so its mere presence in scan.post_types proves
-# nothing about whether A has any actual navigation content).
-@test "core_wp_post_types_dynamic claims wp_navigation when the scan proves A has dynamic navigation content (#17)" {
+# on nav_post_count specifically rather than on the post type being
+# registered (verified against WordPress core: wp_navigation is registered
+# unconditionally, so its mere presence in scan.post_types proves nothing
+# about whether A has any actual navigation content).
+#
+# FIX-PACK (Nat's review, second pass): the first version of this function
+# gated on nav_uses_dynamic_page_list == true instead. That is backwards for
+# #17's own acceptance criterion ("a block-theme source's navigation arrives
+# on the target and points at the target's own page IDs"): a dynamic
+# wp:page-list navigation carries NO ids at all, so it is precisely the case
+# that needs no id-remap -- while a STATIC navigation (real navigation-link
+# blocks with real page ids, the exact case _core_wp_remap_nav_page_ids
+# exists for) reads nav_uses_dynamic_page_list == false, IDENTICALLY to a
+# source with no navigation at all, and was never claimed. The old gate
+# would only ever have exercised the remap machinery on content that never
+# needed remapping in the first place. inventory_nav_post_count
+# (lib/inventory.sh) supplies the actually-missing fact -- does A have ANY
+# wp_navigation post at all, regardless of its content's shape -- and the
+# tests below are the two Nat asked for explicitly: claims when A has one,
+# does not claim when A has none.
+@test "core_wp_post_types_dynamic claims wp_navigation when the scan shows A has at least one wp_navigation post (#17)" {
   local scan="$BATS_TEST_TMPDIR/scan.json"
   cat > "$scan" <<'EOF'
-{"post_types":[{"name":"page"},{"name":"wp_navigation"}],"nav_uses_dynamic_page_list":true}
+{"post_types":[{"name":"page"},{"name":"wp_navigation"}],"nav_post_count":1}
 EOF
   run core_wp_post_types_dynamic "$scan"
   [ "$status" -eq 0 ]
   [ "$output" = "wp_navigation" ]
 }
 
-@test "core_wp_post_types_dynamic claims nothing when nav_uses_dynamic_page_list is false (#17)" {
+# The regression test that actually matters: a STATIC navigation (real
+# navigation-link blocks with real page ids -- exactly what needs the
+# id-remap this PR ships) reads nav_uses_dynamic_page_list == false. Under
+# the OLD gate (nav_uses_dynamic_page_list == true) this scan would have
+# claimed NOTHING -- the id-remap machinery would have shipped with no
+# module-driven path that ever exercises it. This is #17's own acceptance
+# criterion, word for word.
+@test "core_wp_post_types_dynamic claims wp_navigation for a STATIC navigation too -- nav_post_count > 0 regardless of nav_uses_dynamic_page_list (#17)" {
   local scan="$BATS_TEST_TMPDIR/scan.json"
   cat > "$scan" <<'EOF'
-{"post_types":[{"name":"page"},{"name":"wp_navigation"}],"nav_uses_dynamic_page_list":false}
+{"post_types":[{"name":"page"},{"name":"wp_navigation"}],"nav_post_count":1,"nav_uses_dynamic_page_list":false}
+EOF
+  run core_wp_post_types_dynamic "$scan"
+  [ "$status" -eq 0 ]
+  [ "$output" = "wp_navigation" ]
+}
+
+@test "core_wp_post_types_dynamic claims nothing when A genuinely has zero wp_navigation posts -- the false-positive guard (#17)" {
+  local scan="$BATS_TEST_TMPDIR/scan.json"
+  cat > "$scan" <<'EOF'
+{"post_types":[{"name":"page"},{"name":"wp_navigation"}],"nav_post_count":0}
 EOF
   run core_wp_post_types_dynamic "$scan"
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 }
 
-@test "core_wp_post_types_dynamic claims nothing when nav_uses_dynamic_page_list is null, i.e. the A-side query failed (#17)" {
+@test "core_wp_post_types_dynamic claims nothing when nav_post_count is null, i.e. the A-side query failed (#17)" {
   local scan="$BATS_TEST_TMPDIR/scan.json"
   cat > "$scan" <<'EOF'
-{"post_types":[{"name":"page"}],"nav_uses_dynamic_page_list":null}
+{"post_types":[{"name":"page"}],"nav_post_count":null}
 EOF
   run core_wp_post_types_dynamic "$scan"
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 }
 
-@test "core_wp_post_types_dynamic claims nothing when the scan predates nav_uses_dynamic_page_list entirely -- missing key, not malformed (#17)" {
+@test "core_wp_post_types_dynamic claims nothing when the scan predates nav_post_count entirely -- missing key, not malformed (#17)" {
   local scan="$BATS_TEST_TMPDIR/scan.json"
   echo '{"post_types":[{"name":"page"}]}' > "$scan"
   run core_wp_post_types_dynamic "$scan"
@@ -417,7 +450,7 @@ EOF
 
 @test "core_wp_post_types_dynamic fails closed on a scan with no post_types list at all (#17)" {
   local scan="$BATS_TEST_TMPDIR/scan.json"
-  echo '{"nav_uses_dynamic_page_list":true}' > "$scan"
+  echo '{"nav_post_count":1}' > "$scan"
   run core_wp_post_types_dynamic "$scan"
   [ "$status" -ne 0 ]
   [[ "$output" == *"post_types"* ]] || false

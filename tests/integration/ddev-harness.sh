@@ -121,6 +121,57 @@ jq -e '.options[] | select(.option_name=="automatic_css_settings")' "${RUN_DIR}/
 # active_theme.stylesheet: both sites resolved a real active theme.
 jq -e '.active_theme.stylesheet | length > 0' "${RUN_DIR}/scan-a.json" >/dev/null
 jq -e '.active_theme.stylesheet | length > 0' "${RUN_DIR}/scan-b.json" >/dev/null
+# nav_post_count (#17 fix-pack): site-a-seed.sh seeds exactly two
+# wp_navigation posts on A ("Main", dynamic, and "Footer", static) — the real
+# fact core_wp_post_types_dynamic's claim is gated on, distinct from
+# nav_uses_dynamic_page_list's shape question just above.
+jq -e '.nav_post_count == 2' "${RUN_DIR}/scan-a.json" >/dev/null
+jq -e '.nav_post_count == null' "${RUN_DIR}/scan-b.json" >/dev/null
+
+# Issue #17, closing the gap Nat's review found: proving core-wp's own
+# automatic CLAIM works — not merely that the id-remap mechanics work once
+# something else has already selected wp_navigation. The graft run's
+# manifest further down still lists wp_navigation BY HAND, but only because
+# that manifest also drives several proofs unrelated to this issue (media,
+# etch_cfs, fakebooking-protect) via SITEGRAFT_MANIFEST_PREFILLED — a path
+# that bypasses plan_defaults/module_selection entirely by design (the
+# escape hatch docs/decisions/0007-module-dynamic-selections.md documents
+# for scripted runs). That manifest proves nothing about whether the module
+# would have claimed wp_navigation on its own.
+#
+# module_selection (lib/modules.sh) is the one real entry point
+# plan_defaults calls — never core_wp_post_types_dynamic directly — so this
+# calls it exactly the way `plan` would, against A's genuine,
+# wp-cli-produced scan-a.json, with zero manifest involved.
+echo "==> asserting core-wp's own module_selection claims wp_navigation from A's REAL scan, with no manifest written by hand (#17)"
+. "${ROOT}/lib/core.sh"
+# shellcheck disable=SC2034 # read via lib/modules.sh's modules_discover()/module_selection(), sourced right below, not in this file -- same cross-file blind spot as this file's other SC2034 disables
+SITEGRAFT_ROOT="$ROOT"
+# shellcheck disable=SC2034 # same as above: read via lib/modules.sh's modules_discover(), not in this file
+SITEGRAFT_MODULES_DIR="${ROOT}/modules"
+. "${ROOT}/lib/modules.sh"
+modules_discover
+NAV_CLAIM=$(module_selection core_wp post_types "${RUN_DIR}/scan-a.json")
+case "$NAV_CLAIM" in
+  *wp_navigation*) : ;;
+  *) echo "FAIL: module_selection core_wp post_types did not claim wp_navigation against A's real scan (nav_post_count=2) — output: ${NAV_CLAIM}" >&2; exit 1 ;;
+esac
+echo "==> confirmed: core-wp's own module_selection claims wp_navigation from a real scan showing navigation content present"
+
+# The negative case, same real code path, against a copy of the SAME real
+# scan with nav_post_count zeroed out — the false-positive guard Nat's
+# review specifically required: a classic-theme site (A has zero
+# wp_navigation posts) must claim nothing, or verify_nav_present
+# (lib/verify.sh) would HARD FAIL every such graft by default.
+echo "==> asserting the SAME real module_selection claims NOTHING when A genuinely has no wp_navigation posts (#17)"
+NO_NAV_SCAN="${RUN_DIR}/scan-a-no-nav.json"
+jq '.nav_post_count = 0' "${RUN_DIR}/scan-a.json" > "$NO_NAV_SCAN"
+NO_NAV_CLAIM=$(module_selection core_wp post_types "$NO_NAV_SCAN")
+case "$NO_NAV_CLAIM" in
+  *wp_navigation*) echo "FAIL: module_selection core_wp post_types claimed wp_navigation against a scan recording nav_post_count=0 — this would HARD FAIL every classic-theme graft's verify_nav_present by default" >&2; exit 1 ;;
+  *) : ;;
+esac
+echo "==> confirmed: core-wp's own module_selection claims nothing when A genuinely has no wp_navigation posts"
 
 if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "scan" ]; then
   echo "SCAN OK (SITEGRAFT_HARNESS_STOP_AFTER=scan)"
