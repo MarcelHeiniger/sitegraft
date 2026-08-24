@@ -8,17 +8,28 @@
 setup() {
   load '../../lib/core.sh'
   load '../../lib/profile.sh'
+  # inventory.sh for sq(), which every path baked into a generated restore.sh
+  # goes through; bin/sitegraft sources it before backup.sh for this phase too.
+  load '../../lib/inventory.sh'
   load '../../lib/backup.sh'
 
   export SITEGRAFT_PROFILES_DIR="$BATS_TEST_TMPDIR/profiles"
   export SITEGRAFT_STATE_DIR="$BATS_TEST_TMPDIR/state"
   mkdir -p "$SITEGRAFT_PROFILES_DIR" "$SITEGRAFT_STATE_DIR"
 
+  # A real directory for B: the pre-restore snapshot's wp-content manifest is
+  # read from B's own filesystem and cross-checked against the pulled archive by
+  # entry count, so B has to hold exactly what the backup_wp_content stub below
+  # pulls.
+  B_ROOT="$BATS_TEST_TMPDIR/site-b"
+  mkdir -p "${B_ROOT}/wp-content/themes"
+  touch "${B_ROOT}/wp-content/themes/dummy.txt"
+
   cat > "${SITEGRAFT_PROFILES_DIR}/t.conf" <<EOF
 SITE_A_ALIAS="a"
 SITE_A_WP_PATH="/var/www/a"
 SITE_B_ALIAS="b"
-SITE_B_WP_PATH="/var/www/b"
+SITE_B_WP_PATH="${B_ROOT}"
 SITE_B_WP_CMD="wp"
 SITEGRAFT_STATE_DIR="${SITEGRAFT_STATE_DIR}"
 EOF
@@ -145,4 +156,59 @@ EOF
 @test "phase_restore --dry-run does not falsely report failure (MAJOR regression, same bug as phase_backup)" {
   SITEGRAFT_DRY_RUN=1 run phase_restore --profile t --run "$RUN_DIR" --yes
   [ "$status" -eq 0 ]
+}
+
+# "Even a restore has to stay reversible" is not satisfied by a snapshot whose
+# own restore.sh could not be generated. The generator refuses to leave behind
+# a script bash cannot parse, and phase_restore must stop there rather than run
+# the real restore with no way back.
+@test "phase_restore refuses to run when the pre-restore snapshot's restore.sh cannot be generated" {
+  backup_generate_restore_script() { return 1; }
+  run phase_restore --profile t --run "$RUN_DIR" --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"without a usable way back"* ]] || false
+  [[ "$output" != *"FAKE RESTORE RAN"* ]] || false
+}
+
+# --- the safety net has to be real before the destructive half runs ---
+# phase_restore's snapshot subshell is the same `( ... ) || return 1` shape as
+# phase_backup's, so bash suppresses errexit inside it and an explicit `set -e`
+# does not bring it back. Each artifact call therefore carries `|| exit 1`.
+#
+# The asymmetry matters more here than in phase_backup: this branch has NO
+# downstream artifact verification at all. If a snapshot call fails and its
+# guard is gone, the subshell still returns 0, the snapshot's own restore.sh is
+# generated over an empty or partial directory, and the real restore proceeds
+# with a safety net that cannot restore anything. Each of these asserts that
+# the restore never ran — not merely that phase_restore returned non-zero.
+
+@test "phase_restore FAILS, and never runs the restore, when the snapshot's wp-content pull fails while leaving a partial copy" {
+  backup_wp_content() {
+    local dest_dir="$1"
+    mkdir -p "${dest_dir}/themes"
+    touch "${dest_dir}/themes/dummy.txt"   # non-empty: nothing downstream would notice
+    return 1                               # ... but the pull FAILED
+  }
+  run phase_restore --profile t --run "$RUN_DIR" --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"FAKE RESTORE RAN"* ]] || false
+}
+
+@test "phase_restore FAILS, and never runs the restore, when the snapshot's database export fails while leaving a plausible dump" {
+  backup_db_export() {
+    local dest_dir="$1"
+    mkdir -p "$dest_dir"
+    printf 'fake pre-restore db snapshot' | gzip > "${dest_dir}/b-db.sql.gz"
+    return 1
+  }
+  run phase_restore --profile t --run "$RUN_DIR" --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"FAKE RESTORE RAN"* ]] || false
+}
+
+@test "phase_restore FAILS, and never runs the restore, when the snapshot's wp-content manifest cannot be recorded" {
+  backup_write_wp_content_manifest() { return 1; }
+  run phase_restore --profile t --run "$RUN_DIR" --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"FAKE RESTORE RAN"* ]] || false
 }

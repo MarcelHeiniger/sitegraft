@@ -164,6 +164,12 @@ main() {
       require_cmd rsync || exit 1
       require_cmd gzip || exit 1
       require_lib profile 1 || exit 1
+      # inventory.sh for sq(): phase_restore generates a restore.sh of its own
+      # for the pre-restore safety snapshot, and every path baked into a
+      # generated script goes through sq() (see
+      # backup_generate_restore_script's header comment). Without this the
+      # snapshot's restore.sh could not be generated at all.
+      require_lib inventory 1 || exit 1
       require_lib backup 3 || exit 1
       phase_restore "$@"
       ;;
