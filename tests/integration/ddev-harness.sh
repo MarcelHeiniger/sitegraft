@@ -170,12 +170,18 @@ echo "==> running scan"
 "${ROOT}/bin/sitegraft" scan --profile "$PROFILE"
 # `${profile}-` is the exact run-dir prefix lib/inventory.sh's phase_scan
 # writes (run_dir="${SITEGRAFT_STATE_DIR}/${profile}-$(date ...)"), so the
-# glob has to be built from the same two variables rather than the old
-# literal "ddev-test-" -- with SITEGRAFT_HARNESS_ID set, $PROFILE is
-# "ddev-test-<id>", and a glob still anchored on the bare "ddev-test-"
-# prefix would silently match nothing (state dir is scoped too, so this
-# harness's own runs live under $STATE_DIR regardless, but the prefix must
-# still agree with what phase_scan actually named the directory).
+# glob is built from the same two variables rather than the old literal
+# "ddev-test-". NOT because the bare literal would fail to match -- with
+# SITEGRAFT_HARNESS_ID set phase_scan names the directory
+# "ddev-test-<id>-<timestamp>", which a "ddev-test-*" glob matches
+# perfectly well (measured; an earlier version of this comment claimed it
+# would "silently match nothing", which is wrong). The real reason is that
+# it is the STATE DIR that isolates one session's runs from another's: on
+# a shared state dir a bare-prefix glob happily selects the most recent
+# match whoever wrote it -- the silently-operating-on-another-session's-run
+# failure the header comment describes. Deriving the glob from $PROFILE
+# keeps the discovery saying what this run is actually looking for, and
+# keeps it agreeing with whatever phase_scan named the directory.
 # B1 fix-pack (Viktor's review, measured live): `ls -dt ... | head -1` is
 # NOT safe merely because `ls` is not `ddev exec` -- `ls -dt` sorts and
 # builds its ENTIRE output before writing any of it, then writes it in one
