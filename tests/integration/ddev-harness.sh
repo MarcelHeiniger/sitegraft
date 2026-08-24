@@ -229,6 +229,16 @@ echo "==> asserting the protected-data checksum is stable across two immediate r
                             # directly below, bare-local deletion check) needs
                             # these; backup_checksum alone didn't, which is why
                             # this was missing until that check was added.
+# shellcheck source=../../lib/inventory.sh
+. "${ROOT}/lib/inventory.sh" # sq() — backup_generate_restore_script (used
+                            # directly below, bare-local deletion check) emits
+                            # every interpolated path through it. Found live on
+                            # this harness: without it the bare-local block
+                            # died with "sq: command not found" AFTER the whole
+                            # wrapped-local restore had already passed.
+                            # bin/sitegraft sources inventory before backup for
+                            # every phase that reaches that generator; this
+                            # file has to do the same.
 # shellcheck source=../../lib/backup.sh
 . "${ROOT}/lib/backup.sh"   # reuse the exact same normalized checksum
 b_table() { ddev exec --raw -p "$PROJECT_B" -- wp eval "global \$wpdb; echo \$wpdb->prefix.'$1';"; }
