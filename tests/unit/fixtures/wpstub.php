@@ -24,14 +24,24 @@
  *
  * THE RULE THIS FILE LIVES BY: a stub that is more PERMISSIVE than real
  * WordPress produces green tests about a reality that does not exist. This
- * is not hypothetical — it already happened here. get_posts() originally
- * ignored 'posts_per_page', so deleting `'posts_per_page' => -1` from
- * sitegraft_media_import_batch left the whole suite green at 471/471,
- * while on a real site it would have capped the resume query at FIVE
- * attachments (get_posts defaults numberposts to 5) and re-imported every
- * media item past the fifth as a duplicate on every re-run — precisely the
- * bug this library exists to fix. Anything modelled loosely here must be
- * modelled loosely in the SAFE direction, or written down below.
+ * is not hypothetical — it already happened here, twice, and the second time
+ * it was hiding a live fail-open in production:
+ *
+ *   - get_posts() originally ignored 'posts_per_page', so deleting
+ *     `'posts_per_page' => -1` from sitegraft_media_import_batch left the
+ *     whole suite green, while on a real site it would have capped the
+ *     resume query at FIVE attachments (get_posts defaults numberposts to 5)
+ *     and re-imported every media item past the fifth as a duplicate on
+ *     every re-run — precisely the bug this library exists to fix.
+ *   - update_post_meta() originally returned true unconditionally, which hid
+ *     that production was DROPPING its return value entirely. Measured with
+ *     the meta write failing: run 1 reported
+ *     {"ok":true,"imported":[7],"failed":[]} and run 2 inserted a second
+ *     copy of the same attachment. A stub cannot be allowed to succeed at
+ *     something the real thing can fail at.
+ *
+ * Anything modelled loosely here must be modelled loosely in the SAFE
+ * direction, or written down below.
  *
  * KNOWN DIVERGENCES, deliberate and NOT fixed — each one makes a test
  * STRONGER than reality, which is safe, but must not be mistaken for proof
@@ -85,6 +95,11 @@ $GLOBALS['wpstub'] = array(
 	'inserted'     => array(),
 	// Every wp_update_attachment_metadata call, in order.
 	'metadata_written' => array(),
+	// Meta keys whose write is refused, as a broken B would refuse it (a DB
+	// error, or a plugin short-circuiting the `update_post_metadata` filter).
+	// The write returns false AND stores nothing, which is what real failure
+	// looks like -- not merely a false return over a successful write.
+	'meta_write_fail'  => array(),
 );
 
 function wpstub_set_uploads( $dir ) {
@@ -237,7 +252,30 @@ function get_post_meta( $id, $key, $single = false ) {
 	return wpstub_meta( $id, $key );
 }
 
+/**
+ * Models real update_post_meta()'s return value, which is AMBIGUOUS and was
+ * the fourth permissivity found in this stub. Verified against
+ * wp-includes/meta.php's update_metadata():
+ *
+ *   - a plugin can short-circuit the `update_post_metadata` filter and make
+ *     it return false without writing anything;
+ *   - and it ALSO returns false when the stored value was already identical
+ *     ($old_value[0] === $meta_value), having written nothing because there
+ *     was nothing to write.
+ *
+ * So false does not mean "failed", and code that checks the boolean alone is
+ * wrong in both directions. Production reads the value back instead; this
+ * models both cases so that choice is actually pinned by a test.
+ */
 function update_post_meta( $id, $key, $value ) {
+	if ( in_array( $key, $GLOBALS['wpstub']['meta_write_fail'], true ) ) {
+		return false;
+	}
+	$existing = wpstub_meta( $id, $key );
+	if ( $existing !== '' && (string) $existing === (string) $value ) {
+		// Written already, nothing to do -- core returns false here.
+		return false;
+	}
 	$GLOBALS['wpstub']['meta'][ (int) $id ][ $key ] = $value;
 	return true;
 }
@@ -321,9 +359,11 @@ function wp_generate_attachment_metadata( $id, $file ) {
 	return array( 'file' => $file );
 }
 
+/** Real core just forwards update_post_meta(), so it inherits the same
+ * ambiguous return -- and the same ability to write nothing at all. */
 function wp_update_attachment_metadata( $id, $metadata ) {
 	$GLOBALS['wpstub']['metadata_written'][] = array( 'id' => (int) $id, 'metadata' => $metadata );
-	return true;
+	return update_post_meta( $id, '_wp_attachment_metadata', $metadata );
 }
 
 // sitegraft_media_import_one does `require_once ABSPATH .

@@ -378,3 +378,131 @@ php_run() {
   [[ "$output" == *'"inserts":0'* ]] || false
   [[ "$output" == *'"ok":true'* ]] || false
 }
+
+# --- B1: the confinement guard's own ANCHOR ---------------------------------
+
+# The sibling test above pins the trailing '/'. This one pins the `!== 0`.
+# Relaxed to `=== false`, the guard stops asking "does this path START in
+# uploads?" and starts asking "does the uploads path appear ANYWHERE in it?"
+# — and a full-path mirror satisfies that. rsnapshot, borg, a bind-mount:
+# any backup that files things under their absolute path produces one.
+#
+#   uploads   = /srv/site/wp-content/uploads
+#   real_path = /mnt/backup/srv/site/wp-content/uploads/x.jpg   <- strpos 11, not 0
+#
+# Measured: real code refuses; with the anchor relaxed,
+# {"imported":[42],"inserts":1}. And the next graft's
+# graft_prune_previous_run would then `wp post delete --force` that
+# out-of-tree file off the disk.
+#
+# pwd -P is load-bearing, not decoration: BATS_TEST_TMPDIR can be an
+# unresolved path (/tmp -> /private/tmp on macOS), while $real_path is always
+# resolved. A mirror built from the UNresolved path would not contain the
+# resolved uploads path at all, so the test would pass for the wrong reason
+# and keep passing under the mutant.
+@test "sitegraft_media_import_batch refuses a full-path mirror that contains the uploads path without starting with it" {
+  local real_tmp real_uploads mirror_file rel
+  real_tmp=$(cd "$BATS_TEST_TMPDIR" && pwd -P)
+  real_uploads="${real_tmp}/uploads"
+  # .../mirror/<the whole resolved uploads path>/x.jpg
+  mirror_file="${real_tmp}/mirror${real_uploads}/x.jpg"
+  mkdir -p "$(dirname "$mirror_file")"
+  printf 'a backup copy, not the live file' > "$mirror_file"
+  # One level up out of uploads, then down into the mirror. Constructed, not
+  # guessed, so it stays correct whatever the tmpdir happens to be.
+  rel="../mirror${real_uploads}/x.jpg"
+
+  # The premise itself is asserted: the resolved path must CONTAIN the
+  # uploads path somewhere other than position 0, or this test proves nothing.
+  [[ "$mirror_file" == *"${real_uploads}/"* ]] || false
+  [[ "$mirror_file" != "${real_uploads}/"* ]] || false
+
+  run php_run "
+    \$r = sitegraft_media_import_batch([['old' => 42, 'rel_path' => '${rel}', 'title' => 'X']]);
+    echo json_encode([
+      'failed'   => \$r['failed'],
+      'imported' => \$r['imported'],
+      'inserts'  => wpstub_insert_count(),
+    ]);
+  "
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"resolves outside B's uploads directory"* ]] || false
+  [[ "$output" == *'"imported":[]'* ]] || false
+  [[ "$output" == *'"inserts":0'* ]] || false
+  [ -f "$mirror_file" ]
+}
+
+# --- B2: the resume marker's write was never checked -------------------------
+
+# update_post_meta's return value used to be dropped on the floor, and the
+# stub used to return true unconditionally, so the two hid each other. A B
+# that cannot write the marker — a DB error, or a plugin short-circuiting the
+# `update_post_metadata` filter — produced this, measured:
+#   run1: {"ok":true,"imported":[7],"failed":[],"inserts":1}
+#   run2: {"ok":true,"imported":[7],"already":[],"inserts":2}
+# Full success reported, no marker on B, and the re-run imported a DUPLICATE
+# — word for word the bug the resumability design exists to prevent. And
+# graft_prune_previous_run could never find that attachment again.
+@test "sitegraft_media_import_batch refuses to call an attachment imported when its resume marker could not be written" {
+  run php_run '
+    $GLOBALS["wpstub"]["meta_write_fail"] = ["_sitegraft_source_id"];
+    wpstub_add_attachment(7, "A", "2024/01/a.jpg");
+    $r = sitegraft_media_import_batch([["old" => 7, "rel_path" => "2024/01/a.jpg", "title" => "A"]]);
+    echo json_encode([
+      "imported" => $r["imported"],
+      "map"      => $r["map"],
+      "failed"   => $r["failed"],
+      "ok"       => $r["ok"],
+    ]);
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"imported":[]'* ]] || false
+  [[ "$output" == *'"map":{}'* ]] || false
+  [[ "$output" == *"_sitegraft_source_id marker could not be written"* ]] || false
+  # The orphan is NAMED, so an operator can remove it deliberately. It is not
+  # auto-deleted: wp_delete_attachment reaches wp_delete_attachment_files,
+  # which would destroy the file graft_media_sync just placed on B.
+  [[ "$output" == *"post 1000"* ]] || false
+  [[ "$output" == *"will import a second copy"* ]] || false
+  # Still accounted for -- refused, never dropped on the floor.
+  [[ "$output" == *'"ok":true'* ]] || false
+}
+
+# The other half of that fix, and the reason it reads the value back instead
+# of checking the boolean. Verified against wp-includes/meta.php:
+# update_metadata returns FALSE when the stored value is already identical
+# ($old_value[0] === $meta_value) — nothing failed, there was simply nothing
+# to write. A boolean check would call that an error and fail a perfectly
+# good import; the read-back sees the marker is present and correct.
+@test "sitegraft_media_import_batch accepts a resume marker that was already correct, which core reports as a false return" {
+  run php_run '
+    // Marker already sitting on the id the insert will hand back, with no
+    // post row -- so the batch does not see it as already_present and really
+    // does go through the import path, where update_post_meta returns false
+    // for "unchanged".
+    $GLOBALS["wpstub"]["meta"][1000]["_sitegraft_source_id"] = 7;
+    wpstub_add_attachment(7, "A", "2024/01/a.jpg");
+    $r = sitegraft_media_import_batch([["old" => 7, "rel_path" => "2024/01/a.jpg", "title" => "A"]]);
+    echo json_encode(["imported" => $r["imported"], "failed" => $r["failed"], "map" => $r["map"]]);
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"imported":[7]'* ]] || false
+  [[ "$output" == *'"failed":[]'* ]] || false
+  [[ "$output" == *'"7":1000'* ]] || false
+}
+
+# Same dropped-return-value class, smaller stake: an attachment on B with no
+# _wp_attachment_metadata has no image sizes, so every thumbnail and srcset
+# on the grafted site silently falls back to the full-size file.
+@test "sitegraft_media_import_one reports a failure when the generated attachment metadata could not be stored" {
+  run php_run '
+    $GLOBALS["wpstub"]["meta_write_fail"] = ["_wp_attachment_metadata"];
+    wpstub_add_attachment(7, "A", "2024/01/a.jpg");
+    $r = sitegraft_media_import_batch([["old" => 7, "rel_path" => "2024/01/a.jpg", "title" => "A"]]);
+    echo json_encode(["imported" => $r["imported"], "failed" => $r["failed"], "ok" => $r["ok"]]);
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"imported":[]'* ]] || false
+  [[ "$output" == *"attachment metadata could not be stored"* ]] || false
+  [[ "$output" == *'"ok":true'* ]] || false
+}

@@ -209,7 +209,29 @@ function sitegraft_media_import_one( $old_id, $abs_path, $title ) {
 	}
 
 	$metadata = wp_generate_attachment_metadata( $new_id, $abs_path );
-	wp_update_attachment_metadata( $new_id, $metadata );
+	if ( is_array( $metadata ) && ! empty( $metadata ) ) {
+		// Same dropped-return-value class as the resume marker above, and
+		// checked the same way (read back, do not trust the boolean --
+		// wp_update_attachment_metadata just forwards update_post_meta's
+		// ambiguous false). An attachment on B with no _wp_attachment_metadata
+		// has no image sizes: every thumbnail and every srcset on the grafted
+		// site silently falls back to the full-size file.
+		//
+		// Only checked when there IS metadata to store: wp_generate_attachment_metadata
+		// legitimately returns an empty array for a file type WordPress
+		// generates nothing for, and that is not a failure.
+		wp_update_attachment_metadata( $new_id, $metadata );
+		$stored_metadata = get_post_meta( $new_id, '_wp_attachment_metadata', true );
+		if ( empty( $stored_metadata ) ) {
+			return array(
+				'ok'     => false,
+				'new_id' => null,
+				'error'  => 'attachment was created on B as post ' . (int) $new_id
+					. ' but its generated attachment metadata could not be stored (no image sizes would exist on B).'
+					. ' Delete post ' . (int) $new_id . ' on B before re-running.',
+			);
+		}
+	}
 
 	return array( 'ok' => true, 'new_id' => (int) $new_id, 'error' => null );
 }
@@ -346,7 +368,39 @@ function sitegraft_media_import_batch( array $requested ) {
 			$result = array( 'ok' => false, 'new_id' => null, 'error' => $e->getMessage() );
 		}
 		if ( $result['ok'] ) {
+			// The resume marker is the single write this entire design rests on:
+			// without it B carries no record of where an attachment came from, so
+			// the next call re-imports it as a DUPLICATE and
+			// graft_prune_previous_run can never find it again. Its return value
+			// used to be dropped on the floor, which made a broken B report a
+			// clean success: measured, with the meta write failing, run 1 returned
+			// {"ok":true,"imported":[7],"failed":[]} and run 2 inserted a second
+			// copy of the same attachment.
+			//
+			// Verified by READING IT BACK, not by trusting the boolean. Checked
+			// against wp-includes/meta.php: update_metadata returns false BOTH when
+			// a plugin short-circuits the `update_post_metadata` filter AND when the
+			// stored value was already identical ($old_value[0] === $meta_value),
+			// so false alone cannot tell a real failure from a harmless no-op. The
+			// read-back is unambiguous and covers both.
 			update_post_meta( $result['new_id'], '_sitegraft_source_id', $old_id );
+			$stored_marker = get_post_meta( $result['new_id'], '_sitegraft_source_id', true );
+			if ( (string) $stored_marker !== (string) $old_id ) {
+				// Deliberately NOT rolled back. wp_delete_attachment() reaches
+				// wp_delete_attachment_files() (verified in wp-includes/post.php,
+				// and MEDIA_TRASH is undefined by default so even $force_delete =
+				// false gets there), which would delete the file graft_media_sync
+				// just placed on B -- the exact disk-side destruction this file
+				// warns about elsewhere. The untagged attachment is named instead,
+				// so an operator can remove it deliberately.
+				$failed[] = array(
+					'old'   => $old_id,
+					'error' => 'attachment was created on B as post ' . (int) $result['new_id']
+						. ' but its _sitegraft_source_id marker could not be written, so this run cannot track it.'
+						. ' Delete post ' . (int) $result['new_id'] . ' on B before re-running, or the retry will import a second copy.',
+				);
+				continue;
+			}
 			$imported_map[ (string) $old_id ] = (int) $result['new_id'];
 		} else {
 			$failed[] = array( 'old' => $old_id, 'error' => (string) $result['error'] );
