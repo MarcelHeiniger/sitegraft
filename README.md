@@ -87,6 +87,21 @@ worked example (`motopress.sh.example`) are provided for writing new ones.
 - `jq` — manifest parsing
 - `gum` (falls back to `fzf`, falls back to plain text prompts) — interactive selection
 
+No minimum PHP version is required on either site: sitegraft runs on whatever
+PHP the WordPress install already runs, deliberately, because the old installs
+this tool exists to migrate are often the oldest ones. Nothing fatals on an
+older PHP. Two capabilities do get better with a newer one, and both degrade
+by failing closed rather than by importing something wrong:
+
+- Attachment titles holding bytes that are not valid UTF-8 (routine on
+  pre-UTF-8 WordPress) are substituted rather than rejected only on PHP 7.2+,
+  where `JSON_INVALID_UTF8_SUBSTITUTE` exists.
+- Per-attachment error isolation during the media import relies on catching
+  `Throwable`, which exists from PHP 7.0. On PHP 5.x an unexpected error
+  inside one attachment's import aborts that whole `wp eval` instead of being
+  recorded against that one attachment — the step still refuses to report
+  success, it just tells you less about which attachment caused it.
+
 Test-only: `bats-core` for unit tests, `ddev` for the integration test harness.
 
 ```sh

@@ -238,16 +238,40 @@ Syncs whatever the plan approved for the rendering stack, then hard-refuses if
 anything is still mismatched — pass `--allow-stack-mismatch` to override, which
 itself requires a second, louder confirmation than anything else in this tool
 (`plan`'s own copy-offer already gives you a way to avoid ever needing this flag).
-Then: media sync, WXR export/import of the selected content, ID remapping
-(attachments, featured images, `page_on_front`/`page_for_posts`), domain
-search-replace scoped to migrated content only, options migration, and any
-module-specific post-import hooks.
+Then: media sync (files copied to B's uploads directory), attachment import (every
+attachment on A registered as a WordPress attachment on B), WXR export/import of the
+selected content, ID remapping (attachments, featured images,
+`page_on_front`/`page_for_posts`), domain search-replace scoped to migrated content
+only, options migration, and any module-specific post-import hooks.
+
+Attachment import is batched, not one container invocation per attachment: a single
+`wp eval` on A collects every attachment's metadata, and a single `wp eval` on B
+imports and remaps all of them in one WordPress bootstrap. On a site with a few
+hundred attachments this completes in minutes rather than the hours a per-attachment
+loop would take. The step end-of-run report always states how many attachments were
+**actually** imported and remapped — never how many were merely requested.
+
+The step exits non-zero, naming every attachment that failed and why, if **any**
+attachment it was asked to import did not land on B — not only if the batch loses
+track of one. There is no flag to continue past that: re-running `graft` is the way
+forward, and it retries **only** what failed. Whatever did import is already
+recorded in the run's `id-map.tsv` before the step refuses, and the batch asks B
+itself which attachments already carry sitegraft's source-id marker before importing
+anything, so nothing is imported twice.
+
+One case is deliberately **not** a failure: an attachment A holds no local file for
+(external or offloaded media, i.e. no `_wp_attached_file`) was never locally storable
+in the first place. Those are listed as skips, with a warning, and the step still
+succeeds.
 
 `--dry-run` prints every command it would run instead of running it — nothing on B
-is touched. Every step is also individually idempotent (tracked via marker files in
-the run directory), so a `graft` that's interrupted partway through can simply be
-re-run and picks up where it left off, rather than starting over or duplicating
-content.
+is touched. Because A is never actually queried under `--dry-run`, the attachment
+step cannot know how many attachments exist and so cannot list them individually; it
+names the two files it would write into B's `wp-content` (the attachment payload and
+the media-import library) and remove again, plus the two `wp eval` calls. Every step
+is also individually idempotent (tracked via marker files in the run directory), so a
+`graft` that's interrupted partway through can simply be re-run and picks up where it
+left off, rather than starting over or duplicating content.
 
 ### 4.5 `verify` — confirm the graft actually worked
 

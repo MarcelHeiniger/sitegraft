@@ -512,64 +512,343 @@ graft_integrity_gate() {
 # wp-cli's `import` command. graft_media_sync (Task 4.1) has already
 # rsync'd/tar-streamed the real files onto B by the time this runs, at the
 # exact same relative wp-content/uploads/<path> A used — so this only ever
-# needs `wp media import --skip-copy` (register the already-placed local
-# file in place, per wp-cli's own docs: "media files ... are imported to
-# the library but not moved on disk") against a file already on B's own
-# filesystem. No network fetch, no dependency on A being reachable from B —
-# closer to sitegraft's own stated architecture than a WXR-based attachment
-# import could ever be.
+# needs to register the already-placed local file against a file already on
+# B's own filesystem. No network fetch, no dependency on A being reachable
+# from B — closer to sitegraft's own stated architecture than a WXR-based
+# attachment import could ever be.
 #
-# Writes id-map.tsv rows in the exact same format the mapping mu-plugin
-# produces (old_id<TAB>new_id<TAB>post_type, §7) by APPENDING — graft_fetch_id_map
-# (below) appends B's own post/term log to the same file afterward, so by
-# the time graft_remap_attachment_ids (Task 4.3) runs, id-map.tsv already
-# has a complete picture regardless of which mechanism produced which row.
+# Issue #11 rewrite: the version of this step that shelled out to
+# `wp media import --skip-copy` per attachment ran FOUR wp-cli container
+# invocations per attachment (post meta get _wp_attached_file + post get
+# --field=post_title against A, wp media import + post meta update
+# _sitegraft_source_id against B). Measured on a 518-attachment reference
+# pair: 6.4 imports/min, then 3.3 remaps/min — close to three hours for
+# this step alone, almost entirely container-startup overhead, not real
+# work. Rebuilt to mirror the content-remap mechanism (Task 4.3,
+# graft_remap_attachment_ids below): one `wp eval` on A dumps every
+# attachment's metadata as JSON in a single bootstrap
+# (graft_collect_attachment_metadata_json), then one `wp eval` on B
+# (graft_import_attachments itself, requiring
+# lib/php/media-import-functions.php) does every insert and every meta
+# write for every attachment in a single bootstrap — roughly 2000 container
+# starts replaced with two, regardless of how many attachments there are.
+#
+# Resumability is preserved at the SAME granularity the rest of this file
+# already promises (docs/usage.md: "a graft that's interrupted partway
+# through can simply be re-run... rather than starting over or duplicating
+# content") — actually tightened to true per-attachment granularity, which
+# the pre-batch per-attachment loop this replaced did NOT have: that loop
+# re-queried and unconditionally re-appended a row for every attachment on
+# every call, with no check for one already present on B, so resuming
+# after a partial interruption would have re-imported (and duplicated)
+# whatever the earlier attempt had already finished. The batch instead asks
+# B itself, in-process, which old_ids already carry _sitegraft_source_id
+# before importing anything (sitegraft_media_import_batch's own docblock),
+# and REPLACES id-map.tsv's attachment rows from that ground truth on every
+# call rather than appending to them.
+
+# graft_collect_attachment_metadata_json <alias_lc> — single wp eval
+# returning a JSON array of every attachment's { old, rel_path, title } on
+# <alias_lc>. rel_path is "" for an attachment with no _wp_attached_file
+# meta (an external/offloaded media entry, e.g.) — included rather than
+# dropped, so the batch's own accounting
+# (lib/php/media-import-functions.php, sitegraft_media_build_report) can
+# report it explicitly instead of it silently vanishing before ever
+# reaching B, the same case the pre-batch loop logged with its own
+# per-item warning.
+#
+# Two details in the eval below are load-bearing, and both are stated here
+# rather than as PHP comments inside it: that source is bash
+# SINGLE-quoted, so an apostrophe anywhere in it silently ends the string
+# and breaks the script.
+#
+#   - get_post_field( "post_title", $id, "raw" ), never get_the_title(),
+#     and never get_post_field's own two-argument form. Verified against
+#     wp-includes/post.php and default-filters.php rather than assumed:
+#     core hangs wptexturize, convert_chars and trim on `the_title`, so
+#     get_the_title() is definitely lossy (and prefixes "Protected: " for a
+#     password-protected attachment). get_post_field defaults $context to
+#     "display", which runs sanitize_post_field, which returns early ONLY
+#     for "raw" and otherwise applies `apply_filters( "post_title", ... )`.
+#     Stock core hangs nothing on `post_title`, so on a clean install the
+#     two forms look identical -- but any plugin on A can hook it, and a
+#     graft must carry A's STORED bytes, not what A's plugins render. The
+#     pre-batch loop read the raw column (`post get --field=post_title`);
+#     "raw" is how this keeps that guarantee.
+#
+#   - JSON_INVALID_UTF8_SUBSTITUTE, behind a defined() guard. A title
+#     holding latin1 bytes is routine on the elderly installs a graft tool
+#     exists to migrate, and plain json_encode returns false on one
+#     ("Malformed UTF-8 characters"). false echoes as the empty string, so
+#     the eval would print NOTHING and the step would die on "could not
+#     read the attachment list" -- fail-closed, but undiagnosable.
+#
+#     The guard is not decoration. The constant landed in PHP 7.2, and
+#     NOTHING in this repo declares a PHP floor -- README states no PHP
+#     requirement at all. The sites this substitution exists for (old,
+#     latin1-titled WordPress) are exactly the ones most likely to be
+#     running something older, where naming the bare constant is a fatal
+#     error: it would turn a step that merely handled non-UTF-8 badly into
+#     one that cannot run at all. Falling back to 0 is precisely the
+#     pre-fix behaviour, so on PHP < 7.2 nothing gets worse and on 7.2+ the
+#     bug is fixed. Chosen over declaring "PHP 7.2+ required", which would
+#     exclude the population this tool exists to migrate.
+graft_collect_attachment_metadata_json() {
+  local alias_lc="$1"
+  wp_remote "$alias_lc" eval '
+    $ids = get_posts( array(
+      "post_type"      => "attachment",
+      "post_status"    => "inherit",
+      "posts_per_page" => -1,
+      "fields"         => "ids",
+      "orderby"        => "ID",
+      "order"          => "ASC",
+    ) );
+    $out = array();
+    foreach ( $ids as $id ) {
+      $out[] = array(
+        "old"      => (int) $id,
+        "rel_path" => (string) get_post_meta( $id, "_wp_attached_file", true ),
+        "title"    => (string) get_post_field( "post_title", $id, "raw" ),
+      );
+    }
+    echo json_encode( $out, defined( "JSON_INVALID_UTF8_SUBSTITUTE" ) ? JSON_INVALID_UTF8_SUBSTITUTE : 0 );
+  '
+}
+
+# graft_push_media_import_lib <run_dir> — pushes
+# lib/php/media-import-functions.php onto B, same wrapper-aware helper and
+# lifecycle as graft_push_remap_lib (Task 4.3) uses for its own required
+# library file.
+graft_push_media_import_lib() {
+  local run_dir="$1"
+  graft_push_file b "${SITEGRAFT_ROOT}/lib/php/media-import-functions.php" "${SITE_B_WP_PATH}/wp-content" "sitegraft-media-import-functions.php"
+  printf '%s/wp-content/sitegraft-media-import-functions.php' "$SITE_B_WP_PATH"
+}
+
 graft_import_attachments() {
   local run_dir="$1"
   local id_map_tsv="${run_dir}/id-map.tsv"
-  local ids
-  ids=$(wp_remote a post list --post_type=attachment --format=csv --fields=ID 2>/dev/null | tail -n +2)
-  [ -n "$ids" ] || return 0
-  local old_id
-  for old_id in $ids; do
-    [ -n "$old_id" ] || continue
-    local rel_path title new_id
-    # Same set -e fragility class as graft_remap_featured_images' own fix
-    # (this file, MAJOR-1 fix-pack) — `post meta get` on a missing key
-    # exits non-zero, which would silently kill the whole graft under
-    # bin/sitegraft's `set -e` the first time an attachment genuinely has
-    # no _wp_attached_file (an external/offloaded media entry, say). Never
-    # actually reproduced for THIS call (the harness fixture's one
-    # attachment always has it), but fixed proactively rather than waiting
-    # to hit it live a second time.
-    rel_path=$(wp_remote a post meta get "$old_id" _wp_attached_file 2>/dev/null || true)
-    if [ -z "$rel_path" ]; then
-      log_warn "attachment ${old_id} on A has no _wp_attached_file meta — skipping (not a locally-stored file, e.g. an external/offloaded media library entry)"
-      continue
-    fi
-    title=$(wp_remote a post get "$old_id" --field=post_title 2>/dev/null)
+
+  local attachments_json
+  attachments_json=$(graft_collect_attachment_metadata_json a)
+  # Two different things land here as "not a JSON array", and the earlier
+  # version of this comment described the first one wrongly. Under
+  # bin/sitegraft's real `set -euo pipefail`, a wp-cli that EXITS non-zero
+  # never reaches this check at all: `attachments_json=$(cmd)` aborts the
+  # script on the spot. What actually gets here is (a) a wp-cli that exits
+  # ZERO while printing non-JSON — a PHP notice/warning ahead of the
+  # payload, an interactive prompt, a wrapper's own banner — and (b) a
+  # --dry-run, where wp_remote's OWN internal echo (lib/inventory.sh)
+  # substitutes literal "[dry-run] ..." text for the query. Both are
+  # detected the same way and handled according to which one happened.
+  if ! echo "$attachments_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
     if is_dry_run; then
-      printf '[dry-run] wp_remote b media import %s/wp-content/uploads/%s --skip-copy --title=%s --porcelain\n' "$SITE_B_WP_PATH" "$rel_path" "$title"
-      continue
+      # A --dry-run cannot know the attachment count: A was never queried.
+      # It CAN name the two files this step writes into B's wp-content and
+      # removes again — real writes on B that a reviewer reading a dry-run
+      # has to see, and that the single generic line here before this
+      # actively implied did not exist. The pre-batch per-attachment loop
+      # listed every file it would import; that fidelity is not recoverable
+      # without querying A, but the B-side writes are, so those are named.
+      printf '[dry-run] wp_remote a eval (collect attachment metadata for import)\n'
+      printf '[dry-run] push A'"'"'s attachment list -> %s/wp-content/sitegraft-media-import-payload.json (attachment count unknown under --dry-run: A was not queried)\n' "$SITE_B_WP_PATH"
+      printf '[dry-run] push lib/php/media-import-functions.php -> %s/wp-content/sitegraft-media-import-functions.php\n' "$SITE_B_WP_PATH"
+      printf '[dry-run] wp_remote b eval (sitegraft_media_import_batch over every attachment A reports)\n'
+      printf '[dry-run] rm %s/wp-content/sitegraft-media-import-payload.json\n' "$SITE_B_WP_PATH"
+      printf '[dry-run] rm %s/wp-content/sitegraft-media-import-functions.php\n' "$SITE_B_WP_PATH"
+      return 0
     fi
-    # Same set -e fragility class fixed elsewhere in this function/file
-    # (MAJOR-1 fix-pack) — `wp media import` failing (a corrupt file, an
-    # unsupported type) exits non-zero, which would otherwise abort the
-    # whole graft right here instead of reaching the graceful
-    # skip-and-warn handling immediately below.
-    new_id=$(wp_remote b media import "${SITE_B_WP_PATH}/wp-content/uploads/${rel_path}" --skip-copy --title="$title" --porcelain 2>/dev/null || true)
-    if [ -z "$new_id" ]; then
-      log_warn "failed to import attachment (A id ${old_id}, file ${rel_path}) onto B — was it actually placed by graft_media_sync? skipping"
-      continue
-    fi
-    # Same idempotent-reimport marker the mapping mu-plugin sets on every
-    # other imported post (§7/§11) — attachments bypass the mu-plugin
-    # entirely (see this function's own header comment), so this is set by
-    # hand here instead, to keep graft_prune_previous_run's coverage
-    # consistent across every migrated post_type, attachments included.
-    wp_remote b post meta update "$new_id" _sitegraft_source_id "$old_id" >/dev/null 2>&1
-    printf '%s\t%s\tattachment\n' "$old_id" "$new_id" >> "$id_map_tsv"
-  done
+    log_error "could not read A's attachment list — wp eval on A exited 0 but did not return a JSON array (see any output above). Raw output: ${attachments_json}"
+    return 1
+  fi
+
+  local requested_count
+  requested_count=$(echo "$attachments_json" | jq 'length')
+  [ "$requested_count" -gt 0 ] || { log_info "no attachments on A — nothing to import"; return 0; }
+
+  # Belt and braces, and knowingly unreachable today: under --dry-run
+  # wp_remote never really queries A, so $attachments_json is always the
+  # literal "[dry-run] ..." text and the branch above has already returned.
+  # Getting here at all would mean wp_remote had started executing A-side
+  # reads during a dry run — the one condition under which this second stop
+  # is worth its four lines, since everything below it writes to B. Kept
+  # deliberately; not counted as covered.
+  if is_dry_run; then
+    printf '[dry-run] wp_remote b eval (media import batch, %s attachment(s) requested)\n' "$requested_count"
+    return 0
+  fi
+
+  local remote_path lib_path
+  remote_path=$(graft_push_remap_payload "$run_dir" "$attachments_json" "sitegraft-media-import-payload.json")
+  lib_path=$(graft_push_media_import_lib "$run_dir")
+
+  # sitegraft_media_import_batch (required from the pushed lib) does every
+  # insert and every meta write for every requested attachment inside this
+  # ONE bootstrap — see that function's own docblock
+  # (lib/php/media-import-functions.php) for the idempotent-resume and
+  # fail-closed-accounting guarantees the glue code below relies on.
+  local result_json
+  result_json=$(wp_remote b eval '
+    require_once WP_CONTENT_DIR . "/sitegraft-media-import-functions.php";
+    $payload_path = WP_CONTENT_DIR . "/sitegraft-media-import-payload.json";
+    $payload = json_decode( file_get_contents( $payload_path ), true );
+    if ( ! is_array( $payload ) ) {
+      echo json_encode( array( "ok" => false, "error" => "no media-import payload found or unreadable: " . json_last_error_msg() ) );
+      return;
+    }
+    // The same UTF-8 substitution as the A-side collection, behind the
+    // same defined() guard (see that docblock for why the guard is load-
+    // bearing rather than decoration), but the stakes here are higher: by
+    // this point the batch has ALREADY done all the work — every post inserted,
+    // every _sitegraft_source_id written. A single non-UTF-8 byte anywhere
+    // in the report (a filename, a WordPress error message built from a
+    // path) made plain json_encode return false, which echoes as the empty
+    // string, which graft_import_attachments correctly refuses — leaving
+    // id-map.tsv unwritten with the import fully done. Re-running then
+    // found everything already_present and failed to encode again: a
+    // permanently stuck step. The pre-batch loop never had this failure
+    // mode, because it passed titles through argv and never through JSON.
+    $encoded = json_encode( sitegraft_media_import_batch( $payload ), defined( "JSON_INVALID_UTF8_SUBSTITUTE" ) ? JSON_INVALID_UTF8_SUBSTITUTE : 0 );
+    if ( $encoded === false ) {
+      // REACHABLE, contrary to what this comment claimed before. On PHP
+      // 7.2+ the substitution above makes json_encode succeed, and the only
+      // remaining failures would be INF/NAN, recursion or depth, none of
+      // which this report can contain. But the defined() guard deliberately
+      // falls back to flag 0 on older PHP — which README documents as
+      // supported, and which is exactly the latin1-titled population this
+      // whole substitution exists for. There, one non-UTF-8 byte in a
+      // per-item error message (a filename, typically) brings the original
+      // bug straight back. Measured on this report shape:
+      //   json_encode($report, JSON_INVALID_UTF8_SUBSTITUTE)  -> string
+      //   json_encode($report, 0)                             -> bool(false)
+      //   json_last_error_msg() -> "Malformed UTF-8 characters..."
+      // So this turns "empty stdout, no explanation" — the single hardest
+      // thing to diagnose in this whole step — into a named error. It is
+      // not exercised by the suite only because the suite runs on a PHP
+      // where the constant exists; that is a coverage gap, not a dead
+      // branch.
+      $encoded = json_encode( array( "ok" => false, "error" => "media-import batch result could not be JSON-encoded: " . json_last_error_msg() ) );
+    }
+    echo $encoded;
+  ')
+
+  graft_remove_file b "$remote_path"
+  graft_remove_file b "$lib_path"
+
+  # Fail closed: no output, or output that isn't a JSON object, means the
+  # wp eval process crashed or was killed partway through — exactly the
+  # "silently ate an error per item and reported a global success" failure
+  # mode issue #11 names as the worst possible outcome here. The actual
+  # JSON shape is what's checked, not merely a non-zero exit from
+  # run_or_echo/wp_remote — a `wp eval` that hits a genuine PHP fatal can
+  # still leave partial, unparseable text on stdout.
+  if ! echo "$result_json" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    log_error "media import batch on B produced no parseable result — refusing to report success. Raw output: ${result_json}"
+    return 1
+  fi
+
+  local batch_error
+  batch_error=$(echo "$result_json" | jq -r '.error // empty')
+  if [ -n "$batch_error" ]; then
+    log_error "media import batch on B failed: ${batch_error}"
+    return 1
+  fi
+
+  local ok
+  ok=$(echo "$result_json" | jq -r '.ok')
+  if [ "$ok" != "true" ]; then
+    log_error "media import batch on B did not account for every requested attachment: $(echo "$result_json" | jq -c '{requested, accounted_for}') — refusing to report success"
+    return 1
+  fi
+
+  # Replace id-map.tsv's attachment rows from this call's ground-truth map
+  # (imported now, or already present from an earlier partial call of this
+  # same step) — never append. See this function's own header comment for
+  # why append-only was the pre-batch implementation's duplicate-row bug on
+  # a resumed, partially-completed step.
+  # N5: `.map` missing entirely (an object result from some future/older
+  # library version) sent `jq -r '.map | to_entries[]'` into "null (null)
+  # has no keys", jq exit 5, INSIDE a `map_tsv=$(...)` assignment — under
+  # bin/sitegraft's real `set -euo pipefail` that aborts the whole script
+  # on a raw jq error line instead of this function's own controlled
+  # log_error, exactly what the `type == "object"` guard above already
+  # exists to prevent one level up. An EMPTY map is fine and expected (see
+  # sitegraft_media_build_report's stdClass note) — what is refused is a
+  # map that is absent or not an object.
+  if ! echo "$result_json" | jq -e '(.map | type) == "object"' >/dev/null 2>&1; then
+    log_error "media import batch on B returned no usable id map (.map is absent or not a JSON object) — refusing to rewrite id-map.tsv. Raw output: ${result_json}"
+    return 1
+  fi
+
+  local other_rows map_tsv
+  other_rows=""
+  [ -f "$id_map_tsv" ] && other_rows=$(awk -F'\t' '$3!="attachment"' "$id_map_tsv")
+  map_tsv=$(echo "$result_json" | jq -r '.map | to_entries[] | "\(.key)\t\(.value)\tattachment"')
+  {
+    [ -z "$other_rows" ] || printf '%s\n' "$other_rows"
+    [ -z "$map_tsv" ] || printf '%s\n' "$map_tsv"
+  } > "$id_map_tsv"
+
+  local imported_count already_present_count no_local_file_count failed_count
+  imported_count=$(echo "$result_json" | jq '.imported | length')
+  already_present_count=$(echo "$result_json" | jq '.already_present | length')
+  no_local_file_count=$(echo "$result_json" | jq '.no_local_file | length')
+  failed_count=$(echo "$result_json" | jq '.failed | length')
+
+  # An attachment A holds no _wp_attached_file for was never locally
+  # storable in the first place (external/offloaded media): skipping it is
+  # the correct outcome, not a failure, and stays a warning — the same
+  # thing the pre-batch per-attachment loop did.
+  if [ "$no_local_file_count" -gt 0 ]; then
+    log_warn "skipped ${no_local_file_count} attachment(s) with no _wp_attached_file meta on A (not locally-stored, e.g. external/offloaded media): $(echo "$result_json" | jq -c '.no_local_file')"
+  fi
+
+  # What ACTUALLY landed on B, not what was planned (CLAUDE.md: "never
+  # report success you have not earned"). already_present_count is > 0 only
+  # when this call resumed a previously-interrupted run of this same step.
+  # Printed BEFORE the refusal below so a failed step still tells the
+  # operator what it did manage to do.
+  log_info "media import: ${imported_count} newly imported, ${already_present_count} already present (resumed), ${no_local_file_count} skipped (no local file), ${failed_count} failed — ${requested_count} attachment(s) requested"
+
+  # BLOCKER (review): this used to be a log_warn and a zero exit. `ok` from
+  # the batch only means every attachment landed in SOME bucket, and
+  # `failed` IS one of those buckets — so a batch that got 400 of 518 in
+  # and lost 118 to per-item errors came back ok=true and this function
+  # returned 0. phase_graft wires every step as `graft_step_done ... || {
+  # <step>; graft_mark_step ...; }`, so a zero exit writes
+  # graft.import_attachments.done, a resumed run skips this step FOREVER,
+  # the 118 are never retried, and graft_remap_attachment_ids /
+  # graft_remap_featured_images then hit `[ -s "$id_map_tsv" ] || return 0`
+  # and say nothing at all. The only witness was this warning, in a
+  # 3000-line log. Measured before the fix: 400/518 imported -> exit 0;
+  # 0/518 imported -> exit 0 with a zero-byte id-map.tsv.
+  #
+  # Not theoretical, and routine on a SECOND graft: graft_prune_previous_run
+  # deletes every _sitegraft_source_id-tagged post with `wp post delete
+  # --force`, which removes the attached file from disk, so the next import
+  # finds nothing to register and EVERY attachment fails — and the graft
+  # used to carry on to completion with zero media.
+  #
+  # The id-map rewrite above deliberately stays above this refusal: what
+  # did import is recorded, so a re-run retries only what failed (the
+  # resume path sitegraft_media_import_batch already guarantees). There is
+  # no --allow-partial-media escape hatch on purpose — re-running IS the
+  # escape hatch, and it is the one that ends with the media actually
+  # migrated.
+  if [ "$failed_count" -gt 0 ]; then
+    # Capped at 20. On a total failure this list holds one object per
+    # attachment -- 518 of them on the reference pair -- and dumping all of
+    # them onto a single line produces something nobody reads at 3am, which
+    # is exactly when this message gets read. The count is already stated,
+    # and the full set is one `jq` away in the batch result.
+    local failed_sample failed_suffix
+    failed_sample=$(echo "$result_json" | jq -c '.failed[0:20]')
+    failed_suffix=""
+    [ "$failed_count" -gt 20 ] && failed_suffix=" (first 20 of ${failed_count} shown)"
+    log_error "failed to import ${failed_count} of ${requested_count} attachment(s) onto B: ${failed_sample}${failed_suffix} — refusing to report success; re-run to retry only the ones that failed"
+    return 1
+  fi
 }
 
 # design doc §6.4 step 3/5 / review finding A4: export lands in the run directory
@@ -936,6 +1215,7 @@ graft_remap_featured_images() {
   [ -s "$id_map_tsv" ] || return 0
   local old_id new_id post_type
   # shellcheck disable=SC2094 # false positive for both this loop's own read (3<) and the awk call inside it below: id_map_tsv is only ever READ in this loop, never written. NOTE: this directive scopes to the WHOLE while/done block below (21 lines), not just this one line -- a directive can't precede a bare `done`, only a complete compound command, so it has to sit here instead of right above the awk call it's really about.
+  # shellcheck disable=SC2034 # old_id (below) genuinely is unused in THIS loop's body -- it's read to keep the tuple destructure aligned with id-map.tsv's own old_id<TAB>new_id<TAB>post_type format (every other reader of this file in lib/graft.sh reads the same three fields), not because this function needs it. Real, pre-existing, harmless: only surfaced by shellcheck now (issue #11's media-step rewrite) because that was the last OTHER use of the name "old_id" anywhere in this file, and shellcheck's SC2034 check is not fully scope-aware across functions -- it stopped treating the name as "used elsewhere" once that last usage was removed.
   while IFS=$'\t' read -r old_id new_id post_type <&3; do
     [ "$post_type" != "attachment" ] || continue
     local current_thumb
