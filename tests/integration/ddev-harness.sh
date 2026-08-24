@@ -4,9 +4,26 @@
 # Spins up two disposable DDEV sites, seeds fixtures, and tears down unconditionally.
 set -euo pipefail
 
+# SITEGRAFT_HARNESS_ID optionally scopes every disposable resource this
+# harness creates — the two DDEV project names, the local sitegraft profile
+# file, and the run state dir — with a shared suffix. Several Claude sessions
+# can run against this machine's one Docker daemon at once; without this,
+# they'd all fight over the same fixed project names ("sitegraft-test-a"),
+# the same profiles/ddev-test.conf, and the same /tmp/sitegraft-ddev-test-runs
+# — and cleanup() below (ddev delete + rm -rf, unconditional, on EXIT) would
+# tear down whichever session finishes first out from under the others still
+# running. Empty by default, so an invocation with no environment variable
+# set behaves byte-for-byte like before this existed. Example:
+#   SITEGRAFT_HARNESS_ID=nat1 tests/integration/ddev-harness.sh
+SITEGRAFT_HARNESS_ID="${SITEGRAFT_HARNESS_ID:-}"
+HARNESS_ID_SUFFIX=""
+[ -n "$SITEGRAFT_HARNESS_ID" ] && HARNESS_ID_SUFFIX="-${SITEGRAFT_HARNESS_ID}"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-PROJECT_A="sitegraft-test-a"
-PROJECT_B="sitegraft-test-b"
+PROJECT_A="sitegraft-test-a${HARNESS_ID_SUFFIX}"
+PROJECT_B="sitegraft-test-b${HARNESS_ID_SUFFIX}"
+PROFILE="ddev-test${HARNESS_ID_SUFFIX}"
+STATE_DIR="/tmp/sitegraft-ddev-test-runs${HARNESS_ID_SUFFIX}"
 
 cleanup() {
   ddev delete -Oy "$PROJECT_A" >/dev/null 2>&1 || true
@@ -23,7 +40,7 @@ cleanup() {
   # m7: this harness-generated profile (real project names, gitignored) was
   # never removed — left behind after every run instead of being test-only
   # scratch state.
-  rm -f "${ROOT}/profiles/ddev-test.conf"
+  rm -f "${ROOT}/profiles/${PROFILE}.conf"
   # Same tidiness for the bare-local deletion-semantics check's own scratch
   # dir (unset until that block runs, hence the guard).
   [ -n "${BARE_TEST_DIR:-}" ] && rm -rf "${BARE_TEST_DIR}"
@@ -87,7 +104,7 @@ echo "==> writing a local sitegraft profile for this harness run"
 # DDEV's default for --docroot=.), never the orchestrator's host path —
 # passing the host path here fails wp-cli's "is this a WordPress install?"
 # check, since that path does not exist inside the container.
-cat > "${ROOT}/profiles/ddev-test.conf" <<EOF
+cat > "${ROOT}/profiles/${PROFILE}.conf" <<EOF
 SITE_A_ALIAS="a"
 SITE_A_WP_PATH="/var/www/html"
 SITE_A_WP_CMD="ddev exec --raw -p ${PROJECT_A} -- wp"
@@ -96,12 +113,20 @@ SITE_B_ALIAS="b"
 SITE_B_WP_PATH="/var/www/html"
 SITE_B_WP_CMD="ddev exec --raw -p ${PROJECT_B} -- wp"
 SITE_B_URL="https://b.example.com"
-SITEGRAFT_STATE_DIR="/tmp/sitegraft-ddev-test-runs"
+SITEGRAFT_STATE_DIR="${STATE_DIR}"
 EOF
 
 echo "==> running scan"
-"${ROOT}/bin/sitegraft" scan --profile ddev-test
-RUN_DIR=$(ls -dt /tmp/sitegraft-ddev-test-runs/ddev-test-* | head -1)
+"${ROOT}/bin/sitegraft" scan --profile "$PROFILE"
+# `${profile}-` is the exact run-dir prefix lib/inventory.sh's phase_scan
+# writes (run_dir="${SITEGRAFT_STATE_DIR}/${profile}-$(date ...)"), so the
+# glob has to be built from the same two variables rather than the old
+# literal "ddev-test-" -- with SITEGRAFT_HARNESS_ID set, $PROFILE is
+# "ddev-test-<id>", and a glob still anchored on the bare "ddev-test-"
+# prefix would silently match nothing (state dir is scoped too, so this
+# harness's own runs live under $STATE_DIR regardless, but the prefix must
+# still agree with what phase_scan actually named the directory).
+RUN_DIR=$(ls -dt "${STATE_DIR}/${PROFILE}-"* | head -1)
 
 echo "==> asserting fixtures are visible in the scan output"
 jq -e '.post_types[] | select(.name=="etch_cfs")' "${RUN_DIR}/scan-a.json" >/dev/null
@@ -190,7 +215,7 @@ BAD_PREFILLED="${RUN_DIR}/manifest-prefilled-bad.json"
 cat > "$BAD_PREFILLED" <<'EOF'
 {"migrate":{},"protect":{},"clean":{"enabled":false,"post_types":[]},"options":{}}
 EOF
-if SITEGRAFT_MANIFEST_PREFILLED="$BAD_PREFILLED" "${ROOT}/bin/sitegraft" plan --profile ddev-test --run "$RUN_DIR"; then
+if SITEGRAFT_MANIFEST_PREFILLED="$BAD_PREFILLED" "${ROOT}/bin/sitegraft" plan --profile "$PROFILE" --run "$RUN_DIR"; then
   echo "plan should have REFUSED — B has a real custom-code signal (the mu-plugin fixture) and this manifest never acknowledged it — aborting"
   exit 1
 fi
@@ -211,7 +236,7 @@ jq -n --argjson signals "$(jq -c '.custom_code_signals' "${RUN_DIR}/scan-b.json"
   options: {},
   custom_code_review: {acknowledged: true, signals: $signals}
 }' > "$GOOD_PREFILLED"
-SITEGRAFT_MANIFEST_PREFILLED="$GOOD_PREFILLED" "${ROOT}/bin/sitegraft" plan --profile ddev-test --run "$RUN_DIR"
+SITEGRAFT_MANIFEST_PREFILLED="$GOOD_PREFILLED" "${ROOT}/bin/sitegraft" plan --profile "$PROFILE" --run "$RUN_DIR"
 
 echo "==> asserting the frozen manifest is correct"
 jq -e '.frozen == true' "${RUN_DIR}/manifest.json" >/dev/null
@@ -246,7 +271,7 @@ echo "==> seeding a marker option on B for the mutate-and-revert restore proof (
 ddev exec --raw -p "$PROJECT_B" -- wp option update sitegraft_test_marker "PRE_BACKUP_VALUE" >/dev/null
 
 echo "==> running backup"
-"${ROOT}/bin/sitegraft" backup --profile ddev-test --run "$RUN_DIR"
+"${ROOT}/bin/sitegraft" backup --profile "$PROFILE" --run "$RUN_DIR"
 
 echo "==> asserting the backup is complete and its artifacts are present"
 [ -f "${RUN_DIR}/backup/b-db.sql.gz" ]
@@ -306,7 +331,17 @@ b_protected_checksum() {
   local table_dump options_dump post_id post_dump
   table_dump=$(ddev exec --raw -p "$PROJECT_B" -- wp db export - --tables="$(b_table fakebooking_reservations)")
   options_dump=$(ddev exec --raw -p "$PROJECT_B" -- wp option get fakebooking_settings --format=json)
-  post_id=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=fake_reservation --field=ID | head -1)
+  # `head -1` piped directly onto `ddev exec` has the same early-exit/SIGPIPE
+  # exposure as `grep -q` does (see the comment above the "(a) asserting
+  # migrated post_types" block further down in this file for the full
+  # mechanics) -- captured whole first, then the first line is taken with
+  # parameter expansion instead of a second process, which also sidesteps
+  # `read`'s own `set -e` trap on empty input (an empty $post_ids must still
+  # yield an empty $post_id here, exactly what `head -1` on empty input
+  # already did).
+  local post_ids
+  post_ids=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=fake_reservation --field=ID)
+  post_id="${post_ids%%$'\n'*}"
   post_dump=""
   [ -n "$post_id" ] && post_dump=$(ddev exec --raw -p "$PROJECT_B" -- wp post get "$post_id" --field=post_content)
   # Real bug found live while proving MAJOR-2's exposure: `$(...)` strips
@@ -374,7 +409,7 @@ ddev exec --raw -p "$PROJECT_B" -- test -f /var/www/html/wp-content/sitegraft-ad
 # "leaves it alone" are two different claims and only one of them is provable
 # by reading the script.
 echo "==> asserting 'sitegraft restore --dry-run' previews the removal and touches nothing"
-"${ROOT}/bin/sitegraft" restore --profile ddev-test --run "$RUN_DIR" --yes --dry-run 2>&1 | tee "${RUN_DIR}/restore-dryrun.log"
+"${ROOT}/bin/sitegraft" restore --profile "$PROFILE" --run "$RUN_DIR" --yes --dry-run 2>&1 | tee "${RUN_DIR}/restore-dryrun.log"
 if ! grep -q 'sitegraft-added-after-backup.txt' "${RUN_DIR}/restore-dryrun.log"; then
   echo "'restore --dry-run' did not report the file added since the backup — the preview does not actually preview (issue #14) — aborting"
   exit 1
@@ -395,7 +430,7 @@ echo "==> confirmed: --dry-run listed the removal and wrote nothing to B"
 # against a real WordPress install, and B's protected data must come back
 # byte-identical (same normalized checksum) afterward.
 echo "==> running restore (--yes, non-interactive) and asserting it succeeds"
-"${ROOT}/bin/sitegraft" restore --profile ddev-test --run "$RUN_DIR" --yes 2>&1 | tee "${RUN_DIR}/restore.log"
+"${ROOT}/bin/sitegraft" restore --profile "$PROFILE" --run "$RUN_DIR" --yes 2>&1 | tee "${RUN_DIR}/restore.log"
 
 # issue #14 acceptance: "restoring a wrapped-local target after a graft leaves
 # no file that the backup did not contain."
@@ -503,7 +538,15 @@ touch "/tmp/${PROJECT_B}/wp-content/SITEGRAFT_TEST_MARKER_TO_BE_DELETED.txt"
 # Extract the exact command backup_generate_restore_script baked into
 # restore.sh's `if ! { <cmd>; }; then` guard for the wp-content step (see
 # lib/backup.sh's own heredoc) — never hand-retyped.
-WP_CONTENT_RESTORE_LINE=$(grep -E '^if ! \{ rsync .*--delete ' "${BARE_TEST_DIR}/restore.sh" | head -1)
+#
+# `grep -m1` reading the file directly, no pipe to `head` at all: the
+# producer here is `grep` reading a plain, already-fully-written file, not a
+# live `ddev exec` (or anything else still writing when the consumer might
+# exit early), so there is no still-alive writer for a `head` on the other
+# end to SIGPIPE in the first place -- `-m1` gets the same one-match effect
+# without introducing a pipeline that pipefail could ever fail on a genuine
+# match. A genuine no-match still exits 1 here, same as before.
+WP_CONTENT_RESTORE_LINE=$(grep -m1 -E '^if ! \{ rsync .*--delete ' "${BARE_TEST_DIR}/restore.sh")
 if [ -z "$WP_CONTENT_RESTORE_LINE" ]; then
   echo "generated restore.sh has no 'rsync ... --delete' wp-content-restore command on the bare-local branch — generator drift, the deletion guarantee would silently break — aborting"
   exit 1
@@ -580,7 +623,10 @@ OLD_ATTACH_ID=$(ddev exec --raw -p "$PROJECT_A" -- wp post list --post_type=atta
 echo "==> MAJOR-2 (review, Viktor): injecting a real collision into B's protected data — a domain string AND an \"id\":<A's-attachment-id> payload inside BOTH fakebooking_settings (wp_options) and the protected fake_reservation post's own content (wp_posts) — the two REACHABLE surfaces the previous checksum never covered"
 ddev exec --raw -p "$PROJECT_B" -- wp option update fakebooking_settings \
   "{\"currency\":\"CHF\",\"tax_rate\":3.7,\"note\":\"see ${DOMAIN_A}/booking for details\",\"decoy\":\"\\\"id\\\":${OLD_ATTACH_ID}\"}" --format=json
-FAKEBOOKING_POST_ID=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=fake_reservation --field=ID | head -1)
+# Same `head -1`-on-`ddev exec` SIGPIPE exposure as b_protected_checksum's
+# post_id capture above -- same fix.
+FAKEBOOKING_POST_IDS=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=fake_reservation --field=ID)
+FAKEBOOKING_POST_ID="${FAKEBOOKING_POST_IDS%%$'\n'*}"
 [ -n "$FAKEBOOKING_POST_ID" ]
 ddev exec --raw -p "$PROJECT_B" -- wp post update "$FAKEBOOKING_POST_ID" \
   --post_content="Booking details at ${DOMAIN_A}/room — internal ref \"id\":${OLD_ATTACH_ID}"
@@ -606,7 +652,7 @@ PRE_GRAFT_CHECKSUM=$(b_protected_checksum)
 # custom-code gate, then this real one for graft) was the thing papering
 # over the gap, not sitegraft itself.
 echo "==> re-running backup against the REAL graft manifest, so checksums_protected_pre_graft reflects the actual protect selection (and the injected MAJOR-2 collision payload) verify will check against"
-"${ROOT}/bin/sitegraft" backup --profile ddev-test --run "$RUN_DIR"
+"${ROOT}/bin/sitegraft" backup --profile "$PROFILE" --run "$RUN_DIR"
 jq -e '.checksums_protected_pre_graft.fakebooking | startswith("sha256:")' "${RUN_DIR}/manifest.json" >/dev/null
 
 echo "==> MAJOR-B (review fix-pack, reproduced live by Viktor): running graft --dry-run FIRST against this exact run directory, then asserting the REAL graft right after still does the work rather than silently skipping it"
@@ -622,7 +668,7 @@ echo "==> MAJOR-B (review fix-pack, reproduced live by Viktor): running graft --
 # after the dry run), then proven for real by every assertion (a)-(h) below,
 # which only pass if the REAL graft that follows actually migrated content
 # rather than a no-op skip.
-"${ROOT}/bin/sitegraft" graft --profile ddev-test --run "$RUN_DIR" --allow-stack-mismatch --dry-run
+"${ROOT}/bin/sitegraft" graft --profile "$PROFILE" --run "$RUN_DIR" --allow-stack-mismatch --dry-run
 DONE_MARKERS_AFTER_DRY_RUN=$(find "$RUN_DIR" -maxdepth 1 -name 'graft.*.done' 2>/dev/null)
 if [ -n "$DONE_MARKERS_AFTER_DRY_RUN" ]; then
   echo "FAIL: graft --dry-run left marker file(s) behind — a real graft against this run directory would silently skip these steps (MAJOR-B regression):" >&2
@@ -640,18 +686,66 @@ echo "==> running graft"
 # modules/etch.sh — but never matches this harness's fixtures, which
 # simulate Etch via a mu-plugin, not a real "etch" plugin list entry), so
 # graft_check_stack_precondition has nothing else to resolve either way.
-"${ROOT}/bin/sitegraft" graft --profile ddev-test --run "$RUN_DIR" --allow-stack-mismatch
+"${ROOT}/bin/sitegraft" graft --profile "$PROFILE" --run "$RUN_DIR" --allow-stack-mismatch
 
 echo "==> (a) asserting migrated post_types exist and are visible on B"
-ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=page --field=post_title | grep -q '^Home$'
-ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=etch_cfs --field=post_title | grep -q 'Hero CFS'
-ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=etch_cfs --field=post_title | grep -q 'Image Block CFS'
+# Every `grep -q` below this comment, through the rest of the file, is
+# matched from a captured variable via a here-string rather than piped
+# directly onto a `ddev exec` invocation. Reasoning (same defect class
+# lib/backup.sh's backup_verify_db_export and lib/graft.sh's
+# graft_sync_theme_parent already document at length; see those
+# two comments for the full account, not repeated here per occurrence):
+# `grep -q` exits the instant it finds a match, closing the read end of the
+# pipe, and under this file's `set -o pipefail` (line 5) whatever the
+# still-writing producer then reports becomes the status of the whole
+# pipeline -- turning a SUCCESSFUL match into a FAILED assertion. (Without
+# pipefail the pipeline would take `grep`'s own 0 and this would never be
+# fatal; pipefail is deliberate and stays, so the pipe is what goes.)
+#
+# One detail differs from backup_verify_db_export's case and is worth
+# recording, because the exit code in the abort message does not match what
+# that comment leads you to expect. There the producer is `gunzip`, killed
+# outright by SIGPIPE, exit 141. Here the producer is `ddev exec` -- a
+# long-lived `docker exec` wrapper written in Go, which does NOT die on the
+# signal: it catches the failed write, prints its own diagnostic
+#     Failed to execute command `wp post list ...`: signal: broken pipe
+# and exits 255. That 255 is what pipefail propagates and what aborts the
+# run.
+#
+# Also unlike backup_verify_db_export's case, this is NOT about output size:
+# a two-line `wp post list` is just as exposed as a multi-megabyte export,
+# because the race is between the consumer's early exit and the producer
+# still having something left to write -- not any particular byte count.
+# Measured directly against a disposable DDEV project: with a producer that
+# writes one more line 0.3s after the line that matches, `ddev exec ... |
+# grep -q` failed 25 times out of 25 with exactly the message above, while
+# the captured-variable form below failed 0 times out of 25. The real-world
+# window is `wp`'s own post-write teardown, which is short and variable --
+# hence a defect that fires on some runs and not others. `head -1` piped directly onto
+# a `ddev exec`/live-command producer has the identical early-exit shape and
+# gets the identical variable-capture fix, both earlier in this file --
+# which is also why `ls -dt ... | head -1` (used a few times, e.g. this
+# script's own RUN_DIR discovery near the top) is deliberately left
+# untouched: `ls` finishes and exits before `head` can ever cut it off, so
+# there is no still-alive producer for `head` to SIGPIPE in that case -- the
+# danger here is a producer that is still alive when the consumer exits
+# early, not the presence of a pipe by itself.
+B_PAGE_TITLES=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=page --field=post_title)
+grep -q '^Home$' <<< "$B_PAGE_TITLES"
+B_ETCH_CFS_TITLES=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=etch_cfs --field=post_title)
+grep -q 'Hero CFS' <<< "$B_ETCH_CFS_TITLES"
+grep -q 'Image Block CFS' <<< "$B_ETCH_CFS_TITLES"
 B_ATTACH_COUNT=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=attachment --format=count)
 [ "$B_ATTACH_COUNT" -ge 1 ]
+# Captured once and reused by both the "Main" and "Footer" `grep -q` checks
+# below (one ddev round trip instead of two identical ones) -- each check is
+# left at its original spot so the Step 5 / issue #17 narration immediately
+# above stays attached to the assertion it explains.
+B_NAV_TITLES=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=wp_navigation --field=post_title)
 # Step 5 fixture addition: wp_navigation was added to core-wp's migrate
 # post_types above specifically to exercise verify_nav_present against real
 # migrated data (site-a-seed.sh's "Main" wp_navigation post).
-ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=wp_navigation --field=post_title | grep -q '^Main$'
+grep -q '^Main$' <<< "$B_NAV_TITLES"
 
 # Issue #17: site-a-seed.sh's "Footer" wp_navigation post carries a STATIC
 # navigation-link pointing at A's "Home" page BY ID -- the real proof that
@@ -662,7 +756,7 @@ ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=wp_navigation --fiel
 # uses: resolve A's OWN Home page id through the run's real id-map.tsv to
 # get the id B's copy actually landed on, then require the migrated
 # Footer's content to carry THAT id and never A's original one.
-ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=wp_navigation --field=post_title | grep -q '^Footer$'
+grep -q '^Footer$' <<< "$B_NAV_TITLES"
 A_HOME_ID=$(ddev exec --raw -p "$PROJECT_A" -- wp post list --post_type=page --title="Home" --field=ID)
 B_HOME_ID_FROM_MAP=$(awk -F'\t' -v old="$A_HOME_ID" '$1==old && $3=="page"{print $2}' "${RUN_DIR}/id-map.tsv")
 [ -n "$B_HOME_ID_FROM_MAP" ]
@@ -730,12 +824,16 @@ case "$IMAGE_BLOCK_CONTENT" in
     exit 1
     ;;
 esac
-echo "$IMAGE_BLOCK_CONTENT" | grep -q "${PROJECT_B}.ddev.site"
+# $IMAGE_BLOCK_CONTENT is already a captured variable here, not a live pipe
+# -- converted to the same here-string form as the checks above purely for
+# consistency (no `ddev exec`/live producer is actually at risk on this one).
+grep -q "${PROJECT_B}.ddev.site" <<< "$IMAGE_BLOCK_CONTENT"
 
 echo "==> (d) asserting page_on_front resolves to the correctly remapped page on B (design doc §9.3)"
 B_FRONT_ID=$(ddev exec --raw -p "$PROJECT_B" -- wp option get page_on_front)
 [ -n "$B_FRONT_ID" ] && [ "$B_FRONT_ID" != "0" ]
-ddev exec --raw -p "$PROJECT_B" -- wp post get "$B_FRONT_ID" --field=post_title | grep -q '^Home$'
+B_FRONT_TITLE=$(ddev exec --raw -p "$PROJECT_B" -- wp post get "$B_FRONT_ID" --field=post_title)
+grep -q '^Home$' <<< "$B_FRONT_TITLE"
 NEW_HOME_ID_FROM_MAP=$(awk -F'\t' -v old="$(ddev exec --raw -p "$PROJECT_A" -- wp option get page_on_front)" '$1==old && $3=="page"{print $2}' "${RUN_DIR}/id-map.tsv")
 [ "$B_FRONT_ID" = "$NEW_HOME_ID_FROM_MAP" ]
 
@@ -800,7 +898,7 @@ fi
 echo "==> confirmed: the integrity gate aborts on a real WXR file leaking an out-of-allowlist post_type, and passes the same file before mutation"
 
 echo "==> re-running graft is a no-op past the completed markers (marker-gated resumability, design doc §6.4)"
-"${ROOT}/bin/sitegraft" graft --profile ddev-test --run "$RUN_DIR" --allow-stack-mismatch
+"${ROOT}/bin/sitegraft" graft --profile "$PROFILE" --run "$RUN_DIR" --allow-stack-mismatch
 POST_RERUN_CHECKSUM=$(b_protected_checksum)
 [ "$POST_RERUN_CHECKSUM" = "$PRE_GRAFT_CHECKSUM" ]
 
@@ -819,7 +917,7 @@ fi
 # reporting PASS.
 
 echo "==> updating the harness profile with B's real, live-resolved URL (needed for verify's HTTP smoke check) — same DDEV_PRIMARY_URL override reasoning as the DOMAIN_A/DOMAIN_B comment above; the earlier SITE_B_URL='https://b.example.com' was never the URL DDEV actually serves"
-cat > "${ROOT}/profiles/ddev-test.conf" <<EOF
+cat > "${ROOT}/profiles/${PROFILE}.conf" <<EOF
 SITE_A_ALIAS="a"
 SITE_A_WP_PATH="/var/www/html"
 SITE_A_WP_CMD="ddev exec --raw -p ${PROJECT_A} -- wp"
@@ -828,11 +926,11 @@ SITE_B_ALIAS="b"
 SITE_B_WP_PATH="/var/www/html"
 SITE_B_WP_CMD="ddev exec --raw -p ${PROJECT_B} -- wp"
 SITE_B_URL="${DOMAIN_B}"
-SITEGRAFT_STATE_DIR="/tmp/sitegraft-ddev-test-runs"
+SITEGRAFT_STATE_DIR="${STATE_DIR}"
 EOF
 
 echo "==> running verify"
-"${ROOT}/bin/sitegraft" verify --profile ddev-test --run "$RUN_DIR"
+"${ROOT}/bin/sitegraft" verify --profile "$PROFILE" --run "$RUN_DIR"
 
 VERIFY_REPORT="${RUN_DIR}/verify-report.md"
 echo "==> asserting the verify report exists and every check passed cleanly (no HARD FAIL) on a graft that should be entirely correct"
@@ -866,7 +964,7 @@ echo "==> confirmed: verify report shows every positive check passed, on real mi
 
 echo "==> NEGATIVE CASE: mutating a migrated option's value on B after graft, to prove verify actually detects a real B3-class regression rather than always reporting PASS (finding B3's whole reason to exist)"
 ddev exec --raw -p "$PROJECT_B" -- wp option update etch_settings '{"theme_mode":"CORRUPTED_BY_HARNESS_NEGATIVE_CASE"}' --format=json
-if "${ROOT}/bin/sitegraft" verify --profile ddev-test --run "$RUN_DIR"; then
+if "${ROOT}/bin/sitegraft" verify --profile "$PROFILE" --run "$RUN_DIR"; then
   echo "FAIL: verify reported success even though etch_settings on B no longer matches the value graft migrated from A — verify is not actually checking what it claims to check (finding B3 regression)" >&2
   exit 1
 fi
@@ -877,7 +975,7 @@ echo "==> confirmed: verify correctly HARD FAILS (non-zero exit, report says so 
 
 echo "==> reverting the injected corruption and re-confirming verify passes clean again"
 ddev exec --raw -p "$PROJECT_B" -- wp option update etch_settings '{"theme_mode":"dark"}' --format=json
-"${ROOT}/bin/sitegraft" verify --profile ddev-test --run "$RUN_DIR"
+"${ROOT}/bin/sitegraft" verify --profile "$PROFILE" --run "$RUN_DIR"
 grep -q "Result: PASS" "$VERIFY_REPORT"
 
 # Security-review fix-pack (post-merge-review by Marcel + Kimi, converging
@@ -902,7 +1000,7 @@ HERO_ID=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=etch_cfs -
 [ -n "$HERO_ID" ]
 HERO_CONTENT_BEFORE=$(ddev exec --raw -p "$PROJECT_B" -- wp post get "$HERO_ID" --field=post_content)
 ddev exec --raw -p "$PROJECT_B" -- wp post update "$HERO_ID" --post_content="${HERO_CONTENT_BEFORE} <!-- leaked reference to ${DOMAIN_A} -->"
-if "${ROOT}/bin/sitegraft" verify --profile ddev-test --run "$RUN_DIR"; then
+if "${ROOT}/bin/sitegraft" verify --profile "$PROFILE" --run "$RUN_DIR"; then
   echo "FAIL: verify reported success even though A's domain string was injected into a post graft actually imported — verify_domain_absent is not checking real content (the exact dead-check regression this fix-pack repairs)" >&2
   exit 1
 fi
@@ -927,7 +1025,7 @@ echo "==> confirmed: verify_domain_absent fires on a real domain leak in importe
 
 echo "==> reverting the injected domain leak and re-confirming verify passes clean again"
 ddev exec --raw -p "$PROJECT_B" -- wp post update "$HERO_ID" --post_content="$HERO_CONTENT_BEFORE"
-"${ROOT}/bin/sitegraft" verify --profile ddev-test --run "$RUN_DIR"
+"${ROOT}/bin/sitegraft" verify --profile "$PROFILE" --run "$RUN_DIR"
 grep -q "Result: PASS" "$VERIFY_REPORT"
 
 # Security-review fix-pack (Kimi): same fail-open class as the domain check
@@ -939,7 +1037,7 @@ grep -q "Result: PASS" "$VERIFY_REPORT"
 # error (already covered by tests/unit/test_verify.bats).
 echo "==> NEGATIVE CASE 3 (orphan post_parent check): setting a migrated page's post_parent to an ID that does not exist on B"
 ddev exec --raw -p "$PROJECT_B" -- wp post update "$FEATURED_PAGE_ID_B" --post_parent=999999
-"${ROOT}/bin/sitegraft" verify --profile ddev-test --run "$RUN_DIR"
+"${ROOT}/bin/sitegraft" verify --profile "$PROFILE" --run "$RUN_DIR"
 ORPHAN_LINE=$(grep "orphan post_parent references found" "$VERIFY_REPORT")
 [ -n "$ORPHAN_LINE" ]
 case "$ORPHAN_LINE" in
@@ -954,7 +1052,7 @@ echo "==> confirmed: the orphan post_parent check genuinely detects a real orpha
 
 echo "==> reverting the injected orphan and re-confirming verify passes clean again"
 ddev exec --raw -p "$PROJECT_B" -- wp post update "$FEATURED_PAGE_ID_B" --post_parent=0
-"${ROOT}/bin/sitegraft" verify --profile ddev-test --run "$RUN_DIR"
+"${ROOT}/bin/sitegraft" verify --profile "$PROFILE" --run "$RUN_DIR"
 grep -q "Result: PASS" "$VERIFY_REPORT"
 
 echo "ALL VERIFY ASSERTIONS PASSED"
@@ -965,7 +1063,7 @@ if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "verify" ]; then
 fi
 
 echo "==> running restore (--yes, non-interactive) and re-checking protected state after the full graft->verify->restore round-trip"
-"${ROOT}/bin/sitegraft" restore --profile ddev-test --run "$RUN_DIR" --yes
+"${ROOT}/bin/sitegraft" restore --profile "$PROFILE" --run "$RUN_DIR" --yes
 
 echo "==> asserting B's protected fake-plugin data is byte-identical to its pre-graft state after restore (same PRE_GRAFT_CHECKSUM baseline as the marker-gated-resumability check above)"
 RESTORE_CHECKSUM=$(b_protected_checksum)
