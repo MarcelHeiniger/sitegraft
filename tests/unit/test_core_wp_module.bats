@@ -751,13 +751,18 @@ _php_available() { command -v php >/dev/null 2>&1; }
 }
 
 # B5 (Viktor's review, execution-proven gap): a bare wp:navigation block
-# with a "ref" attribute embeds ANOTHER wp_navigation post BY ID -- this is
-# how a shared/reusable navigation gets referenced from a page or template.
-# Before this fix, only modules/etch.sh's OWN component-ref remap happened
-# to catch this (its blind "ref":<old> substitution has zero awareness of
-# what block it's inside) -- on a block-theme source without Etch, nothing
-# remapped it at all. ref needs no "kind" disambiguation either: it can
-# only ever mean a wp_navigation post, by the block's own definition.
+# with a "ref" attribute embeds ANOTHER wp_navigation post BY ID -- one
+# navigation embedding another. Scope check (third-round review, Viktor):
+# _core_wp_remap_nav_page_ids only ever scans posts id-map.tsv tags
+# wp_navigation, so this rule only ever fires when the "ref" is NESTED
+# inside another migrated wp_navigation post -- not one embedded in a
+# migrated page or template (no shipped module migrates wp_template_part
+# at all, and a page is never in this scan's scope). Before this fix, only
+# modules/etch.sh's OWN component-ref remap happened to catch a ref inside
+# a wp_navigation post (its blind "ref":<old> substitution has zero
+# awareness of what block it's inside) -- on a block-theme source without
+# Etch, nothing remapped it. ref needs no "kind" disambiguation either: it
+# can only ever mean a wp_navigation post, by the block's own definition.
 @test "_core_wp_nav_remap_php remaps a wp:navigation block's ref through the map (B5)" {
   _php_available || skip "php CLI not available in this environment"
   local phpfile="$BATS_TEST_TMPDIR/remap.php"
@@ -978,6 +983,88 @@ PHP
       fwrite(STDERR, \"a '-->' leaked INSIDE the block comment at offset \$first_close (real close is at \$real_close): \$out\n\");
       exit(1);
     }
+    echo 'OK';
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "OK" ]
+}
+
+# --- Third-round review (Kimi + Viktor): three surviving mutants, all on
+# new code from this fix-pack. Tests below are Viktor's own proposed
+# regression tests, adapted to this file's existing conventions.
+
+# M20: `(?:core/)?` in the pattern and the `$name = preg_replace('~^core/~', ...)`
+# strip are BOTH new in this fix-pack's B5 rewrite -- before it there was no
+# name switch at all (the function only ever handled navigation-link/
+# -submenu, matched unconditionally). Removing the strip left every prior
+# test green because none of them ever fed a "core/"-prefixed block name.
+@test "_core_wp_nav_remap_php handles a core/-prefixed block name for all three id-bearing shapes (M20)" {
+  _php_available || skip "php CLI not available in this environment"
+  local phpfile="$BATS_TEST_TMPDIR/remap.php"
+  { echo '<?php'; _core_wp_nav_remap_php; } > "$phpfile"
+  run php -r "
+    require '${phpfile}';
+    \$map = ['5' => '205', '12' => '212', '77' => '177'];
+    \$cases = [
+      '<!-- wp:core/navigation-link {\"kind\":\"post-type\",\"id\":5} /-->'  => '\"id\":205',
+      '<!-- wp:core/page-list {\"parentPageID\":12} /-->'                    => '\"parentPageID\":212',
+      '<!-- wp:core/navigation {\"ref\":77} /-->'                            => '\"ref\":177',
+    ];
+    foreach (\$cases as \$in => \$needle) {
+      \$out = sitegraft_core_wp_remap_nav_link_ids(\$map, \$in);
+      if (strpos(\$out, \$needle) === false) { fwrite(STDERR, \"core/-prefixed block not remapped: \$out\n\"); exit(1); }
+    }
+    echo 'OK';
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "OK" ]
+}
+
+# M19: 'post-type' === $attrs['kind'] is a WHITELIST -- only that one exact
+# value is ever remapped. No test previously fed a THIRD kind value
+# ("custom", a bare-URL link with no real target) to confirm the check
+# actually behaves as a whitelist rather than merely excluding "taxonomy"
+# specifically -- flipping the comparison to `'taxonomy' !== $attrs['kind']`
+# (a blacklist) would have passed every existing test unnoticed.
+@test "_core_wp_nav_remap_php trusts only kind:post-type -- a third, unknown kind carrying an id is left untouched (whitelist, not blacklist) (M19)" {
+  _php_available || skip "php CLI not available in this environment"
+  local phpfile="$BATS_TEST_TMPDIR/remap.php"
+  { echo '<?php'; _core_wp_nav_remap_php; } > "$phpfile"
+  run php -r "
+    require '${phpfile}';
+    \$in = '<!-- wp:navigation-link {\"label\":\"X\",\"kind\":\"custom\",\"id\":5,\"url\":\"https://a/x\"} /-->';
+    \$out = sitegraft_core_wp_remap_nav_link_ids(['5' => '205'], \$in);
+    if (\$out !== \$in) { fwrite(STDERR, \"a non-post-type kind was wrongly remapped: \$out\n\"); exit(1); }
+    echo 'OK';
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "OK" ]
+}
+
+# M5, the most serious of the three: the B3 oracle test's label ("Über uns &
+# Team --> <script>") contains neither a literal backslash nor a double
+# quote, so it only ever exercised 4 of the 6 strtr() rules WordPress's real
+# serialize_block_attributes() applies. Dropping the '\\' => '\u005c' rule
+# (or replacing strtr with a preg_replace chain that mishandles it) survived
+# every prior test. Consequence, proved by this test's own assertion: a
+# label ending in a literal backslash re-serializes to INVALID JSON under
+# that mutant (the trailing backslash escapes the closing quote), so
+# json_decode returns null and the rewritten block loses its attributes
+# entirely -- not merely a cosmetic escaping difference.
+@test "_core_wp_nav_remap_php's serializer escapes a literal backslash the way WordPress does -- dropping that rule yields INVALID JSON (M5)" {
+  _php_available || skip "php CLI not available in this environment"
+  local phpfile="$BATS_TEST_TMPDIR/remap.php"
+  { echo '<?php'; _core_wp_nav_remap_php; _wp_serialize_block_attributes_oracle; } > "$phpfile"
+  run php -r "
+    require '${phpfile}';
+    \$attrs = ['label' => 'Doku C:\\\\\\\\Temp\\\\\\\\', 'kind' => 'post-type', 'id' => 5];
+    \$in  = '<!-- wp:navigation-link ' . wp_serialize_block_attributes_oracle(\$attrs) . ' /-->';
+    \$out = sitegraft_core_wp_remap_nav_link_ids(['5' => '205'], \$in);
+    \$after = \$attrs; \$after['id'] = 205;
+    \$expected = '<!-- wp:navigation-link ' . wp_serialize_block_attributes_oracle(\$after) . ' /-->';
+    if (\$out !== \$expected) { fwrite(STDERR, \"MISMATCH\nexpected: \$expected\nactual:   \$out\n\"); exit(1); }
+    preg_match('~<!--\s*wp:navigation-link\s+(\{.*\})\s*/-->~', \$out, \$m);
+    if (json_decode(\$m[1], true) === null) { fwrite(STDERR, \"rewritten attrs are not valid JSON: \$m[1]\n\"); exit(1); }
     echo 'OK';
   "
   [ "$status" -eq 0 ]

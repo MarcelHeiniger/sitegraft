@@ -1148,12 +1148,21 @@ graft_remap_attachment_ids() {
   # module post_import step, and is the one place that DOES understand
   # "kind") cannot repair this after the fact: it only ever touches
   # "kind":"post-type" entries by the same ambiguity-safety design, so a
-  # taxonomy-kind corruption introduced here survives untouched. Excluding
-  # wp_navigation posts from this one function's scope is safe and loses
-  # nothing legitimate: a navigation-link/navigation-submenu block never
-  # embeds an attachment reference in the first place (it links to a page,
-  # post, term, or a bare custom URL -- never a media item), so there is no
-  # real attachment substitution this exclusion could be skipping.
+  # taxonomy-kind corruption introduced here survives untouched.
+  #
+  # PRECISION (third-round review, Viktor): the exclusion below removes the
+  # ENTIRE wp_navigation post from this function's scope, not just its
+  # navigation-link/navigation-submenu blocks specifically -- there is no
+  # per-block granularity available at this point, only per-post. In
+  # practice this loses nothing real: a wp_navigation post's content is,
+  # by construction, navigation blocks (navigation-link, navigation-
+  # submenu, page-list, and similar), and none of those embed an
+  # attachment reference (they link to a page, post, term, or a bare
+  # custom URL -- never a media item). A wp_navigation post that somehow
+  # also carried an unrelated attachment-referencing block would lose
+  # THAT block's attachment-id remap too, not just its navigation blocks'
+  # ids -- an acceptable trade against corrupting a taxonomy-kind id, and
+  # not a shape any real Navigation-block editing flow produces.
   post_ids_json=$(awk -F'\t' '$3 != "wp_navigation"{print $2}' "$id_map_tsv" \
     | jq -R -s -c 'split("\n") | map(select(length > 0))')
   payload_json=$(jq -n --argjson attachments "$attach_map_json" --argjson post_ids "$post_ids_json" \

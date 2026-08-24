@@ -441,6 +441,27 @@ _assert_alias() {
   [[ "$output" == *'"post_status" => "any"'* ]] || false
 }
 
+# Third-round review (Kimi, verifying Viktor's own list of prior nits):
+# the sibling function got this pin, this one did not -- even though
+# core_wp_post_types_dynamic's own header comment explicitly says
+# inventory_nav_post_count uses "the same post_status => 'any' scope as its
+# sibling", a claim nothing here actually checked. Same reasoning as the
+# test above: a scan silently narrowed to published-only would read a
+# draft/private dynamic navigation as non-dynamic, a different route to
+# the same class of false negative.
+@test "inventory_nav_uses_dynamic_page_list queries wp_navigation posts of ANY status, not published-only -- matches its sibling's scope" {
+  local calls="$BATS_TEST_TMPDIR/calls.log"
+  wp_remote() {
+    local alias_lc="$1"; shift
+    printf '%s
+' "$*" >> "${BATS_TEST_TMPDIR}/calls.log"
+    echo false
+  }
+  inventory_nav_uses_dynamic_page_list a >/dev/null
+  run cat "$calls"
+  [[ "$output" == *'"post_status" => "any"'* ]] || false
+}
+
 @test "inventory_nav_post_count returns 0, not an error, when A genuinely has no wp_navigation posts" {
   wp_remote() { echo 0; }
   run inventory_nav_post_count a

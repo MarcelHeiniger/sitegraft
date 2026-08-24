@@ -475,10 +475,21 @@ function sitegraft_core_wp_remap_nav_link_ids( $map, $content ) {
 	// "id". A wp:page-list block SCOPED to a parent page carries that
 	// page's id in "parentPageID" -- a dynamic navigation (no hardcoded
 	// CHILD ids) can still name its own SCOPE by id. A bare wp:navigation
-	// block's "ref" attribute embeds ANOTHER wp_navigation post by id --
-	// how a shared/reusable navigation gets referenced from a page or
-	// template. Neither needs a "kind" disambiguation the way
-	// navigation-link's "id" does: parentPageID can only ever mean a page
+	// block's "ref" attribute embeds ANOTHER wp_navigation post by id.
+	// Third-round review (Viktor): an earlier version of this comment
+	// claimed this handles "how a shared/reusable navigation gets
+	// referenced from a page or template" -- that overstates this
+	// function's actual reach. _core_wp_remap_nav_page_ids (below) only
+	// ever passes content from posts id-map.tsv tags wp_navigation; a
+	// migrated PAGE is never in that scan at all, and no shipped module
+	// migrates wp_template_part either. So the ref rule here can only
+	// ever fire on a wp:navigation block NESTED inside another migrated
+	// wp_navigation post's own content -- one navigation embedding
+	// another by reference -- not one embedded in a page or template.
+	// That narrower case is still real and still worth remapping
+	// correctly; it just is not the broader one the old wording implied.
+	// Neither shape needs a "kind" disambiguation the way navigation-
+	// link's "id" does: parentPageID can only ever mean a page
 	// (core/page-list has no other id-bearing attribute), and ref can
 	// only ever mean a wp_navigation post -- both safe to remap
 	// unconditionally whenever present and non-zero.
