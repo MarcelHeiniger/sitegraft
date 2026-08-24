@@ -392,10 +392,14 @@ echo "==> confirmed: restore's db import genuinely re-imported B's database (mut
 # checksum assertion above never exercises deletion at all (nothing removes
 # a file from B's wp-content before restore runs), so a harness that stopped
 # there would report a DoD item "green" on a property it never actually
-# tested. This block genuinely exercises deletion — on the ONE path that's
-# supposed to guarantee it (design doc §6.7 / docs/definition-of-done.md,
-# amended in this same PR to scope "exact pre-graft state" to ssh-remote and
-# bare-local targets only).
+# tested. This block genuinely exercises deletion on the BARE-LOCAL path —
+# which is also the ssh-remote path's mechanism (`rsync --delete`), so it is
+# the live evidence for both (design doc §6.7 /
+# docs/definition-of-done.md). The WRAPPED-LOCAL path has a different
+# mechanism and its own live assertion further down: since issue #14 it prunes
+# by difference against the backup's archive, and the DoD's earlier wording
+# here — scoping "exact pre-graft state" to ssh-remote and bare-local only —
+# no longer holds.
 #
 # DDEV's docroot is a REAL host-filesystem directory (the container serves
 # the SAME files this harness script can already see at /tmp/${PROJECT_B} —

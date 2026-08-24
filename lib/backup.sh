@@ -205,9 +205,33 @@ backup_wp_content() {
   fi
 }
 
-# backup_write_wp_content_manifest <src_dir> <manifest_file> — records exactly
-# what this backup's wp-content archive contains, one relative path per entry,
-# NUL-delimited (issue #14).
+# backup_list_b_wp_content — prints B's wp-content, one ABSOLUTE path per
+# entry, NUL-delimited, read from B's OWN filesystem through B's own access
+# path (ssh, the container wrapper, or directly). Deliberately the same
+# mechanism, on the same side of the wrapper, as the `_sg_list_live` the
+# generated restore.sh uses — see backup_write_wp_content_manifest below for
+# why that identity is the whole point and not an implementation detail.
+#
+# Not run_or_echo-wrapped: it is a read of B that produces the value its
+# caller returns, and its only caller already returns early under --dry-run
+# without writing a manifest at all.
+backup_list_b_wp_content() {
+  local root="${SITE_B_WP_PATH}/wp-content"
+  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
+    ssh -- "$SITE_B_SSH_HOST" "find $(sq "$root") -mindepth 1 -print0"
+  else
+    local prefix; prefix=$(_backup_local_exec_prefix b)
+    if [ -n "$prefix" ]; then
+      bash -c "${prefix} find $(sq "$root") -mindepth 1 -print0"
+    else
+      find "$root" -mindepth 1 -print0
+    fi
+  fi
+}
+
+# backup_write_wp_content_manifest <archive_dir> <manifest_file> — records
+# exactly what this backup covers, one relative path per entry, NUL-delimited
+# (issue #14).
 #
 # This is what makes an exact-state restore possible on a wrapped-local target
 # without ever wiping wp-content. The obstacle backup_generate_restore_script
@@ -215,14 +239,60 @@ backup_wp_content() {
 # subdirectory of wp-content, and removing that directory fails with "Device or
 # resource busy" — so the restore never removes the directory. With this
 # manifest it does not have to: it can list what B's wp-content holds now,
-# subtract what the backup held, and remove precisely that difference. Only
+# subtract what the backup covered, and remove precisely that difference. Only
 # known additions are deleted, never a wipe-and-rebuild.
 #
-# Generated from the PULLED COPY on the orchestrator, not by asking B a second
-# time: the copy is what restore.sh will actually put back, so it is the only
-# listing that can be authoritative about "what this backup contains". Asking B
-# again would also open a window in which a file lands between the archive and
-# the listing and is then treated as original.
+# READ FROM B, NOT FROM THE PULLED COPY — and this reversed an earlier
+# decision, for a reason that was measured rather than reasoned about. The
+# earlier version listed the copy on the orchestrator, arguing the copy is what
+# restore.sh puts back and is therefore the authoritative description of the
+# backup. That argument is sound and still wrong, because it assumes the copy
+# carries B's filenames. It does not, and not in a corner case:
+#
+#   $ printf x > src/$'Caf\xc3\xa9.css'          # NFC, as B stores it
+#   $ tar czf - -C . src | tar xzf - -C dst --strip-components=1
+#   $ ls dst | od -c   ->   C a f e 314 201 . c s s     # NFD
+#
+# macOS's bsdtar rewrites a name from NFC (é as one code point) to NFD (e plus
+# a combining acute) while extracting. backup_wp_content's local branch is
+# exactly that tar pipeline, so on a macOS orchestrator — the tool's primary
+# environment — the copy's accented names differ BYTE FOR BYTE from B's. The
+# manifest inherited that, `comm` compares bytes, and every accented file the
+# backup contained was classified as a file added since the backup and deleted.
+# Reproduced end to end with no shim and no forged input: a wp-content holding
+# `themes/Café.css` came back from `restore.sh` without it, exit code 0, and
+# the script printed "Confirmed: B's wp-content now holds exactly what this
+# backup holds." Accented upload filenames are ordinary on the French- and
+# German-language sites this tool exists for.
+#
+# Listing B directly removes the conversion from the loop entirely: both sides
+# of the comparison — this manifest, and restore.sh's own `_sg_list_live` —
+# now come from the same filesystem's own bytes, so byte equality is correct
+# by construction instead of by luck. No Unicode tables, no `uconv`/`iconv`
+# dependency on the target, nothing to be portable about.
+#
+# The cost is a drift window: a file that lands on B between the archive being
+# pulled and this listing is recorded as original and will be KEPT by a later
+# restore. That is the conservative direction (a file left in place, never a
+# file deleted), and the tool already documents that B is expected to be
+# quiescent for the duration.
+#
+# The archive is still cross-checked against it, by ENTRY COUNT, and that check
+# is load-bearing in both directions:
+#   - manifest shorter than the archive  -> the manifest is truncated, and a
+#     truncated keep-list deletes everything it fails to mention;
+#   - archive shorter than the manifest  -> the wp-content pull was partial,
+#     which `backup_verify_wp_content` cannot see (it only tests non-empty).
+# Because the two listings now come from independent sources, their agreement
+# is real evidence. Under the old design they could not disagree — the manifest
+# was generated FROM the archive — so a partial pull produced a manifest and an
+# archive that were partial together, agreed with each other, and drove a
+# restore that deleted files which had never been additions.
+#
+# Counts, not names: the archive's names may legitimately differ from B's, for
+# exactly the normalization reason above. Names are compared at restore time
+# instead, where both sides come from B (see _sg_assert_backup_landed in the
+# generated script).
 #
 # NUL-delimited, because a WordPress uploads directory is user-supplied
 # filenames: spaces, quotes, glob characters and (rarely, but legally) newlines
@@ -231,33 +301,72 @@ backup_wp_content() {
 # are two extra deletions. The generated restore.sh re-validates every entry it
 # reads before acting on it.
 #
-# An EMPTY manifest is refused rather than written: it says "the backup
-# contained nothing", which on the restore side reads as "every file in
-# wp-content is an addition — delete all of them". A real wp-content is never
-# empty, and backup_verify_wp_content already refuses an empty archive for the
-# same reason; this is the same check applied to the artifact derived from it.
+# An EMPTY manifest is refused rather than written: it says "the backup covered
+# nothing", which on the restore side reads as "every file in wp-content is an
+# addition — delete all of them". A real wp-content is never empty, and
+# backup_verify_wp_content already refuses an empty archive for the same
+# reason.
 backup_write_wp_content_manifest() {
-  local src_dir="$1" manifest_file="$2"
+  local archive_dir="$1" manifest_file="$2"
   if is_dry_run; then
     log_info "[dry-run] would record a wp-content manifest at ${manifest_file}"
     return 0
   fi
-  if [ ! -d "$src_dir" ]; then
-    log_error "cannot record a wp-content manifest: ${src_dir} does not exist"
+  if [ ! -d "$archive_dir" ]; then
+    log_error "cannot record a wp-content manifest: ${archive_dir} does not exist"
     return 1
   fi
-  if ! ( cd "$src_dir" && find . -mindepth 1 -print0 ) > "$manifest_file"; then
-    log_error "could not record a wp-content manifest at ${manifest_file}"
-    rm -f "$manifest_file"
+  local root="${SITE_B_WP_PATH}/wp-content"
+  local raw="${manifest_file}.listing" partial="${manifest_file}.partial"
+  rm -f "$raw" "$partial"
+  if ! backup_list_b_wp_content > "$raw"; then
+    log_error "could not list B's wp-content (${root}) to record a manifest"
+    rm -f "$raw"
     return 1
   fi
-  if [ ! -s "$manifest_file" ]; then
+
+  # Anchored to B's own wp-content root: a listing that returns a path from
+  # somewhere else is not a listing this manifest can describe, and the
+  # manifest is what a restore later deletes from. Refuse it here, where
+  # nothing has been written to B yet. Recorded in a flag rather than returned
+  # from inside the loop, because the loop's stdout is the manifest being
+  # written — leaving through the middle of it is how a half-written manifest
+  # gets left on disk.
+  local abs rel count=0 bad=""
+  while IFS= read -r -d '' abs; do
+    [ -n "$abs" ] || continue
+    case "$abs" in
+      "${root}/"?*) ;;
+      *) bad="$abs"; break ;;
+    esac
+    rel=".${abs#"$root"}"
+    printf '%s\0' "$rel"
+    count=$((count + 1))
+  done < "$raw" > "$partial"
+  rm -f "$raw"
+
+  if [ -n "$bad" ]; then
+    log_error "cannot record a wp-content manifest: listing B's wp-content returned a path outside ${root} ([${bad}])"
+    rm -f "$partial"
+    return 1
+  fi
+  if [ "$count" -eq 0 ]; then
     log_error "wp-content manifest at ${manifest_file} came out empty — refusing to keep a manifest that would tell restore.sh to delete every file in B's wp-content"
-    rm -f "$manifest_file"
+    rm -f "$partial"
     return 1
   fi
+
+  local archive_count
+  archive_count=$( ( cd "$archive_dir" && find . -mindepth 1 -print0 ) | tr -dc '\0' | wc -c | tr -d ' ' )
+  if [ "$count" -ne "$archive_count" ]; then
+    log_error "backup aborted: B's wp-content holds ${count} path(s) but the archive pulled from it (${archive_dir}) holds ${archive_count}. Either the pull was partial, or B was written to while it ran. Both make this backup unsafe to restore from — a restore would delete files that were never additions. Re-run the backup with B quiescent."
+    rm -f "$partial"
+    return 1
+  fi
+
+  mv "$partial" "$manifest_file"
   chmod 600 "$manifest_file" 2>/dev/null || true
-  log_info "recorded wp-content manifest: ${manifest_file}"
+  log_info "recorded wp-content manifest: ${manifest_file} (${count} path(s), cross-checked against the archive)"
 }
 
 # backup_verify_db_export <gz_file> <table_prefix> — design doc §6.3 (Marcel's
@@ -357,6 +466,26 @@ backup_verify_wp_content() {
 # copy of the run dir to somewhere else, anything between backup time and
 # restore time). It's written using only gzip/wc/ls — never a sitegraft
 # function — to keep the self-containment guarantee intact.
+#
+# Every operator-supplied value baked into the script below goes through sq()
+# (lib/inventory.sh), which emits a single-quoted shell LITERAL. It is not
+# cosmetic. The three heredocs that build this script are expanding heredocs:
+# what bash writes into the file is text, and that text is parsed again by
+# bash when the script RUNS. Interpolating a profile value between plain
+# double quotes therefore hands it to a shell — a SITE_B_WP_PATH of
+# "/var/www/html$(id > /tmp/x)" ran `id` at line 31 of the generated script,
+# before the first integrity check and even under --dry-run (reproduced live
+# in this exact form). A single apostrophe in the same value — a DDEV project
+# named after somebody — produced a restore.sh that bash could not parse at
+# all, while `backup` went on to write backup.complete and call the backup
+# good. sq() closes both: a literal is data, in every shell that re-reads it.
+#
+# The one value that is deliberately NOT quoted is `$prefix`
+# (_backup_local_exec_prefix's wrapper command line, derived from
+# SITE_B_WP_CMD). It has to stay a sequence of separate command words to be a
+# command at all — SITE_B_WP_CMD is, by the design doc's own §5.1 contract, a
+# command line the tool executes. That is unchanged from `main` and from every
+# other phase; it is a property of what WP_CMD is, not of this script.
 backup_generate_restore_script() {
   local run_dir="$1"
   local wp_cmd_b restore_db_cmd restore_wp_content_cmd
@@ -373,12 +502,19 @@ _sg_delete_from_stdin() { echo 'internal error: this restore.sh does not use a w
 
   # Decorative only (see backup_wp_cmd_literal's own comment) — if it can't
   # resolve for any reason, the header comment just says so; it never blocks
-  # generating the actual restore commands below.
+  # generating the actual restore commands below. Newlines are folded to
+  # spaces: this value is interpolated into a `#` comment line, and a value
+  # carrying a newline would end that comment and turn the remainder into code.
   wp_cmd_b="$(backup_wp_cmd_literal b 2>/dev/null || echo '(unresolved)')"
+  wp_cmd_b="$(printf '%s' "$wp_cmd_b" | tr '\n' ' ')"
 
   if [ -n "${SITE_B_SSH_HOST:-}" ]; then
-    restore_wp_content_cmd="ssh '${SITE_B_SSH_HOST}' \"mkdir -p '${SITE_B_WP_PATH}/wp-content'\" && rsync -avz --delete '${run_dir}/backup/b-wp-content/' '${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/wp-content/'"
-    restore_db_cmd="gunzip -c '${run_dir}/backup/b-db.sql.gz' | ssh '${SITE_B_SSH_HOST}' \"${SITE_B_WP_CMD} --path='${SITE_B_WP_PATH}' db import -\""
+    # Two shells parse the remote half: restore.sh's own, then the far end's.
+    # Hence sq() applied twice to the remote path — the inner call quotes it
+    # for the remote shell, the outer one quotes that whole command string for
+    # the local one.
+    restore_wp_content_cmd="ssh $(sq "$SITE_B_SSH_HOST") $(sq "mkdir -p $(sq "${SITE_B_WP_PATH}/wp-content")") && rsync -avz --delete $(sq "${run_dir}/backup/b-wp-content/") $(sq "${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/wp-content/")"
+    restore_db_cmd="gunzip -c $(sq "${run_dir}/backup/b-db.sql.gz") | ssh $(sq "$SITE_B_SSH_HOST") $(sq "${SITE_B_WP_CMD} --path=$(sq "${SITE_B_WP_PATH}") db import -")"
     restore_semantics="exact-state, via rsync --delete — wp-content is mirrored back to exactly what this backup contains, and any file added to it since is removed"
   else
     local prefix; prefix=$(_backup_local_exec_prefix b)
@@ -410,8 +546,8 @@ _sg_delete_from_stdin() { echo 'internal error: this restore.sh does not use a w
       # the paths B holds that the manifest does not list. No wipe, no mount
       # point removed, no guessing: only known additions.
       prune_mode="manifest"
-      restore_semantics="exact-state, via this backup's own wp-content manifest — the backup is extracted in place, then every path wp-content holds that the manifest does not list is reported and removed (wp-content itself is never removed: on a container-synced target that can fail with 'Device or resource busy')"
-      restore_wp_content_cmd="${prefix} mkdir -p '${SITE_B_WP_PATH}/wp-content' && tar czf - -C '${run_dir}/backup/b-wp-content' . | ${prefix} tar xzf - -C '${SITE_B_WP_PATH}/wp-content'"
+      restore_semantics="exact-state, by difference against this backup's own wp-content archive — the archive is extracted in place, then every path wp-content holds that the archive does not contain is reported and removed (wp-content itself is never removed: on a container-synced target that can fail with 'Device or resource busy'). The backup's manifest is what certifies the archive is complete; it never selects anything for deletion"
+      restore_wp_content_cmd="${prefix} mkdir -p $(sq "${SITE_B_WP_PATH}/wp-content") && tar czf - -C $(sq "${run_dir}/backup/b-wp-content") . | ${prefix} tar xzf - -C $(sq "${SITE_B_WP_PATH}/wp-content")"
       # The two wrapped commands the prune needs, isolated into their own
       # tiny functions so the rest of the generated logic is wrapper-
       # agnostic. Paths are NEVER passed as arguments here: the list of
@@ -420,9 +556,9 @@ _sg_delete_from_stdin() { echo 'internal error: this restore.sh does not use a w
       # neither be split nor re-expanded by any shell the wrapper puts in
       # between (several do — see _backup_local_exec_prefix's own comment on
       # `--raw`).
-      prune_helpers="_sg_list_live() { ${prefix} find '${SITE_B_WP_PATH}/wp-content' -mindepth 1 -print0; }
+      prune_helpers="_sg_list_live() { ${prefix} find $(sq "${SITE_B_WP_PATH}/wp-content") -mindepth 1 -print0; }
 _sg_delete_from_stdin() { ${prefix} xargs -0 rm -rf --; }"
-      log_info "B is a wrapped-local site (SITE_B_WP_CMD implies a wrapper, e.g. DDEV) — the generated restore.sh restores wp-content to exactly what this backup contains: it extracts the backup in place and then removes the paths the backup's manifest does not list. It never removes wp-content itself (a container sync can make that fail with 'Device or resource busy'), and it refuses to remove anything at all if that manifest is missing, empty or unsafe rather than silently downgrading to overwrite-only."
+      log_info "B is a wrapped-local site (SITE_B_WP_CMD implies a wrapper, e.g. DDEV) — the generated restore.sh restores wp-content to exactly what this backup contains: it extracts the backup's archive in place and then removes the paths wp-content holds that the archive does not, recomputed after the extraction. It never removes wp-content itself (a container sync can make that fail with 'Device or resource busy'), and it refuses to remove anything at all — rather than silently downgrading to overwrite-only — if this backup's manifest is missing, empty, unreadable, reads back as no entries, disagrees with the archive's entry count, or if any listed path is unsafe or is still missing from B after the extraction."
       # MAJOR bug found by review (Viktor), confirmed live: `${SITE_B_WP_CMD}`
       # still carries `--raw`, and `--raw` doesn't just fail to help stdin —
       # it silently DROPS it. Reproduced on a real DDEV project: seeded an
@@ -442,10 +578,10 @@ _sg_delete_from_stdin() { ${prefix} xargs -0 rm -rf --; }"
       # DDEV harness run so far), and this asymmetry (stdout fine, stdin
       # dropped) is exactly what makes this bug easy to miss without testing
       # a real round-trip.
-      restore_db_cmd="gunzip -c '${run_dir}/backup/b-db.sql.gz' | ${prefix} wp --path='${SITE_B_WP_PATH}' db import -"
+      restore_db_cmd="gunzip -c $(sq "${run_dir}/backup/b-db.sql.gz") | ${prefix} wp --path=$(sq "${SITE_B_WP_PATH}") db import -"
     else
-      restore_wp_content_cmd="rsync -avz --delete '${run_dir}/backup/b-wp-content/' '${SITE_B_WP_PATH}/wp-content/'"
-      restore_db_cmd="gunzip -c '${run_dir}/backup/b-db.sql.gz' | ${SITE_B_WP_CMD} --path='${SITE_B_WP_PATH}' db import -"
+      restore_wp_content_cmd="rsync -avz --delete $(sq "${run_dir}/backup/b-wp-content/") $(sq "${SITE_B_WP_PATH}/wp-content/")"
+      restore_db_cmd="gunzip -c $(sq "${run_dir}/backup/b-db.sql.gz") | ${SITE_B_WP_CMD} --path=$(sq "${SITE_B_WP_PATH}") db import -"
       restore_semantics="exact-state, via rsync --delete — wp-content is mirrored back to exactly what this backup contains, and any file added to it since is removed"
     fi
   fi
@@ -456,10 +592,23 @@ _sg_delete_from_stdin() { ${prefix} xargs -0 rm -rf --; }"
   # runtime variables — is written literally, without a backslash in front of
   # every `$`. That escaping is exactly where a generated script acquires
   # bugs no test of the generator can see.
+  # Every one of these is a shell LITERAL, produced by sq() — see this
+  # function's own header comment for the command-execution and unparseable-
+  # script bugs that reach the generated file through these six lines.
+  local q_db_dump q_wp_content_dir q_manifest q_root q_prune_mode q_semantics q_run_dir
+  q_db_dump=$(sq "${run_dir}/backup/b-db.sql.gz")
+  q_wp_content_dir=$(sq "${run_dir}/backup/b-wp-content")
+  q_manifest=$(sq "${run_dir}/backup/b-wp-content.manifest")
+  q_root=$(sq "$b_wp_content_root")
+  q_prune_mode=$(sq "$prune_mode")
+  q_semantics=$(sq "$restore_semantics")
+  # Comment line, same newline-folding reason as wp_cmd_b above.
+  q_run_dir=$(printf '%s' "$run_dir" | tr '\n' ' ')
+
   cat > "${run_dir}/restore.sh" <<EOF
 #!/usr/bin/env bash
 # restore.sh-capability: dry-run
-# Generated by 'sitegraft backup' for run: ${run_dir}
+# Generated by 'sitegraft backup' for run: ${q_run_dir}
 # Self-contained: every command below is a literal, baked-in ssh/rsync/wp-cli
 # invocation (wp-cli literal prefix: ${wp_cmd_b}). This script never calls a
 # sitegraft function and never sources a sitegraft lib file — it runs
@@ -484,12 +633,12 @@ _sg_delete_from_stdin() { ${prefix} xargs -0 rm -rf --; }"
 # script.
 set -euo pipefail
 
-DB_DUMP="${run_dir}/backup/b-db.sql.gz"
-WP_CONTENT_DIR="${run_dir}/backup/b-wp-content"
-WP_CONTENT_MANIFEST="${run_dir}/backup/b-wp-content.manifest"
-B_WP_CONTENT_ROOT="${b_wp_content_root}"
-PRUNE_MODE="${prune_mode}"
-RESTORE_SEMANTICS="${restore_semantics}"
+DB_DUMP=${q_db_dump}
+WP_CONTENT_DIR=${q_wp_content_dir}
+WP_CONTENT_MANIFEST=${q_manifest}
+B_WP_CONTENT_ROOT=${q_root}
+PRUNE_MODE=${q_prune_mode}
+RESTORE_SEMANTICS=${q_semantics}
 
 ${prune_helpers}
 EOF
@@ -514,11 +663,18 @@ SG_TMP=""
 _sg_cleanup() { [ -n "$SG_TMP" ] && rm -rf "$SG_TMP"; return 0; }
 trap _sg_cleanup EXIT
 
+# NOTE: this exits the script, and it does so with an explicit `exit`, not by
+# returning non-zero and relying on `set -e`. That matters if it is ever called
+# from somewhere errexit does not reach — the left operand of `||`, a `!`, an
+# `if` condition — where a `return 1` would be silently downgraded to a warning
+# that lets the restore carry on. Keep the `exit`.
 _sg_die() { echo "$1" >&2; exit 1; }
 
 SG_NL='
 '
 SG_PRUNE_COUNT=0
+SG_ARCHIVE_COUNT=0
+SG_MANIFEST_COUNT=0
 
 # _sg_check_rel <relative-path> — the anchor of everything below. Every path
 # this script may delete is built by joining B's wp-content root to a path
@@ -530,35 +686,67 @@ SG_PRUNE_COUNT=0
 # rejected path is never skipped-and-ignored: the caller aborts the whole
 # restore, because a listing that contains one path this script cannot reason
 # about is a listing it cannot safely act on at all.
+#
+# The ".." test is per COMPONENT, not a substring match. A `*../*` glob also
+# matches "themes/foo../bar" — a directory legally named "foo.." — and, being
+# fail-closed, that did not risk a wrong deletion; it aborted the entire
+# restore over a perfectly valid filename, at the moment the operator most
+# needs the restore to run.
 _sg_check_rel() {
   case "$1" in
     ./?*) ;;
     *) return 1 ;;
   esac
   case "$1" in
-    *../*|*/..) return 1 ;;
-  esac
-  case "$1" in
     *"$SG_NL"*) return 1 ;;
   esac
+  local rest="${1#./}" comp
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      */*) comp="${rest%%/*}"; rest="${rest#*/}" ;;
+      *)   comp="$rest"; rest="" ;;
+    esac
+    if [ "$comp" = ".." ]; then return 1; fi
+  done
   return 0
 }
 
-# _sg_scan_prune — computes the set of paths B's wp-content holds that this
-# backup does not: read the manifest, list B, subtract. Sets SG_PRUNE_COUNT
-# and writes $SG_TMP/to-remove.txt (relative, sorted, for reporting) and
-# $SG_TMP/to-remove.nul (absolute, NUL-delimited, for xargs).
+# The keep-set is the ARCHIVE, and the manifest never deletes anything.
 #
-# Re-runnable on purpose: it is called a second time after the removal, to
-# check that the removal actually happened.
+# Which of the two artifacts drives the deletion is not a style question, and
+# the answer is not the one that looks obvious. It is settled by what the
+# extraction does to B's filenames, measured on macOS:
+#
+#   dst/ holds  Caf\xc3\xa9.css        (NFC — B's own name)
+#   src/ holds  Cafe\xcc\x81.css       (NFD — the archive's name)
+#   $ tar czf - -C src . | tar xzf - -C dst
+#   dst/ now holds  Cafe\xcc\x81.css   (RENAMED)
+#
+# Extracting the backup does not merely overwrite B's files, it renames them to
+# the archive's own byte sequences. So immediately after the extraction — which
+# is the only moment at which anything is deleted — B's names ARE the archive's
+# names, whatever normalization either side started in. That makes the archive
+# listing the one keep-set that is correct by construction, and it makes any
+# listing taken BEFORE the extraction (including the manifest) a listing of
+# names that may no longer exist.
+#
+# The manifest still exists, and is still required, for a different job it is
+# the only artifact able to do: certify that the archive is COMPLETE. It was
+# produced independently, from B's own filesystem at backup time, so comparing
+# their entry counts catches a wp-content pull that was partial and an archive
+# that lost files afterwards — neither of which a keep-set can detect about
+# itself. It is a witness, never an authority: no path is ever deleted because
+# the manifest failed to mention it.
+#
+# _sg_scan_prune — lists B, subtracts the archive. Sets SG_PRUNE_COUNT and
+# writes $SG_TMP/to-remove.txt (relative, sorted, for reporting),
+# $SG_TMP/to-remove.nul (absolute, NUL-delimited, for xargs) and
+# $SG_TMP/missing.txt (archive paths B does not show).
+#
+# Re-runnable on purpose: it is called again after the extraction, and again
+# after the removal to check the removal actually happened.
 _sg_scan_prune() {
   local rel abs
-  while IFS= read -r -d '' rel; do
-    [ -n "$rel" ] || continue
-    _sg_check_rel "$rel" || _sg_die "refusing to remove anything from B: this backup's wp-content manifest holds an entry that is not a safe relative path under wp-content ([${rel}]) — the manifest is corrupt or was tampered with"
-    printf '%s\n' "$rel"
-  done < "$WP_CONTENT_MANIFEST" > "$SG_TMP/manifest.txt"
-
   if ! _sg_list_live > "$SG_TMP/live.raw"; then
     _sg_die "refusing to remove anything from B: could not list B's current wp-content (${B_WP_CONTENT_ROOT})"
   fi
@@ -584,9 +772,12 @@ _sg_scan_prune() {
     _sg_die "refusing to remove anything from B: listing B's wp-content (${B_WP_CONTENT_ROOT}) returned zero entries. A live wp-content is never empty, so this is a listing that failed silently, not a target with nothing to remove."
   fi
 
-  LC_ALL=C sort "$SG_TMP/manifest.txt" > "$SG_TMP/manifest.sorted"
   LC_ALL=C sort "$SG_TMP/live.txt" > "$SG_TMP/live.sorted"
-  LC_ALL=C comm -13 "$SG_TMP/manifest.sorted" "$SG_TMP/live.sorted" > "$SG_TMP/to-remove.txt"
+  LC_ALL=C comm -13 "$SG_TMP/archive.sorted" "$SG_TMP/live.sorted" > "$SG_TMP/to-remove.txt"
+  # The mirror image: paths the archive holds that B does not show. Before the
+  # extraction that is ordinary (they are about to be restored); after it, it
+  # is not — see _sg_assert_backup_landed.
+  LC_ALL=C comm -23 "$SG_TMP/archive.sorted" "$SG_TMP/live.sorted" > "$SG_TMP/missing.txt"
 
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
@@ -596,14 +787,89 @@ _sg_scan_prune() {
   SG_PRUNE_COUNT=$(wc -l < "$SG_TMP/to-remove.txt" | tr -d ' ')
 }
 
+# _sg_load_keep_sets — reads the two backup-side listings once: the archive
+# (the keep-set) and the manifest (its independent witness). Neither depends on
+# B, so neither is re-read on the later scans.
+_sg_load_keep_sets() {
+  local rel abs
+
+  while IFS= read -r -d '' abs; do
+    [ -n "$abs" ] || continue
+    rel="$abs"
+    _sg_check_rel "$rel" || _sg_die "refusing to remove anything from B: this backup's wp-content archive (${WP_CONTENT_DIR}) holds an entry that is not a safe relative path under wp-content ([${rel}]) — the archive is damaged or was tampered with"
+    printf '%s\n' "$rel"
+  done < <( cd "$WP_CONTENT_DIR" && find . -mindepth 1 -print0 ) > "$SG_TMP/archive.txt"
+
+  # Belt and braces, and deliberately so: the integrity block above already
+  # refuses a WP_CONTENT_DIR that is missing or has no entries, so no input
+  # reaches here with an empty archive listing and no test can make this line
+  # fire. It is kept because it guards the one invariant everything below rests
+  # on — the keep-set is not empty — and because the check that currently makes
+  # it unreachable lives fifty lines away and is not obviously load-bearing
+  # from here. Recorded as a knowingly untested guard rather than presented as
+  # a covered one.
+  if [ ! -s "$SG_TMP/archive.txt" ]; then
+    _sg_die "refusing to remove anything from B: this backup's wp-content archive (${WP_CONTENT_DIR}) listed no entries. An empty keep-list would mean every file in B's wp-content is an addition to delete."
+  fi
+
+  while IFS= read -r -d '' rel; do
+    [ -n "$rel" ] || continue
+    _sg_check_rel "$rel" || _sg_die "refusing to remove anything from B: this backup's wp-content manifest holds an entry that is not a safe relative path under wp-content ([${rel}]) — the manifest is corrupt or was tampered with"
+    printf '%s\n' "$rel"
+  done < "$WP_CONTENT_MANIFEST" > "$SG_TMP/manifest.txt"
+
+  # A non-empty FILE and a non-empty PARSED listing are different facts. `[ -s ]`
+  # — the only check the manifest used to get — proves the first. A manifest
+  # that carries bytes but no NUL delimiter (a newline-delimited file, a copy
+  # that lost its trailing NUL) passes it and yields ZERO entries here, and zero
+  # entries used to mean "the backup covered nothing", i.e. every path on B is
+  # an addition. Measured on this exact script before this check existed: a
+  # manifest truncated to 10 bytes emptied a 7-path wp-content, including the
+  # two files the backup itself contained, and only then failed. The
+  # re-verification pass could not catch it either — it re-read the SAME
+  # manifest, so it agreed with itself.
+  if [ ! -s "$SG_TMP/manifest.txt" ]; then
+    _sg_die "refusing to restore: this backup's wp-content manifest (${WP_CONTENT_MANIFEST}) is not empty as a file but yielded no entries when read. It is NUL-delimited; a copy that lost its delimiters reads as an empty listing, and this script will not certify an archive against a listing it could not read. The manifest is corrupt. Take a fresh backup, or restore from a run that has an intact one."
+  fi
+
+  # The cross-check. Compared by entry COUNT, not by name: the two listings come
+  # from different filesystems (the manifest from B's own, the archive from the
+  # orchestrator's copy) and macOS's tar rewrites accented names between them,
+  # so the same file legitimately appears under two byte sequences. Counts are
+  # immune to that and still catch what matters: a truncated manifest, a run dir copied only
+  # in part, and a wp-content pull that was incomplete when the backup ran.
+  SG_ARCHIVE_COUNT=$(wc -l < "$SG_TMP/archive.txt" | tr -d ' ')
+  SG_MANIFEST_COUNT=$(wc -l < "$SG_TMP/manifest.txt" | tr -d ' ')
+  if [ "$SG_MANIFEST_COUNT" -ne "$SG_ARCHIVE_COUNT" ]; then
+    _sg_die "refusing to restore: this backup's wp-content manifest does not describe the archive it sits next to. The manifest (${WP_CONTENT_MANIFEST}) lists ${SG_MANIFEST_COUNT} path(s); the archive (${WP_CONTENT_DIR}) holds ${SG_ARCHIVE_COUNT}. Either the archive is incomplete — in which case restoring from it would delete files that were never additions — or the manifest was truncated after the backup was taken. Take a fresh backup, or restore from a run whose two artifacts agree."
+  fi
+
+  LC_ALL=C sort "$SG_TMP/archive.txt" > "$SG_TMP/archive.sorted"
+  LC_ALL=C sort "$SG_TMP/manifest.txt" > "$SG_TMP/manifest.sorted"
+  # Union of the two, used ONLY to keep the pre-extraction preview honest — see
+  # _sg_prune_preflight.
+  LC_ALL=C sort -u "$SG_TMP/archive.txt" "$SG_TMP/manifest.txt" > "$SG_TMP/accounted.sorted"
+}
+
 _sg_prune_preflight() {
   [ "$PRUNE_MODE" = "manifest" ] || return 0
-  [ -e "$WP_CONTENT_MANIFEST" ] || _sg_die "refusing to restore: this backup has no wp-content manifest (${WP_CONTENT_MANIFEST}). On this target wp-content cannot be safely wiped and rebuilt, so that manifest is the only way to know which files were added after the backup — without it, restoring would silently leave every one of them in place. Refusing rather than quietly downgrading to overwrite-only. Take a fresh backup, or restore from a run that has a manifest."
+  [ -e "$WP_CONTENT_MANIFEST" ] || _sg_die "refusing to restore: this backup has no wp-content manifest (${WP_CONTENT_MANIFEST}). On this target wp-content cannot be safely wiped and rebuilt, so an exact-state restore depends on knowing what this backup covered — and without that manifest there is nothing to certify the archive against, so restoring could delete files that were never additions. Refusing rather than quietly downgrading to overwrite-only. Take a fresh backup, or restore from a run that has a manifest."
   [ -f "$WP_CONTENT_MANIFEST" ] || _sg_die "refusing to restore: ${WP_CONTENT_MANIFEST} is not a regular file"
   [ -r "$WP_CONTENT_MANIFEST" ] || _sg_die "refusing to restore: the wp-content manifest ${WP_CONTENT_MANIFEST} is not readable"
-  [ -s "$WP_CONTENT_MANIFEST" ] || _sg_die "refusing to restore: the wp-content manifest ${WP_CONTENT_MANIFEST} is empty. An empty manifest would mean every file in B's wp-content is an addition — i.e. delete all of them. The backup is incomplete."
+  [ -s "$WP_CONTENT_MANIFEST" ] || _sg_die "refusing to restore: the wp-content manifest ${WP_CONTENT_MANIFEST} is empty. An empty manifest cannot certify that this backup's archive is complete, and an incomplete archive restored as an exact state deletes files that were never additions. The backup is incomplete."
   SG_TMP=$(mktemp -d) || _sg_die "refusing to restore: could not create a temporary directory"
+  _sg_load_keep_sets
   _sg_scan_prune
+
+  # The preview is deliberately WIDER than the keep-set: a path is only
+  # reported for removal if neither the archive nor the manifest accounts for
+  # it. Before the extraction, B still carries its own names — which on macOS
+  # are not the archive's names for any accented file (see the block comment
+  # above) — and threatening to delete a file that the extraction is in fact
+  # about to rename would be alarming and wrong. The real removal set is
+  # recomputed after the extraction, when B's names are the archive's names.
+  LC_ALL=C comm -13 "$SG_TMP/accounted.sorted" "$SG_TMP/live.sorted" > "$SG_TMP/to-preview.txt"
+  SG_PRUNE_COUNT=$(wc -l < "$SG_TMP/to-preview.txt" | tr -d ' ')
 }
 
 _sg_report_prune() {
@@ -617,11 +883,61 @@ _sg_report_prune() {
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     printf '  %s\n' "${B_WP_CONTENT_ROOT}/${rel#./}"
-  done < "$SG_TMP/to-remove.txt"
+  done < "$SG_TMP/to-preview.txt"
+}
+
+# _sg_assert_backup_landed — run AFTER the archive has been extracted onto B
+# and BEFORE anything is removed. Every path the archive holds must now be
+# present on B, byte for byte. Extracting the archive is what puts them there,
+# under the archive's own names, so anything still missing means the extraction
+# did not fully land — and this script is one step away from deleting files
+# while holding a listing it cannot reconcile with the backup.
+#
+# The other cause is Unicode normalization. "Café.css" has two legal UTF-8
+# encodings — NFC (é as one code point, C3 A9) and NFD (e followed by a
+# combining acute, 65 CC 81) — and `comm` compares bytes. Extraction normally
+# settles that by renaming B's file to the archive's form (measured; see the
+# block comment above), but a target that creates a second entry instead of
+# renaming, or a tar that converts on the way out, leaves the two forms apart.
+#
+# What this does NOT do is normalize. Doing that portably needs a Unicode table
+# (uconv, iconv -f UTF-8-MAC, python3's unicodedata) that is not guaranteed on
+# whatever machine a restore runs on, and this script's whole premise is that
+# it runs with ssh/rsync/tar/gzip/find/sort/comm/xargs and nothing else. So it
+# detects and refuses, naming the files, and says what it suspects. Refusing a
+# restore is recoverable; deleting a file the backup contained is not.
+_sg_assert_backup_landed() {
+  [ -s "$SG_TMP/missing.txt" ] || return 0
+  local n rel shown=0
+  n=$(wc -l < "$SG_TMP/missing.txt" | tr -d ' ')
+  {
+    echo "refusing to remove anything from B: ${n} path(s) this backup contains are still not present on B after extracting it. Nothing was removed, and the database has NOT been touched."
+    while IFS= read -r rel; do
+      [ -n "$rel" ] || continue
+      shown=$((shown + 1))
+      if [ "$shown" -gt 20 ]; then echo "  ... and $((n - 20)) more"; break; fi
+      printf '  %s\n' "${B_WP_CONTENT_ROOT}/${rel#./}"
+    done < "$SG_TMP/missing.txt"
+    echo "Either the extraction did not fully land, or these names exist on B in a different Unicode normalization: an accented filename has two legal UTF-8 encodings (NFC, one code point; NFD, a letter plus a combining mark), and a name held in one form does not match the same name reported in the other. This script compares bytes and cannot normalize them without a Unicode table it is not allowed to depend on, so it refuses rather than delete a file it failed to recognise. Check the paths above by hand, then re-run."
+  } >&2
+  exit 1
 }
 
 _sg_apply_prune() {
   [ "$PRUNE_MODE" = "manifest" ] || return 0
+  # Re-scan now that the archive has been extracted: B's names are the
+  # archive's names from here on, so this is the first listing that can be
+  # subtracted from without guessing.
+  _sg_scan_prune
+  _sg_assert_backup_landed
+  # And it must agree with what the operator was shown. The preview is computed
+  # against the archive AND the manifest, so the two sets coincide whenever
+  # nothing moved; a difference means either something else is writing to B's
+  # wp-content, or the extraction left both normalization forms of a name
+  # behind instead of renaming one into the other.
+  if ! cmp -s "$SG_TMP/to-preview.txt" "$SG_TMP/to-remove.txt"; then
+    _sg_die "refusing to remove anything from B: the set of paths to remove is not the one reported above. Either something else is writing to B's wp-content, or extracting this backup left a filename present under two different Unicode normalizations. Nothing was removed, and the database has NOT been touched."
+  fi
   [ "$SG_PRUNE_COUNT" -gt 0 ] || return 0
   echo "Removing ${SG_PRUNE_COUNT} path(s) added to wp-content since this backup ..."
   # The list travels on stdin, NUL-delimited: no path is ever a command-line
@@ -711,6 +1027,23 @@ if ! { ${restore_db_cmd}; }; then
 fi
 echo "Restore complete."
 EOF
+
+  # NIT-N6 (Kimi): the last thing a backup produces is the only artifact that
+  # is a PROGRAM, and nothing checked that bash could even read it. A single
+  # apostrophe in SITE_B_WP_PATH used to emit a restore.sh with a syntax error
+  # in it, and `backup` still wrote backup.complete — a backup declared good
+  # whose restore path cannot run at all. sq() above is the fix for that
+  # particular value; this is the net under it, and the natural place to catch
+  # whatever the NEXT unquoted interpolation turns out to be. Discarded rather
+  # than left behind: a restore.sh that does not parse is not a partial
+  # capability, and leaving it means the missing-restore.sh guard in
+  # phase_restore never fires either.
+  local parse_err
+  if ! parse_err=$(bash -n "${run_dir}/restore.sh" 2>&1); then
+    rm -f "${run_dir}/restore.sh"
+    log_error "the generated restore.sh does not parse and has been discarded — a backup whose restore script bash cannot read is not restorable. Check the profile's SITE_B_* values for a character that broke the generated file: ${parse_err}"
+    return 1
+  fi
   chmod 700 "${run_dir}/restore.sh"
 }
 
@@ -883,22 +1216,29 @@ phase_backup() {
     umask 077
     mkdir -p "${run_dir}/backup"
     chmod 700 "${run_dir}/backup"
-    backup_db_export "${run_dir}/backup"
-    backup_wp_content "${run_dir}/backup/b-wp-content"
-    # issue #14: recorded here, right after the archive it describes, so the
-    # two can never be out of step. The generated restore.sh refuses to remove
-    # anything without it.
+    # `|| exit 1` on all three, not left to the `set -e` above. Verified on
+    # bash 3.2.57: bash suppresses errexit for the WHOLE of a compound command
+    # that is the left operand of `||` — which this subshell is (`) || return
+    # 1`) — and an explicit `set -e` inside it does NOT re-enable it:
     #
-    # `|| exit 1`, not left to the `set -e` above. Found while mutation-testing
-    # this change, and it is not what the surrounding code assumes: bash
-    # suppresses `set -e` for the WHOLE of a compound command that is the left
-    # operand of `||` — which this subshell is (`) || return 1`). A failure
-    # here would therefore NOT have stopped the subshell; execution would have
-    # carried on and the backup would have gone on to write backup.complete
-    # with no manifest, reporting a success it had not earned. The two calls
-    # above are saved from the same trap only by their own downstream
-    # verification (backup_verify_db_export / backup_verify_wp_content); this
-    # one says so explicitly instead of relying on that.
+    #   f() { return 1; }
+    #   ( set -e; echo A; f; echo B; true ) || echo "subshell failed"
+    #   -> A / B, and "subshell failed" never prints.
+    #
+    # An earlier version documented the first two as "saved by their own
+    # downstream verification" instead. That is true of the database dump,
+    # which really is checked afterwards (gzip -t, a size floor, its core
+    # tables). It is not true of wp-content: backup_verify_wp_content only
+    # tests that the directory is non-empty, so a PARTIAL pull passes it. This
+    # feature makes that materially worse — the manifest is cross-checked
+    # against the archive, and both would be partial together on the same run —
+    # so the restore would go on to delete files that were never additions.
+    # Two lines, rather than an argument about why they are not needed.
+    backup_db_export "${run_dir}/backup" || exit 1
+    backup_wp_content "${run_dir}/backup/b-wp-content" || exit 1
+    # issue #14: recorded here, right after the archive it cross-checks
+    # against, so the two can never be out of step. The generated restore.sh
+    # refuses to remove anything without it.
     backup_write_wp_content_manifest "${run_dir}/backup/b-wp-content" "${run_dir}/backup/b-wp-content.manifest" || exit 1
     if [ -f "${run_dir}/backup/b-db.sql.gz" ]; then
       chmod 600 "${run_dir}/backup/b-db.sql.gz"
@@ -936,7 +1276,10 @@ phase_backup() {
     chmod 600 "${run_dir}/manifest.json" 2>/dev/null || true
   fi
 
-  backup_generate_restore_script "$run_dir"
+  # `|| return 1`: the generated restore.sh is now refused (and discarded) if
+  # bash cannot parse it, and a backup whose restore script does not exist is
+  # not a backup that may be marked complete.
+  backup_generate_restore_script "$run_dir" || return 1
 
   if ! is_dry_run; then
     touch "${run_dir}/backup.complete"
@@ -1038,8 +1381,11 @@ phase_restore() {
     umask 077
     mkdir -p "${pre_restore_dir}/backup"
     chmod 700 "${pre_restore_dir}" "${pre_restore_dir}/backup"
-    backup_db_export "${pre_restore_dir}/backup"
-    backup_wp_content "${pre_restore_dir}/backup/b-wp-content"
+    # `|| exit 1` for the same reason as phase_backup's own calls — see the
+    # comment there: errexit does not fire inside a subshell that is the left
+    # operand of `||`, explicit `set -e` or not.
+    backup_db_export "${pre_restore_dir}/backup" || exit 1
+    backup_wp_content "${pre_restore_dir}/backup/b-wp-content" || exit 1
     # The snapshot gets its own manifest for the same reason it gets its own
     # restore.sh: "even a restore has to stay reversible" means reversible to
     # the SAME standard. Without this, rolling back a restore on a
@@ -1053,7 +1399,10 @@ phase_restore() {
       chmod 600 "${pre_restore_dir}/backup/b-db.sql.gz"
     fi
   ) || return 1
-  backup_generate_restore_script "$pre_restore_dir"
+  backup_generate_restore_script "$pre_restore_dir" || {
+    log_error "could not generate a restore.sh for the pre-restore safety snapshot at ${pre_restore_dir} — refusing to run the restore without a usable way back. Nothing on B was touched."
+    return 1
+  }
 
   # --dry-run used to mean "print the path of restore.sh and stop", which told
   # the operator nothing about what a restore would actually do. The one thing

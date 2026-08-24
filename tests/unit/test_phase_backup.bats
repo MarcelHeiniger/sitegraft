@@ -15,11 +15,20 @@ setup() {
   export SITEGRAFT_STATE_DIR="$BATS_TEST_TMPDIR/state"
   mkdir -p "$SITEGRAFT_PROFILES_DIR" "$SITEGRAFT_STATE_DIR"
 
+  # A real directory for B: the wp-content manifest is read from B's own
+  # filesystem, not from the pulled archive (see
+  # backup_write_wp_content_manifest's comment), and it is cross-checked
+  # against the archive by entry count — so B has to hold exactly what the
+  # backup_wp_content stub below pulls.
+  B_ROOT="$BATS_TEST_TMPDIR/site-b"
+  mkdir -p "${B_ROOT}/wp-content/themes"
+  touch "${B_ROOT}/wp-content/themes/dummy-theme.txt"
+
   cat > "${SITEGRAFT_PROFILES_DIR}/t.conf" <<EOF
 SITE_A_ALIAS="a"
 SITE_A_WP_PATH="/var/www/a"
 SITE_B_ALIAS="b"
-SITE_B_WP_PATH="/var/www/b"
+SITE_B_WP_PATH="${B_ROOT}"
 SITE_B_WP_CMD="wp"
 SITEGRAFT_STATE_DIR="${SITEGRAFT_STATE_DIR}"
 EOF
@@ -197,6 +206,23 @@ EOF
   [ ! -f "${RUN_DIR}/backup.complete" ]
 }
 
+# The cross-check that gives the wp-content pull a real downstream test, which
+# it never had: backup_verify_wp_content only asks whether the archive is
+# non-empty, so a PULL THAT STOPPED HALFWAY passed. With the manifest read from
+# B instead of from the archive, the two listings are independent, and a
+# short archive is a countable fact rather than an invisible one. It matters
+# because the restore treats the archive as the keep-set: a partial archive
+# restored as an exact state deletes files that were never additions.
+@test "phase_backup aborts when the wp-content pull is PARTIAL (non-empty, but short of what B holds)" {
+  mkdir -p "${B_ROOT}/wp-content/plugins/acss"
+  touch "${B_ROOT}/wp-content/plugins/acss/acss.php"
+  # the stub still pulls only the themes half
+  run phase_backup --profile t --run "$RUN_DIR"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"path(s) but the archive"* ]] || false
+  [ ! -f "${RUN_DIR}/backup.complete" ]
+}
+
 @test "phase_backup --dry-run generates restore.sh but writes no completion marker or checksums" {
   run phase_backup --profile t --run "$RUN_DIR" --dry-run
   [ "$status" -eq 0 ]
@@ -223,4 +249,59 @@ EOF
   phase_backup --profile t --run "$RUN_DIR"
   run grep -E '^\s*\.\s+.*lib/|^\s*source\s+.*lib/' "${RUN_DIR}/restore.sh"
   [ "$status" -ne 0 ]
+}
+
+# --- a failed pull is a failed backup, not a smaller one ---
+# bash suppresses `errexit` for a compound command that is the LEFT operand of
+# `||`, and phase_backup's artifact subshell is exactly that (`) || return 1`).
+# So `set -e` inside it does not stop it: a failing backup_db_export or
+# backup_wp_content lets execution carry on. That is not symmetric between the
+# two — the db dump has real downstream checks (gzip -t, a size floor, core
+# tables), wp-content has only "non-empty", so a PARTIAL pull sails through.
+# And with the wp-content manifest derived from that partial copy, the restore
+# no longer merely leaves things behind: it deletes files that were never
+# additions.
+
+@test "phase_backup fails, and writes no backup.complete, when the wp-content pull fails while leaving a partial copy" {
+  backup_wp_content() {
+    local dest_dir="$1"
+    mkdir -p "${dest_dir}/themes"
+    touch "${dest_dir}/themes/dummy-theme.txt"   # non-empty: passes verification
+    return 1                                     # ... but the pull FAILED
+  }
+  run phase_backup --profile t --run "$RUN_DIR"
+  [ "$status" -ne 0 ]
+  [ ! -e "${RUN_DIR}/backup.complete" ]
+}
+
+@test "phase_backup fails, and writes no backup.complete, when the database export fails while leaving a plausible dump" {
+  backup_db_export() {
+    local dest_dir="$1"
+    mkdir -p "$dest_dir"
+    {
+      printf -- '-- MySQL dump\n'
+      printf 'CREATE TABLE `wp_options` (\n'
+      local i; for i in $(seq 1 30); do printf "INSERT INTO t VALUES (%d,'%s%s');\n" "$i" "$RANDOM" "$RANDOM"; done
+      printf ');\n'
+      printf 'CREATE TABLE `wp_posts` (\n'
+      for i in $(seq 1 30); do printf "INSERT INTO t VALUES (%d,'%s%s');\n" "$i" "$RANDOM" "$RANDOM"; done
+      printf ');\n'
+    } | gzip > "${dest_dir}/b-db.sql.gz"
+    return 1
+  }
+  run phase_backup --profile t --run "$RUN_DIR"
+  [ "$status" -ne 0 ]
+  [ ! -e "${RUN_DIR}/backup.complete" ]
+}
+
+@test "phase_backup writes no backup.complete when the restore.sh generator fails" {
+  # The generator now refuses (and discards) a restore.sh that bash cannot
+  # parse — see backup_generate_restore_script. That refusal only means
+  # anything if phase_backup acts on it: a backup whose restore script does not
+  # exist must not be marked complete, because `graft` accepts any run dir that
+  # carries the marker.
+  backup_generate_restore_script() { return 1; }
+  run phase_backup --profile t --run "$RUN_DIR"
+  [ "$status" -ne 0 ]
+  [ ! -e "${RUN_DIR}/backup.complete" ]
 }

@@ -8,17 +8,28 @@
 setup() {
   load '../../lib/core.sh'
   load '../../lib/profile.sh'
+  # inventory.sh for sq(), which every path baked into a generated restore.sh
+  # goes through; bin/sitegraft sources it before backup.sh for this phase too.
+  load '../../lib/inventory.sh'
   load '../../lib/backup.sh'
 
   export SITEGRAFT_PROFILES_DIR="$BATS_TEST_TMPDIR/profiles"
   export SITEGRAFT_STATE_DIR="$BATS_TEST_TMPDIR/state"
   mkdir -p "$SITEGRAFT_PROFILES_DIR" "$SITEGRAFT_STATE_DIR"
 
+  # A real directory for B: the pre-restore snapshot's wp-content manifest is
+  # read from B's own filesystem and cross-checked against the pulled archive by
+  # entry count, so B has to hold exactly what the backup_wp_content stub below
+  # pulls.
+  B_ROOT="$BATS_TEST_TMPDIR/site-b"
+  mkdir -p "${B_ROOT}/wp-content/themes"
+  touch "${B_ROOT}/wp-content/themes/dummy.txt"
+
   cat > "${SITEGRAFT_PROFILES_DIR}/t.conf" <<EOF
 SITE_A_ALIAS="a"
 SITE_A_WP_PATH="/var/www/a"
 SITE_B_ALIAS="b"
-SITE_B_WP_PATH="/var/www/b"
+SITE_B_WP_PATH="${B_ROOT}"
 SITE_B_WP_CMD="wp"
 SITEGRAFT_STATE_DIR="${SITEGRAFT_STATE_DIR}"
 EOF
@@ -145,4 +156,16 @@ EOF
 @test "phase_restore --dry-run does not falsely report failure (MAJOR regression, same bug as phase_backup)" {
   SITEGRAFT_DRY_RUN=1 run phase_restore --profile t --run "$RUN_DIR" --yes
   [ "$status" -eq 0 ]
+}
+
+# "Even a restore has to stay reversible" is not satisfied by a snapshot whose
+# own restore.sh could not be generated. The generator refuses to leave behind
+# a script bash cannot parse, and phase_restore must stop there rather than run
+# the real restore with no way back.
+@test "phase_restore refuses to run when the pre-restore snapshot's restore.sh cannot be generated" {
+  backup_generate_restore_script() { return 1; }
+  run phase_restore --profile t --run "$RUN_DIR" --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"without a usable way back"* ]] || false
+  [[ "$output" != *"FAKE RESTORE RAN"* ]] || false
 }

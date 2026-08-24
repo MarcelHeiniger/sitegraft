@@ -224,11 +224,16 @@ machine, plus a **self-contained, ready-to-run `restore.sh`** written into the s
 run directory. This must succeed before `graft` will run at all — `graft` refuses
 outright if no `backup.complete` marker exists for the run.
 
-Alongside the archive, `backup` records a **manifest of what `wp-content`
-contained** (`backup/b-wp-content.manifest`). That is what lets `restore.sh` put B
-back to exactly its pre-`graft` state on a containerized target — see
-[`restore`](#46-restore--roll-b-back) below. It is written at run time, never
-committed, and is readable only by you.
+Alongside the archive, `backup` records a **manifest of what B's `wp-content`
+held** (`backup/b-wp-content.manifest`), read from B's own filesystem rather than
+from the archive it sits next to. Its job is to certify that the archive is
+complete: the two listings come from different sources, so if their entry counts
+disagree the pull was partial (or B was being written to while it ran) and the
+backup is refused rather than kept. That matters because `restore.sh` treats the
+archive as the list of files to keep — see [`restore`](#46-restore--roll-b-back)
+below — and an incomplete archive restored as an exact state would delete files
+that were never additions. It is written at run time, never committed, and is
+readable only by you.
 
 `--dry-run` prints the commands that would run and skips writing real backup
 files, checksums, the manifest, or the completion marker — it never claims success
@@ -360,17 +365,24 @@ gets there depends on the target:
 - **ssh-remote and plain local B** — `rsync --delete`, a straight mirror.
 - **Containerized local B** (a `SITE_B_WP_CMD` with a wrapper, e.g. DDEV) —
   `wp-content` is never wiped, because a container sync can make the directory
-  itself un-removable (`Device or resource busy`). Instead the backup is extracted
-  in place, and the paths B holds that the backup's manifest does *not* list are
-  reported and then removed — only known additions, never a wipe-and-rebuild. The
+  itself un-removable (`Device or resource busy`). Instead the backup's
+  `wp-content` archive is extracted in place, and then every path B holds that the
+  archive does *not* contain is reported and removed — only known additions, never
+  a wipe-and-rebuild. The removal list is recomputed *after* the extraction (that
+  is what makes B's filenames the archive's filenames, down to the byte) and the
   script re-lists B afterwards to confirm the removal actually happened.
 
-If that manifest is missing, empty, or contains anything that isn't a plain
-relative path inside `wp-content`, `restore.sh` **refuses to restore at all** and
-says why. It never quietly falls back to overwriting-without-deleting: a restore
-that silently does less than it says is the failure mode this tool exists to avoid.
-An old run directory taken before manifests existed therefore needs a fresh
-`backup`.
+`restore.sh` **refuses to restore at all**, and says why, if any of these hold: the
+manifest is missing, empty, unreadable, or reads back as no entries; the manifest's
+entry count disagrees with the archive's; either listing contains anything that is
+not a plain relative path inside `wp-content`; B's listing comes back empty; or a
+path the archive contains is still not present on B after the extraction. That last
+one is how a filename that exists under two different Unicode normalizations (an
+accented name can be encoded either way, and paths are compared as bytes) is caught
+instead of being mistaken for a file added since the backup: the script names the
+paths and stops. It never quietly falls back to overwriting-without-deleting, and it
+never deletes on a guess. An old run directory taken before manifests existed
+therefore needs a fresh `backup`.
 
 `--dry-run` is a real preview here, not a printed command line: it runs
 `restore.sh --dry-run`, which reads B, lists every path it would remove, and writes
