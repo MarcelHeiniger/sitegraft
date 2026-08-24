@@ -409,12 +409,24 @@ _core_wp_fix_theme_mods() {
 # "only exercisable through a live wp eval" problem NIT-1 already solved. A
 # `wp:navigation-link`/`wp:navigation-submenu` block comment's attributes are
 # a single, self-contained JSON object right after the block name; isolating
-# just that object with a regex (balanced-brace via a recursive subpattern,
-# not a naive `\{.*?\}`, so a nested value never truncates the match early)
+# just that object with a regex (balanced-brace via a recursive subpattern)
 # and running it through plain json_decode/json_encode needs no WordPress
 # bootstrap at all, and is exactly as precise -- the id/kind decision itself
 # is still made by reading real, decoded JSON, only the surrounding HTML-
 # comment framing is regex.
+#
+# WHY THE RECURSIVE SUBPATTERN SPECIFICALLY (fourth-round review, Viktor,
+# correcting an earlier version of this comment): NOT because a naive
+# `\{.*?\}` truncates on a nested value -- it doesn't. Checked directly: a
+# non-greedy `\{.*?\}` anchored by this same pattern's `\s*(/)?-->` tail
+# backtracks correctly and captures a real nested object
+# (`{"ref":77,"style":{"typography":{...}},"layout":{...}}`) exactly like
+# the recursive form does, for ordinary single-line content. The actual,
+# verified divergence is multi-line attrs: `.` does not match a newline
+# without PCRE's `/s` modifier (not used here), so `\{.*?\}` fails outright
+# on attributes split across lines, while `[^{}]++` inside the recursive
+# form matches any character including newlines and succeeds. Checked both
+# ways directly, not assumed.
 #
 # WHY THE "kind":"post-type" CHECK IS LOAD-BEARING, not decoration: a
 # navigation-link's `"id"` attribute is AMBIGUOUS on its own --
@@ -481,9 +493,25 @@ function sitegraft_core_wp_remap_nav_link_ids( $map, $content ) {
 	// referenced from a page or template" -- that overstates this
 	// function's actual reach. _core_wp_remap_nav_page_ids (below) only
 	// ever passes content from posts id-map.tsv tags wp_navigation; a
-	// migrated PAGE is never in that scan at all, and no shipped module
-	// migrates wp_template_part either. So the ref rule here can only
-	// ever fire on a wp:navigation block NESTED inside another migrated
+	// migrated PAGE is never in that scan at all. Fourth-round review
+	// (Viktor), one more precision on the same point: modules/etch.sh
+	// DOES migrate wp_template -- the canonical place a block theme's
+	// own `wp:navigation {"ref":N}` actually lives (a header/footer
+	// template embedding the site's shared navigation) -- so "no shipped
+	// module migrates a template" would be the wrong reason for this
+	// scope limit even though it happens to be true of
+	// wp_template_part specifically. The real reason is narrower and
+	// holds regardless of what other modules migrate: this function's
+	// OWN scan is restricted to wp_navigation rows, full stop, so a ref
+	// inside a migrated wp_template is out of reach here no matter what.
+	// On an Etch source it is not actually left unremapped in practice --
+	// etch_post_import's own blind "ref":<old> substitution (this file,
+	// above) scans EVERY non-attachment migrated post, wp_template
+	// included, and catches it incidentally, the same way it already
+	// covers a ref inside wp_navigation's own content. On a block-theme
+	// source without Etch, nothing remaps a ref inside a migrated
+	// wp_template. So the ref rule here can only ever fire, on its own,
+	// on a wp:navigation block NESTED inside another migrated
 	// wp_navigation post's own content -- one navigation embedding
 	// another by reference -- not one embedded in a page or template.
 	// That narrower case is still real and still worth remapping
