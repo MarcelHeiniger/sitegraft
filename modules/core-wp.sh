@@ -100,14 +100,39 @@ core_wp_post_types_dynamic() {
     return 1
   fi
 
-  # jq's `//` treats both an absent key and an explicit `null` as falsy,
-  # which is exactly the "missing key (old scan) and null (query failed) are
-  # the same 'no evidence' answer" rule this function's header comment
-  # documents -- one line does both cases at once, deliberately, rather than
-  # two branches that could drift apart. `0` (a real, meaningful "A has no
-  # navigation" answer) is NOT falsy to jq's `//` (only `false`/`null` are),
-  # so a genuine zero count reaches the numeric comparison below exactly as
-  # itself, never silently swapped for "unknown".
+  # B4 (Viktor's review, mutation-proven): the missing-key, explicit-null and
+  # zero cases must NOT all collapse into the same silent "claim nothing",
+  # even though they all end there. Missing-key and zero are legitimate,
+  # unremarkable answers -- an old scan predating this field, and a real
+  # classic-theme site with no navigation, respectively -- and stay silent.
+  # An explicit `null`, though, means the scan record EXISTS and says the
+  # A-side count query itself FAILED (lib/inventory.sh's
+  # inventory_nav_post_count / inventory_scan_site never write a bare
+  # `null` for any other reason) -- on a genuinely block-theme A whose
+  # count query happened to fail, that reads to an operator as "verify
+  # prints NAV:not-selected", indistinguishable from a deliberate,
+  # successful decision that A has none. Proved by mutation before this
+  # fix: changing the OTHER jq call's `// "unknown"` fallback to `// 0`
+  # survived the entire suite, because nothing observed the difference
+  # between "0" and "couldn't tell" -- ADR 0007 §4 is explicit that these
+  # must read differently ("return 0 for 'nothing here', non-zero for 'I
+  # could not tell'"), and core_wp_option_keys_dynamic already sets that
+  # precedent in this very file by hard-failing when it cannot tell. This
+  # function does not go that far (an unreadable count is not the same
+  # class of "the scan itself is unusable" core_wp_option_keys_dynamic's
+  # own hard-fail cases are), but it must not stay silent about it either.
+  if jq -e 'has("nav_post_count") and .nav_post_count == null' "$scan_json" >/dev/null 2>&1; then
+    log_warn "core-wp: ${scan_json} records nav_post_count as null -- the A-side wp_navigation count query failed (lib/inventory.sh's inventory_nav_post_count), so wp_navigation is NOT being claimed even though A may genuinely have navigation content. Re-run 'sitegraft scan' to retry, or migrate wp_navigation explicitly via a SITEGRAFT_MANIFEST_PREFILLED manifest if you already know A has some."
+  fi
+
+  # jq's `//` treats both an absent key and an explicit `null` as falsy --
+  # correct for deciding whether to CLAIM (both mean "no evidence of
+  # navigation to migrate"), which is all this second query is for; the
+  # warn above already gave the null case its own, separate voice. `0` (a
+  # real, meaningful "A has no navigation" answer) is NOT falsy to jq's
+  # `//` (only `false`/`null` are), so a genuine zero count reaches the
+  # numeric comparison below exactly as itself, never silently swapped for
+  # "unknown".
   nav_count=$(jq -r '.nav_post_count // "unknown"' "$scan_json" 2>/dev/null) || nav_count=unknown
   case "$nav_count" in
     ''|*[!0-9]*) return 0 ;; # not a plain non-negative integer -- "unknown", or garbled -- claim nothing
@@ -394,11 +419,19 @@ _core_wp_fix_theme_mods() {
 # WHY THE "kind":"post-type" CHECK IS LOAD-BEARING, not decoration: a
 # navigation-link's `"id"` attribute is AMBIGUOUS on its own --
 # {"id":7,"kind":"taxonomy","type":"category"} carries a TERM id, not a post
-# id, and sitegraft migrates no term id-map at all (theme_mods'
-# nav_menu_locations, B2 above, is REMOVED rather than remapped for exactly
-# this reason: there is nothing to remap it through). A blind
-# `"id":<old>(?!\d)` substitution run against id-map.tsv's POST ids -- the
-# same sentinel technique graft_remap_attachment_ids already uses for
+# id. CORRECTION (Viktor's review, B1): an earlier version of this comment
+# claimed "sitegraft migrates no term id-map at all" -- that is factually
+# wrong. mu-plugins/sitegraft-id-mapper.php's wp_import_insert_term handler
+# DOES log one, as id-map.tsv rows tagged `term:<taxonomy>` in column 3 --
+# theme_mods' nav_menu_locations (B2 above) is REMOVED rather than remapped
+# because nothing CONSUMES that term map for a content remap today, not
+# because it doesn't exist. It does, and _core_wp_remap_nav_page_ids's own
+# `map_json` below MUST exclude those rows explicitly (not just
+# "attachment"), or jq's `add` lets a term row's key silently overwrite a
+# real page mapping that happens to share the same OLD numeric id -- exactly
+# the collision this comment is otherwise warning about, self-inflicted. A
+# blind `"id":<old>(?!\d)` substitution run against id-map.tsv's POST ids --
+# the same sentinel technique graft_remap_attachment_ids already uses for
 # attachment ids -- would silently rewrite a category's term id whenever it
 # happens to numerically coincide with a migrated post's OLD id, corrupting
 # a reference that was never a post reference to begin with. Only a value
@@ -408,19 +441,97 @@ _core_wp_fix_theme_mods() {
 # its id happens to collide with something in the map.
 _core_wp_nav_remap_php() {
   cat <<'PHP'
+function sitegraft_core_wp_serialize_block_attributes( $attrs ) {
+	// Replicates WordPress core's serialize_block_attributes()
+	// (wp-includes/blocks.php) exactly -- verified directly against that
+	// file's real source, not reverse-engineered. wp_json_encode() itself
+	// falls through to a plain json_encode() call with the same flags
+	// whenever encoding succeeds (wp-includes/functions.php), so
+	// reproducing it here needs no WordPress bootstrap. B3 (Viktor's
+	// review, execution-proven): a bare json_encode( $attrs ) does NONE of
+	// this -- a label containing a literal "-->" survives untouched and
+	// lands INSIDE the rewritten block's own attrs, ahead of the block's
+	// real closing delimiter. A subsequent parse_blocks() call (Site
+	// Editor, front-end render, anything) would then read that leaked
+	// "-->" as the block's actual end, truncating the JSON attrs
+	// mid-string and leaking the remainder into the page as plain text.
+	$encoded = json_encode( $attrs, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+	return strtr(
+		$encoded,
+		array(
+			'\\\\' => '\\u005c',
+			'--'   => '\\u002d\\u002d',
+			'<'    => '\\u003c',
+			'>'    => '\\u003e',
+			'&'    => '\\u0026',
+			'\\"'  => '\\u0022',
+		)
+	);
+}
+
 function sitegraft_core_wp_remap_nav_link_ids( $map, $content ) {
-	$pattern = '~<!--\s*wp:((?:core/)?navigation-(?:link|submenu))\s+(\{(?:[^{}]++|(?2))*+\})\s*(/)?-->~';
+	// B5 (Viktor's review, execution-proven): three DIFFERENT block shapes
+	// carry a page/navigation id, not just navigation-link/-submenu's
+	// "id". A wp:page-list block SCOPED to a parent page carries that
+	// page's id in "parentPageID" -- a dynamic navigation (no hardcoded
+	// CHILD ids) can still name its own SCOPE by id. A bare wp:navigation
+	// block's "ref" attribute embeds ANOTHER wp_navigation post by id --
+	// how a shared/reusable navigation gets referenced from a page or
+	// template. Neither needs a "kind" disambiguation the way
+	// navigation-link's "id" does: parentPageID can only ever mean a page
+	// (core/page-list has no other id-bearing attribute), and ref can
+	// only ever mean a wp_navigation post -- both safe to remap
+	// unconditionally whenever present and non-zero.
+	$pattern = '~<!--\s*wp:((?:core/)?(?:navigation-link|navigation-submenu|navigation|page-list))\s+(\{(?:[^{}]++|(?2))*+\})\s*(/)?-->~';
 	return preg_replace_callback( $pattern, function ( $m ) use ( $map ) {
 		$attrs = json_decode( $m[2], true );
-		if ( ! is_array( $attrs ) || ! isset( $attrs['kind'], $attrs['id'] ) || $attrs['kind'] !== 'post-type' ) {
+		if ( ! is_array( $attrs ) ) {
 			return $m[0];
 		}
-		$old_id = (string) $attrs['id'];
-		if ( ! array_key_exists( $old_id, $map ) ) {
+		// Strip an optional "core/" prefix so all three ways WordPress can
+		// spell a block name resolve to the same three-way switch below.
+		$name = preg_replace( '~^core/~', '', $m[1] );
+
+		$changed = false;
+		// Nit (Viktor's review): a navigation-link/-submenu carrying "id" and
+		// "type" but NO "kind" field at all is deliberately left untouched,
+		// same as a "kind":"taxonomy" one, and for the same reason -- not
+		// because it is known to be safe or known to be a term reference,
+		// but because it is NOT known to be a post reference. "kind" is the
+		// one field this whole function trusts to disambiguate "id"; a block
+		// saved by an older Gutenberg version (or hand-authored/imported)
+		// that predates "kind" being written at all is a real possibility,
+		// not a contrived one, and guessing "type":"page" implies
+		// "kind":"post-type" would be exactly the guess this function exists
+		// to refuse making. isset( $attrs['kind'], ... ) already requires
+		// BOTH keys present, so this case falls through unchanged by
+		// construction; documented here so that omission reads as a decision
+		// rather than an oversight.
+		if ( ( 'navigation-link' === $name || 'navigation-submenu' === $name )
+			&& isset( $attrs['kind'], $attrs['id'] ) && 'post-type' === $attrs['kind'] ) {
+			$old_id = (string) $attrs['id'];
+			if ( array_key_exists( $old_id, $map ) ) {
+				$attrs['id'] = (int) $map[ $old_id ];
+				$changed = true;
+			}
+		} elseif ( 'page-list' === $name && isset( $attrs['parentPageID'] ) && (int) $attrs['parentPageID'] > 0 ) {
+			$old_id = (string) $attrs['parentPageID'];
+			if ( array_key_exists( $old_id, $map ) ) {
+				$attrs['parentPageID'] = (int) $map[ $old_id ];
+				$changed = true;
+			}
+		} elseif ( 'navigation' === $name && isset( $attrs['ref'] ) && (int) $attrs['ref'] > 0 ) {
+			$old_id = (string) $attrs['ref'];
+			if ( array_key_exists( $old_id, $map ) ) {
+				$attrs['ref'] = (int) $map[ $old_id ];
+				$changed = true;
+			}
+		}
+
+		if ( ! $changed ) {
 			return $m[0];
 		}
-		$attrs['id'] = (int) $map[ $old_id ];
-		$new_attrs = json_encode( $attrs );
+		$new_attrs = sitegraft_core_wp_serialize_block_attributes( $attrs );
 		if ( false === $new_attrs ) {
 			return $m[0];
 		}
@@ -469,8 +580,15 @@ _core_wp_remap_nav_page_ids() {
   [ -s "$id_map_tsv" ] || return 0
 
   local nav_ids_json
+  # Nit (Viktor's review): `| unique` was missing here -- modules/etch.sh's
+  # own equivalent (`ids_json`, its component-ref remap) already dedupes,
+  # for the same reason: a hand-edited or otherwise duplicated id-map.tsv
+  # row would otherwise walk the same post id twice through the PHP loop
+  # below, applying the substitution to whatever its FIRST pass already
+  # produced -- harmless for a straight id swap once, but not a guarantee
+  # this function's own logic depends on holding.
   nav_ids_json=$(awk -F'\t' '$3=="wp_navigation" && $2 ~ /^[0-9]+$/ {print $2}' "$id_map_tsv" \
-    | jq -R -s -c 'split("\n") | map(select(length > 0))')
+    | jq -R -s -c 'split("\n") | map(select(length > 0)) | unique')
   # No wp_navigation post travelled in this run -- legitimately nothing to
   # do, not an error (a manifest excluding wp_navigation from migrate is a
   # valid, deliberate choice, same as page_on_front's own header comment
@@ -485,7 +603,16 @@ _core_wp_remap_nav_page_ids() {
   # attachment reference to begin with (etch_post_import's own component-ref
   # remap excludes them from its map for the identical reason).
   local map_json
-  map_json=$(awk -F'\t' '$3 != "attachment" && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {printf "%s\t%s\n", $1, $2}' "$id_map_tsv" \
+  # B1 (Viktor's review, execution-proven): excluding "attachment" alone is
+  # NOT enough. mu-plugins/sitegraft-id-mapper.php's wp_import_insert_term
+  # handler writes id-map.tsv rows tagged `term:<taxonomy>` in column 3 --
+  # real rows, not hypothetical -- and jq's `add` below lets the LAST row
+  # for a given OLD id win. Without this second exclusion, a term whose old
+  # id collides with a migrated page's old id (both id sequences start at 1
+  # on a fresh WordPress site) silently overwrites the correct page mapping
+  # with the term's new id -- corrupting a "kind":"post-type" reference that
+  # was never a term reference to begin with. Proved live before this fix.
+  map_json=$(awk -F'\t' '$3 != "attachment" && $3 !~ /^term:/ && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {printf "%s\t%s\n", $1, $2}' "$id_map_tsv" \
     | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t")) | map({(.[0]): .[1]}) | add // {}')
 
   local remap_fn php

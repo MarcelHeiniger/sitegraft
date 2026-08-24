@@ -82,6 +82,51 @@ setup() {
   [[ "$output" != *"--tables"* ]] || false
 }
 
+# B2 (Viktor's review of PR #38/#17, execution-proven): wp_navigation posts
+# entered id-map.tsv for the first time once #17 started migrating them, and
+# graft_migrated_post_ids_json (used by graft_search_replace_domain too, and
+# correctly unfiltered THERE — a domain leak inside a navigation-link's
+# custom-URL is exactly the kind of thing that DOES need remapping) takes
+# EVERY row regardless of post_type. sitegraft_remap_attachment_refs
+# (lib/php/content-remap-functions.php) substitutes `"id":<old>` for every
+# ATTACHMENT old id, with zero awareness of a navigation-link's own "kind"
+# attribute -- so a "kind":"taxonomy" link whose id happens to numerically
+# collide with a migrated ATTACHMENT's old id gets its TERM id silently
+# replaced with the attachment's NEW id. Proved live: a "kind":"taxonomy"
+# navigation-link with id 5, and an attachment also carrying old id 5
+# (term ids and attachment/post ids are two independent sequences that both
+# start at 1 on a fresh WordPress site, so this is a real, not remote,
+# collision), comes out with the attachment's NEW id instead of its own
+# untouched term id. modules/core-wp.sh's own _core_wp_remap_nav_page_ids
+# (which runs AFTER this function, in the module post_import step) cannot
+# repair this: it only ever touches "kind":"post-type" entries by design
+# (the same ambiguity-safety reasoning), so a taxonomy-kind corruption
+# introduced here survives untouched. wp_navigation posts are excluded from
+# THIS function's post_ids scope specifically -- not from
+# graft_migrated_post_ids_json itself, which graft_search_replace_domain
+# still needs unfiltered.
+@test "graft_remap_attachment_ids excludes wp_navigation posts from its post_ids scope -- a navigation-link's taxonomy-kind id must never be corrupted by an unrelated attachment remap (B2)" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '10	42	attachment
+77	177	wp_navigation
+5	105	page
+' > "$tsv"
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local captured="$BATS_TEST_TMPDIR/captured.json"
+  graft_push_remap_payload() { printf '%s' "$2" > "$captured"; echo "/fake/remote/path.json"; }
+  graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
+  wp_remote() { echo "sitegraft: id-remap rewrote 0 post(s)"; }
+  graft_remove_file() { :; }
+  run graft_remap_attachment_ids "$tsv" "$run_dir"
+  [ "$status" -eq 0 ]
+  # Attachment rows' OWN new ids legitimately stay in post_ids (unchanged,
+  # pre-existing behavior -- an attachment's own post_content/post_excerpt
+  # can reference OTHER attachments, e.g. a media description). Only the
+  # wp_navigation row's new id (177) is excluded.
+  run jq -e '.post_ids == ["42","105"]' "$captured"
+  [ "$status" -eq 0 ]
+}
+
 @test "graft_remap_attachment_ids's wp eval call requires the shared content-remap library and calls its function, never a table-wide search-replace" {
   local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
   printf '10\t42\tattachment\n' > "$tsv"

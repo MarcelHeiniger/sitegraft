@@ -421,6 +421,26 @@ _assert_alias() {
   [ "$output" = "2" ]
 }
 
+# Nit (Viktor's review): nothing pinned "post_status => 'any'" specifically
+# -- a scan that silently narrowed this to "publish" only would undercount
+# a navigation still in draft/private status, collapsing right back into
+# the exact "A has none" false negative B4/#17 exist to avoid, just from a
+# different cause. This asserts the real query text, not merely its return
+# value, the same way core_wp_post_import's own tests assert on captured
+# call text rather than only outcomes.
+@test "inventory_nav_post_count queries wp_navigation posts of ANY status, not published-only -- a draft/private navigation must still be counted" {
+  local calls="$BATS_TEST_TMPDIR/calls.log"
+  wp_remote() {
+    local alias_lc="$1"; shift
+    printf '%s
+' "$*" >> "${BATS_TEST_TMPDIR}/calls.log"
+    echo 1
+  }
+  inventory_nav_post_count a >/dev/null
+  run cat "$calls"
+  [[ "$output" == *'"post_status" => "any"'* ]] || false
+}
+
 @test "inventory_nav_post_count returns 0, not an error, when A genuinely has no wp_navigation posts" {
   wp_remote() { echo 0; }
   run inventory_nav_post_count a

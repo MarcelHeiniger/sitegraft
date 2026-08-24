@@ -586,12 +586,25 @@ B_HOME_ID_FROM_MAP=$(awk -F'\t' -v old="$A_HOME_ID" '$1==old && $3=="page"{print
 [ -n "$B_HOME_ID_FROM_MAP" ]
 B_FOOTER_ID=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=wp_navigation --title="Footer" --field=ID)
 FOOTER_CONTENT_ON_B=$(ddev exec --raw -p "$PROJECT_B" -- wp post get "$B_FOOTER_ID" --field=post_content)
+# N1 (Viktor's review, execution-proven both directions): a bare
+# `*"id":<N>"*` glob has no digit boundary -- the exact bug class
+# lib/php/content-remap-functions.php's own (?!\d) negative lookahead
+# exists to prevent, reproduced here in the one place meant to PROVE that
+# class of bug is absent. Proved live: with A_HOME_ID=4 and a correct B id
+# of 45, the substring "id":4 is a literal PREFIX of "id":45, so the
+# negative check below would have wrongly FAILED a genuinely correct
+# graft; with B_HOME_ID_FROM_MAP=4 and a WRONG on-disk id of 47, the same
+# substring match would have wrongly PASSED. Fixed the same way JSON
+# itself draws the boundary: a number value is always immediately followed
+# by either "," (more keys follow) or "}" (it's the last key) -- never
+# another digit -- so both terminators are checked explicitly instead of
+# assuming the fixture's own key order.
 case "$FOOTER_CONTENT_ON_B" in
-  *"\"id\":${B_HOME_ID_FROM_MAP}"*) : ;;
+  *"\"id\":${B_HOME_ID_FROM_MAP},"*|*"\"id\":${B_HOME_ID_FROM_MAP}}"*) : ;;
   *) echo "FAIL: B's Footer navigation does not carry B's own remapped Home page id (${B_HOME_ID_FROM_MAP}) — content: ${FOOTER_CONTENT_ON_B}" >&2; exit 1 ;;
 esac
 case "$FOOTER_CONTENT_ON_B" in
-  *"\"id\":${A_HOME_ID}"*) echo "FAIL: B's Footer navigation still carries A's OWN Home page id (${A_HOME_ID}) — the id-remap did not run or did not match" >&2; exit 1 ;;
+  *"\"id\":${A_HOME_ID},"*|*"\"id\":${A_HOME_ID}}"*) echo "FAIL: B's Footer navigation still carries A's OWN Home page id (${A_HOME_ID}) — the id-remap did not run or did not match" >&2; exit 1 ;;
   *) : ;;
 esac
 echo "==> confirmed: wp_navigation's static navigation-link id was remapped from A's Home page id (${A_HOME_ID}) to B's (${B_HOME_ID_FROM_MAP})"

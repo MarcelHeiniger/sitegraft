@@ -1127,7 +1127,35 @@ graft_remap_attachment_ids() {
   attach_map_json=$(awk -F'\t' '$3=="attachment"{printf "%s\t%s\n", $1, $2}' "$id_map_tsv" \
     | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {old: .[0], new: .[1]})')
   [ "$(echo "$attach_map_json" | jq 'length')" != "0" ] || return 0
-  post_ids_json=$(graft_migrated_post_ids_json "$id_map_tsv")
+  # B2 (Viktor's review of issue #17/PR #38, execution-proven): NOT
+  # graft_migrated_post_ids_json (below) unfiltered -- that shared helper is
+  # correct for graft_search_replace_domain's own use (a domain leak inside
+  # a wp_navigation post's custom-link URL genuinely needs the same
+  # search-replace every other migrated post gets), but wrong here.
+  # sitegraft_remap_attachment_refs substitutes `"id":<old_attachment_id>`
+  # for every post in scope with zero awareness of what that "id" MEANS in
+  # context -- a wp_navigation post's navigation-link block can carry
+  # "kind":"taxonomy" (a TERM id) or "kind":"post-type" (a POST id) under
+  # the exact same `"id":N` JSON key, and this function's blind substitution
+  # cannot tell them apart. Attachment ids and term ids are independent
+  # sequences that both start at 1 on a fresh WordPress site, so a
+  # collision is a real, not theoretical, risk on a small site: a
+  # "kind":"taxonomy" link whose id happens to equal a migrated attachment's
+  # OLD id would silently come out carrying that attachment's NEW id
+  # instead of its own untouched term id -- corrupting a reference that was
+  # never about an attachment at all. modules/core-wp.sh's own
+  # _core_wp_remap_nav_page_ids (which runs AFTER this function, in the
+  # module post_import step, and is the one place that DOES understand
+  # "kind") cannot repair this after the fact: it only ever touches
+  # "kind":"post-type" entries by the same ambiguity-safety design, so a
+  # taxonomy-kind corruption introduced here survives untouched. Excluding
+  # wp_navigation posts from this one function's scope is safe and loses
+  # nothing legitimate: a navigation-link/navigation-submenu block never
+  # embeds an attachment reference in the first place (it links to a page,
+  # post, term, or a bare custom URL -- never a media item), so there is no
+  # real attachment substitution this exclusion could be skipping.
+  post_ids_json=$(awk -F'\t' '$3 != "wp_navigation"{print $2}' "$id_map_tsv" \
+    | jq -R -s -c 'split("\n") | map(select(length > 0))')
   payload_json=$(jq -n --argjson attachments "$attach_map_json" --argjson post_ids "$post_ids_json" \
     '{attachments: $attachments, post_ids: $post_ids}')
   remote_path=$(graft_push_remap_payload "$run_dir" "$payload_json" "sitegraft-id-remap-payload.json")
