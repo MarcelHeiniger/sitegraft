@@ -1,4 +1,5 @@
 # tests/unit/test_inventory.bats
+bats_require_minimum_version 1.5.0
 setup() {
   load '../../lib/core.sh'
   load '../../lib/modules.sh'
@@ -385,4 +386,181 @@ _assert_alias() {
   [ "$status" -eq 0 ]
   run cat "$BATS_TEST_TMPDIR/ssh-calls.log"
   [[ "$output" == "-i /home/user/.ssh/id_ed25519_b --"* ]] || false
+}
+
+# --- inventory_nav_post_count -----------------------------------------------
+#
+# #17, fix-pack after review (Nat): the module claiming wp_navigation
+# (modules/core-wp.sh's core_wp_post_types_dynamic) was gating on
+# nav_uses_dynamic_page_list == true, which is exactly backwards for the
+# issue's own acceptance criterion. A dynamic wp:page-list navigation
+# carries no ids at all, so it is precisely the case that needs NO remap --
+# and a STATIC navigation (real navigation-link blocks with real page ids,
+# the case the id-remap in core_wp_post_import exists for) reads
+# nav_uses_dynamic_page_list == false, IDENTICALLY to a source with no
+# navigation at all. That gate could never claim the case #17 is about.
+#
+# This function is the missing fact: does A have ANY wp_navigation post at
+# all, regardless of its content's shape. A-only, same reasoning as its
+# sibling inventory_nav_uses_dynamic_page_list (§6.1: B's navigation,
+# whatever form it takes, is either being replaced or none of sitegraft's
+# business, §13) -- and the same post_status => "any" scope, so the two
+# facts describe the exact same set of posts from two different angles
+# (presence vs. shape) rather than silently disagreeing about which posts
+# they're each counting.
+@test "inventory_nav_post_count returns the number of wp_navigation posts on the given site" {
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$*" in
+      eval*) echo 2 ;;
+      *) echo "UNEXPECTED CALL: $*" >&2; return 1 ;;
+    esac
+  }
+  run inventory_nav_post_count a
+  [ "$status" -eq 0 ]
+  [ "$output" = "2" ]
+}
+
+# Nit (Viktor's review): nothing pinned "post_status => 'any'" specifically
+# -- a scan that silently narrowed this to "publish" only would undercount
+# a navigation still in draft/private status, collapsing right back into
+# the exact "A has none" false negative B4/#17 exist to avoid, just from a
+# different cause. This asserts the real query text, not merely its return
+# value, the same way core_wp_post_import's own tests assert on captured
+# call text rather than only outcomes.
+@test "inventory_nav_post_count queries wp_navigation posts of ANY status, not published-only -- a draft/private navigation must still be counted" {
+  local calls="$BATS_TEST_TMPDIR/calls.log"
+  wp_remote() {
+    local alias_lc="$1"; shift
+    printf '%s
+' "$*" >> "${BATS_TEST_TMPDIR}/calls.log"
+    echo 1
+  }
+  inventory_nav_post_count a >/dev/null
+  run cat "$calls"
+  [[ "$output" == *'"post_status" => "any"'* ]] || false
+}
+
+# Third-round review (Kimi, verifying Viktor's own list of prior nits):
+# the sibling function got this pin, this one did not -- even though
+# core_wp_post_types_dynamic's own header comment explicitly says
+# inventory_nav_post_count uses "the same post_status => 'any' scope as its
+# sibling", a claim nothing here actually checked. Same reasoning as the
+# test above: a scan silently narrowed to published-only would read a
+# draft/private dynamic navigation as non-dynamic, a different route to
+# the same class of false negative.
+@test "inventory_nav_uses_dynamic_page_list queries wp_navigation posts of ANY status, not published-only -- matches its sibling's scope" {
+  local calls="$BATS_TEST_TMPDIR/calls.log"
+  wp_remote() {
+    local alias_lc="$1"; shift
+    printf '%s
+' "$*" >> "${BATS_TEST_TMPDIR}/calls.log"
+    echo false
+  }
+  inventory_nav_uses_dynamic_page_list a >/dev/null
+  run cat "$calls"
+  [[ "$output" == *'"post_status" => "any"'* ]] || false
+}
+
+@test "inventory_nav_post_count returns 0, not an error, when A genuinely has no wp_navigation posts" {
+  wp_remote() { echo 0; }
+  run inventory_nav_post_count a
+  [ "$status" -eq 0 ]
+  [ "$output" = "0" ]
+}
+
+@test "inventory_scan_site records nav_post_count on A from a real count" {
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$*" in
+      "post-type list --format=json") echo '[]' ;;
+      "option list --unserialize --format=json") echo '[]' ;;
+      "db tables --format=list --all-tables-with-prefix") echo 'wp_options' ;;
+      "plugin list --format=json") echo '[]' ;;
+      "theme list --status=active --format=json") echo '[{"name":"t"}]' ;;
+      "menu list --format=json") echo '[]' ;;
+      eval*)
+        case "$*" in
+          *"count(\$navs)"*) echo 3 ;;
+          *"wp:page-list"*) echo 'false' ;;
+          *) echo 'null' ;;
+        esac
+        ;;
+      *) echo '[]' ;;
+    esac
+  }
+  local out="$BATS_TEST_TMPDIR/scan-a.json"
+  inventory_scan_site a "$out"
+  run jq -e '.nav_post_count == 3' "$out"
+  [ "$status" -eq 0 ]
+}
+
+@test "inventory_scan_site records nav_post_count as null on B -- A-only, same as nav_uses_dynamic_page_list" {
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$*" in
+      "post-type list --format=json") echo '[]' ;;
+      "option list --unserialize --format=json") echo '[]' ;;
+      "db tables --format=list --all-tables-with-prefix") echo 'wp_options' ;;
+      "plugin list --format=json") echo '[]' ;;
+      "theme list --status=active --format=json") echo '[{"name":"t"}]' ;;
+      "menu list --format=json") echo '[]' ;;
+      eval*) echo 5 ;;
+      *) echo '[]' ;;
+    esac
+  }
+  local out="$BATS_TEST_TMPDIR/scan-b.json"
+  inventory_scan_site b "$out"
+  run jq -e '.nav_post_count == null' "$out"
+  [ "$status" -eq 0 ]
+}
+
+@test "inventory_scan_site records nav_post_count as null (unknown, not zero) when the A-side query fails" {
+  # Stdout deliberately looks like a plausible count ("2") even though the
+  # command fails (non-zero exit, plus a stderr message) -- a flaky wp-cli
+  # invocation can echo partial output before erroring. This is what makes
+  # the test load-bearing for the exit-status check specifically: a stub
+  # that only ever produced non-numeric/empty stdout on failure would pass
+  # even with that check deleted, since the digit-only guard below it would
+  # catch it anyway (verified live: this exact test caught a mutant that
+  # removed the exit-status check, where a "return 1 with non-numeric
+  # stdout" stub did not).
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$*" in
+      "post-type list --format=json") echo '[]' ;;
+      "option list --unserialize --format=json") echo '[]' ;;
+      "db tables --format=list --all-tables-with-prefix") echo 'wp_options' ;;
+      "plugin list --format=json") echo '[]' ;;
+      "theme list --status=active --format=json") echo '[{"name":"t"}]' ;;
+      "menu list --format=json") echo '[]' ;;
+      eval*) echo "2"; echo "wp-cli error: could not connect" >&2; return 1 ;;
+      *) echo '[]' ;;
+    esac
+  }
+  local out="$BATS_TEST_TMPDIR/scan-a.json"
+  run --separate-stderr inventory_scan_site a "$out"
+  [ "$status" -eq 0 ]
+  run jq -e '.nav_post_count == null' "$out"
+  [ "$status" -eq 0 ]
+}
+
+@test "inventory_scan_site records nav_post_count as null when the A-side query returns something that is not a plain non-negative integer" {
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$*" in
+      "post-type list --format=json") echo '[]' ;;
+      "option list --unserialize --format=json") echo '[]' ;;
+      "db tables --format=list --all-tables-with-prefix") echo 'wp_options' ;;
+      "plugin list --format=json") echo '[]' ;;
+      "theme list --status=active --format=json") echo '[{"name":"t"}]' ;;
+      "menu list --format=json") echo '[]' ;;
+      eval*) echo 'garbled <b>output</b>' ;;
+      *) echo '[]' ;;
+    esac
+  }
+  local out="$BATS_TEST_TMPDIR/scan-a.json"
+  inventory_scan_site a "$out"
+  run jq -e '.nav_post_count == null' "$out"
+  [ "$status" -eq 0 ]
 }

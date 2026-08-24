@@ -32,6 +32,116 @@ post
 EOF
 }
 
+# Issue #17: `wp_navigation` -- the block themes' navigation post type -- was
+# declared by no module at all, so it fell into protect._unclaimed and was
+# never migrated, even from a block-theme A whose header component
+# referenced one.
+#
+# NOT a third static entry in core_wp_post_types above, and settling that
+# took actually reading WordPress core rather than assuming it from the
+# type's name: wp_navigation (like wp_template/wp_global_styles, which
+# modules/etch.sh's own header comment already makes the identical point
+# about) is registered by WordPress core UNCONDITIONALLY -- verified
+# directly against wp-includes/post.php's create_initial_post_types(), where
+# register_post_type('wp_navigation', ...) carries no
+# current_theme_supports()/theme-type guard of any kind, exactly like
+# page/post a few lines above it in the very same function. So
+# scan.post_types will list wp_navigation as registered on a plain
+# classic-theme site too -- checking for the post type's REGISTRATION (the
+# way core_wp_detect checks for "page") proves nothing about whether A has
+# any actual navigation content worth migrating.
+#
+# What core_wp_option_keys_dynamic's "claim the key only if the scan shows
+# it present" reasoning (issue #15) demands here, translated from an option
+# key to a post type: claim wp_navigation only when the scan carries
+# POSITIVE EVIDENCE A actually holds a wp_navigation POST, not merely that
+# the type exists.
+#
+# FIX-PACK (Nat's review, second pass on this PR): the first version of this
+# function gated on nav_uses_dynamic_page_list == true instead of on
+# presence, which is backwards for #17's own acceptance criterion ("a
+# block-theme source's navigation arrives on the target and points at the
+# target's own page IDs"). A dynamic wp:page-list navigation carries NO ids
+# at all, so it is precisely the case that needs no id-remap -- while a
+# STATIC navigation (real navigation-link blocks with real page ids, the
+# exact case _core_wp_remap_nav_page_ids below exists for) reads
+# nav_uses_dynamic_page_list == false, IDENTICALLY to a source with no
+# navigation at all, and was never claimed by the old gate. The old version
+# would only ever have exercised the id-remap machinery on content that
+# never needed remapping.
+#
+# nav_post_count (lib/inventory.sh, added in this fix-pack) is the actually
+# missing fact: does A have ANY wp_navigation post at all, regardless of
+# what its content looks like -- a different question from
+# nav_uses_dynamic_page_list's shape question, which stays useful for other
+# purposes (design doc §0 point 11/§6.1) but was never the right fact to
+# gate a CLAIM on. `0`, `null` (the A-side query itself failed) and the key
+# being entirely absent (a scan taken before this field existed) all fall
+# through to "claim nothing" -- the fail-safe direction, deliberately: a
+# false positive here is the expensive kind. verify_nav_present
+# (lib/verify.sh) HARD FAILS the whole graft when wp_navigation is in the
+# migrate selection and B ends up with none after import -- and plan's own
+# default selection is "on" (plan_select_interactive pre-checks every
+# claimed item; a scripted/accepted-defaults run keeps it). Claiming
+# wp_navigation unconditionally would make every classic-theme graft fail
+# verify by default, for a post type A never actually used. Both directions
+# are covered by test: a scan recording nav_post_count > 0 claims
+# wp_navigation (dynamic OR static content, either way — the tests cover
+# both), a scan recording nav_post_count == 0 claims nothing.
+core_wp_post_types_dynamic() {
+  local scan_json="$1" nav_count
+
+  # Same fail-closed treatment as core_wp_option_keys_dynamic's own "no
+  # options list" check, and for the same reason: without a post_types
+  # array this is not confirmably a real scan of a real WordPress site, and
+  # "nothing to claim" must not read the same as "cannot tell".
+  if ! jq -e 'has("post_types") and (.post_types | type == "array")' "$scan_json" >/dev/null 2>&1; then
+    log_error "core-wp: ${scan_json} has no post_types list -- cannot confirm this is a real WordPress scan, so refusing to guess whether wp_navigation is worth migrating (re-run 'sitegraft scan')"
+    return 1
+  fi
+
+  # B4 (Viktor's review, mutation-proven): the missing-key, explicit-null and
+  # zero cases must NOT all collapse into the same silent "claim nothing",
+  # even though they all end there. Missing-key and zero are legitimate,
+  # unremarkable answers -- an old scan predating this field, and a real
+  # classic-theme site with no navigation, respectively -- and stay silent.
+  # An explicit `null`, though, means the scan record EXISTS and says the
+  # A-side count query itself FAILED (lib/inventory.sh's
+  # inventory_nav_post_count / inventory_scan_site never write a bare
+  # `null` for any other reason) -- on a genuinely block-theme A whose
+  # count query happened to fail, that reads to an operator as "verify
+  # prints NAV:not-selected", indistinguishable from a deliberate,
+  # successful decision that A has none. Proved by mutation before this
+  # fix: changing the OTHER jq call's `// "unknown"` fallback to `// 0`
+  # survived the entire suite, because nothing observed the difference
+  # between "0" and "couldn't tell" -- ADR 0007 §4 is explicit that these
+  # must read differently ("return 0 for 'nothing here', non-zero for 'I
+  # could not tell'"), and core_wp_option_keys_dynamic already sets that
+  # precedent in this very file by hard-failing when it cannot tell. This
+  # function does not go that far (an unreadable count is not the same
+  # class of "the scan itself is unusable" core_wp_option_keys_dynamic's
+  # own hard-fail cases are), but it must not stay silent about it either.
+  if jq -e 'has("nav_post_count") and .nav_post_count == null' "$scan_json" >/dev/null 2>&1; then
+    log_warn "core-wp: ${scan_json} records nav_post_count as null -- the A-side wp_navigation count query failed (lib/inventory.sh's inventory_nav_post_count), so wp_navigation is NOT being claimed even though A may genuinely have navigation content. Re-run 'sitegraft scan' to retry, or migrate wp_navigation explicitly via a SITEGRAFT_MANIFEST_PREFILLED manifest if you already know A has some."
+  fi
+
+  # jq's `//` treats both an absent key and an explicit `null` as falsy --
+  # correct for deciding whether to CLAIM (both mean "no evidence of
+  # navigation to migrate"), which is all this second query is for; the
+  # warn above already gave the null case its own, separate voice. `0` (a
+  # real, meaningful "A has no navigation" answer) is NOT falsy to jq's
+  # `//` (only `false`/`null` are), so a genuine zero count reaches the
+  # numeric comparison below exactly as itself, never silently swapped for
+  # "unknown".
+  nav_count=$(jq -r '.nav_post_count // "unknown"' "$scan_json" 2>/dev/null) || nav_count=unknown
+  case "$nav_count" in
+    ''|*[!0-9]*) return 0 ;; # not a plain non-negative integer -- "unknown", or garbled -- claim nothing
+  esac
+  [ "$nav_count" -gt 0 ] || return 0
+
+  echo wp_navigation
+}
+
 # blogname/blogdescription: harmless, commonly-expected site identity values.
 # show_on_front/page_on_front/page_for_posts: the front-page trio design doc
 # §9.3 is specifically about — show_on_front is a plain string ("page" or
@@ -169,6 +279,7 @@ core_wp_post_import() {
   done
 
   _core_wp_fix_theme_mods "$run_dir" "$id_map_tsv" "$wp_cmd_b"
+  _core_wp_remap_nav_page_ids "$id_map_tsv" "$wp_cmd_b"
 }
 
 # B2 (third review round), and the same class of bug as page_on_front just
@@ -279,4 +390,303 @@ _core_wp_fix_theme_mods() {
     # shellcheck disable=SC2086 # intentionally unquoted: wp_cmd_b may be a multi-word wrapper (e.g. ddev exec ... wp) and must word-split
     run_or_echo $wp_cmd_b option update "$key" "$fixed" --format=json
   done
+}
+
+# Issue #17 -- the actual substitution logic behind _core_wp_remap_nav_page_ids
+# below, kept in its OWN function (not inlined directly into that function's
+# `wp eval` heredoc) specifically so tests/unit/test_core_wp_module.bats can
+# capture this exact source and run it through a real `php` CLI process, no
+# WordPress bootstrap needed -- the identical reason lib/php/content-remap-
+# functions.php was pulled out of a bash string in the first place (that
+# file's own header comment, review, Viktor, NIT-1): an inline bash-string
+# PHP payload is syntactically impossible to unit test on its own, and a
+# bash helper that used to build one can stay green for years after the
+# thing it built stopped being called at all -- exactly the false-coverage
+# trap that file's rewrite closed once already.
+#
+# WHY A REGEX OVER PARSE_BLOCKS()/SERIALIZE_BLOCKS(): those are WordPress
+# functions, not portable PHP -- using them would reintroduce the exact
+# "only exercisable through a live wp eval" problem NIT-1 already solved. A
+# `wp:navigation-link`/`wp:navigation-submenu` block comment's attributes are
+# a single, self-contained JSON object right after the block name; isolating
+# just that object with a regex (balanced-brace via a recursive subpattern)
+# and running it through plain json_decode/json_encode needs no WordPress
+# bootstrap at all, and is exactly as precise -- the id/kind decision itself
+# is still made by reading real, decoded JSON, only the surrounding HTML-
+# comment framing is regex.
+#
+# WHY THE RECURSIVE SUBPATTERN SPECIFICALLY (fourth-round review, Viktor,
+# correcting an earlier version of this comment): NOT because a naive
+# `\{.*?\}` truncates on a nested value -- it doesn't. Checked directly: a
+# non-greedy `\{.*?\}` anchored by this same pattern's `\s*(/)?-->` tail
+# backtracks correctly and captures a real nested object
+# (`{"ref":77,"style":{"typography":{...}},"layout":{...}}`) exactly like
+# the recursive form does, for ordinary single-line content. The actual,
+# verified divergence is multi-line attrs: `.` does not match a newline
+# without PCRE's `/s` modifier (not used here), so `\{.*?\}` fails outright
+# on attributes split across lines, while `[^{}]++` inside the recursive
+# form matches any character including newlines and succeeds. Checked both
+# ways directly, not assumed.
+#
+# WHY THE "kind":"post-type" CHECK IS LOAD-BEARING, not decoration: a
+# navigation-link's `"id"` attribute is AMBIGUOUS on its own --
+# {"id":7,"kind":"taxonomy","type":"category"} carries a TERM id, not a post
+# id. CORRECTION (Viktor's review, B1): an earlier version of this comment
+# claimed "sitegraft migrates no term id-map at all" -- that is factually
+# wrong. mu-plugins/sitegraft-id-mapper.php's wp_import_insert_term handler
+# DOES log one, as id-map.tsv rows tagged `term:<taxonomy>` in column 3 --
+# theme_mods' nav_menu_locations (B2 above) is REMOVED rather than remapped
+# because nothing CONSUMES that term map for a content remap today, not
+# because it doesn't exist. It does, and _core_wp_remap_nav_page_ids's own
+# `map_json` below MUST exclude those rows explicitly (not just
+# "attachment"), or jq's `add` lets a term row's key silently overwrite a
+# real page mapping that happens to share the same OLD numeric id -- exactly
+# the collision this comment is otherwise warning about, self-inflicted. A
+# blind `"id":<old>(?!\d)` substitution run against id-map.tsv's POST ids --
+# the same sentinel technique graft_remap_attachment_ids already uses for
+# attachment ids -- would silently rewrite a category's term id whenever it
+# happens to numerically coincide with a migrated post's OLD id, corrupting
+# a reference that was never a post reference to begin with. Only a value
+# that decodes with `"kind":"post-type"` (covers `"type":"page"` and
+# `"type":"post"` alike) is ever touched; a "custom" link (a bare URL, no
+# id) or a "taxonomy" link is left untouched by construction, whether or not
+# its id happens to collide with something in the map.
+_core_wp_nav_remap_php() {
+  cat <<'PHP'
+function sitegraft_core_wp_serialize_block_attributes( $attrs ) {
+	// Replicates WordPress core's serialize_block_attributes()
+	// (wp-includes/blocks.php) exactly -- verified directly against that
+	// file's real source, not reverse-engineered. wp_json_encode() itself
+	// falls through to a plain json_encode() call with the same flags
+	// whenever encoding succeeds (wp-includes/functions.php), so
+	// reproducing it here needs no WordPress bootstrap. B3 (Viktor's
+	// review, execution-proven): a bare json_encode( $attrs ) does NONE of
+	// this -- a label containing a literal "-->" survives untouched and
+	// lands INSIDE the rewritten block's own attrs, ahead of the block's
+	// real closing delimiter. A subsequent parse_blocks() call (Site
+	// Editor, front-end render, anything) would then read that leaked
+	// "-->" as the block's actual end, truncating the JSON attrs
+	// mid-string and leaking the remainder into the page as plain text.
+	$encoded = json_encode( $attrs, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+	return strtr(
+		$encoded,
+		array(
+			'\\\\' => '\\u005c',
+			'--'   => '\\u002d\\u002d',
+			'<'    => '\\u003c',
+			'>'    => '\\u003e',
+			'&'    => '\\u0026',
+			'\\"'  => '\\u0022',
+		)
+	);
+}
+
+function sitegraft_core_wp_remap_nav_link_ids( $map, $content ) {
+	// B5 (Viktor's review, execution-proven): three DIFFERENT block shapes
+	// carry a page/navigation id, not just navigation-link/-submenu's
+	// "id". A wp:page-list block SCOPED to a parent page carries that
+	// page's id in "parentPageID" -- a dynamic navigation (no hardcoded
+	// CHILD ids) can still name its own SCOPE by id. A bare wp:navigation
+	// block's "ref" attribute embeds ANOTHER wp_navigation post by id.
+	// Third-round review (Viktor): an earlier version of this comment
+	// claimed this handles "how a shared/reusable navigation gets
+	// referenced from a page or template" -- that overstates this
+	// function's actual reach. _core_wp_remap_nav_page_ids (below) only
+	// ever passes content from posts id-map.tsv tags wp_navigation; a
+	// migrated PAGE is never in that scan at all. Fourth-round review
+	// (Viktor), one more precision on the same point: modules/etch.sh
+	// DOES migrate wp_template -- the canonical place a block theme's
+	// own `wp:navigation {"ref":N}` actually lives (a header/footer
+	// template embedding the site's shared navigation) -- so "no shipped
+	// module migrates a template" would be the wrong reason for this
+	// scope limit even though it happens to be true of
+	// wp_template_part specifically. The real reason is narrower and
+	// holds regardless of what other modules migrate: this function's
+	// OWN scan is restricted to wp_navigation rows, full stop, so a ref
+	// inside a migrated wp_template is out of reach here no matter what.
+	// On an Etch source it is not actually left unremapped in practice --
+	// etch_post_import's own blind "ref":<old> substitution (this file,
+	// above) scans EVERY non-attachment migrated post, wp_template
+	// included, and catches it incidentally, the same way it already
+	// covers a ref inside wp_navigation's own content. On a block-theme
+	// source without Etch, nothing remaps a ref inside a migrated
+	// wp_template. So the ref rule here can only ever fire, on its own,
+	// on a wp:navigation block NESTED inside another migrated
+	// wp_navigation post's own content -- one navigation embedding
+	// another by reference -- not one embedded in a page or template.
+	// That narrower case is still real and still worth remapping
+	// correctly; it just is not the broader one the old wording implied.
+	// Neither shape needs a "kind" disambiguation the way navigation-
+	// link's "id" does: parentPageID can only ever mean a page
+	// (core/page-list has no other id-bearing attribute), and ref can
+	// only ever mean a wp_navigation post -- both safe to remap
+	// unconditionally whenever present and non-zero.
+	$pattern = '~<!--\s*wp:((?:core/)?(?:navigation-link|navigation-submenu|navigation|page-list))\s+(\{(?:[^{}]++|(?2))*+\})\s*(/)?-->~';
+	return preg_replace_callback( $pattern, function ( $m ) use ( $map ) {
+		$attrs = json_decode( $m[2], true );
+		if ( ! is_array( $attrs ) ) {
+			return $m[0];
+		}
+		// Strip an optional "core/" prefix so all three ways WordPress can
+		// spell a block name resolve to the same three-way switch below.
+		$name = preg_replace( '~^core/~', '', $m[1] );
+
+		$changed = false;
+		// Nit (Viktor's review): a navigation-link/-submenu carrying "id" and
+		// "type" but NO "kind" field at all is deliberately left untouched,
+		// same as a "kind":"taxonomy" one, and for the same reason -- not
+		// because it is known to be safe or known to be a term reference,
+		// but because it is NOT known to be a post reference. "kind" is the
+		// one field this whole function trusts to disambiguate "id"; a block
+		// saved by an older Gutenberg version (or hand-authored/imported)
+		// that predates "kind" being written at all is a real possibility,
+		// not a contrived one, and guessing "type":"page" implies
+		// "kind":"post-type" would be exactly the guess this function exists
+		// to refuse making. isset( $attrs['kind'], ... ) already requires
+		// BOTH keys present, so this case falls through unchanged by
+		// construction; documented here so that omission reads as a decision
+		// rather than an oversight.
+		if ( ( 'navigation-link' === $name || 'navigation-submenu' === $name )
+			&& isset( $attrs['kind'], $attrs['id'] ) && 'post-type' === $attrs['kind'] ) {
+			$old_id = (string) $attrs['id'];
+			if ( array_key_exists( $old_id, $map ) ) {
+				$attrs['id'] = (int) $map[ $old_id ];
+				$changed = true;
+			}
+		} elseif ( 'page-list' === $name && isset( $attrs['parentPageID'] ) && (int) $attrs['parentPageID'] > 0 ) {
+			$old_id = (string) $attrs['parentPageID'];
+			if ( array_key_exists( $old_id, $map ) ) {
+				$attrs['parentPageID'] = (int) $map[ $old_id ];
+				$changed = true;
+			}
+		} elseif ( 'navigation' === $name && isset( $attrs['ref'] ) && (int) $attrs['ref'] > 0 ) {
+			$old_id = (string) $attrs['ref'];
+			if ( array_key_exists( $old_id, $map ) ) {
+				$attrs['ref'] = (int) $map[ $old_id ];
+				$changed = true;
+			}
+		}
+
+		if ( ! $changed ) {
+			return $m[0];
+		}
+		$new_attrs = sitegraft_core_wp_serialize_block_attributes( $attrs );
+		if ( false === $new_attrs ) {
+			return $m[0];
+		}
+		$close = ( isset( $m[3] ) && $m[3] !== '' ) ? '/' : '';
+		return '<!-- wp:' . $m[1] . ' ' . $new_attrs . ' ' . $close . '-->';
+	}, $content );
+}
+PHP
+}
+
+# _core_wp_remap_nav_page_ids <id_map_tsv> <wp_cmd_b> -- issue #17's id-remap.
+# A wp_navigation post's navigation-link content holds POST ids for the
+# pages/posts it links to, and those ids change on import -- the same class
+# of problem design doc §9.3 documents for page_on_front and B2 documents
+# for theme_mods' custom_logo, one field over.
+#
+# MEASURED, not assumed, that graft's existing generic remap does not already
+# cover this (see this PR's own description for how): graft_remap_
+# attachment_ids (lib/graft.sh) calls sitegraft_remap_attachment_refs
+# (lib/php/content-remap-functions.php) with an `$attachments` map built
+# exclusively from id-map.tsv rows tagged "attachment" -- read directly,
+# `awk -F'\t' '$3=="attachment"'` in graft_remap_attachment_ids itself -- so
+# a page or post id inside navigation content is never in that set and
+# travels to B unrewritten. This module's own post_import hook is where it
+# happens instead, the same division of labour design doc §11's edge-case
+# table already draws for a module-specific reference ("outside the core's
+# generic remap — that's the job of the relevant module's post_import
+# hook"), and the one etch_post_import already uses for Etch's own
+# component "ref" ids just above.
+#
+# SCOPE: only wp_navigation posts THIS run imported (id-map.tsv's own
+# wp_navigation rows), and within those, only ids id-map.tsv actually maps --
+# the same "concretely reachable, never a blind sweep" discipline
+# graft_remap_featured_images documents for its own scope. A wp:page-list
+# (dynamic) navigation has no navigation-link/-submenu blocks carrying a
+# post-type id at all, so this is a correct, harmless no-op against one --
+# no separate "is it dynamic" branch is needed here, the pattern simply
+# never matches anything in that content.
+_core_wp_remap_nav_page_ids() {
+  local id_map_tsv="$1" wp_cmd_b="$2"
+  # Same guard, same reason, as graft_remap_attachment_ids/
+  # graft_remap_featured_images: id-map.tsv genuinely not existing yet
+  # (a first-time --dry-run, graft_fetch_id_map never creates it under
+  # --dry-run) and existing-but-empty are the same "nothing to remap yet"
+  # case. `-s` (exists AND non-empty) matches those siblings' own check.
+  [ -s "$id_map_tsv" ] || return 0
+
+  local nav_ids_json
+  # Nit (Viktor's review): `| unique` was missing here -- modules/etch.sh's
+  # own equivalent (`ids_json`, its component-ref remap) already dedupes,
+  # for the same reason: a hand-edited or otherwise duplicated id-map.tsv
+  # row would otherwise walk the same post id twice through the PHP loop
+  # below, applying the substitution to whatever its FIRST pass already
+  # produced -- harmless for a straight id swap once, but not a guarantee
+  # this function's own logic depends on holding.
+  nav_ids_json=$(awk -F'\t' '$3=="wp_navigation" && $2 ~ /^[0-9]+$/ {print $2}' "$id_map_tsv" \
+    | jq -R -s -c 'split("\n") | map(select(length > 0)) | unique')
+  # No wp_navigation post travelled in this run -- legitimately nothing to
+  # do, not an error (a manifest excluding wp_navigation from migrate is a
+  # valid, deliberate choice, same as page_on_front's own header comment
+  # documents for page/post).
+  [ "$(printf '%s' "$nav_ids_json" | jq 'length')" != "0" ] || return 0
+
+  # The substitution map is every NON-ATTACHMENT id-map.tsv row (old post id
+  # -> new post id) -- a navigation-link can point at any migrated post
+  # type, not only at other wp_navigation posts. Attachment rows are
+  # excluded on purpose: they would only create an opportunity for a
+  # numeric coincidence to match a "kind":"post-type" id that was never an
+  # attachment reference to begin with (etch_post_import's own component-ref
+  # remap excludes them from its map for the identical reason).
+  local map_json
+  # B1 (Viktor's review, execution-proven): excluding "attachment" alone is
+  # NOT enough. mu-plugins/sitegraft-id-mapper.php's wp_import_insert_term
+  # handler writes id-map.tsv rows tagged `term:<taxonomy>` in column 3 --
+  # real rows, not hypothetical -- and jq's `add` below lets the LAST row
+  # for a given OLD id win. Without this second exclusion, a term whose old
+  # id collides with a migrated page's old id (both id sequences start at 1
+  # on a fresh WordPress site) silently overwrites the correct page mapping
+  # with the term's new id -- corrupting a "kind":"post-type" reference that
+  # was never a term reference to begin with. Proved live before this fix.
+  map_json=$(awk -F'\t' '$3 != "attachment" && $3 !~ /^term:/ && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {printf "%s\t%s\n", $1, $2}' "$id_map_tsv" \
+    | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t")) | map({(.[0]): .[1]}) | add // {}')
+
+  local remap_fn php
+  remap_fn=$(_core_wp_nav_remap_php)
+  # The payload is embedded via bash-side interpolation into a PHP single-
+  # quoted string literal, same technique etch_post_import's own component-
+  # ref remap already uses just above -- safe here because both $map_json and
+  # $nav_ids_json are built entirely from id-map.tsv's own digit-only old/new
+  # id columns (the awk filters above require `~ /^[0-9]+$/` on both), so
+  # neither can ever contain a single quote to break out of the literal.
+  php=$(cat <<PHP
+${remap_fn}
+\$map = json_decode('${map_json}', true);
+\$nav_ids = json_decode('${nav_ids_json}', true);
+if ( ! is_array( \$map ) || ! is_array( \$nav_ids ) ) { echo "0"; return; }
+\$changed = 0;
+global \$wpdb;
+foreach ( \$nav_ids as \$pid ) {
+	\$pid = (int) \$pid;
+	\$content = get_post_field( 'post_content', \$pid );
+	if ( ! is_string( \$content ) || '' === \$content ) { continue; }
+	\$new_content = sitegraft_core_wp_remap_nav_link_ids( \$map, \$content );
+	if ( \$new_content !== \$content ) {
+		\$wpdb->update( \$wpdb->posts, array( 'post_content' => \$new_content ), array( 'ID' => \$pid ) );
+		clean_post_cache( \$pid );
+		\$changed++;
+	}
+}
+echo \$changed;
+PHP
+)
+
+  log_info "core-wp post_import: remapping navigation-link page/post ids across $(printf '%s' "$nav_ids_json" | jq 'length') migrated wp_navigation post(s)..."
+  # run_or_echo, for the same reason every other write in this file uses it:
+  # module post_import hooks run unconditionally, dry-run included.
+  # shellcheck disable=SC2086 # intentionally unquoted: wp_cmd_b may be a multi-word wrapper (e.g. ddev exec ... wp) and must word-split
+  run_or_echo $wp_cmd_b eval "$php"
 }

@@ -169,6 +169,44 @@ echo json_encode($dynamic);
 '
 }
 
+# #17 fix-pack (Nat's review, docs/decisions/0007-module-dynamic-selections.md's
+# module contract): the fact inventory_nav_uses_dynamic_page_list above CANNOT
+# answer. That function starts `$dynamic = false` and only ever flips it to
+# true, so "A has zero wp_navigation posts" and "A has wp_navigation posts,
+# none of which use wp:page-list" both read as the identical `false` --
+# indistinguishable from the scan alone. That ambiguity is exactly backwards
+# for #17's own acceptance criterion ("a block-theme source's navigation
+# arrives on the target and points at the target's own page IDs"): a dynamic
+# wp:page-list navigation carries no ids at all, so it is precisely the case
+# that needs no id-remap, while a STATIC navigation (real navigation-link
+# blocks with real page ids, the case modules/core-wp.sh's
+# _core_wp_remap_nav_page_ids exists for) is the one #17 is actually about --
+# and it reads nav_uses_dynamic_page_list == false, identically to no
+# navigation at all.
+#
+# This is the missing fact, and it is a different question from the shape
+# question above: does A have ANY wp_navigation post, regardless of what its
+# content looks like. Same post_status => "any" scope as its sibling, on
+# purpose -- both functions describe the exact same set of posts from two
+# different angles (presence vs. shape), never two different sets that could
+# silently disagree about what "on A" means. A-only, same reasoning as
+# inventory_nav_uses_dynamic_page_list (§6.1: B's navigation, whatever form
+# it takes, is either being replaced or none of sitegraft's business, §13).
+#
+# Returns a plain non-negative integer as text (valid JSON on its own, same
+# convention as its sibling's "true"/"false") so callers can --argjson it
+# directly; a query failure or a non-numeric result are both the caller's
+# job to treat as unknown (null), never silently as zero -- zero is a real,
+# meaningful answer here (a genuine classic-theme site) and must not be
+# indistinguishable from "the query never actually ran".
+inventory_nav_post_count() {
+  local alias_lc="$1"
+  wp_remote "$alias_lc" eval '
+$navs = get_posts(array("post_type" => "wp_navigation", "numberposts" => -1, "post_status" => "any"));
+echo count($navs);
+'
+}
+
 # inventory_check_path_topology <alias: a|b> — refuse, at scan time, the one
 # site shape sitegraft cannot drive: reachable over SSH, but with wp-cli
 # running inside a container on the far end.
@@ -316,6 +354,29 @@ inventory_scan_site() {
     esac
   fi
 
+  # #17 fix-pack: the presence fact, computed the same fail-safe way as
+  # nav_dynamic just above (A-only, null on query failure, never silently
+  # zero -- see inventory_nav_post_count's own header comment for why zero
+  # and unknown must never collapse to the same recorded value).
+  local nav_count='null'
+  if [ "$alias_lc" = "a" ]; then
+    if ! nav_count=$(inventory_nav_post_count "$alias_lc" 2>/dev/null); then
+      local nav_count_err
+      nav_count_err=$(inventory_nav_post_count "$alias_lc" 2>&1 >/dev/null)
+      log_warn "could not count site A's wp_navigation posts — recording nav_post_count as unknown (null): ${nav_count_err}"
+      nav_count='null'
+    fi
+    # Guard against a non-numeric/garbled result being embedded as JSON --
+    # same defensive treatment as $nav_dynamic's own true|false check above.
+    # A plain digit-only test (bash 3.2 portable, no extglob needed): every
+    # value get_posts()'s count() can actually produce is a non-negative
+    # integer, so anything else -- empty, or carrying a non-digit -- means
+    # the query did not really answer and must not be trusted as a count.
+    case "$nav_count" in
+      ''|*[!0-9]*) nav_count='null' ;;
+    esac
+  fi
+
   # Every large payload below used to reach jq as a command-line argument via
   # --argjson. Found on the first real A/B pair: on a genuine site, `wp option
   # list --format=json` alone is megabytes — a WooCommerce + multilingual +
@@ -381,6 +442,7 @@ inventory_scan_site() {
     --argjson menus_unknown "$menus_unknown" \
     --argjson custom_code_detected "$custom_code_detected" \
     --argjson nav_uses_dynamic_page_list "$nav_dynamic" \
+    --argjson nav_post_count "$nav_count" \
     --arg table_prefix "$table_prefix" \
     '{
       post_types: $post_types[0],
@@ -394,7 +456,8 @@ inventory_scan_site() {
       classic_menu_names: [$menus[0][]? | select((.count // 0) > 0) | .name],
       custom_code_signals: $custom_code_signals[0],
       custom_code_detected: $custom_code_detected,
-      nav_uses_dynamic_page_list: $nav_uses_dynamic_page_list
+      nav_uses_dynamic_page_list: $nav_uses_dynamic_page_list,
+      nav_post_count: $nav_post_count
     }' \
     > "$out_json"; then
     rm -rf "$payload_dir"

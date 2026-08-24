@@ -121,6 +121,57 @@ jq -e '.options[] | select(.option_name=="automatic_css_settings")' "${RUN_DIR}/
 # active_theme.stylesheet: both sites resolved a real active theme.
 jq -e '.active_theme.stylesheet | length > 0' "${RUN_DIR}/scan-a.json" >/dev/null
 jq -e '.active_theme.stylesheet | length > 0' "${RUN_DIR}/scan-b.json" >/dev/null
+# nav_post_count (#17 fix-pack): site-a-seed.sh seeds exactly two
+# wp_navigation posts on A ("Main", dynamic, and "Footer", static) — the real
+# fact core_wp_post_types_dynamic's claim is gated on, distinct from
+# nav_uses_dynamic_page_list's shape question just above.
+jq -e '.nav_post_count == 2' "${RUN_DIR}/scan-a.json" >/dev/null
+jq -e '.nav_post_count == null' "${RUN_DIR}/scan-b.json" >/dev/null
+
+# Issue #17, closing the gap Nat's review found: proving core-wp's own
+# automatic CLAIM works — not merely that the id-remap mechanics work once
+# something else has already selected wp_navigation. The graft run's
+# manifest further down still lists wp_navigation BY HAND, but only because
+# that manifest also drives several proofs unrelated to this issue (media,
+# etch_cfs, fakebooking-protect) via SITEGRAFT_MANIFEST_PREFILLED — a path
+# that bypasses plan_defaults/module_selection entirely by design (the
+# escape hatch docs/decisions/0007-module-dynamic-selections.md documents
+# for scripted runs). That manifest proves nothing about whether the module
+# would have claimed wp_navigation on its own.
+#
+# module_selection (lib/modules.sh) is the one real entry point
+# plan_defaults calls — never core_wp_post_types_dynamic directly — so this
+# calls it exactly the way `plan` would, against A's genuine,
+# wp-cli-produced scan-a.json, with zero manifest involved.
+echo "==> asserting core-wp's own module_selection claims wp_navigation from A's REAL scan, with no manifest written by hand (#17)"
+. "${ROOT}/lib/core.sh"
+# shellcheck disable=SC2034 # read via lib/modules.sh's modules_discover()/module_selection(), sourced right below, not in this file -- same cross-file blind spot as this file's other SC2034 disables
+SITEGRAFT_ROOT="$ROOT"
+# shellcheck disable=SC2034 # same as above: read via lib/modules.sh's modules_discover(), not in this file
+SITEGRAFT_MODULES_DIR="${ROOT}/modules"
+. "${ROOT}/lib/modules.sh"
+modules_discover
+NAV_CLAIM=$(module_selection core_wp post_types "${RUN_DIR}/scan-a.json")
+case "$NAV_CLAIM" in
+  *wp_navigation*) : ;;
+  *) echo "FAIL: module_selection core_wp post_types did not claim wp_navigation against A's real scan (nav_post_count=2) — output: ${NAV_CLAIM}" >&2; exit 1 ;;
+esac
+echo "==> confirmed: core-wp's own module_selection claims wp_navigation from a real scan showing navigation content present"
+
+# The negative case, same real code path, against a copy of the SAME real
+# scan with nav_post_count zeroed out — the false-positive guard Nat's
+# review specifically required: a classic-theme site (A has zero
+# wp_navigation posts) must claim nothing, or verify_nav_present
+# (lib/verify.sh) would HARD FAIL every such graft by default.
+echo "==> asserting the SAME real module_selection claims NOTHING when A genuinely has no wp_navigation posts (#17)"
+NO_NAV_SCAN="${RUN_DIR}/scan-a-no-nav.json"
+jq '.nav_post_count = 0' "${RUN_DIR}/scan-a.json" > "$NO_NAV_SCAN"
+NO_NAV_CLAIM=$(module_selection core_wp post_types "$NO_NAV_SCAN")
+case "$NO_NAV_CLAIM" in
+  *wp_navigation*) echo "FAIL: module_selection core_wp post_types claimed wp_navigation against a scan recording nav_post_count=0 — this would HARD FAIL every classic-theme graft's verify_nav_present by default" >&2; exit 1 ;;
+  *) : ;;
+esac
+echo "==> confirmed: core-wp's own module_selection claims nothing when A genuinely has no wp_navigation posts"
 
 if [ "${SITEGRAFT_HARNESS_STOP_AFTER:-}" = "scan" ]; then
   echo "SCAN OK (SITEGRAFT_HARNESS_STOP_AFTER=scan)"
@@ -519,6 +570,44 @@ B_ATTACH_COUNT=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=att
 # post_types above specifically to exercise verify_nav_present against real
 # migrated data (site-a-seed.sh's "Main" wp_navigation post).
 ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=wp_navigation --field=post_title | grep -q '^Main$'
+
+# Issue #17: site-a-seed.sh's "Footer" wp_navigation post carries a STATIC
+# navigation-link pointing at A's "Home" page BY ID -- the real proof that
+# _core_wp_remap_nav_page_ids (modules/core-wp.sh) actually rewrites that id
+# against real, wp-cli-produced Gutenberg block markup, not only against
+# the hand-fabricated fixtures tests/unit/test_core_wp_module.bats uses.
+# Same id-map.tsv lookup technique the page_on_front assertion below already
+# uses: resolve A's OWN Home page id through the run's real id-map.tsv to
+# get the id B's copy actually landed on, then require the migrated
+# Footer's content to carry THAT id and never A's original one.
+ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=wp_navigation --field=post_title | grep -q '^Footer$'
+A_HOME_ID=$(ddev exec --raw -p "$PROJECT_A" -- wp post list --post_type=page --title="Home" --field=ID)
+B_HOME_ID_FROM_MAP=$(awk -F'\t' -v old="$A_HOME_ID" '$1==old && $3=="page"{print $2}' "${RUN_DIR}/id-map.tsv")
+[ -n "$B_HOME_ID_FROM_MAP" ]
+B_FOOTER_ID=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=wp_navigation --title="Footer" --field=ID)
+FOOTER_CONTENT_ON_B=$(ddev exec --raw -p "$PROJECT_B" -- wp post get "$B_FOOTER_ID" --field=post_content)
+# N1 (Viktor's review, execution-proven both directions): a bare
+# `*"id":<N>"*` glob has no digit boundary -- the exact bug class
+# lib/php/content-remap-functions.php's own (?!\d) negative lookahead
+# exists to prevent, reproduced here in the one place meant to PROVE that
+# class of bug is absent. Proved live: with A_HOME_ID=4 and a correct B id
+# of 45, the substring "id":4 is a literal PREFIX of "id":45, so the
+# negative check below would have wrongly FAILED a genuinely correct
+# graft; with B_HOME_ID_FROM_MAP=4 and a WRONG on-disk id of 47, the same
+# substring match would have wrongly PASSED. Fixed the same way JSON
+# itself draws the boundary: a number value is always immediately followed
+# by either "," (more keys follow) or "}" (it's the last key) -- never
+# another digit -- so both terminators are checked explicitly instead of
+# assuming the fixture's own key order.
+case "$FOOTER_CONTENT_ON_B" in
+  *"\"id\":${B_HOME_ID_FROM_MAP},"*|*"\"id\":${B_HOME_ID_FROM_MAP}}"*) : ;;
+  *) echo "FAIL: B's Footer navigation does not carry B's own remapped Home page id (${B_HOME_ID_FROM_MAP}) — content: ${FOOTER_CONTENT_ON_B}" >&2; exit 1 ;;
+esac
+case "$FOOTER_CONTENT_ON_B" in
+  *"\"id\":${A_HOME_ID},"*|*"\"id\":${A_HOME_ID}}"*) echo "FAIL: B's Footer navigation still carries A's OWN Home page id (${A_HOME_ID}) — the id-remap did not run or did not match" >&2; exit 1 ;;
+  *) : ;;
+esac
+echo "==> confirmed: wp_navigation's static navigation-link id was remapped from A's Home page id (${A_HOME_ID}) to B's (${B_HOME_ID_FROM_MAP})"
 
 echo "==> (b) asserting B's protected fake-plugin data is BYTE-IDENTICAL before/after graft (the central non-contamination proof)"
 POST_GRAFT_CHECKSUM=$(b_protected_checksum)
