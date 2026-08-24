@@ -800,14 +800,23 @@ _sg_load_keep_sets() {
     printf '%s\n' "$rel"
   done < <( cd "$WP_CONTENT_DIR" && find . -mindepth 1 -print0 ) > "$SG_TMP/archive.txt"
 
-  # Belt and braces, and deliberately so: the integrity block above already
-  # refuses a WP_CONTENT_DIR that is missing or has no entries, so no input
-  # reaches here with an empty archive listing and no test can make this line
-  # fire. It is kept because it guards the one invariant everything below rests
-  # on — the keep-set is not empty — and because the check that currently makes
-  # it unreachable lives fifty lines away and is not obviously load-bearing
-  # from here. Recorded as a knowingly untested guard rather than presented as
-  # a covered one.
+  # Reachable, and load-bearing. An earlier version of this comment claimed the
+  # integrity block above made it unreachable, because that block refuses a
+  # WP_CONTENT_DIR that is missing or lists nothing. That was wrong, and the
+  # counter-example is one chmod:
+  #
+  #   $ chmod 400 <run>/backup/b-wp-content
+  #   [ -d ] passes; ls -A returns names (read bit is set)  -> integrity block OK
+  #   restore.sh: line NNN: cd: .../b-wp-content: Permission denied
+  #   refusing to remove anything from B: ... archive ... listed no entries.
+  #
+  # Listing the directory needs the READ bit; entering it to run `find` needs
+  # the EXECUTE bit. Mode 400 has one and not the other, so the integrity block
+  # is satisfied and the listing still comes back empty. Nothing upstream
+  # catches it either: the `cd` fails inside a process substitution, whose exit
+  # status `set -e` and `pipefail` never see. This line is the only thing
+  # standing between a keep-set of zero paths and deleting all of B's
+  # wp-content.
   if [ ! -s "$SG_TMP/archive.txt" ]; then
     _sg_die "refusing to remove anything from B: this backup's wp-content archive (${WP_CONTENT_DIR}) listed no entries. An empty keep-list would mean every file in B's wp-content is an addition to delete."
   fi

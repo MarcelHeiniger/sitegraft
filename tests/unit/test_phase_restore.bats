@@ -169,3 +169,46 @@ EOF
   [[ "$output" == *"without a usable way back"* ]] || false
   [[ "$output" != *"FAKE RESTORE RAN"* ]] || false
 }
+
+# --- the safety net has to be real before the destructive half runs ---
+# phase_restore's snapshot subshell is the same `( ... ) || return 1` shape as
+# phase_backup's, so bash suppresses errexit inside it and an explicit `set -e`
+# does not bring it back. Each artifact call therefore carries `|| exit 1`.
+#
+# The asymmetry matters more here than in phase_backup: this branch has NO
+# downstream artifact verification at all. If a snapshot call fails and its
+# guard is gone, the subshell still returns 0, the snapshot's own restore.sh is
+# generated over an empty or partial directory, and the real restore proceeds
+# with a safety net that cannot restore anything. Each of these asserts that
+# the restore never ran — not merely that phase_restore returned non-zero.
+
+@test "phase_restore FAILS, and never runs the restore, when the snapshot's wp-content pull fails while leaving a partial copy" {
+  backup_wp_content() {
+    local dest_dir="$1"
+    mkdir -p "${dest_dir}/themes"
+    touch "${dest_dir}/themes/dummy.txt"   # non-empty: nothing downstream would notice
+    return 1                               # ... but the pull FAILED
+  }
+  run phase_restore --profile t --run "$RUN_DIR" --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"FAKE RESTORE RAN"* ]] || false
+}
+
+@test "phase_restore FAILS, and never runs the restore, when the snapshot's database export fails while leaving a plausible dump" {
+  backup_db_export() {
+    local dest_dir="$1"
+    mkdir -p "$dest_dir"
+    printf 'fake pre-restore db snapshot' | gzip > "${dest_dir}/b-db.sql.gz"
+    return 1
+  }
+  run phase_restore --profile t --run "$RUN_DIR" --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"FAKE RESTORE RAN"* ]] || false
+}
+
+@test "phase_restore FAILS, and never runs the restore, when the snapshot's wp-content manifest cannot be recorded" {
+  backup_write_wp_content_manifest() { return 1; }
+  run phase_restore --profile t --run "$RUN_DIR" --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"FAKE RESTORE RAN"* ]] || false
+}

@@ -420,11 +420,43 @@ STUB
 
   backup_wp_content "${RUN_DIR}/backup/b-wp-content" >/dev/null
   backup_write_wp_content_manifest "${RUN_DIR}/backup/b-wp-content" "${RUN_DIR}/backup/b-wp-content.manifest"
+  # Opt-in, and separate from B_ROOT_EXTRA_NFC: only the REFUSAL test wants the
+  # archive pinned. The positive round-trip test needs the archive exactly as
+  # the pull produced it, because on macOS that is what makes it agree with B
+  # after the extraction.
+  #
+  # AFTER the manifest, on purpose: the manifest must still be able to carry
+  # B's own bytes, which is what proves it is read from B rather than from the
+  # archive (see the "read from B, not from the pulled archive" test, and
+  # mutant M14).
+  [ -n "${ARCHIVE_FORCE_NFC:-}" ] && _force_archive_nfc "${RUN_DIR}/backup/b-wp-content"
   _fake_dump_rows 50 | gzip > "${RUN_DIR}/backup/b-db.sql.gz"
   if [ -n "${1:-}" ]; then
     SITE_B_WP_CMD="${1} wp"
   fi
   backup_generate_restore_script "$RUN_DIR"
+}
+
+# _force_archive_nfc <archive-dir> — pins the archive's accented entry to NFC,
+# whatever the pull produced.
+#
+# Without this the normalization test was macOS-only by construction: it
+# borrowed bsdtar's NFC->NFD rewrite to manufacture the divergence it was
+# supposed to be testing. GNU tar does not rewrite anything, so on Linux the
+# archive and B agreed, nothing diverged, the restore succeeded, and the test
+# that asserts a REFUSAL went red in CI. A test must build its own premise.
+#
+# Written by deleting both spellings and re-creating the NFC one: on a
+# normalization-INSENSITIVE volume (APFS) the two names resolve to the same
+# entry, so the second `rm` is a no-op and the fresh `printf` is what fixes the
+# stored bytes. A bare `mv` between two equivalent names is not reliable there.
+_force_archive_nfc() {
+  local dir="$1" nfc nfd content
+  nfc=$(printf 'Caf\xc3\xa9.css')
+  nfd=$(printf 'Cafe\xcc\x81.css')
+  content=$(cat "${dir}/themes/${nfd}" 2>/dev/null || cat "${dir}/themes/${nfc}" 2>/dev/null || echo accented)
+  rm -f "${dir}/themes/${nfd}" "${dir}/themes/${nfc}"
+  printf '%s\n' "$content" > "${dir}/themes/${nfc}"
 }
 
 # _wrapper_shim <name> <body> — writes an executable that stands in for a
@@ -987,20 +1019,30 @@ exec "$@"')
 # archive and why it is compared after the extraction, not before. This test
 # covers the case where that does not settle it — a target that reports a name
 # the extraction did not align, which is what a run dir carried to another host
-# or a normalization-preserving target produces. One macOS volume cannot hold
-# both forms at once (APFS is normalization-insensitive; verified before writing
-# this test), so the target's listing is what has to be made to differ.
-_nfc_find_shim() {
-  _wrapper_shim nfcfind 'if [ "$1" = "find" ]; then
-  "$@" | perl -0777 -pe "s/e\xcc\x81/\xc3\xa9/g"
+# or a normalization-preserving target produces.
+#
+# The divergence is built by this test, not borrowed from the platform. That
+# distinction cost a red CI: an earlier version pinned only the target's side
+# and let `tar` supply the other, which works on macOS (bsdtar rewrites
+# NFC->NFD during the pull) and is a no-op on Linux (GNU tar rewrites nothing),
+# so on Linux both sides agreed, the restore succeeded, and a test asserting a
+# REFUSAL failed. Now both ends are pinned: _force_archive_nfc holds the
+# archive at NFC on either platform, and the shim below rewrites the target's
+# listing to NFD. One macOS volume cannot hold both forms at once (APFS is
+# normalization-insensitive; verified), so the target's LISTING — not its
+# filesystem — is what has to be made to differ.
+_nfd_find_shim() {
+  _wrapper_shim nfdfind 'if [ "$1" = "find" ]; then
+  "$@" | perl -0777 -pe "s/\xc3\xa9/e\xcc\x81/g"
   exit ${PIPESTATUS[0]}
 fi
 exec "$@"'
 }
 
 @test "the generated wrapped-local restore.sh REFUSES to delete when the target reports a backed-up name in a different Unicode normalization" {
-  local shim; shim=$(_nfc_find_shim)
+  local shim; shim=$(_nfd_find_shim)
   B_ROOT_EXTRA_NFC=1
+  ARCHIVE_FORCE_NFC=1
   _wrapped_fixture "$shim"
   run "${RUN_DIR}/restore.sh"
   [ "$status" -ne 0 ]
@@ -1084,4 +1126,28 @@ exec "$@"')
   [ -f "${B_ROOT}/wp-content/RACE-ADDED-DURING-EXTRACTION.txt" ]
   [ -f "${B_ROOT}/wp-content/index.php" ]
   [ -f "${B_ROOT}/wp-content/themes/t/style.css" ]
+}
+
+# The keep-set coming back empty must never read as "keep nothing". Reaching it
+# needs a directory that can be LISTED but not ENTERED — `ls -A` needs the read
+# bit, `cd` needs the execute bit, and mode 400 has one and not the other. So
+# the integrity check upstream is satisfied and the archive listing is still
+# empty. The `cd` fails inside a process substitution, whose status neither
+# `set -e` nor `pipefail` observes, so this guard is the only thing left.
+@test "the generated wrapped-local restore.sh REFUSES when the archive cannot be entered and lists no entries" {
+  if [ "$(id -u)" -eq 0 ]; then
+    skip "running as root: mode bits do not restrict root, so the archive stays listable"
+  fi
+  _wrapped_fixture
+  printf 'grafted\n' > "${B_ROOT}/wp-content/themes/GRAFTED.css"
+  chmod 400 "${RUN_DIR}/backup/b-wp-content"
+  run "${RUN_DIR}/restore.sh"
+  local st="$status" out="$output"
+  chmod 700 "${RUN_DIR}/backup/b-wp-content"
+  [ "$st" -ne 0 ]
+  [[ "$out" == *"listed no entries"* ]] || false
+  # nothing removed — least of all the files the backup contains
+  [ -f "${B_ROOT}/wp-content/index.php" ]
+  [ -f "${B_ROOT}/wp-content/themes/t/style.css" ]
+  [ -f "${B_ROOT}/wp-content/themes/GRAFTED.css" ]
 }
