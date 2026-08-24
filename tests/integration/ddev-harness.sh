@@ -459,8 +459,8 @@ b_table() { ddev exec --raw -p "$PROJECT_B" -- wp eval "global \$wpdb; echo \$wp
 # is discarded before the outer `|| return 1` ever sees anything: the
 # outer `ddev exec` still runs (with `--tables=""` if b_table failed) and
 # can itself still succeed, so the guard on the outer line never fires.
-# Reproduced directly: `t=$(echo "OUTER-OK-avec=[$(bash -c 'exit 9')]") ||
-# return 1` -- the inner failure is invisible, $t is "OUTER-OK-avec=[]",
+# Reproduced directly: `t=$(echo "OUTER-OK-with=[$(bash -c 'exit 9')]") ||
+# return 1` -- the inner failure is invisible, $t is "OUTER-OK-with=[]",
 # and the calling function returns 0. Fixed by capturing b_table's own
 # output as its own guarded statement FIRST, so its failure has a `||
 # return 1` directly on it rather than buried inside another
@@ -897,8 +897,10 @@ echo "==> (a) asserting migrated post_types exist and are visible on B"
 # in practice even though it was piped through a live producer (see that
 # site's own comment further down). For `ddev exec`, size genuinely does
 # NOT matter -- a two-line `wp post list` is exposed exactly like a large
-# one, because the wait is on the container's own teardown, not on
-# clearing a buffer. Same underlying rule either way, just a different
+# one, because the wait is on `wp`'s own post-write teardown inside the
+# `docker exec` session (the containers themselves stay up for the whole
+# run -- they are started near the top and only removed in cleanup()),
+# not on clearing a buffer. Same underlying rule either way, just a different
 # reason the "bytes left to write" question resolves differently for a
 # buffered pipe (`ls`, `echo`) versus a long-lived subprocess (`ddev
 # exec`).
