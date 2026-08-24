@@ -711,12 +711,23 @@ graft_import_attachments() {
     // mode, because it passed titles through argv and never through JSON.
     $encoded = json_encode( sitegraft_media_import_batch( $payload ), defined( "JSON_INVALID_UTF8_SUBSTITUTE" ) ? JSON_INVALID_UTF8_SUBSTITUTE : 0 );
     if ( $encoded === false ) {
-      // Belt and braces, and not reachable by anything this file can
-      // produce: with SUBSTITUTE the only remaining json_encode failures
-      // are INF/NAN floats, recursion and depth, and every value in the
-      // report is an int or a cast string. Kept anyway because the failure
-      // it guards is empty stdout with no explanation at all — the single
-      // hardest thing to diagnose in this whole step.
+      // REACHABLE, contrary to what this comment claimed before. On PHP
+      // 7.2+ the substitution above makes json_encode succeed, and the only
+      // remaining failures would be INF/NAN, recursion or depth, none of
+      // which this report can contain. But the defined() guard deliberately
+      // falls back to flag 0 on older PHP — which README documents as
+      // supported, and which is exactly the latin1-titled population this
+      // whole substitution exists for. There, one non-UTF-8 byte in a
+      // per-item error message (a filename, typically) brings the original
+      // bug straight back. Measured on this report shape:
+      //   json_encode($report, JSON_INVALID_UTF8_SUBSTITUTE)  -> string
+      //   json_encode($report, 0)                             -> bool(false)
+      //   json_last_error_msg() -> "Malformed UTF-8 characters..."
+      // So this turns "empty stdout, no explanation" — the single hardest
+      // thing to diagnose in this whole step — into a named error. It is
+      // not exercised by the suite only because the suite runs on a PHP
+      // where the constant exists; that is a coverage gap, not a dead
+      // branch.
       $encoded = json_encode( array( "ok" => false, "error" => "media-import batch result could not be JSON-encoded: " . json_last_error_msg() ) );
     }
     echo $encoded;

@@ -506,3 +506,43 @@ php_run() {
   [[ "$output" == *"attachment metadata could not be stored"* ]] || false
   [[ "$output" == *'"ok":true'* ]] || false
 }
+
+# --- the metadata guard's other half: an EMPTY result is normal ------------
+
+# wp_generate_attachment_metadata legitimately returns an EMPTY array for
+# anything WordPress generates nothing for. Verified in
+# wp-admin/includes/image.php: it opens with `$metadata = array();` and only
+# fills it for a displayable image (or HEIC), a video, or an audio file. A
+# .zip/.doc/.csv/.txt hits none of those branches — and neither does an
+# ordinary JPEG when file_is_displayable_image() says no, which is what
+# happens when GD and Imagick are both missing, routine on the elderly
+# hosting this tool exists to migrate.
+#
+# So `! empty( $metadata )` is what stops an empty-but-correct result from
+# being read as a storage failure. Without it, ONE non-image anywhere in a
+# media library fails the entire step. Measured side by side:
+#   prod + faithful stub, .zip : {"ok":true,"imported":[9],"failed":[]}
+#   mutant + faithful stub     : imported:[] failed:["metadata could not be stored"]
+#   mutant + the OLD stub      : {"ok":true,"imported":[9],"failed":[]}  <- suite blind
+# The old stub returned a non-empty array for everything, so the guard had
+# no test at all and the mutant survived a full green suite.
+@test "sitegraft_media_import_batch imports a non-image attachment whose generated metadata is legitimately empty" {
+  printf 'PK\003\004 not really a zip' > "${UPLOADS}/2024/01/docs.zip"
+  run php_run '
+    $r = sitegraft_media_import_batch([["old" => 9, "rel_path" => "2024/01/docs.zip", "title" => "Docs"]]);
+    $new_id = $r["map"]["9"];
+    echo json_encode([
+      "ok"        => $r["ok"],
+      "imported"  => $r["imported"],
+      "failed"    => $r["failed"],
+      "source_id" => wpstub_meta($new_id, "_sitegraft_source_id"),
+    ]);
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"imported":[9]'* ]] || false
+  [[ "$output" == *'"failed":[]'* ]] || false
+  [[ "$output" == *'"ok":true'* ]] || false
+  # It is a fully tracked import, not a grudging pass: the resume marker is
+  # written, so a re-run will not duplicate it.
+  [[ "$output" == *'"source_id":9'* ]] || false
+}

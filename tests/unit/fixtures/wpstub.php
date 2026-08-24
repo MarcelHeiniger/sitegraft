@@ -355,7 +355,30 @@ function wp_insert_attachment( $postarr, $file = false ) {
 	return $new_id;
 }
 
+/**
+ * Models real wp_generate_attachment_metadata()'s EMPTY result, which was the
+ * fifth permissivity found in this stub. Verified against
+ * wp-admin/includes/image.php: the function opens with `$metadata = array();`
+ * and only fills it on three branches — a displayable image (or HEIC), a
+ * video, or an audio file. A .zip, .doc, .csv or .txt hits none of them and
+ * comes back EMPTY, and so does an ordinary JPEG when
+ * file_is_displayable_image() says no, which is what happens when GD and
+ * Imagick are both missing — routine on the elderly hosting this tool exists
+ * to migrate.
+ *
+ * Returning a non-empty array unconditionally (this stub used to) left
+ * sitegraft_media_import_one's `! empty( $metadata )` guard completely
+ * unpinned: without that guard, one non-image anywhere in a media library
+ * fails the whole step, and the suite stayed green while it did.
+ *
+ * Only image types are modelled as producing metadata, matching the mime map
+ * wp_check_filetype uses above — loose in the SAFE direction.
+ */
 function wp_generate_attachment_metadata( $id, $file ) {
+	$filetype = wp_check_filetype( wp_basename( $file ), null );
+	if ( empty( $filetype['type'] ) || 0 !== strpos( $filetype['type'], 'image/' ) ) {
+		return array();
+	}
 	return array( 'file' => $file );
 }
 
