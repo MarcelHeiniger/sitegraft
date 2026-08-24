@@ -288,7 +288,7 @@ graft_sync_theme_parent() {
   # the first match and SIGPIPEs whatever is still writing upstream, which
   # under bin/sitegraft's `set -o pipefail` turns a successful match into a
   # failed pipeline (exit 141) — the same defect that made
-  # backup_verify_dump reject every valid real-site backup.
+  # backup_verify_db_export reject every valid real-site backup.
   if grep -qx "$parent" <<< "$b_themes"; then
     log_info "parent theme '${parent}' is already present on B — not copying it"
     return 0

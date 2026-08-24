@@ -9,13 +9,34 @@ set -euo pipefail
 # file, and the run state dir — with a shared suffix. Several Claude sessions
 # can run against this machine's one Docker daemon at once; without this,
 # they'd all fight over the same fixed project names ("sitegraft-test-a"),
-# the same profiles/ddev-test.conf, and the same /tmp/sitegraft-ddev-test-runs
-# — and cleanup() below (ddev delete + rm -rf, unconditional, on EXIT) would
-# tear down whichever session finishes first out from under the others still
-# running. Empty by default, so an invocation with no environment variable
-# set behaves byte-for-byte like before this existed. Example:
+# and the same profiles/ddev-test.conf — cleanup() below (ddev delete +
+# rm -rf, unconditional, on EXIT) would tear down whichever session finishes
+# first out from under the others still running (cleanup() never touches
+# the state dir itself, only the two DDEV projects, their /tmp dirs, and the
+# profile file). The state dir's own unscoped collision is different and
+# subtler: with SITEGRAFT_STATE_DIR shared, this script's own `ls -dt
+# "${STATE_DIR}/${PROFILE}-"*` run-dir discovery (a few lines below) would
+# happily pick up the MOST RECENT matching entry regardless of which
+# session wrote it — a second concurrent unscoped run could make this
+# session silently start operating on the other session's run directory
+# (scan/plan/backup/graft state) instead of its own. Empty by default, so
+# an invocation with no environment variable set behaves byte-for-byte like
+# before this existed. Example:
 #   SITEGRAFT_HARNESS_ID=nat1 tests/integration/ddev-harness.sh
 SITEGRAFT_HARNESS_ID="${SITEGRAFT_HARNESS_ID:-}"
+# R3 (review): this value is spliced straight into `ddev config
+# --project-name`, a filesystem path (STATE_DIR), and a profile filename --
+# a space, an uppercase letter, or a `/` would break one of those with an
+# error message that gives no hint the cause was this env var. Reject early
+# with a clear message instead of a confusing failure three steps later.
+case "$SITEGRAFT_HARNESS_ID" in
+  '') : ;; # unset/empty is the default, always allowed
+  *[!a-z0-9-]*)
+    echo "SITEGRAFT_HARNESS_ID must contain only lowercase letters, digits, and hyphens (got '${SITEGRAFT_HARNESS_ID}')" >&2
+    exit 1
+    ;;
+  *) : ;;
+esac
 HARNESS_ID_SUFFIX=""
 [ -n "$SITEGRAFT_HARNESS_ID" ] && HARNESS_ID_SUFFIX="-${SITEGRAFT_HARNESS_ID}"
 
@@ -44,6 +65,12 @@ cleanup() {
   # Same tidiness for the bare-local deletion-semantics check's own scratch
   # dir (unset until that block runs, hence the guard).
   [ -n "${BARE_TEST_DIR:-}" ] && rm -rf "${BARE_TEST_DIR}"
+  # Deliberately NOT touching $STATE_DIR here (Viktor's review raised this,
+  # not adopted): its run directories hold the backups and pre-restore
+  # snapshots this harness explicitly promises to keep, so wiping them on
+  # every EXIT would be destructive and surprising, not tidy. B1's fix
+  # above (no more `ls -dt | head -1` pipe) is what makes an unbounded
+  # state dir merely wasteful disk space instead of an intermittent abort.
   true
 }
 trap cleanup EXIT
@@ -126,7 +153,43 @@ echo "==> running scan"
 # prefix would silently match nothing (state dir is scoped too, so this
 # harness's own runs live under $STATE_DIR regardless, but the prefix must
 # still agree with what phase_scan actually named the directory).
-RUN_DIR=$(ls -dt "${STATE_DIR}/${PROFILE}-"* | head -1)
+# B1 fix-pack (Viktor's review, measured live): `ls -dt ... | head -1` is
+# NOT safe merely because `ls` is not `ddev exec` -- `ls -dt` sorts and
+# builds its ENTIRE output before writing any of it, then writes it in one
+# go; once the state dir accumulates enough run directories (this harness's
+# own cleanup() never prunes it -- see the header comment above) that
+# output exceeds the pipe's buffer, `ls` blocks mid-write while `head -1`
+# has already read its one line and exited, closing the pipe out from under
+# it -- SIGPIPE, exit 141, and under this file's pipefail that aborts the
+# whole run despite a perfectly good match existing. Reproduced directly:
+# with 300 entries in the state dir this exact `ls -dt ... | head -1` form
+# failed rc=141 three times out of three; the no-pipe form below, on the
+# same directory, succeeded three times out of three. The general rule
+# (rewritten from this fix-pack's earlier, incorrect version, which claimed
+# `ls` always finishes before `head` can cut it off): the danger is ANY
+# producer that still has bytes left to write when the consumer exits early
+# -- true of `ddev exec` regardless of output size, and just as true of
+# `ls` once its output is large enough, not merely of long-lived processes.
+# So every early-exiting consumer in this file (`grep -q`, `head -1`) is
+# fixed the same way: capture the producer's full output into a variable
+# first, with no consumer downstream of it able to close the pipe early.
+#
+# lib/plan.sh, lib/backup.sh, lib/verify.sh, and lib/graft.sh each run this
+# identical `ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* | head -1` shape
+# for their own run-dir discovery and are NOT already safe by virtue of
+# being `ls` -- they are exposed to the exact same SIGPIPE race. What
+# protects them is different and unrelated: each pipeline there ends in
+# `|| true` (verified: lib/plan.sh, lib/backup.sh, lib/verify.sh,
+# lib/graft.sh each `run_dir=$(ls -dt ... | head -1 || true)`), which
+# swallows ANY pipeline failure -- a genuine no-match and a SIGPIPE alike --
+# and the very next line explicitly tests `[ -n "$run_dir" ]` before
+# proceeding. That is a legitimate, different fix from the one applied
+# here (this harness has no such `|| true` + explicit-check pair, so it
+# relies on `set -e` catching a failed assignment instead), left alone
+# because it is out of scope for this file. It is not evidence that `ls`
+# piped into `head` is safe in general.
+RUN_DIR_CANDIDATES=$(ls -dt "${STATE_DIR}/${PROFILE}-"*)
+RUN_DIR="${RUN_DIR_CANDIDATES%%$'\n'*}"
 
 echo "==> asserting fixtures are visible in the scan output"
 jq -e '.post_types[] | select(.name=="etch_cfs")' "${RUN_DIR}/scan-a.json" >/dev/null
@@ -327,10 +390,41 @@ b_table() { ddev exec --raw -p "$PROJECT_B" -- wp eval "global \$wpdb; echo \$wp
 # the fake_reservation post's own row (wp_posts, same table every migrated
 # post lands in) — both now included, so this checksum actually covers
 # what the tool's non-contamination promise is supposed to cover.
+# R1 (review, Kimi/Viktor's fix-pack; the coordinator's own reproduction,
+# reused here verbatim): on this project's actual runtime, GNU bash
+# 3.2.57(1) (macOS's system `/usr/bin/env bash` -- verify with `bash
+# --version` before assuming otherwise), `set -e` is INERT for a command
+# substitution's failure once that substitution is inside a function and
+# the function itself is only ever called through ANOTHER command
+# substitution. Reproduced directly on this machine:
+#     g() { local x; x=$(bash -c "exit 9"); echo CONTINUED; }
+#     V=$(g)
+#     # prints CONTINUED, $V is CONTINUED, $? is 0 -- the internal failure
+#     # never happened as far as the caller can tell.
+# b_protected_checksum is called ONLY as `X=$(b_protected_checksum)` (seven
+# call sites below and further down -- CHECKSUM_1/2, CHECKSUM_AFTER_RESTORE,
+# PRE_GRAFT_CHECKSUM, POST_GRAFT_CHECKSUM, POST_RERUN_CHECKSUM,
+# RESTORE_CHECKSUM, counted directly, not assumed), so it sits in exactly
+# that trap: a real `wp db export` / `wp option get` / `wp post list` /
+# `wp post get` failure inside it -- a dropped ddev connection, a
+# container that's mid-restart -- would silently leave the corresponding
+# *_dump variable holding
+# whatever partial or empty output came through, `backup_checksum` would
+# still run against that partial data without complaint, and the
+# non-contamination proof this whole harness exists to make (PRE_GRAFT_
+# CHECKSUM == POST_GRAFT_CHECKSUM) would pass having compared two checksums
+# of equally-broken input -- never having proven anything. Every `ddev
+# exec` capture in this function is therefore guarded with an explicit
+# `|| return 1`: unlike bare `set -e`, an explicit `||` is never "ignored"
+# by anything, on any bash version, in any calling context. The nominal
+# (everything-succeeds) path is unaffected -- the function's own return
+# status is still whatever backup_checksum's call at the end returns
+# (always 0; see lib/backup.sh), since none of these `|| return 1` guards
+# ever fire when every ddev exec call actually succeeds.
 b_protected_checksum() {
   local table_dump options_dump post_id post_dump
-  table_dump=$(ddev exec --raw -p "$PROJECT_B" -- wp db export - --tables="$(b_table fakebooking_reservations)")
-  options_dump=$(ddev exec --raw -p "$PROJECT_B" -- wp option get fakebooking_settings --format=json)
+  table_dump=$(ddev exec --raw -p "$PROJECT_B" -- wp db export - --tables="$(b_table fakebooking_reservations)") || return 1
+  options_dump=$(ddev exec --raw -p "$PROJECT_B" -- wp option get fakebooking_settings --format=json) || return 1
   # `head -1` piped directly onto `ddev exec` has the same early-exit/SIGPIPE
   # exposure as `grep -q` does (see the comment above the "(a) asserting
   # migrated post_types" block further down in this file for the full
@@ -340,10 +434,10 @@ b_protected_checksum() {
   # yield an empty $post_id here, exactly what `head -1` on empty input
   # already did).
   local post_ids
-  post_ids=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=fake_reservation --field=ID)
+  post_ids=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=fake_reservation --field=ID) || return 1
   post_id="${post_ids%%$'\n'*}"
   post_dump=""
-  [ -n "$post_id" ] && post_dump=$(ddev exec --raw -p "$PROJECT_B" -- wp post get "$post_id" --field=post_content)
+  [ -n "$post_id" ] && { post_dump=$(ddev exec --raw -p "$PROJECT_B" -- wp post get "$post_id" --field=post_content) || return 1; }
   # Real bug found live while proving MAJOR-2's exposure: `$(...)` strips
   # ALL trailing newlines from each captured piece, so plain
   # "${a}${b}${c}" concatenation glues table_dump's LAST line (a real
@@ -459,7 +553,14 @@ fi
 echo "==> confirmed: the wrapped-local restore is exact-state (issue #14)"
 
 echo "==> asserting restore took a pre-restore safety snapshot of B's CURRENT state (db AND wp-content) before touching anything, and that the snapshot itself is turnkey-reversible"
-PRE_RESTORE_DIR=$(ls -dt "${RUN_DIR}"/pre-restore-* 2>/dev/null | head -1)
+# Same `ls -dt ... | head -1` SIGPIPE exposure as RUN_DIR's discovery above
+# (B1 fix-pack) -- same no-pipe fix. `2>/dev/null` stays: a genuine no-match
+# here must still abort (ls itself then returns non-zero, which a bare
+# `VAR=$(ls ...)` assignment still propagates through `set -e`, exactly as
+# before), this only silences the "No such file or directory" ls prints to
+# stderr on that path.
+PRE_RESTORE_CANDIDATES=$(ls -dt "${RUN_DIR}"/pre-restore-* 2>/dev/null)
+PRE_RESTORE_DIR="${PRE_RESTORE_CANDIDATES%%$'\n'*}"
 [ -n "$PRE_RESTORE_DIR" ]
 [ -s "${PRE_RESTORE_DIR}/backup/b-db.sql.gz" ]
 [ -d "${PRE_RESTORE_DIR}/backup/b-wp-content" ] && [ -n "$(ls -A "${PRE_RESTORE_DIR}/backup/b-wp-content")" ]
@@ -689,9 +790,15 @@ echo "==> running graft"
 "${ROOT}/bin/sitegraft" graft --profile "$PROFILE" --run "$RUN_DIR" --allow-stack-mismatch
 
 echo "==> (a) asserting migrated post_types exist and are visible on B"
-# Every `grep -q` below this comment, through the rest of the file, is
+# Every `grep -q` below this comment that consumes `ddev exec` output --
+# through the rest of case (a) and a couple of spots further down -- is
 # matched from a captured variable via a here-string rather than piped
-# directly onto a `ddev exec` invocation. Reasoning (same defect class
+# directly onto the `ddev exec` invocation itself. (This does NOT describe
+# every `grep`/`grep -q` in the file: plenty elsewhere -- against
+# $VERIFY_REPORT, $MUTATED_WXR -- read an already-complete, fully-written
+# file, never a live `ddev exec`, and piping straight into those is fine
+# as-is; see B1's fix a little further up for why a completed file has no
+# live producer to race in the first place.) Reasoning (same defect class
 # lib/backup.sh's backup_verify_db_export and lib/graft.sh's
 # graft_sync_theme_parent already document at length; see those
 # two comments for the full account, not repeated here per occurrence):
@@ -721,15 +828,22 @@ echo "==> (a) asserting migrated post_types exist and are visible on B"
 # grep -q` failed 25 times out of 25 with exactly the message above, while
 # the captured-variable form below failed 0 times out of 25. The real-world
 # window is `wp`'s own post-write teardown, which is short and variable --
-# hence a defect that fires on some runs and not others. `head -1` piped directly onto
-# a `ddev exec`/live-command producer has the identical early-exit shape and
-# gets the identical variable-capture fix, both earlier in this file --
-# which is also why `ls -dt ... | head -1` (used a few times, e.g. this
-# script's own RUN_DIR discovery near the top) is deliberately left
-# untouched: `ls` finishes and exits before `head` can ever cut it off, so
-# there is no still-alive producer for `head` to SIGPIPE in that case -- the
-# danger here is a producer that is still alive when the consumer exits
-# early, not the presence of a pipe by itself.
+# hence a defect that fires on some runs and not others. `head -1` piped
+# directly onto a `ddev exec`/live-command producer has the identical
+# early-exit shape and gets the identical variable-capture fix, both
+# earlier in this file (b_protected_checksum's post_id, and
+# FAKEBOOKING_POST_ID a little further down).
+#
+# `ls -dt ... | head -1` gets the SAME fix too (RUN_DIR/PRE_RESTORE_DIR/
+# REAL_WXR, all above this point) -- an earlier version of this comment
+# claimed `ls` always finishes writing before `head` can cut it off, which
+# is wrong and was measured to be wrong (B1 fix-pack): `ls -dt` sorts and
+# builds its whole output before writing, so once a state dir holds enough
+# entries to exceed the pipe buffer, it blocks mid-write exactly like
+# `ddev exec` does. The actual rule, unchanged from the start of this
+# comment: the danger is any producer that still has bytes left to write
+# when the consumer exits early -- not which command the producer happens
+# to be, and not output size either.
 B_PAGE_TITLES=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=page --field=post_title)
 grep -q '^Home$' <<< "$B_PAGE_TITLES"
 B_ETCH_CFS_TITLES=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=etch_cfs --field=post_title)
@@ -824,9 +938,19 @@ case "$IMAGE_BLOCK_CONTENT" in
     exit 1
     ;;
 esac
-# $IMAGE_BLOCK_CONTENT is already a captured variable here, not a live pipe
-# -- converted to the same here-string form as the checks above purely for
-# consistency (no `ddev exec`/live producer is actually at risk on this one).
+# $IMAGE_BLOCK_CONTENT is already a plain captured variable at this point
+# (populated by the `ddev exec ... wp post get` call several lines above,
+# already complete) -- matched via the same here-string form as the checks
+# above for consistency. Note this is NOT "safe because it's a variable,
+# not `ddev exec`": the original `echo "$IMAGE_BLOCK_CONTENT" | grep -q`
+# form still piped through a live producer (`echo`), which takes SIGPIPE
+# exactly like anything else does -- it only never actually raced here
+# because $IMAGE_BLOCK_CONTENT is small enough to clear the pipe buffer in
+# one write before `grep -q` could ever exit and cut it off. That is a
+# size-dependent kind of safe, not a structural one -- the same mistake B1
+# corrected above about `ls`, so it is not repeated here as a justification.
+# The here-string removes the pipe entirely, so this line does not depend
+# on size at all, regardless of why the old form happened not to fail.
 grep -q "${PROJECT_B}.ddev.site" <<< "$IMAGE_BLOCK_CONTENT"
 
 echo "==> (d) asserting page_on_front resolves to the correctly remapped page on B (design doc §9.3)"
@@ -872,7 +996,13 @@ echo "==> (e) asserting the integrity gate ABORTS on a real WXR file carrying a 
 # Uses the REAL WXR file graft's own export step just produced (not a
 # hand-fabricated fixture) — proves the gate works against genuine wp-cli
 # export output, not only the synthetic XML in tests/unit/test_graft_integrity_gate.bats.
-REAL_WXR=$(ls "${RUN_DIR}/export"/*.xml | head -1)
+# Same class as RUN_DIR/PRE_RESTORE_DIR above (B1 fix-pack), minus the
+# `-dt`: no ordering guarantee is needed here (exactly one export/*.xml is
+# ever produced by this run), just avoiding the pipe. stderr is left
+# unsuppressed, same as before: a genuine no-match still prints ls's own
+# "No such file" diagnostic before the `[ -n ... ]` check below fails it.
+REAL_WXR_CANDIDATES=$(ls "${RUN_DIR}/export"/*.xml)
+REAL_WXR="${REAL_WXR_CANDIDATES%%$'\n'*}"
 [ -n "$REAL_WXR" ]
 ALLOWED_TYPES=$(jq -c '[.migrate[].post_types[]?]' "${RUN_DIR}/manifest.json")
 # Sanity check first: the gate must PASS the real, untouched file — otherwise
