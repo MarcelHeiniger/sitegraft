@@ -12,8 +12,9 @@ set -euo pipefail
 # and the same profiles/ddev-test.conf — cleanup() below (ddev delete +
 # rm -rf, unconditional, on EXIT) would tear down whichever session finishes
 # first out from under the others still running (cleanup() never touches
-# the state dir itself, only the two DDEV projects, their /tmp dirs, and the
-# profile file). The state dir's own unscoped collision is different and
+# the state dir itself, only the two DDEV projects, their /tmp dirs, the
+# profile file, and the bare-local deletion-semantics check's own scratch
+# dir). The state dir's own unscoped collision is different and
 # subtler: with SITEGRAFT_STATE_DIR shared, this script's own `ls -dt
 # "${STATE_DIR}/${PROFILE}-"*` run-dir discovery (a few lines below) would
 # happily pick up the MOST RECENT matching entry regardless of which
@@ -29,10 +30,32 @@ SITEGRAFT_HARNESS_ID="${SITEGRAFT_HARNESS_ID:-}"
 # a space, an uppercase letter, or a `/` would break one of those with an
 # error message that gives no hint the cause was this env var. Reject early
 # with a clear message instead of a confusing failure three steps later.
+#
+# Second review pass, blocking: `*[!a-z0-9-]*` is a glob RANGE, which is
+# collation-dependent. Measured directly, four locales, `bash --version`
+# 3.2.57(1): under C the range rejects "Nat1"/"NAT" as intended, but under
+# en_US.UTF-8, de_CH.UTF-8, and fr_FR.UTF-8 it ACCEPTS them -- exactly the
+# uppercase case this guard's own error message claims to reject, and
+# accented UTF-8 letters ("naté") too. This is spelled out as an enumerated
+# character class instead, which glob matching treats as a literal set of
+# bytes, never subject to collation -- do NOT "simplify" this back to
+# `[a-z0-9-]`, that reopens the exact hole just closed (re-verify against
+# en_US.UTF-8/de_CH.UTF-8/fr_FR.UTF-8, not just C, before ever touching it).
+# `[![:lower:][:digit:]-]` was considered and rejected too: POSIX character
+# classes fix the uppercase case but still pass accented UTF-8 letters
+# through under a UTF-8 locale, which the enumerated class does not.
 case "$SITEGRAFT_HARNESS_ID" in
   '') : ;; # unset/empty is the default, always allowed
-  *[!a-z0-9-]*)
+  *[!abcdefghijklmnopqrstuvwxyz0123456789-]*)
     echo "SITEGRAFT_HARNESS_ID must contain only lowercase letters, digits, and hyphens (got '${SITEGRAFT_HARNESS_ID}')" >&2
+    exit 1
+    ;;
+  -*|*-)
+    # A DDEV project name/profile/STATE_DIR path segment starting or
+    # ending with a hyphen is an invalid DNS label -- precisely the
+    # confusing downstream failure this guard exists to head off, so it
+    # gets the same early, explicit rejection as an illegal character.
+    echo "SITEGRAFT_HARNESS_ID must not start or end with a hyphen (got '${SITEGRAFT_HARNESS_ID}')" >&2
     exit 1
     ;;
   *) : ;;
@@ -164,7 +187,13 @@ echo "==> running scan"
 # whole run despite a perfectly good match existing. Reproduced directly:
 # with 300 entries in the state dir this exact `ls -dt ... | head -1` form
 # failed rc=141 three times out of three; the no-pipe form below, on the
-# same directory, succeeded three times out of three. The general rule
+# same directory, succeeded three times out of three. This is NOT "300
+# entries is the threshold" -- macOS sizes a pipe's buffer dynamically
+# (observed between 16 KiB and 64 KiB), and the second review pass
+# measured, with longer paths than this reproduction uses, an inconsistent
+# 1/5 then 0/5 failures at 300 entries, 3/5 at 350, and 5/5 at 400: the
+# real threshold moves with the pipe buffer size and the length of each
+# entry's path, not with a fixed entry count. The general rule
 # (rewritten from this fix-pack's earlier, incorrect version, which claimed
 # `ls` always finishes before `head` can cut it off): the danger is ANY
 # producer that still has bytes left to write when the consumer exits early
@@ -408,22 +437,39 @@ b_table() { ddev exec --raw -p "$PROJECT_B" -- wp eval "global \$wpdb; echo \$wp
 # that trap: a real `wp db export` / `wp option get` / `wp post list` /
 # `wp post get` failure inside it -- a dropped ddev connection, a
 # container that's mid-restart -- would silently leave the corresponding
-# *_dump variable holding
-# whatever partial or empty output came through, `backup_checksum` would
-# still run against that partial data without complaint, and the
-# non-contamination proof this whole harness exists to make (PRE_GRAFT_
-# CHECKSUM == POST_GRAFT_CHECKSUM) would pass having compared two checksums
-# of equally-broken input -- never having proven anything. Every `ddev
-# exec` capture in this function is therefore guarded with an explicit
-# `|| return 1`: unlike bare `set -e`, an explicit `||` is never "ignored"
-# by anything, on any bash version, in any calling context. The nominal
-# (everything-succeeds) path is unaffected -- the function's own return
-# status is still whatever backup_checksum's call at the end returns
-# (always 0; see lib/backup.sh), since none of these `|| return 1` guards
-# ever fire when every ddev exec call actually succeeds.
+# *_dump variable holding whatever partial or empty output came through,
+# `backup_checksum` would still run against that partial data without
+# complaint, and the non-contamination proof this whole harness exists to
+# make (PRE_GRAFT_CHECKSUM == POST_GRAFT_CHECKSUM) would pass having
+# compared two checksums of equally-broken input -- never having proven
+# anything. There are five REACHABLE `ddev exec` calls in this function
+# (table_dump's own, options_dump's, post_ids', post_dump's, and
+# b_table's), and all five are guarded with an explicit `|| return 1`:
+# unlike bare `set -e`, an explicit `||` is never "ignored" by anything,
+# on any bash version, in any calling context. The nominal (everything-
+# succeeds) path is unaffected -- the function's own return status is
+# still whatever backup_checksum's call at the end returns (always 0; see
+# lib/backup.sh), since none of these `|| return 1` guards ever fire when
+# every ddev exec call actually succeeds.
+#
+# Second review pass, blocking: the first version of this fix-pack guarded
+# `table_dump=$(ddev exec ... --tables="$(b_table ...)") || return 1` and
+# claimed EVERY capture was covered -- false. `b_table`'s own failure is a
+# NESTED command substitution inside that same line, and its exit status
+# is discarded before the outer `|| return 1` ever sees anything: the
+# outer `ddev exec` still runs (with `--tables=""` if b_table failed) and
+# can itself still succeed, so the guard on the outer line never fires.
+# Reproduced directly: `t=$(echo "OUTER-OK-avec=[$(bash -c 'exit 9')]") ||
+# return 1` -- the inner failure is invisible, $t is "OUTER-OK-avec=[]",
+# and the calling function returns 0. Fixed by capturing b_table's own
+# output as its own guarded statement FIRST, so its failure has a `||
+# return 1` directly on it rather than buried inside another
+# substitution's argument list.
 b_protected_checksum() {
   local table_dump options_dump post_id post_dump
-  table_dump=$(ddev exec --raw -p "$PROJECT_B" -- wp db export - --tables="$(b_table fakebooking_reservations)") || return 1
+  local fakebooking_table
+  fakebooking_table=$(b_table fakebooking_reservations) || return 1
+  table_dump=$(ddev exec --raw -p "$PROJECT_B" -- wp db export - --tables="$fakebooking_table") || return 1
   options_dump=$(ddev exec --raw -p "$PROJECT_B" -- wp option get fakebooking_settings --format=json) || return 1
   # `head -1` piped directly onto `ddev exec` has the same early-exit/SIGPIPE
   # exposure as `grep -q` does (see the comment above the "(a) asserting
@@ -834,16 +880,28 @@ echo "==> (a) asserting migrated post_types exist and are visible on B"
 # earlier in this file (b_protected_checksum's post_id, and
 # FAKEBOOKING_POST_ID a little further down).
 #
-# `ls -dt ... | head -1` gets the SAME fix too (RUN_DIR/PRE_RESTORE_DIR/
-# REAL_WXR, all above this point) -- an earlier version of this comment
-# claimed `ls` always finishes writing before `head` can cut it off, which
-# is wrong and was measured to be wrong (B1 fix-pack): `ls -dt` sorts and
-# builds its whole output before writing, so once a state dir holds enough
-# entries to exceed the pipe buffer, it blocks mid-write exactly like
-# `ddev exec` does. The actual rule, unchanged from the start of this
-# comment: the danger is any producer that still has bytes left to write
-# when the consumer exits early -- not which command the producer happens
-# to be, and not output size either.
+# `ls -dt ... | head -1` gets the SAME fix too (RUN_DIR and PRE_RESTORE_DIR
+# above this point; REAL_WXR is further DOWN, near assertion (e)) -- an
+# earlier version of this comment claimed `ls` always finishes writing
+# before `head` can cut it off, which is wrong and was measured to be
+# wrong (B1 fix-pack): `ls -dt` sorts and builds its whole output before
+# writing, so once a state dir holds enough entries to exceed the pipe
+# buffer, it blocks mid-write exactly like `ddev exec` does. The actual
+# rule, unchanged from the start of this comment: the danger is any
+# producer that still has bytes left to write when the consumer exits
+# early -- not which command the producer happens to be. This is NOT "not
+# output size either" (a second earlier version of this comment claimed
+# that too, and it was also wrong): for `ls`/`echo`, size is exactly the
+# criterion -- a small enough `ls`/`echo` never blocks and never races,
+# which is why $IMAGE_BLOCK_CONTENT's `echo | grep -q` form never failed
+# in practice even though it was piped through a live producer (see that
+# site's own comment further down). For `ddev exec`, size genuinely does
+# NOT matter -- a two-line `wp post list` is exposed exactly like a large
+# one, because the wait is on the container's own teardown, not on
+# clearing a buffer. Same underlying rule either way, just a different
+# reason the "bytes left to write" question resolves differently for a
+# buffered pipe (`ls`, `echo`) versus a long-lived subprocess (`ddev
+# exec`).
 B_PAGE_TITLES=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=page --field=post_title)
 grep -q '^Home$' <<< "$B_PAGE_TITLES"
 B_ETCH_CFS_TITLES=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=etch_cfs --field=post_title)
@@ -1000,7 +1058,9 @@ echo "==> (e) asserting the integrity gate ABORTS on a real WXR file carrying a 
 # `-dt`: no ordering guarantee is needed here (exactly one export/*.xml is
 # ever produced by this run), just avoiding the pipe. stderr is left
 # unsuppressed, same as before: a genuine no-match still prints ls's own
-# "No such file" diagnostic before the `[ -n ... ]` check below fails it.
+# "No such file" diagnostic, and the script dies right there at the
+# assignment under `set -e` -- measured directly, the `[ -n ... ]` check
+# below is never even reached on that path, same as PRE_RESTORE_DIR above.
 REAL_WXR_CANDIDATES=$(ls "${RUN_DIR}/export"/*.xml)
 REAL_WXR="${REAL_WXR_CANDIDATES%%$'\n'*}"
 [ -n "$REAL_WXR" ]
