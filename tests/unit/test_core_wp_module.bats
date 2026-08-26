@@ -136,6 +136,53 @@ EOF
   [ ! -f "$BATS_TEST_TMPDIR/calls.log" ]
 }
 
+# --- PR #61 follow-up: core_wp_post_import's lookup has no `$3` type filter,
+# so column 2 of any id-map.tsv row whose column 1 matches old_id reaches
+# `wp option update` verbatim. Dropping the wp_import_insert_term handler
+# stops this version from WRITING such rows, but an id-map.tsv already on
+# disk still carries them, and graft's step-idempotency markers make
+# resuming onto one a real path. These two tests pin the write side shut.
+#
+# Both fixtures use column 2 = "Array" because that is literally what the
+# removed handler wrote (PHP's array-to-string coercion), not an invented
+# shape.
+
+@test "core_wp_post_import refuses to write a non-numeric new id to B (legacy term: row from a pre-fix id-map.tsv)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '"5"' > "${run_dir}/option-page_on_front.value"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  # Column 1 is 5 because the removed handler put the newly-INSERTED post's
+  # id on B there, which can collide with A's own page_on_front value.
+  printf '5\tArray\tterm:category\n' > "$tsv"
+  wp_cmd_b_stub() { echo "wp_cmd_b_stub $*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  run core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
+  # The point of the test: nothing reached B at all. Without the guard this
+  # is `wp option update page_on_front Array` against the live site.
+  [ ! -f "$BATS_TEST_TMPDIR/calls.log" ]
+  [[ "$output" == *"non-numeric new id"* ]] || false
+  # Not silent, and not the "no corresponding entry" message either — that
+  # one belongs to the genuinely-absent case and must stay distinguishable.
+  [[ "$output" != *"has no corresponding entry"* ]] || false
+}
+
+@test "core_wp_post_import refuses the write when a legacy term: row collides with a real page row (awk emits both)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '"5"' > "${run_dir}/option-page_on_front.value"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  # The lookup prints every matching row, so new_id here is the two-line
+  # string "105\nArray" — not one value or the other. Writing that to B is
+  # worse than either alone.
+  printf '5\t105\tpage\n5\tArray\tterm:category\n' > "$tsv"
+  wp_cmd_b_stub() { echo "wp_cmd_b_stub $*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  run core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
+  [ ! -f "$BATS_TEST_TMPDIR/calls.log" ]
+  [[ "$output" == *"non-numeric new id"* ]] || false
+}
+
 # Fix-pack bug found live (DDEV harness, MAJOR-B's new graft --dry-run
 # assertion, running end to end for the first time against a genuinely
 # fresh run directory — same root cause and same fix as

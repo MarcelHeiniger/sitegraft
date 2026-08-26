@@ -281,6 +281,33 @@ core_wp_post_import() {
     # here rather than only in the removed handler's own comment.
     new_id=$(awk -F'\t' -v old="$old_id" '$1==old{print $2}' "$id_map_tsv" 2>/dev/null)
     if [ -n "$new_id" ]; then
+      # Fail closed on a non-numeric new id, rather than writing it to B.
+      # The lookup above has no `$3` type filter (see the comment on it), so
+      # column 2 of ANY id-map.tsv row whose column 1 matches old_id lands
+      # here verbatim, and this is the one place that value reaches a live
+      # `wp option update` unguarded by a digit check or a PHP-side (int)
+      # cast. Removing the wp_import_insert_term handler stops THIS version
+      # from writing such rows; it does nothing for an id-map.tsv already on
+      # disk. That case is real, not hypothetical: graft's step-idempotency
+      # markers (graft.*.done) mean a run started under a version that still
+      # had the handler can be resumed under this one, against its existing
+      # id-map.tsv whose term: rows carry the literal string "Array" in
+      # column 2. On a numeric collision between old_id (A's own
+      # page_on_front/page_for_posts) and such a row's column 1, the write
+      # below would set B's front page to "Array" — a live, silent
+      # corruption of the option this function exists to fix.
+      #
+      # Guarding on shape rather than on `term:` deliberately: the class is
+      # "column 2 is not an id", whatever produced the row. `''` is NOT
+      # matched here on purpose — an absent mapping is a different case with
+      # its own warning in the else branch below, and folding the two would
+      # replace that message with this one.
+      case "$new_id" in
+        *[!0-9]*)
+          log_warn "core-wp post_import: id-map.tsv maps A's ${key} (page ${old_id}) to a non-numeric new id ('${new_id}') — refusing to write it to B's ${key}, leaving the option unchanged. This row was almost certainly written by an older sitegraft version; report this with the run directory."
+          continue
+          ;;
+      esac
       # Step 6 dry-run audit: this was a raw, unwrapped write — the ONE real
       # gap the audit found (design doc §3.2's module contract never said a
       # post_import hook must respect --dry-run, and graft_run_module_
