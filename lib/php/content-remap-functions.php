@@ -141,34 +141,83 @@ function sitegraft_domain_present( $haystack, $domain, $escaped ) {
  * $post is the SAME get_post() object both callers already fetched to
  * build $fields in the first place. $fields is a KEYED array —
  * `array( "post_content" => $content, "post_excerpt" => $excerpt )` at
- * both call sites — handed straight through to $wpdb->update() as its own
- * $data argument below, unrepackaged, so the keys ARE the column names,
- * not merely documentation of intent.
+ * both call sites — matched against a fixed, hard-coded list of required
+ * keys below and RE-PACKAGED into a fresh array before it ever reaches
+ * $wpdb->update(). It is NOT passed through as-is (review, Viktor, third
+ * round, execution-proven): an earlier version of this function handed
+ * $fields to $wpdb->update() directly and defended that as necessary —
+ * "the keys ARE the column names, not merely documentation of intent" —
+ * which was a false choice. Viktor's probe called this function with
+ * `["post_content"=>..., "post_excerpt"=>..., "post_status"=>"draft",
+ * "post_title"=>"OVERWRITTEN", "post_author"=>999]` and every one of
+ * those five columns reached $wpdb->update(). No live vulnerability today
+ * — the two call sites' array keys are string literals inside a
+ * single-quoted bash string, and nothing from A's content or the JSON
+ * payload can become a KEY, only a value — but it silently repealed the
+ * exact invariant this PR itself put in CLAUDE.md one commit earlier:
+ * "ONLY those two plain-TEXT columns, NEVER an arbitrary/serialized
+ * value." The "never serialized" half is load-bearing, not decorative:
+ * lib/graft.sh's own scope comment (graft_remap_attachment_ids' header)
+ * argues a direct fetch/modify/write-back is safe specifically BECAUSE
+ * post_content/post_excerpt are plain TEXT and never PHP-serialized —
+ * an argument that stops holding the moment this function can be handed
+ * an arbitrary column set. Re-packaging with the same two literal keys
+ * costs nothing against MAJOR-2: the call site still writes
+ * `array( "post_content" => $content, "post_excerpt" => $excerpt )`, so
+ * the keys stay attached to their values at the one place a swap can
+ * happen — this function bounding what it accepts is an orthogonal
+ * property, not a trade-off against that one.
  *
- * This is the second round of MAJOR-2 (review, Viktor, execution-proven
- * TWICE). Round one replaced $post_id/$orig_content/$orig_excerpt with
- * $post, which really did remove arguments 4/5 of the original five —
- * but the danger was never in 4/5. It was in 2/3: the resulting
- * `sitegraft_write_remapped_post( $post, $content, $excerpt )` still took
- * two adjacent, interchangeable strings, and this docblock used to claim
- * that reading $post's own fields "closes that off structurally" — a
- * claim the code did not back up. Viktor swapped $content and $excerpt at
- * graft_remap_attachment_ids' own call site a SECOND time, against that
- * exact form, and the full 41-test suite touching this function stayed
- * green again: every assertion still matched the call's TEXT, and the
- * round-one "never swapped" test exercised only this HELPER, never the
- * call site where the swap actually happens. A keyed array closes it at
- * the one place a swap is possible: `array( "post_content" => $excerpt,
- * "post_excerpt" => $content )` reads as self-evidently wrong at the call
- * site itself, where a positional swap reads as two equally plausible
- * strings in some order — there is no name attached to catch it. A
- * literal-string assertion on the call site's generated PHP
- * (`tests/unit/test_graft_remap.bats`, `tests/unit/test_graft_options.bats`)
- * is belt-and-suspenders on top of this, not the primary defense: it
- * breaks on the first reformatting of the snippet and only ever covers
- * the two call sites that exist today, where the keyed-array shape here
- * is what makes a swap require an actively wrong-looking edit at ANY
- * future call site, not just these two.
+ * A caller missing either required key gets a visible, immediate refusal
+ * (review, Viktor, third round, execution-proven) rather than silent
+ * corruption: `$fields['post_content']` on a $fields missing that key
+ * used to (a) emit a PHP "Undefined array key" warning into the run's own
+ * output, (b) compare `null === $post->post_content`, which is never
+ * true, so the "nothing changed" short-circuit never fired, and (c) still
+ * report `true` and still call $wpdb->update() — with post_excerpt alone,
+ * a REAL but pointless UPDATE; with $fields entirely empty, an UPDATE
+ * whose SET clause has nothing in it, a straight SQL syntax error against
+ * a real $wpdb that the wpstub_wpdb test double could not model (it
+ * always returns int 1, a permissive divergence exactly of the kind
+ * tests/unit/fixtures/wpstub.php's own header warns against). Worse, the
+ * failure mode was ASYMMETRIC: omitting post_excerpt while post_content
+ * genuinely changed produced NO warning at all, because the `&&` in the
+ * unchanged-check short-circuits before the missing key is ever read — so
+ * this only misbehaved on some inputs, not others. The required-key guard
+ * below runs FIRST, before the unchanged-check, specifically so a missing
+ * key is caught before anything reads it (verified both orders; guard-
+ * after-compare still hits the undefined-index warning on its way to the
+ * guard).
+ *
+ * This is the third round of MAJOR-2 (review, Viktor, execution-proven
+ * three times now). Round one replaced $post_id/$orig_content/
+ * $orig_excerpt with $post, which really did remove arguments 4/5 of the
+ * original five — but the danger was never in 4/5. It was in 2/3: the
+ * resulting `sitegraft_write_remapped_post( $post, $content, $excerpt )`
+ * still took two adjacent, interchangeable strings, and this docblock
+ * used to claim that reading $post's own fields "closes that off
+ * structurally" — a claim the code did not back up. Round two replaced
+ * that pair with the keyed `array $fields` at the call site — real
+ * progress, mutation-verified (a swap there now fails
+ * tests/unit/test_graft_remap.bats and test_graft_options.bats) — but
+ * round two ALSO handed $fields to $wpdb->update() unbounded, opening the
+ * two defects this round closes.
+ *
+ * On defense priority: the keyed array at the call site is a READABILITY
+ * defense, not an enforced one — nothing stops a future edit from writing
+ * `array( "post_content" => $excerpt, "post_excerpt" => $content )`, it
+ * just makes that edit look wrong to a human reading it. The literal-
+ * string assertions in tests/unit/test_graft_remap.bats and
+ * test_graft_options.bats are the only EXECUTABLE defense against that —
+ * they are what actually failed, twice, when Viktor replayed the swap
+ * against rounds one and two — and they remain the primary defense for
+ * that specific failure mode. (An earlier version of this docblock had
+ * this backwards, calling the assertions "belt-and-suspenders... not the
+ * primary defense" — the opposite of what the mutation record shows.)
+ * The keyed array's real, separate value is upstream of that: it is what
+ * makes the swap visible to a reviewer in the first place, at any call
+ * site, present or future, not just the two the current text assertions
+ * happen to cover.
  *
  * Writes via $wpdb->update(), never wp_update_post() — the actual bug
  * behind issue #43. wp_update_post() only calls wp_slash() on its
@@ -259,11 +308,21 @@ function sitegraft_domain_present( $haystack, $domain, $escaped ) {
  * today, a pre-existing gap and out of scope for issue #43.
  */
 function sitegraft_write_remapped_post( $post, array $fields ) {
+	foreach ( array( 'post_content', 'post_excerpt' ) as $required ) {
+		if ( ! array_key_exists( $required, $fields ) ) {
+			echo "sitegraft: WARNING post {$post->ID} write SKIPPED: no {$required} in \$fields\n";
+			return false;
+		}
+	}
 	if ( $fields['post_content'] === $post->post_content && $fields['post_excerpt'] === $post->post_excerpt ) {
 		return false;
 	}
+	$data = array(
+		'post_content' => $fields['post_content'],
+		'post_excerpt' => $fields['post_excerpt'],
+	);
 	global $wpdb;
-	$result = $wpdb->update( $wpdb->posts, $fields, array( 'ID' => (int) $post->ID ) );
+	$result = $wpdb->update( $wpdb->posts, $data, array( 'ID' => (int) $post->ID ) );
 	if ( false === $result ) {
 		echo "sitegraft: WARNING post {$post->ID} write FAILED: {$wpdb->last_error}\n";
 		return false;

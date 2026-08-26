@@ -91,7 +91,7 @@ php_run() {
   [[ "$output" == "OK" ]]
 }
 
-@test "sitegraft_write_remapped_post passes \$fields straight through to \$wpdb->update() as its \$data argument, unrepackaged" {
+@test "sitegraft_write_remapped_post writes \$fields[\"post_content\"] to post_content and \$fields[\"post_excerpt\"] to post_excerpt -- correctly mapped, not swapped" {
   # This is a sanity check of the HELPER itself, not the swap-prevention
   # claim (review, Kimi/coordinator: a prior version of this test's name
   # overstated what it covers). The actual swap risk lives at the CALL
@@ -99,20 +99,133 @@ php_run() {
   # self-evidently wrong to read -- guarded by the literal-string
   # assertions in tests/unit/test_graft_remap.bats and
   # test_graft_options.bats, not by anything this helper-level test can
-  # see. What this test DOES pin: sitegraft_write_remapped_post does not
-  # re-key, reorder, or otherwise touch $fields before handing it to
-  # $wpdb->update() -- the array a caller builds is the exact array that
-  # reaches the database.
+  # see.
   run php_run '
     $post = (object) [ "ID" => 7, "post_content" => "old content", "post_excerpt" => "old excerpt" ];
     $fields = [ "post_content" => "CONTENT-VALUE", "post_excerpt" => "EXCERPT-VALUE" ];
     sitegraft_write_remapped_post( $post, $fields );
     $written = $GLOBALS["wpstub"]["posts_written"][0]["data"];
-    if ( $written !== $fields ) { fwrite(STDERR, "data handed to \$wpdb->update() was not \$fields, unmodified\n"); exit(1); }
+    if ( $written["post_content"] !== "CONTENT-VALUE" ) { fwrite(STDERR, "post_content got: " . $written["post_content"] . "\n"); exit(1); }
+    if ( $written["post_excerpt"] !== "EXCERPT-VALUE" ) { fwrite(STDERR, "post_excerpt got: " . $written["post_excerpt"] . "\n"); exit(1); }
     echo "OK";
   '
   [ "$status" -eq 0 ]
   [[ "$output" == "OK" ]]
+}
+
+# Fix-pack round three (coordinator, verified by Viktor via a live probe):
+# $fields used to be handed to $wpdb->update() AS ITS OWN $data argument,
+# unbounded. Viktor's probe called this function with
+# ["post_content"=>..., "post_excerpt"=>..., "post_status"=>"draft",
+# "post_title"=>"OVERWRITTEN", "post_author"=>999] and every one of those
+# five columns reached $wpdb->update() -- silently repealing the exact
+# invariant this PR put in CLAUDE.md one commit earlier: "ONLY those two
+# plain-TEXT columns, NEVER an arbitrary/serialized value." No live
+# exploit today (both call sites' keys are string literals in a
+# single-quoted bash string -- nothing from A or the JSON payload can
+# become a KEY, only a value) but a silent scope violation regardless.
+# Fixed: the function now rebuilds its own $data with exactly the two
+# literal keys before ever calling $wpdb->update() -- see
+# sitegraft_write_remapped_post's own docblock for why this costs nothing
+# against MAJOR-2 (the call site still writes the keyed array; the keys
+# stay attached to their values at the one place a swap can happen).
+@test "sitegraft_write_remapped_post never writes a column beyond post_content/post_excerpt, even if \$fields carries more (#43 fix-pack round three)" {
+  run php_run '
+    $post = (object) [ "ID" => 9, "post_content" => "old", "post_excerpt" => "old excerpt" ];
+    $fields = [
+      "post_content" => "new",
+      "post_excerpt" => "new excerpt",
+      "post_status"  => "draft",
+      "post_title"   => "OVERWRITTEN",
+      "post_author"  => 999,
+    ];
+    sitegraft_write_remapped_post( $post, $fields );
+    $written = $GLOBALS["wpstub"]["posts_written"][0]["data"];
+    $columns = array_keys( $written );
+    sort( $columns );
+    if ( $columns !== [ "post_content", "post_excerpt" ] ) {
+      fwrite(STDERR, "columns handed to \$wpdb->update(): " . implode( ",", $columns ) . "\n" ); exit(1);
+    }
+    echo "OK";
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == "OK" ]]
+}
+
+# Fix-pack round three (coordinator, verified by Viktor via a live probe):
+# a $fields missing post_content used to (a) emit a PHP "Undefined array
+# key" warning into the run's own output, (b) compare `null ===
+# $post->post_content`, which is never true, so the unchanged-check never
+# short-circuited, and (c) still return true and still call
+# $wpdb->update() -- a REAL but wrong write (with post_excerpt present
+# alone) or an UPDATE with an empty SET clause (with $fields entirely
+# empty) that a real $wpdb would reject as a SQL syntax error, which
+# wpstub_wpdb could not model (it always returns int 1 -- a permissive
+# divergence exactly of the kind tests/unit/fixtures/wpstub.php's own
+# header warns against). The guard runs FIRST, before the unchanged-check,
+# so the missing key is caught before anything reads it.
+@test "sitegraft_write_remapped_post refuses and warns, without writing, when \$fields is missing post_content (#43 fix-pack round three)" {
+  # $post->post_content ("body") really does differ from a $fields with no
+  # post_content key -- exactly the scenario that must reach the guard
+  # BEFORE the unchanged-check reads the missing key (see this function's
+  # own docblock: guard-after-compare still triggers a PHP "Undefined
+  # array key" warning on its way to the guard's own message). The
+  # "!= *Undefined*" assertion below is what pins the ORDER, not merely
+  # the guard's existence -- reordering the two checks reproduces the
+  # PHP warning even though the final return value stays correct.
+  run php_run '
+    $post = (object) [ "ID" => 2, "post_content" => "body", "post_excerpt" => "same" ];
+    $changed = sitegraft_write_remapped_post( $post, [ "post_excerpt" => "same" ] );
+    if ( $changed ) { fwrite(STDERR, "reported success with post_content missing from \$fields\n"); exit(1); }
+    if ( ! empty( $GLOBALS["wpstub"]["posts_written"] ) ) { fwrite(STDERR, "\$wpdb->update was called despite the missing key\n"); exit(1); }
+    echo "OK";
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARNING"* ]] || false
+  [[ "$output" == *"SKIPPED"* ]] || false
+  [[ "$output" == *'no post_content in $fields'* ]] || false
+  [[ "$output" != *"Undefined"* ]] || false
+  [[ "$output" == *"OK"* ]] || false
+}
+
+@test "sitegraft_write_remapped_post refuses and warns, without writing, when \$fields is missing post_excerpt (#43 fix-pack round three)" {
+  # The asymmetric half of the same bug: omitting post_excerpt while
+  # post_content genuinely changed used to produce NO warning at all,
+  # because the old unchanged-check\'s `&&` short-circuited on
+  # post_content before the missing post_excerpt key was ever read -- the
+  # defect only showed up on SOME inputs, not others. The guard-first order
+  # closes that asymmetry: both keys are checked before either is read for
+  # comparison.
+  run php_run '
+    $post = (object) [ "ID" => 3, "post_content" => "old body", "post_excerpt" => "same" ];
+    $changed = sitegraft_write_remapped_post( $post, [ "post_content" => "new body" ] );
+    if ( $changed ) { fwrite(STDERR, "reported success with post_excerpt missing from \$fields\n"); exit(1); }
+    if ( ! empty( $GLOBALS["wpstub"]["posts_written"] ) ) { fwrite(STDERR, "\$wpdb->update was called despite the missing key\n"); exit(1); }
+    echo "OK";
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARNING"* ]] || false
+  [[ "$output" == *"SKIPPED"* ]] || false
+  [[ "$output" == *"post_excerpt"* ]] || false
+  [[ "$output" == *"OK"* ]] || false
+}
+
+@test "sitegraft_write_remapped_post refuses and warns, without writing, when \$fields is entirely empty (#43 fix-pack round three)" {
+  # The worse half of the same bug: an entirely empty \$fields used to
+  # still return true and still call \$wpdb->update() with an empty SET
+  # clause -- a straight SQL syntax error against a real \$wpdb that
+  # wpstub_wpdb\'s permissive always-succeeds update() could not surface.
+  run php_run '
+    $post = (object) [ "ID" => 4, "post_content" => "body", "post_excerpt" => "excerpt" ];
+    $changed = sitegraft_write_remapped_post( $post, [] );
+    if ( $changed ) { fwrite(STDERR, "reported success with \$fields entirely empty\n"); exit(1); }
+    if ( ! empty( $GLOBALS["wpstub"]["posts_written"] ) ) { fwrite(STDERR, "\$wpdb->update was called despite \$fields being empty\n"); exit(1); }
+    echo "OK";
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARNING"* ]] || false
+  [[ "$output" == *"SKIPPED"* ]] || false
+  [[ "$output" == *"OK"* ]] || false
 }
 
 @test "sitegraft_write_remapped_post reports no change and never touches \$wpdb or the cache when content and excerpt are unchanged" {
