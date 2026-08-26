@@ -1828,10 +1828,50 @@ graft_reset_id_map_log() {
 # so the query below finds and removes it exactly the same way, clearing
 # the way for a clean full reimport — paired with graft_reset_id_map_log
 # above so the mapping log agrees with what is left on B afterward.
+#
+# `run_dir` (2nd arg, optional — every existing caller/test that only
+# passes post_types_csv keeps working, with this half simply skipped) is
+# review MAJOR-2's other half of the same fix: graft_reset_id_map_log above
+# only ever clears B's own cumulative log, never ${run_dir}/id-map.tsv
+# itself — the file graft_fetch_id_map has already appended INTO on any
+# earlier pass through this run. graft_import_attachments REPLACES that
+# file's attachment rows from B's own ground truth on every call (its own
+# header comment), but nothing did the same for the mu-plugin-sourced
+# (non-attachment) rows — so a prune rerun deleted the posts those rows
+# pointed at, on B, while leaving the STALE rows themselves sitting in
+# run_dir/id-map.tsv. Reachable exactly where issue #54's resume path lives:
+# an operator (or a future automated retry — see MAJOR-3's fix, below in
+# phase_graft) deletes graft.import.done by hand, or this fix-pack's own new
+# marker-clearing on a verify failure does it automatically, and prune
+# reruns against a run_dir that already has id-map.tsv rows from the FIRST
+# attempt. Without this, graft_verify_import_completeness would then read
+# those stale rows back as "already landed" for old_ids B just had deleted
+# out from under it — passing a gate it exists to fail. Stripped to
+# attachment-only rows (kept, since those are still valid — attachments are
+# never in prune's post_types-driven deletion scope by row, they're
+# separately re-verified/replaced by graft_import_attachments' own rerun),
+# same is_dry_run discipline every other real mutation in this function
+# already follows.
 graft_prune_previous_run() {
-  local post_types_csv="$1"
+  local post_types_csv="$1" run_dir="${2:-}"
   [ -n "$post_types_csv" ] || return 0
   graft_reset_id_map_log
+  if [ -n "$run_dir" ] && [ -s "${run_dir}/id-map.tsv" ]; then
+    is_dry_run || {
+      local kept; kept=$(awk -F'\t' '$3 == "attachment"' "${run_dir}/id-map.tsv")
+      # `[ -n "$kept" ]` guards against `printf '%s\n' ""` writing a single
+      # empty LINE (a genuinely non-empty, 1-byte file) when this run_dir's
+      # id-map.tsv held no attachment rows at all — a caller downstream
+      # checking `[ -s id-map.tsv ]` (graft_verify_import_completeness,
+      # this same function's next run) must still read "nothing here".
+      if [ -n "$kept" ]; then
+        printf '%s\n' "$kept" > "${run_dir}/id-map.tsv.tmp"
+      else
+        : > "${run_dir}/id-map.tsv.tmp"
+      fi
+      mv "${run_dir}/id-map.tsv.tmp" "${run_dir}/id-map.tsv"
+    }
+  fi
   local ids
   ids=$(wp_remote b post list --post_type="$post_types_csv" --meta_key=_sitegraft_source_id --field=ID)
   [ -n "$ids" ] || return 0
@@ -2111,10 +2151,29 @@ phase_graft() {
   # do (run_or_echo), so deleting REAL marker files here regardless would
   # corrupt a genuine prior run's resumability state for nothing — the
   # inverse of the exact bug graft_mark_step's own dry-run guard already
-  # exists to prevent.
-  graft_safety_step_done "$run_dir" prune import_attachments import || {
-    is_dry_run || rm -f "${run_dir}/graft.import_attachments.done" "${run_dir}/graft.import.done"
-    graft_prune_previous_run "$post_types_csv"
+  # exists to prevent. That guard has NO direct test of its own (review,
+  # MAJOR-4) — the dry-run acceptance test below (phase_graft's own
+  # end-to-end dry-run test, tests/unit/test_graft_resume_safety.bats)
+  # covers it: removing `is_dry_run ||` here makes that test fail red.
+  #
+  # `fetch_id_map` is ALSO a consumer here now (review, MAJOR-2, alongside
+  # import_attachments/import): graft_fetch_id_map only ever APPENDS
+  # ${run_dir}/id-map.tsv (its own header comment), and until this fix
+  # nothing ever stripped that file's non-attachment rows back out when
+  # prune reran — a prune rerun deletes those rows' posts on B while the
+  # STALE rows themselves stayed in id-map.tsv, so a later
+  # graft_verify_import_completeness could read them back as "already
+  # landed" against old_ids B no longer has anything for. Listing
+  # fetch_id_map as a consumer forces prune (and the run_dir id-map.tsv
+  # stripping graft_prune_previous_run's own `run_dir` argument now does,
+  # see that function's header) to rerun whenever fetch_id_map has not
+  # ALSO completed since the last prune — and clearing its own marker
+  # below (alongside import_attachments'/import's) means a resume that
+  # only got as far as fetch_id_map reruns it too, against a fresh id-map
+  # this prune pass just cleaned.
+  graft_safety_step_done "$run_dir" prune import_attachments import fetch_id_map || {
+    is_dry_run || rm -f "${run_dir}/graft.import_attachments.done" "${run_dir}/graft.import.done" "${run_dir}/graft.fetch_id_map.done"
+    graft_prune_previous_run "$post_types_csv" "$run_dir"
     graft_mark_step "$run_dir" prune
   }
   graft_step_done "$run_dir" import_attachments || { graft_import_attachments "$run_dir"; graft_mark_step "$run_dir" import_attachments; }
@@ -2142,7 +2201,50 @@ phase_graft() {
   # where fetch_id_map's own marker is already set from an earlier pass.
   # Same "always recheck, never trust a marker for a plain read-only
   # assertion" shape graft_check_stack_precondition already uses above.
-  graft_verify_import_completeness "$run_dir" || return 1
+  # $wxr_post_types_csv passed through (review, part of BLOCKER-1's fix) so
+  # the gate can tell "nothing was ever selected for a WXR import" apart
+  # from "post_types WERE selected but the export is missing right now" —
+  # see graft_verify_import_completeness's own header for why only this
+  # call site (not every unit test of it) needs to pass it.
+  graft_verify_import_completeness "$run_dir" "$wxr_post_types_csv" || {
+    # MAJOR-3 (review): a gate failure used to be a dead end — the SAME
+    # markers phase_graft already trusts for resumability
+    # (import_attachments.done, import.done, fetch_id_map.done) were all
+    # still sitting there from the run that just failed THIS check, so a
+    # second `sitegraft graft` against the same run directory skipped
+    # straight back to this exact same failing check and reprinted the
+    # identical message — reproduced live: infinitely re-runnable, never
+    # actually retrying anything. Cleared here (guarded by is_dry_run for
+    # symmetry with every other marker-clearing site in this function,
+    # even though graft_verify_import_completeness's own `is_dry_run &&
+    # return 0` makes this branch unreachable under --dry-run today — kept
+    # so a future change to that short-circuit can't silently reintroduce
+    # a real mutation under dry-run here) so a repeat invocation actually
+    # DOES something: graft_safety_step_done's own "prune import_attachments
+    # import fetch_id_map" gate (above) reads all three as incomplete
+    # again, so prune reruns first — deleting every post/attachment this
+    # run left on B and resetting both mapping logs (graft_prune_previous_run's
+    # own header) — before import is re-attempted from a clean slate,
+    # rather than colliding with itself the way issue #53 originally
+    # described.
+    #
+    # The message states what is actually true on B right now, not what
+    # would be nice to claim (review, MAJOR-3): a partially migrated set of
+    # posts from THIS run (each carrying _sitegraft_source_id — prune's own
+    # marker for "mine to delete"), the attachment(s) this run already
+    # imported, and the mapping mu-plugin still active until this process
+    # exits — _graft_exit_trap removes it automatically on the way out
+    # (mu_plugin.done is set, mu_cleanup.done is not, since this return
+    # happens before the mu_cleanup step below ever runs), so that part IS
+    # restored. wordpress-importer's own installed/active state on B is
+    # NOT restored by this failure path — importer_cleanup, like
+    # mu_cleanup, sits after this gate and is simply never reached; a known,
+    # separate, narrower gap than the one this fix-pack closes, called out
+    # here rather than silently claimed away.
+    is_dry_run || rm -f "${run_dir}/graft.import_attachments.done" "${run_dir}/graft.import.done" "${run_dir}/graft.fetch_id_map.done"
+    log_error "B right now: a partially migrated set of posts from this run (each still carrying _sitegraft_source_id), plus the attachment(s) this run already imported. The mapping mu-plugin is removed automatically as this process exits; wordpress-importer's own plugin state on B has NOT been restored yet — that only happens once this gate passes. Re-running 'sitegraft graft' against this SAME run directory WILL retry: prune deletes everything this run left on B, then the WXR import runs again from scratch. If the same item(s) get skipped again, this will keep failing the same way — restore B from the pre-graft backup recorded under ${run_dir} instead, or resolve why wordpress-importer considers them pre-existing on B before retrying."
+    return 1
+  }
   graft_step_done "$run_dir" mu_cleanup    || { graft_remove_mu_plugin; graft_mark_step "$run_dir" mu_cleanup; }
   graft_step_done "$run_dir" importer_cleanup || { graft_restore_importer_state "$run_dir"; graft_mark_step "$run_dir" importer_cleanup; }
   graft_step_done "$run_dir" remap_ids     || { graft_remap_attachment_ids "${run_dir}/id-map.tsv" "$run_dir"; graft_mark_step "$run_dir" remap_ids; }
