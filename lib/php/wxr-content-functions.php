@@ -187,11 +187,22 @@ function _sitegraft_stream_wxr_reader( XMLReader $reader, $opened, $previous_err
 
 	$saw_any_node = false;
 	$wxr_version = null;
-	while ( true ) {
-		$advanced = @$reader->read();
-		if ( ! $advanced ) {
-			break;
-		}
+	// issue #70: this loop's condition variable is ALSO what advances the
+	// reader for the item branch below (next(), not read() -- see that
+	// branch's own comment) so that branch's `continue` re-checks this
+	// same $advanced instead of the top of the loop calling read() again.
+	// An earlier version called read() unconditionally at the top of a
+	// `while (true)` loop, INCLUDING on the iteration right after the item
+	// branch had already advanced the reader with next() -- a double
+	// advance. Sibling whitespace (wp-cli's own `wp export` always
+	// indents) or any other node between two <item>s absorbed that extra
+	// step harmlessly; a minified/re-serialized/hand-edited WXR with two
+	// <item>s directly adjacent (no node between them at all) had nothing
+	// for the extra step to land on, so it stepped straight over the
+	// second <item> and silently dropped it -- no error, just a short
+	// result (tests/unit/test_wxr_content_functions.bats, issue #70).
+	$advanced = @$reader->read();
+	while ( $advanced ) {
 		$saw_any_node = true;
 		// Review round 2 minor finding: this file's own namespace URIs are
 		// hardcoded to WXR 1.2's (see this file's own header) -- a 1.0 or
@@ -231,9 +242,15 @@ function _sitegraft_stream_wxr_reader( XMLReader $reader, $opened, $previous_err
 			// Move past this element's subtree without re-walking it node
 			// by node — next() advances to the element's next sibling,
 			// which is also what releases the DOM fragment expand() built
-			// for it.
-			@$reader->next();
+			// for it. Its return value IS this loop's advance for the next
+			// iteration (see this function's own comment above the loop) —
+			// the top of the loop must NOT also call read() here, or a
+			// tightly adjacent next <item> (no node between the two) gets
+			// stepped over and silently dropped (issue #70).
+			$advanced = @$reader->next();
+			continue;
 		}
+		$advanced = @$reader->read();
 	}
 	$fatal_errors = array_filter(
 		libxml_get_errors(),
