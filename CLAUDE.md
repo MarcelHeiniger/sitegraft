@@ -91,4 +91,11 @@ that runs it (see `docs/infrastructure.md`).
   outside the repo (`~/.config/sitegraft/<profile>.creds`, gitignored) or are
   entered interactively.
 - **Bash 3.2 portability** (no associative arrays) — see
-  `docs/decisions/0003-bash-compatibility.md`.
+  `docs/decisions/0003-bash-compatibility.md`. Beyond missing features, watch
+  for constructs that exist but misbehave: **never use bash's `:?`
+  required-parameter expansion** (`${var:?msg}`, `${!var:?msg}`). Inside a
+  function under `set -euo pipefail` it kills the process while reporting
+  `$?=0` — it announces success while failing, the exact sin of the first
+  convention above. Use `${!var:-}` plus an explicit check and `return 1`, as
+  `lib/backup.sh`'s `backup_wp_cmd_literal` does. Enforced by
+  `tests/lint/no-fatal-parameter-expansion.sh` (part of `bats tests/unit/`).

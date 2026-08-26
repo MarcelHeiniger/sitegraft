@@ -1,0 +1,31 @@
+<!--
+tests/unit/fixtures/pre-fix-plan-excerpt.md.fixture
+
+A verbatim excerpt of docs/plans/2026-08-19-sitegraft-implementation.md as it
+stood BEFORE the fix, so tests/lint/no-fatal-parameter-expansion.sh can be
+proved to catch the REAL historical defect and not just a synthetic stand-in.
+Do not "fix" the `${!path_var:?...}` line below — it is the thing under test.
+
+Two deliberate choices:
+  * Pinned as a fixture rather than read from git history (`git show <sha>:...`)
+    so the assertion keeps working however far HEAD moves on.
+  * Suffixed `.md.fixture`, not `.md`, so the repo-wide guard run does not scan
+    it and fail on its own test data. The test copies it to a temp dir as
+    `plan.md` before scanning. This keeps the guard free of any exclusion list
+    — an exclusion is exactly the kind of blind spot it exists to close.
+-->
+
+- [ ] **Step 3: Write `lib/inventory.sh`**
+
+```bash
+wp_remote() {
+  local alias_lc="$1"; shift
+  local alias_uc; alias_uc=$(printf '%s' "$alias_lc" | tr '[:lower:]' '[:upper:]')
+  local host_var="SITE_${alias_uc}_SSH_HOST"
+  local path_var="SITE_${alias_uc}_WP_PATH"
+  local cmd_var="SITE_${alias_uc}_WP_CMD"
+  local host="${!host_var:-}"
+  local path="${!path_var:?missing ${path_var}}"
+  local wp_cmd="${!cmd_var:-wp}"
+}
+```
