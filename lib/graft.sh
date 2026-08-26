@@ -1473,6 +1473,69 @@ graft_step_done() { [ -f "${1}/graft.${2}.done" ]; }
 # disk afterward.
 graft_mark_step() { is_dry_run && return 0; touch "${1}/graft.${2}.done"; }
 
+# graft_safety_step_done <run_dir> <safety_step> <consumer_step...> — issue
+# #54: a "safety" step (prune today; clean and the option-3 pairing once
+# ADR 0008's step-2 paths land) exists purely to make one or more LATER
+# "consumer" steps safe to run — prune deletes every post this tool
+# previously left on B (marked _sitegraft_source_id) so the WXR re-import
+# that follows never collides with its own past output. Its own marker
+# being present is NOT sufficient grounds to skip it on resume: that only
+# tells you prune ran once, not that its guarantee still holds for whatever
+# the consumer step is about to attempt now.
+#
+# Concretely, this is issue #54: `graft_prune_previous_run` runs before
+# `graft_import_wxr` and, before this function existed, was gated by
+# `graft_step_done` exactly like every other step. If prune completes and
+# import is then interrupted partway, a resume sees prune's raw marker as
+# "done" and skips straight to re-running import — against a B that now
+# already holds the partial import's own posts, which collide with
+# themselves on the second attempt (wordpress-importer's `post_exists()`
+# reports them "already exists" — see graft_verify_import_completeness's
+# header comment for why that's exactly issue #53's defect, reproduced
+# inside a single interrupted run). Rerunning prune first, every time
+# import has not yet actually completed, closes that: prune deletes the
+# partial run's own posts (it can't distinguish "leftover from a previous
+# separate graft" from "leftover from this run's own earlier attempt" —
+# both carry the identical _sitegraft_source_id meta, and for THIS purpose
+# that's exactly the right thing to delete), and graft_prune_previous_run's
+# own reset of B's mapping log (see that function's header) discards the
+# now-orphaned id-map rows those deleted posts had already logged, so
+# id-map.tsv can never end up holding two rows for the same old_id — one
+# live, one pointing at a post prune just removed.
+#
+# Three shapes were possible here (issue #54 asks for the choice to be
+# argued, not just picked): (a) explicitly DELETE/invalidate prune's marker
+# file the moment import fails, e.g. from _graft_exit_trap, mirroring how
+# that trap already clears the mu-plugin markers on an interrupted run; (b)
+# merge prune and import under one shared marker so there is only ever one
+# boolean to ask; (c) keep both steps' own markers exactly as they are, and
+# make the GATE itself express "prune is only truly done once whatever it
+# protects has also completed" — what this function does. (c) was chosen
+# over (a) because invalidating on the way OUT (in an EXIT trap) only
+# covers the graceful-failure path; a `kill -9`, a lost SSH connection, or
+# the operator's laptop losing power mid-import never runs any trap at
+# all, and a marker that was never invalidated would silently reproduce
+# the exact bug this closes. Checking the dependency on the way IN, every
+# time, working "is it still safe *right now*" — has no such gap: it needs
+# nothing to have run cleanly on the way out. (c) was chosen over (b)
+# because collapsing two steps that log and are reasoned about separately
+# into one marker would lose the per-step "which one, of possibly several,
+# actually ran" visibility the rest of this file's `graft_step_done`
+# convention gives every other step — and it does not generalize as
+# cleanly: ADR 0008's step 2 needs ONE safety step (prune, or clean+pairing
+# together) to gate potentially several later consumers (import, and
+# eventually the in-place writer), which a single merged marker can't
+# express but a small list of consumer names can.
+graft_safety_step_done() {
+  local run_dir="$1" safety_step="$2"; shift 2
+  graft_step_done "$run_dir" "$safety_step" || return 1
+  local consumer
+  for consumer in "$@"; do
+    graft_step_done "$run_dir" "$consumer" || return 1
+  done
+  return 0
+}
+
 # design doc §6.4 step 8 / review finding A1: this step was missing entirely from
 # the previous draft — sitegraft migrated content but never the Etch/ACSS settings.
 # page_on_front/page_for_posts are written to disk (for core_wp_post_import, §9.3)
@@ -1640,13 +1703,53 @@ graft_search_replace_domain() {
   graft_remove_file b "$lib_path"
 }
 
+# graft_reset_id_map_log — removes B's cumulative mapping log
+# (wp-content/sitegraft-id-map.log, written by the mu-plugin's
+# wp_import_insert_post/wp_import_insert_term hooks). Nothing else ever
+# clears this file: the mu-plugin only appends (FILE_APPEND — see its own
+# header), and graft_fetch_id_map only ever reads it, never truncates it.
+# That is fine as long as every post it has a row for still exists — but
+# issue #54's fix makes graft_prune_previous_run rerun on a resume whenever
+# import has not yet completed, and prune's whole job is deleting posts.
+# Without this, a stale row for a post prune just deleted would survive in
+# the log, get pulled into id-map.tsv by the eventual successful
+# graft_fetch_id_map, and hand every downstream remap (attachment ids in
+# content, featured images, page_on_front, module post_import hooks) an
+# old_id -> new_id pair pointing at a post that no longer exists — the same
+# class of silent, wrong mapping issue #53 exists to catch, reintroduced
+# through prune's own resume path instead of the importer's. Called
+# unconditionally from graft_prune_previous_run, including on a completely
+# fresh run (where it is a harmless no-op — `rm -f` on a file that was
+# never written), so there is exactly one code path to reason about rather
+# than a "first run vs. resume" branch.
+graft_reset_id_map_log() {
+  local target="${SITE_B_WP_PATH}/wp-content/sitegraft-id-map.log"
+  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
+    run_or_echo ssh -- "$SITE_B_SSH_HOST" "rm -f $(sq "$target")"
+  else
+    graft_remove_file b "$target"
+  fi
+}
+
 # design doc §11 "idempotent reimport": before importing, delete any post B already
 # has from a previous sitegraft run (marked with _sitegraft_source_id), for the
 # post_types in this run's manifest. Distinct from the optional `clean` step, which
 # removes B's pre-existing ORIGINAL content instead.
+#
+# Issue #54: this is also the "safety step" graft_safety_step_done's own
+# header comment describes — phase_graft now gates it on BOTH its own
+# marker and import's, so a resume that finds import incomplete reruns
+# this function again rather than trusting a marker written before import
+# ever started. Safe to rerun: a post this run's own earlier, interrupted
+# import attempt already inserted carries the identical
+# _sitegraft_source_id meta as one from a genuinely separate prior graft,
+# so the query below finds and removes it exactly the same way, clearing
+# the way for a clean full reimport — paired with graft_reset_id_map_log
+# above so the mapping log agrees with what is left on B afterward.
 graft_prune_previous_run() {
   local post_types_csv="$1"
   [ -n "$post_types_csv" ] || return 0
+  graft_reset_id_map_log
   local ids
   ids=$(wp_remote b post list --post_type="$post_types_csv" --meta_key=_sitegraft_source_id --field=ID)
   [ -n "$ids" ] || return 0
@@ -1898,7 +2001,40 @@ phase_graft() {
   # "Home" page happened to land exactly on the deleted attachment's old ID
   # — reading as "the page overwrote the attachment" until traced back to
   # prune actually deleting it first).
-  graft_step_done "$run_dir" prune         || { graft_prune_previous_run "$post_types_csv"; graft_mark_step "$run_dir" prune; }
+  #
+  # Issue #54: gated on graft_safety_step_done (see its own header comment
+  # for the three options weighed and why this one), not on prune's own
+  # raw marker — a resume where import_attachments and/or import have not
+  # BOTH completed must rerun prune, not trust a marker written before
+  # either of them ran. import_attachments is listed as a consumer here
+  # for the SAME reason the ordering comment above gives: prune's own
+  # deletion scope ($post_types_csv, which — unlike $wxr_post_types_csv —
+  # includes "attachment") reaches posts import_attachments creates, so a
+  # prune rerun can invalidate its work exactly as it can invalidate a
+  # partial WXR import's.
+  #
+  # The marker clears below are the companion half of that: entering this
+  # block means prune is ABOUT to (re)run and may delete posts
+  # import_attachments and/or import already created in an earlier,
+  # interrupted pass. Their own markers (checked independently, a few
+  # lines below and above this comment) must not go on claiming "done"
+  # against posts that no longer exist — cleared here, unconditionally,
+  # rather than only from _graft_exit_trap's own marker-clearing (which
+  # only ever runs on a graceful `set -e` exit, never on a `kill -9`, a
+  # dropped SSH connection, or the operator's machine losing power
+  # mid-import — exactly the interruption shapes issue #54 is written
+  # against). `is_dry_run ||` guards the actual removal, mirroring
+  # graft_mark_step's own guard just above: under --dry-run this whole
+  # block's `graft_prune_previous_run` call only ever echoes what it would
+  # do (run_or_echo), so deleting REAL marker files here regardless would
+  # corrupt a genuine prior run's resumability state for nothing — the
+  # inverse of the exact bug graft_mark_step's own dry-run guard already
+  # exists to prevent.
+  graft_safety_step_done "$run_dir" prune import_attachments import || {
+    is_dry_run || rm -f "${run_dir}/graft.import_attachments.done" "${run_dir}/graft.import.done"
+    graft_prune_previous_run "$post_types_csv"
+    graft_mark_step "$run_dir" prune
+  }
   graft_step_done "$run_dir" import_attachments || { graft_import_attachments "$run_dir"; graft_mark_step "$run_dir" import_attachments; }
   graft_step_done "$run_dir" importer_setup || { graft_ensure_importer "$run_dir"; graft_mark_step "$run_dir" importer_setup; }
   graft_step_done "$run_dir" export        || {

@@ -157,3 +157,62 @@ setup_no_op_module() {
   SITEGRAFT_DRY_RUN=1 graft_run_module_post_import "$run_dir" "${run_dir}/id-map.tsv"
   [ ! -f "${run_dir}/module-content-rewrites.tsv" ]
 }
+
+# --- graft_safety_step_done (issue #54) -------------------------------------
+#
+# A "safety" step's own marker is not, by itself, grounds to skip it on
+# resume — only true once whatever it protects (its "consumer" step(s))
+# has also completed. See lib/graft.sh's own header comment on this
+# function, right above graft_mark_step, for the full reasoning and the
+# three designs weighed. tests/unit/test_graft_resume_safety.bats covers
+# the real end-to-end resume behavior this function exists to enable
+# (phase_graft, invoked twice as a real subprocess); these are the pure
+# gate-logic unit tests, in the same style as this file's own
+# graft_step_done/graft_mark_step tests above.
+
+@test "graft_safety_step_done is false when the safety step itself never ran" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  run graft_safety_step_done "$run_dir" prune import
+  [ "$status" -eq 1 ]
+}
+
+@test "graft_safety_step_done is false when the safety step ran but its consumer has not (issue #54's exact scenario)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  graft_mark_step "$run_dir" prune
+  run graft_safety_step_done "$run_dir" prune import
+  [ "$status" -eq 1 ]
+}
+
+@test "graft_safety_step_done is true once the safety step AND its consumer have both completed" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  graft_mark_step "$run_dir" prune
+  graft_mark_step "$run_dir" import
+  run graft_safety_step_done "$run_dir" prune import
+  [ "$status" -eq 0 ]
+}
+
+@test "graft_safety_step_done requires EVERY named consumer, not just one of several" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  graft_mark_step "$run_dir" prune
+  graft_mark_step "$run_dir" import_attachments
+  # "import" (the second consumer) is still incomplete.
+  run graft_safety_step_done "$run_dir" prune import_attachments import
+  [ "$status" -eq 1 ]
+  graft_mark_step "$run_dir" import
+  run graft_safety_step_done "$run_dir" prune import_attachments import
+  [ "$status" -eq 0 ]
+}
+
+@test "graft_safety_step_done with no consumers named behaves exactly like plain graft_step_done" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  run graft_safety_step_done "$run_dir" prune
+  [ "$status" -eq 1 ]
+  graft_mark_step "$run_dir" prune
+  run graft_safety_step_done "$run_dir" prune
+  [ "$status" -eq 0 ]
+}
