@@ -221,6 +221,23 @@ instead of `$wp_cmd_b option update key value`. Read-only `$wp_cmd_b` calls
 `modules/motopress.sh.example`'s `motopress_post_import` for a worked
 example, and `modules/core-wp.sh`'s `core_wp_post_import` for the real fix.
 
+**`<mod>_post_import` and `graft_record_module_content_rewrite` (issue #52
+fix-pack, review round 2):** a hook that rewrites `post_content` after
+graft's own id/domain remap (e.g. `modules/etch.sh`'s `etch_post_import`
+rewriting Etch component refs, `modules/core-wp.sh`'s `core_wp_post_import`
+rewriting navigation-link ids) MUST call `graft_record_module_content_
+rewrite "$run_dir" <post_id>` (`lib/graft.sh`) for every post ID it
+ACTUALLY rewrote — never for a post_type it merely touches in general.
+`lib/verify.sh`'s guard 1 (`verify_migrated_content_matches_source`) reads
+that record back to exclude exactly those posts from its strict content-
+equality claim; a hook that skips this call is invisible to that guard, and
+one that calls it for a post it did NOT actually change makes guard 1
+silently under-report what it verified. See `graft_record_module_content_
+rewrite`'s own docblock for the incident this fixes: an earlier version of
+the guard excluded by post_type / module-file presence instead, which
+excluded every post on any real checkout, unconditionally, and reported
+`PASS` regardless.
+
 `lib/modules.sh` discovers modules via the glob `modules/*.sh` (the `.example`
 suffix is explicitly excluded, as is `_template.sh`), sources each file, and builds
 `SITEGRAFT_MODULES` — a space-separated string of names (no associative array,

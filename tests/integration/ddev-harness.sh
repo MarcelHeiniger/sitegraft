@@ -1318,6 +1318,27 @@ fi
 echo "==> confirmed: the domain-absence check reports the real scope it examined (${DOMAIN_SCANNED_POSTS} post(s) + ${DOMAIN_SCANNED_OPTIONS} option(s)), not a bare tick"
 grep -q "no orphan post_parent references" "$VERIFY_REPORT"
 grep -q "expected navigation is present" "$VERIFY_REPORT"
+
+# issue #52 fix-pack, review round 2: same "a tick alone is not proof, name
+# a non-zero scope" discipline the domain-absence assertion above already
+# applies, extended to guard 1 (migrated content matches A's on B). A
+# HARD-coded etch module ships with every real checkout and rewrites Etch
+# component refs across every non-attachment migrated post (modules/
+# etch.sh's etch_post_import) -- round 1 of this fix-pack excluded by
+# post_type instead of by post, which meant EVERY migrated post on a real
+# install was excluded, always, and this line ticked `- [x]` with
+# `(0 of 0 compared; N post(s) excluded ...)` while genuinely comparing
+# nothing. This harness passed GREEN on that defect (it never asserted a
+# non-zero `compared` count) -- exactly the gap this assertion closes.
+CONTENT_MATCH_LINE=$(grep "migrated content matches A's on B" "$VERIFY_REPORT")
+[ -n "$CONTENT_MATCH_LINE" ]
+CONTENT_MATCH_COMPARED=$(printf '%s' "$CONTENT_MATCH_LINE" | sed -n 's/.*(\([0-9][0-9]*\) of [0-9][0-9]* compared.*/\1/p')
+if [ -z "$CONTENT_MATCH_COMPARED" ] || [ "$CONTENT_MATCH_COMPARED" -lt 1 ]; then
+  echo "FAIL: guard 1's content-match line ticked its box without a non-zero 'compared' count on a real graft (a verify whose content guard excluded everything would look identical to one that actually compared something): ${CONTENT_MATCH_LINE}" >&2
+  exit 1
+fi
+echo "==> confirmed: guard 1 (migrated content matches A's on B) reports a non-zero compared count (${CONTENT_MATCH_COMPARED}), not a bare tick over an all-excluded scope"
+
 grep -q "Result: PASS" "$VERIFY_REPORT"
 echo "==> confirmed: verify report shows every positive check passed, on real migrated WordPress data (not stubs)"
 
@@ -1434,6 +1455,38 @@ echo "==> confirmed: the orphan post_parent check genuinely detects a real orpha
 
 echo "==> reverting the injected orphan and re-confirming verify passes clean again"
 ddev exec --raw -p "$PROJECT_B" -- wp post update "$FEATURED_PAGE_ID_B" --post_parent=0
+"${ROOT}/bin/sitegraft" verify --profile "$PROFILE" --run "$RUN_DIR"
+grep -q "Result: PASS" "$VERIFY_REPORT"
+
+# issue #52 fix-pack, review round 2: the one assertion above that a HARD
+# FAIL harness for #52's own content guards was missing entirely. B_HOME_
+# ID_FROM_MAP (resolved earlier via id-map.tsv, same technique as the
+# Footer/page_on_front assertions) is a page THIS run genuinely migrated
+# -- mutating its live post_content on B directly, bypassing graft
+# entirely, is exactly the shape of defect guard 1 exists to catch (a
+# remap that landed wrong, a #43-shaped backslash corruption, any write
+# that silently produced the wrong bytes). This is the only end-to-end
+# proof that guard 1 does anything at all -- the DOMAIN_SCANNED_POSTS-style
+# assertion above proves it examined something; this proves it can fail.
+echo "==> NEGATIVE CASE 4 (issue #52's own guard 1): mutating a migrated page's post_content directly on B, to prove verify_migrated_content_matches_source actually detects a real content mismatch rather than always reporting PASS"
+HOME_CONTENT_BEFORE=$(ddev exec --raw -p "$PROJECT_B" -- wp post get "$B_HOME_ID_FROM_MAP" --field=post_content)
+ddev exec --raw -p "$PROJECT_B" -- wp post update "$B_HOME_ID_FROM_MAP" --post_content="${HOME_CONTENT_BEFORE} <!-- corrupted by harness negative case 4 -->"
+if "${ROOT}/bin/sitegraft" verify --profile "$PROFILE" --run "$RUN_DIR"; then
+  echo "FAIL: verify reported success even though a migrated page's post_content on B no longer matches what graft produced from A — guard 1 (issue #52) is not actually comparing real content" >&2
+  exit 1
+fi
+grep -q "HARD FAIL" "$VERIFY_REPORT"
+CONTENT_HARD_FAIL_LINE=$(grep "migrated post content does not match A's" "$VERIFY_REPORT")
+[ -n "$CONTENT_HARD_FAIL_LINE" ]
+case "$CONTENT_HARD_FAIL_LINE" in
+  *"${B_HOME_ID_FROM_MAP}"*) : ;;
+  *) echo "FAIL: guard 1's hard-fail line did not name the actual corrupted page (${B_HOME_ID_FROM_MAP}): ${CONTENT_HARD_FAIL_LINE}" >&2; exit 1 ;;
+esac
+grep -q "Result: HARD FAIL" "$VERIFY_REPORT"
+echo "==> confirmed: verify_migrated_content_matches_source genuinely detects a real content mismatch on a migrated page (post ${B_HOME_ID_FROM_MAP}) and names it"
+
+echo "==> reverting the injected content corruption and re-confirming verify passes clean again"
+ddev exec --raw -p "$PROJECT_B" -- wp post update "$B_HOME_ID_FROM_MAP" --post_content="$HOME_CONTENT_BEFORE"
 "${ROOT}/bin/sitegraft" verify --profile "$PROFILE" --run "$RUN_DIR"
 grep -q "Result: PASS" "$VERIFY_REPORT"
 

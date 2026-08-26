@@ -8,6 +8,9 @@ bats_require_minimum_version 1.5.0
 # tests/unit/test_core_wp_module.bats uses for modules/core-wp.sh.
 setup() {
   load '../../lib/core.sh'
+  # issue #52 fix-pack, review round 2: etch_post_import now calls
+  # graft_record_module_content_rewrite (lib/graft.sh).
+  load '../../lib/graft.sh'
   # shellcheck disable=SC1091
   load '../../modules/etch.sh'
 }
@@ -317,4 +320,57 @@ _etch_capture_eval() {
   run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
   [ "$status" -eq 0 ]
   [ ! -f "$BATS_TEST_TMPDIR/php.txt" ]
+}
+
+# --- issue #52 fix-pack, review round 2 (B2's real fix): recording which --
+# posts etch_post_import actually rewrote, for lib/verify.sh's guard 1 to
+# exclude by POST, not by post_type.
+
+@test "etch_post_import records each ACTUALLY-rewritten post id via graft_record_module_content_rewrite, and only those" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '14468\t15506\twp_block\n14279\t15505\twp_template\n' > "$tsv"
+  # Simulates the real wp-cli eval: of the two posts in scope, only 15506
+  # actually contained a "ref" that changed -- 15505 has no ref to
+  # rewrite, so the real PHP loop's own `if ($content !== $before)` guard
+  # would never echo it.
+  _etch_capture_eval_real() {
+    case "$1" in
+      option) echo '{}' ;;
+      eval) echo "15506" ;;
+    esac
+  }
+  etch_post_import "$run_dir" "$tsv" "_etch_capture_eval_real"
+  [ -f "${run_dir}/module-content-rewrites.tsv" ]
+  [ "$(cat "${run_dir}/module-content-rewrites.tsv")" = "15506" ]
+}
+
+@test "etch_post_import records nothing when the eval reports no post actually changed" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '14468\t15506\twp_block\n' > "$tsv"
+  _etch_capture_eval_empty() {
+    case "$1" in
+      option) echo '{}' ;;
+      eval) : ;; # no post actually contained a ref to rewrite
+    esac
+  }
+  etch_post_import "$run_dir" "$tsv" "_etch_capture_eval_empty"
+  [ ! -f "${run_dir}/module-content-rewrites.tsv" ]
+}
+
+@test "etch_post_import does not record anything under --dry-run (nothing was actually rewritten)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '14468\t15506\twp_block\n' > "$tsv"
+  _etch_capture_eval_dryrun_stub() {
+    case "$1" in
+      option) echo '{}' ;;
+      eval) echo "SHOULD NOT BE CALLED FOR REAL UNDER DRY-RUN" ;;
+    esac
+  }
+  SITEGRAFT_DRY_RUN=1 run etch_post_import "$run_dir" "$tsv" "_etch_capture_eval_dryrun_stub"
+  [ "$status" -eq 0 ]
+  [ ! -f "${run_dir}/module-content-rewrites.tsv" ]
+  [[ "$output" == *"[dry-run]"* ]] || false
 }

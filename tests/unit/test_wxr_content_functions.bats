@@ -242,3 +242,65 @@ XML
   [ "$status" -eq 0 ]
   [[ "$output" == OK:* ]] || false
 }
+
+# --- review round 2 finding: fail on FATAL libxml errors only -------------
+
+@test "sitegraft_parse_wxr_items tolerates a RECOVERABLE libxml error (an undeclared namespace prefix on an unrelated element) and still extracts the item" {
+  # A real, non-fatal libxml condition (level 2, LIBXML_ERR_ERROR, verified
+  # by direct probe before writing this test — NOT level 1/WARNING, but
+  # still well below LIBXML_ERR_FATAL/3): an <item> carrying one element
+  # under an undeclared namespace prefix. libxml recovers and keeps
+  # parsing; this file must not fail the WHOLE document over it.
+  run parse_file '<item><wp:post_id>1</wp:post_id><wp:post_type>page</wp:post_type><content:encoded><![CDATA[hi]]></content:encoded><excerpt:encoded><![CDATA[]]></excerpt:encoded><foo:bar>baz</foo:bar></item>'
+  [ "$status" -eq 0 ]
+  run jq -e '. == [{"post_id":1,"post_type":"page","post_content":"hi","post_excerpt":""}]' <<< "$output"
+  [ "$status" -eq 0 ]
+}
+
+@test "sitegraft_parse_wxr_items still fails closed on a genuine FATAL parse error (unclosed tag)" {
+  local xml_file="$BATS_TEST_TMPDIR/unclosed.xml"
+  cat > "$xml_file" <<'XML'
+<?xml version="1.0"?>
+<rss version="2.0" xmlns:wp="http://wordpress.org/export/1.2/" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/">
+<channel><wp:wxr_version>1.2</wp:wxr_version>
+<item><wp:post_id>1</wp:post_id><wp:post_type>page</wp:post_type><content:encoded><![CDATA[hi]]></content:encoded><excerpt:encoded><![CDATA[]]></excerpt:encoded>
+XML
+  run php -r "
+    require '${PHP_LIB}';
+    \$items = sitegraft_parse_wxr_items_from_file('${xml_file}');
+    echo json_encode(\$items);
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "false" ]
+}
+
+# --- review round 2 minor finding: WXR version other than 1.2 is a loud --
+# failure, not a silent zero-item result. wp-cli's own `wp export` has
+# only ever emitted 1.2 (no practical consequence for a real graft), but a
+# hand-supplied or third-party WXR 1.0/1.1 file used to parse to `[]`
+# (this file's namespace matching is hardcoded to the 1.2 URIs) --
+# indistinguishable from a genuinely empty 1.2 export.
+@test "sitegraft_parse_wxr_items fails closed (false) on a declared WXR version other than 1.2" {
+  local xml_file="$BATS_TEST_TMPDIR/wxr10.xml"
+  cat > "$xml_file" <<'XML'
+<?xml version="1.0"?>
+<rss version="2.0" xmlns:wp="http://wordpress.org/export/1.0/" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:excerpt="http://wordpress.org/export/1.0/excerpt/">
+<channel><wp:wxr_version>1.0</wp:wxr_version>
+<item><wp:post_id>1</wp:post_id><wp:post_type>page</wp:post_type><content:encoded><![CDATA[hi]]></content:encoded></item>
+</channel></rss>
+XML
+  run php -r "
+    require '${PHP_LIB}';
+    \$items = sitegraft_parse_wxr_items_from_file('${xml_file}');
+    echo json_encode(\$items);
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "false" ]
+}
+
+@test "sitegraft_parse_wxr_items still parses a genuine 1.2 document with wxr_version present (no regression)" {
+  run parse_file '<item><wp:post_id>1</wp:post_id><wp:post_type>page</wp:post_type><content:encoded><![CDATA[hi]]></content:encoded><excerpt:encoded><![CDATA[]]></excerpt:encoded></item>'
+  [ "$status" -eq 0 ]
+  run jq -e '. == [{"post_id":1,"post_type":"page","post_content":"hi","post_excerpt":""}]' <<< "$output"
+  [ "$status" -eq 0 ]
+}

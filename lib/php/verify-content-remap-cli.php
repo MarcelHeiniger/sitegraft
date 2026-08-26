@@ -47,15 +47,21 @@
  *   }
  * "domain" is optional (defaults to {"from":"","to":""} — an empty "from"
  * is graft's own documented "no domain configured" no-op, see
- * sitegraft_remap_domain's own header). Prints a JSON array of
- * {post_id, post_type, post_content, post_excerpt} — one per WXR item
- * found, across every listed file, in
- * document order — to stdout on success. lib/verify.sh's own caller is
- * responsible for filtering this down to whichever post_ids it actually
- * needs (id-map.tsv's migrated rows for the equality guard, or the full set
- * for the pre-graft-unchanged guard); this driver does not know about
- * id-map.tsv at all, on purpose, so it stays a pure "parse + remap"
- * function of its payload with no other run_dir file as a hidden input.
+ * sitegraft_remap_domain's own header). Prints NDJSON to stdout on success
+ * (review finding M1, round 2) — one compact JSON object per line, each
+ * shaped {post_id, post_type, post_content, post_excerpt}, one per WXR
+ * item found across every listed file, in document order, WRITTEN AS SOON
+ * AS each item is remapped rather than collected into one array and
+ * encoded at the end (see the emit function's own comment for why: a
+ * single json_encode() over the whole result was itself the memory
+ * problem this fix-pack round closes). lib/verify.sh's own caller
+ * (_verify_wxr_items_remapped) reassembles this stream into a JSON array
+ * (via `jq -s`, a separate process) and is responsible for filtering it
+ * down to whichever post_ids it actually needs (id-map.tsv's migrated
+ * rows for the equality guard, or the full set for the pre-graft-unchanged
+ * guard); this driver does not know about id-map.tsv at all, on purpose,
+ * so it stays a pure "parse + remap" function of its payload with no
+ * other run_dir file as a hidden input.
  *
  * Exits non-zero with a message on STDERR — never a silent empty result —
  * for every failure mode a caller must not confuse with "genuinely zero
@@ -64,7 +70,9 @@
  * streaming parser returns `false`, distinct from a real empty `[]`, for
  * exactly this), or a payload that is not valid JSON. A WXR file that
  * parses fine and genuinely has zero <item>s (e.g. the export selected
- * nothing) is NOT one of those — that reaches stdout as `[]` with exit 0.
+ * nothing) is NOT one of those — that reaches stdout as an EMPTY stream
+ * (zero NDJSON lines, not even a trailing newline) with exit 0; the
+ * caller's `jq -s` turns an empty stream into `[]` on its own.
  *
  * Reads each WXR file directly off disk via sitegraft_parse_wxr_items_
  * from_file / sitegraft_stream_wxr_items_from_file (issue #52 fix-pack,
@@ -109,13 +117,21 @@ $domain_to     = $payload['domain']['to'] ?? '';
 $has_attachments = ! empty( $attachments );
 $has_domain      = $domain_from !== '';
 
-// One pass per file, remapping each item the moment it streams in --
-// never a first pass that collects every item unremapped, followed by a
-// second pass that remaps and collects again (that shape was itself part
-// of review finding M1: peak memory tracked TWO full copies of the
-// export's items, not one).
-$out = array();
-$remap_and_collect = function ( $item ) use ( &$out, $attachments, $has_attachments, $has_domain, $nav_post_type, $domain_from, $domain_to ) {
+// One pass per file, remapping each item the moment it streams in AND
+// writing it out immediately as one NDJSON line (review finding M1,
+// round 2 — measured, not assumed: the previous version streamed the
+// PARSE but still accumulated every remapped item into $out, then called
+// json_encode($out) once at the end. On the exact 62MB/10,000-item
+// scenario the review re-measured, that single json_encode call was
+// itself the fatal allocation at a 128M memory_limit — streaming the
+// parse alone was not enough, because the OUTPUT side still held two
+// full copies at its peak (the PHP array plus the string json_encode was
+// building from it). NDJSON means this process never holds more than one
+// item's worth of output at a time; lib/verify.sh's own caller
+// (_verify_wxr_items_remapped) is what reassembles the stream into a
+// JSON array afterward, in a separate process (jq), which is where that
+// cost belongs now.
+$emit_item = function ( $item ) use ( $attachments, $has_attachments, $has_domain, $nav_post_type, $domain_from, $domain_to ) {
 	$content = $item['post_content'];
 	$excerpt = $item['post_excerpt'];
 
@@ -128,22 +144,22 @@ $remap_and_collect = function ( $item ) use ( &$out, $attachments, $has_attachme
 		$excerpt = sitegraft_remap_domain( $excerpt, $domain_from, $domain_to );
 	}
 
-	$out[] = array(
-		'post_id'      => $item['post_id'],
-		'post_type'    => $item['post_type'],
-		'post_content' => $content,
-		'post_excerpt' => $excerpt,
-	);
+	echo json_encode(
+		array(
+			'post_id'      => $item['post_id'],
+			'post_type'    => $item['post_type'],
+			'post_content' => $content,
+			'post_excerpt' => $excerpt,
+		)
+	) . "\n";
 };
 
 foreach ( $wxr_files as $file ) {
 	if ( ! is_readable( $file ) ) {
 		verify_content_remap_cli_fail( "WXR file not found or unreadable: {$file}" );
 	}
-	$ok = sitegraft_stream_wxr_items_from_file( $file, $remap_and_collect );
+	$ok = sitegraft_stream_wxr_items_from_file( $file, $emit_item );
 	if ( ! $ok ) {
 		verify_content_remap_cli_fail( "WXR file did not parse as valid XML, or is empty: {$file}" );
 	}
 }
-
-echo json_encode( $out );

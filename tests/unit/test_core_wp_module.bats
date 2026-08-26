@@ -9,6 +9,9 @@ bats_require_minimum_version 1.5.0
 
 setup() {
   load '../../lib/core.sh'
+  # issue #52 fix-pack, review round 2: core_wp_post_import's nav-link
+  # remap now calls graft_record_module_content_rewrite (lib/graft.sh).
+  load '../../lib/graft.sh'
   # shellcheck disable=SC1091
   load '../../modules/core-wp.sh'
   unset SITEGRAFT_DRY_RUN
@@ -503,6 +506,53 @@ EOF
   [[ "$output" == *"eval"* ]] || false
   [[ "$output" == *"sitegraft_core_wp_remap_nav_link_ids"* ]] || false
   [[ "$output" == *'"5":"205"'* ]] || false
+}
+
+# --- issue #52 fix-pack, review round 2 (B2's real fix) ---------------------
+
+@test "core_wp_post_import's nav id-remap records each ACTUALLY-rewritten post id via graft_record_module_content_rewrite" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t205\tpage\n77\t177\twp_navigation\n' > "$tsv"
+  wp_cmd_b_stub() {
+    case "$1" in
+      eval) echo "177" ;;
+    esac
+  }
+  core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ -f "${run_dir}/module-content-rewrites.tsv" ]
+  [ "$(cat "${run_dir}/module-content-rewrites.tsv")" = "177" ]
+}
+
+@test "core_wp_post_import's nav id-remap records nothing when the eval reports no post actually changed" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '77\t177\twp_navigation\n' > "$tsv"
+  wp_cmd_b_stub() {
+    case "$1" in
+      eval) : ;; # no navigation-link in this post's content needed remapping
+    esac
+  }
+  core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ ! -f "${run_dir}/module-content-rewrites.tsv" ]
+}
+
+@test "core_wp_post_import's nav id-remap does not record anything under --dry-run" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '77\t177\twp_navigation\n' > "$tsv"
+  wp_cmd_b_stub() {
+    case "$1" in
+      eval) echo "SHOULD NOT BE CALLED FOR REAL UNDER DRY-RUN" ;;
+    esac
+  }
+  SITEGRAFT_DRY_RUN=1 run core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
+  [ ! -f "${run_dir}/module-content-rewrites.tsv" ]
+  [[ "$output" == *"[dry-run]"* ]] || false
 }
 
 @test "core_wp_post_import's nav id-remap is a no-op when id-map.tsv has no wp_navigation row (#17)" {

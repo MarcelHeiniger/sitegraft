@@ -516,8 +516,21 @@ verify_nav_present() {
 # stderr temp files now use — see this function's own use of `$$` below)
 # so two verify runs against the same run_dir at once can never read or
 # clobber each other's cache. phase_verify removes it once both guards
-# have run (see phase_verify's own comment), so nothing stale survives
-# into a later, separate `sitegraft verify` invocation.
+# have run (see phase_verify's own comment) — on the NORMAL exit path
+# only. Review round 2 minor finding, acknowledged rather than fully
+# closed: a `verify` killed (SIGKILL/power loss) before that cleanup line
+# leaves the cache file behind, and a LATER, unrelated process that
+# happens to reuse the same PID could in principle read it. An EXIT trap
+# would close this properly, but lib/core.sh's own sitegraft_cleanup
+# comment documents exactly why installing a SECOND `trap ... EXIT` from
+# inside a function bats calls directly (phase_verify is exactly that) is
+# unsafe here — it clobbers bats' own per-test trap and was a real,
+# previously-fixed bug in this codebase. The mitigation below (requiring
+# the cache to be NEWER than id-map.tsv, checked before trusting it) closes
+# the practically relevant case — something in run_dir changed since the
+# cache was written — without that risk; it does not close the narrower
+# case where nothing changed and the stale cache happens to still be
+# correct, which is also the case where reusing it does no harm.
 #
 # Three-valued, like verify_page_on_front/verify_domain_absent (see their
 # own header comments for the same reasoning): 0 + a JSON array on stdout =
@@ -537,7 +550,14 @@ verify_nav_present() {
 _verify_wxr_items_remapped() {
   local run_dir="$1" id_map_tsv="$2" manifest="$3"
   local cache_file="${run_dir}/.verify-content-items-cache.$$.json"
-  if [ -f "$cache_file" ]; then
+  # `-nt` (newer than): a cache file is only trusted if nothing in this
+  # run_dir that its content depends on has been touched since it was
+  # written -- see this function's own header comment for what this does
+  # and does not close. `-nt` is true when id_map_tsv doesn't exist at all
+  # (bash's own documented behavior for a missing right-hand file), which
+  # is fine: no id-map.tsv to have changed means there is nothing this
+  # check could catch anyway.
+  if [ -f "$cache_file" ] && [ "$cache_file" -nt "$id_map_tsv" ]; then
     cat "$cache_file"
     return 0
   fi
@@ -592,13 +612,14 @@ _verify_wxr_items_remapped() {
   printf '%s' "$payload_json" > "$payload_file"
   chmod 600 "$payload_file" 2>/dev/null || true
 
-  # stderr captured SEPARATELY from stdout — stdout on success is the JSON
-  # result and must never be contaminated by a diagnostic line the driver
-  # also happened to print. `&&`/`||`, not a bare assignment (the same
-  # set -e pitfall verify_domain_absent's own comment documents at length).
+  # stderr captured SEPARATELY from stdout — stdout on success is the
+  # NDJSON result and must never be contaminated by a diagnostic line the
+  # driver also happened to print. `&&`/`||`, not a bare assignment (the
+  # same set -e pitfall verify_domain_absent's own comment documents at
+  # length).
   local stderr_file="${run_dir}/.verify-content-stderr.$$"
-  local result rc
-  result=$(php "${SITEGRAFT_ROOT}/lib/php/verify-content-remap-cli.php" "$payload_file" 2>"$stderr_file") && rc=0 || rc=$?
+  local ndjson rc
+  ndjson=$(php "${SITEGRAFT_ROOT}/lib/php/verify-content-remap-cli.php" "$payload_file" 2>"$stderr_file") && rc=0 || rc=$?
   local err_text=""
   [ -s "$stderr_file" ] && err_text=$(cat "$stderr_file")
   rm -f "$payload_file" "$stderr_file"
@@ -607,66 +628,21 @@ _verify_wxr_items_remapped() {
     log_error "could not parse/remap A's exported WXR for the content-equality guard(s): ${err_text}"
     return 1
   fi
-  echo "$result" | jq -e . >/dev/null 2>&1 || {
-    log_error "the WXR content-remap driver did not return valid JSON: ${result}"
+  # M1, round 2: the driver now streams one compact JSON object per line
+  # (NDJSON), never a single json_encode()'d array — see that file's own
+  # comment for why. `jq -s` (slurp) reassembles the stream into the JSON
+  # array this function has always returned; empty input slurps to `[]`,
+  # matching a genuinely empty result. This reassembly cost lives here, in
+  # a separate process (jq), not inside the php driver's own memory_limit.
+  local result
+  result=$(printf '%s' "$ndjson" | jq -s -c '.' 2>/dev/null)
+  if [ -z "$result" ] || ! echo "$result" | jq -e . >/dev/null 2>&1; then
+    log_error "the WXR content-remap driver did not return valid NDJSON: ${ndjson}"
     return 1
-  }
+  fi
   printf '%s' "$result" > "$cache_file"
   chmod 600 "$cache_file" 2>/dev/null || true
   printf '%s' "$result"
-}
-
-# _verify_module_post_import_may_rewrite <post_type> — issue #52 fix-pack,
-# review finding B2. True if a module's post_import hook
-# (graft_run_module_post_import, lib/graft.sh) may rewrite <post_type>'s
-# post_content AFTER guard 1's own id/domain remap already ran, which
-# means guard 1 cannot claim byte-equality for it without also modeling
-# that hook's own rewrite — see verify_migrated_content_matches_source's
-# own comment for why it deliberately does not try.
-#
-# graft_run_module_post_import iterates EVERY module file discovered under
-# modules/ and calls its post_import hook UNCONDITIONALLY (lib/graft.sh —
-# no manifest-selection gate at all; each hook self-scopes via id-map.tsv
-# content, never via "was this module's own post_types selected for
-# migration"). So what actually determines whether a hook runs is whether
-# its FILE exists on disk, not the manifest — checked here the same way,
-# deliberately, not by reading manifest.migrate.
-#
-# Two known, shipped hooks rewrite post_content today:
-#   - modules/etch.sh's etch_post_import rewrites Etch's own
-#     `"ref":<id>` component references, across EVERY non-attachment
-#     id-map.tsv row — no post_type restriction at all (see that
-#     function's own header comment). Etch component references are this
-#     tool's primary use case, so this is the common case, not an edge one
-#     — real execution proof: a page carrying a correctly-remapped
-#     `"ref":173` component reference produced a false HARD FAIL against
-#     this function's earlier, non-excluding version.
-#   - modules/core-wp.sh's core_wp_post_import rewrites navigation-link
-#     page/post ids, scoped to wp_navigation posts only.
-#
-# Deliberately NOT a general model of "did the hook actually change THIS
-# post" — that would mean reimplementing each module's own remap logic
-# orchestrator-side (the etch component-ref regex, the core-wp nav-link
-# walker), which would diverge from the real thing over time, exactly the
-# argument this file's own guard 1 comment already makes against a THIRD
-# reimplementation of graft's content remaps. The conservative answer: if
-# a hook COULD have touched this post_type, guard 1 does not claim
-# byte-equality for it — reported UNVERIFIED (see
-# verify_migrated_content_matches_source's own report line), never ticked
-# and never hard-failed on the strength of a comparison that was never
-# safe to make in the first place.
-#
-# A future module with its own content-rewriting post_import hook is not
-# automatically covered by this table — extending it is that module's own
-# PR's job, the one narrow, documented exception to CLAUDE.md's "a new
-# module = a new modules/<plugin>.sh file, zero changes to lib/ or bin/".
-_verify_module_post_import_may_rewrite() {
-  local post_type="$1"
-  [ -f "${SITEGRAFT_ROOT}/modules/etch.sh" ] && return 0
-  if [ "$post_type" = "wp_navigation" ] && [ -f "${SITEGRAFT_ROOT}/modules/core-wp.sh" ]; then
-    return 0
-  fi
-  return 1
 }
 
 # verify_migrated_content_matches_source <run_dir> <id_map_tsv> <manifest>
@@ -692,12 +668,51 @@ _verify_module_post_import_may_rewrite() {
 # post got the RIGHT content; the other proves a post that was supposed to
 # change actually did.
 #
-# Review finding B2: a post whose content a module's post_import hook MAY
-# have rewritten AFTER graft's own id/domain remap (etch's component-ref
-# remap, core-wp's nav-link remap — see _verify_module_post_import_may_
-# rewrite above) is excluded from this function's strict equality
-# comparison — neither ticked nor hard-failed, reported as its own
-# UNVERIFIED count instead.
+# Review finding B2, SECOND fix (round 2 — the first was wrong, and the
+# history is worth keeping): a post whose content a module's post_import
+# hook rewrote AFTER graft's own id/domain remap (etch's component-ref
+# remap, core-wp's nav-link remap) cannot be claimed byte-equal without
+# also modeling that hook's own rewrite, which this function deliberately
+# does not do (see below). The FIRST fix excluded by POST_TYPE — "does a
+# hook exist that COULD touch this type" — gated on whether
+# modules/etch.sh existed on disk. Since that module ships in every real
+# checkout and its hook has no post_type restriction at all, that
+# predicate was TRUE unconditionally, on every real install, for every
+# post_type — it excluded everything, always, and reported the run PASS
+# regardless. That is worse than the false-hard-fail defect it replaced:
+# it silently stopped implementing ADR 0008's first "Required regardless"
+# item at all (a real remap failure, a #43-shaped backslash corruption, a
+# write that landed wrong — none of that was caught by anything anymore),
+# while ticking `- [x]`.
+#
+# The actual fix excludes by POST, not by post_type. graft_record_module_
+# content_rewrite (lib/graft.sh) is called by each hook — modules/etch.sh's
+# etch_post_import, modules/core-wp.sh's core_wp_post_import — once per
+# post it ACTUALLY rewrote (never per post it merely could have), into
+# ${run_dir}/module-content-rewrites.tsv. This function reads that file
+# back and excludes exactly those ids, comparing every OTHER migrated post
+# for real — the only form that still implements ADR 0008's first item:
+# nothing is excluded on the strength of "a hook exists", only on the
+# strength of "this specific post is where a hook actually wrote".
+#
+# Deliberately NOT a general model of "what did the hook change it TO" —
+# that would mean reimplementing each module's own remap logic
+# orchestrator-side (the etch component-ref regex, the core-wp nav-link
+# walker), which would diverge from the real thing over time, the same
+# argument this file already makes against a THIRD reimplementation of
+# graft's own content remaps. Knowing WHICH posts a hook touched is cheap
+# (the hook already counts them) and sufficient: excluded posts are
+# reported UNVERIFIED (see this function's own report line in
+# phase_verify), never ticked and never hard-failed on a comparison this
+# function was never in a position to make safely.
+#
+# Floor, in case module-content-rewrites.tsv ever again ends up excluding
+# everything in scope (a future module with an unconditional hook, a
+# manifest selecting only post_types every shipped hook touches): if
+# EVERY row in scope was excluded, this returns INCOMPLETE (2), never a
+# tick — see the checkable_total==0 branch below. Honest, but not
+# sufficient on its own, which is why the exclusion above is by post, not
+# by type, in the first place.
 #
 # Review finding B1: the live fetch below is scoped with --post_type
 # (this run's own non-attachment/non-term migrate post_types) and
@@ -760,25 +775,29 @@ verify_migrated_content_matches_source() {
     return 0
   fi
 
-  # B2: partition into rows a module's post_import hook may have touched
-  # (excluded from strict equality) and rows nothing else could have
-  # rewritten after graft's own remap (checkable for real).
-  local excluded_types_json='[]' distinct_type
-  while IFS= read -r distinct_type <&3; do
-    [ -n "$distinct_type" ] || continue
-    if _verify_module_post_import_may_rewrite "$distinct_type"; then
-      excluded_types_json=$(echo "$excluded_types_json" | jq --arg t "$distinct_type" '. + [$t]')
-    fi
-  done 3<<< "$(echo "$rows_json" | jq -r '[.[].post_type] | unique[]')"
+  # B2 (round 2's real fix): exclude by POST, never by post_type. A row
+  # missing this file entirely (no module ever wrote to it this run) is
+  # simply an empty exclusion set — every row stays checkable.
+  local rewritten_ids_json='[]'
+  local rewrites_file="${run_dir}/module-content-rewrites.tsv"
+  [ -s "$rewrites_file" ] && rewritten_ids_json=$(jq -R -s -c \
+    'split("\n") | map(select(length > 0) | select(test("^[0-9]+$")) | tonumber) | unique' \
+    "$rewrites_file")
 
   local checkable_json checkable_total excluded
-  checkable_json=$(echo "$rows_json" | jq --argjson excluded "$excluded_types_json" '[.[] | select((.post_type as $t | $excluded | index($t)) == null)]')
+  checkable_json=$(echo "$rows_json" | jq --argjson rw "$rewritten_ids_json" \
+    '[.[] | select((.new_id as $id | $rw | index($id)) == null)]')
   checkable_total=$(echo "$checkable_json" | jq 'length')
   excluded=$((total - checkable_total))
 
   if [ "$checkable_total" -eq 0 ]; then
+    # Floor (review finding B2, part b): every row in scope was excluded
+    # -- nothing was actually verified. total>0 is guaranteed here (the
+    # branch above already returned for total==0), so excluded==total>0
+    # always holds when checkable_total is 0.
+    log_error "every migrated post in scope (${excluded}) was rewritten by a module's post_import hook after graft's own remap — byte-equality could not be verified for any of them this run"
     echo "CONTENT_MATCH:0:0:${excluded}"
-    return 0
+    return 2
   fi
 
   # B1: --post_type and --post_status=any — see this function's own header
@@ -986,7 +1005,12 @@ verify_migrated_content_changed_from_pregraft() {
     return 1
   }
 
-  local unchanged=""
+  # Two SEPARATE findings, review finding B4 (minor): "still byte-identical
+  # to its pre-graft state" and "gone from B entirely" are different facts
+  # about different failure modes, and reporting a vanished post under the
+  # byte-identical message was itself the wrong diagnosis of what happened
+  # to it.
+  local unchanged="" vanished=""
   local id live_row current_sum pre_sum
   while IFS= read -r id <&3; do
     [ -n "$id" ] || continue
@@ -995,7 +1019,7 @@ verify_migrated_content_changed_from_pregraft() {
       # B4: a paired id absent from a SUCCESSFUL response is a finding —
       # the post existed pre-graft and is gone from B now — not a
       # silent `continue`.
-      unchanged="${unchanged}${id}(vanished-from-b) "
+      vanished="${vanished}${id} "
       continue
     fi
     current_sum="sha256:$(backup_content_checksum_of_row "$live_row")"
@@ -1005,6 +1029,11 @@ verify_migrated_content_changed_from_pregraft() {
 
   if [ -n "$unchanged" ]; then
     log_error "post(s) B already had, matching an item this run intended to migrate, are still byte-identical to their pre-graft state — the migration for these silently did not happen (an \"already exists\" import skip, or a write that never landed), post ID(s) on B: ${unchanged}"
+  fi
+  if [ -n "$vanished" ]; then
+    log_error "post(s) B already had, matching an item this run intended to migrate, are no longer on B at all (present pre-graft, per content_checksums_pre_graft; absent from a SUCCESSFUL post list read now) — post ID(s) on B: ${vanished}"
+  fi
+  if [ -n "$unchanged" ] || [ -n "$vanished" ]; then
     return 1
   fi
 }
@@ -1472,6 +1501,13 @@ phase_verify() {
         # shape of the observed defect, and must never render as a pass.
         echo "- [ ] migrated content matches A's: **UNVERIFIED — ${content_match_output##*none-imported:} item(s) were selected for migration but id-map.tsv has no matching row for any of them (nothing was actually imported this run)** — see above" >> "$report"
         ;;
+      *CONTENT_MATCH:0:0:*)
+        # review finding B2, floor (part b): every row in scope was
+        # excluded because a module's post_import hook actually rewrote
+        # it (module-content-rewrites.tsv) -- an honest but insufficient
+        # fallback on its own, never rendered as a pass.
+        echo "- [ ] migrated content matches A's: **UNVERIFIED — every migrated post in scope (${content_match_output##*:}) was rewritten by a module's post_import hook after graft's own remap, so byte-equality could not be verified for any of them** — see above" >> "$report"
+        ;;
       *)
         echo "- [ ] migrated content matches A's: **UNVERIFIED — no WXR export found for this run's migrate selection** (see above; not a hard fail on its own, but not a pass)" >> "$report"
         ;;
@@ -1492,11 +1528,12 @@ phase_verify() {
         if [ "$cm_checkable" -eq 0 ] && [ "$cm_excluded" -eq 0 ]; then
           echo "- [x] migrated content matches A's on B (0 of 0 — nothing was actually imported this run)" >> "$report"
         elif [ "$cm_excluded" -gt 0 ]; then
-          # review finding B2: content a module's post_import hook may
-          # also have rewritten (Etch component refs, core-wp nav-link
-          # ids) is not claimed as byte-equal — named here rather than
-          # silently folded into "compared".
-          echo "- [x] migrated content matches A's on B (${cm_compared} of ${cm_checkable} compared; ${cm_excluded} post(s) excluded — a module's post_import hook may also rewrite their content, so byte-equality cannot be claimed for them)" >> "$report"
+          # review finding B2: content a module's post_import hook
+          # ACTUALLY rewrote (per module-content-rewrites.tsv — Etch
+          # component refs, core-wp nav-link ids) is not claimed as
+          # byte-equal — named here rather than silently folded into
+          # "compared".
+          echo "- [x] migrated content matches A's on B (${cm_compared} of ${cm_checkable} compared; ${cm_excluded} post(s) excluded — a module's post_import hook actually rewrote their content after graft's own remap, so byte-equality cannot be claimed for them)" >> "$report"
         else
           echo "- [x] migrated content matches A's on B (${cm_compared} of ${cm_checkable} compared)" >> "$report"
         fi

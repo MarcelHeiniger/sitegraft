@@ -1515,6 +1515,40 @@ graft_prune_previous_run() {
   done 3<<< "$ids"
 }
 
+# graft_record_module_content_rewrite <run_dir> <post_id> — issue #52 fix-
+# pack, review round 2's real fix for finding B2. Called by a module's own
+# post_import hook (modules/etch.sh's etch_post_import, modules/core-wp.sh's
+# core_wp_post_import — the two shipped hooks that rewrite post_content
+# after graft's own id/domain remap already ran) for every post ID it
+# ACTUALLY rewrote, never for a whole post_type it merely COULD have
+# touched.
+#
+# lib/verify.sh's guard 1 (verify_migrated_content_matches_source) reads
+# ${run_dir}/module-content-rewrites.tsv back to exclude exactly those post
+# IDs from its strict content-equality comparison, comparing every OTHER
+# migrated post for real. An earlier version excluded by post_type instead
+# (whether a module's hook file existed on disk at all) — on any real
+# checkout that is unconditionally true (both shipped modules always exist)
+# and excluded every post, always, which is worse than the false-hard-fail
+# defect it replaced: it stopped detecting the one thing ADR 0008's first
+# "Required regardless" item exists for (a real remap failure, a #43-shaped
+# backslash corruption, a write that silently landed wrong) and reported
+# PASS regardless.
+#
+# One post ID per line, digit-only — anything else is refused rather than
+# risk a malformed line corrupting the file for every other reader of it.
+# Append-only: a module hook loops over many posts and calls this once per
+# post it actually changed, potentially interleaved with a second module's
+# own calls in the same run (both modules always ship, so both hooks
+# always run) — never overwritten mid-run.
+graft_record_module_content_rewrite() {
+  local run_dir="$1" post_id="$2"
+  case "$post_id" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  printf '%s\n' "$post_id" >> "${run_dir}/module-content-rewrites.tsv"
+}
+
 graft_run_module_post_import() {
   local run_dir="$1" id_map_tsv="$2"
   local mod

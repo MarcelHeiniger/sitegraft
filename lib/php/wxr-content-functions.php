@@ -159,11 +159,24 @@ function sitegraft_stream_wxr_items_from_file( $file_path, callable $emit ) {
  * _sitegraft_stream_wxr_reader( XMLReader $reader, bool $opened, bool
  * $previous_error_setting, callable $emit ): bool — shared driver loop for
  * both entry points above. Fails CLOSED: any of "could not open/parse at
- * all", "libxml recorded a real parse error along the way", or "the
+ * all", "libxml recorded a FATAL parse error along the way", or "the
  * document had no nodes whatsoever" (an empty file — not the same as a
  * well-formed-but-itemless one, which DOES have root/channel nodes before
  * ever reaching an <item>) return false, never a partially-collected
  * result presented as complete.
+ *
+ * "FATAL" specifically (review round 2 finding, execution-verified): an
+ * earlier version failed the WHOLE file on ANY recorded libxml error,
+ * including a RECOVERABLE warning (LIBXML_ERR_WARNING, level 1) or a
+ * non-fatal error (LIBXML_ERR_ERROR, level 2) — e.g. a single <item>
+ * carrying an undeclared namespace prefix on one unrelated element. XML
+ * parsers, and libxml specifically, routinely keep parsing past those and
+ * still produce a usable document; "the parser logged a warning about one
+ * thing" is not the same claim as "this file did not parse", and treating
+ * them the same made both content guards HARD FAIL a WXR export that
+ * genuinely parsed fine except for one cosmetic issue. Only
+ * LIBXML_ERR_FATAL (level 3 — the document is genuinely unusable past
+ * this point) fails the parse now.
  */
 function _sitegraft_stream_wxr_reader( XMLReader $reader, $opened, $previous_error_setting, callable $emit ) {
 	if ( ! $opened ) {
@@ -173,16 +186,42 @@ function _sitegraft_stream_wxr_reader( XMLReader $reader, $opened, $previous_err
 	}
 
 	$saw_any_node = false;
+	$wxr_version = null;
 	while ( true ) {
 		$advanced = @$reader->read();
 		if ( ! $advanced ) {
 			break;
 		}
 		$saw_any_node = true;
+		// Review round 2 minor finding: this file's own namespace URIs are
+		// hardcoded to WXR 1.2's (see this file's own header) -- a 1.0 or
+		// 1.1 document declares wp:/content:/excerpt: under DIFFERENT URIs
+		// (WordPress has never kept these stable across major WXR
+		// revisions, unlike this file's own earlier claim), so its <item>
+		// elements silently match NOTHING and this function used to
+		// return a real, empty `[]` for them -- indistinguishable from a
+		// genuinely itemless 1.2 export. wp:wxr_version's own text is
+		// checked by localName alone (not by namespace, for the same
+		// reason its <item> children aren't found under the 1.2 URI in an
+		// older document) so a non-1.2 document fails closed explicitly
+		// instead of silently reporting zero items. wp-cli's own `wp
+		// export` has only ever emitted 1.2 (see graft_integrity_gate's
+		// own comment, lib/graft.sh), so this has no practical
+		// consequence for a real graft -- it only prevents THIS class of
+		// silent-zero from resurfacing for a hand-supplied or third-party
+		// WXR file.
+		if ( $reader->nodeType === XMLReader::ELEMENT && $reader->localName === 'wxr_version' && null === $wxr_version ) {
+			$wxr_version = trim( (string) @$reader->readString() );
+		}
 		if ( $reader->nodeType === XMLReader::ELEMENT
 			&& $reader->localName === 'item'
 			&& $reader->namespaceURI === '' ) {
-			$node = $reader->expand();
+			// @-suppressed like read()/next() above -- a truncated/unclosed
+			// document can make expand() emit a PHP-level warning on top of
+			// libxml's own recorded error; the explicit instanceof check right
+			// below (and the fatal-error scan at the end of this function) is
+			// what this file actually acts on, not PHP's own runtime notice.
+			$node = @$reader->expand();
 			if ( $node instanceof DOMNode ) {
 				$item = _sitegraft_wxr_item_from_node( $node );
 				if ( null !== $item ) {
@@ -196,12 +235,21 @@ function _sitegraft_stream_wxr_reader( XMLReader $reader, $opened, $previous_err
 			@$reader->next();
 		}
 	}
-	$had_errors = count( libxml_get_errors() ) > 0;
+	$fatal_errors = array_filter(
+		libxml_get_errors(),
+		function ( $error ) {
+			return $error->level >= LIBXML_ERR_FATAL;
+		}
+	);
+	$had_errors = count( $fatal_errors ) > 0;
 	libxml_clear_errors();
 	libxml_use_internal_errors( $previous_error_setting );
 	$reader->close();
 
 	if ( $had_errors || ! $saw_any_node ) {
+		return false;
+	}
+	if ( null !== $wxr_version && '1.2' !== $wxr_version ) {
 		return false;
 	}
 	return true;

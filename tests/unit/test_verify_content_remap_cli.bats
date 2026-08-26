@@ -52,7 +52,7 @@ EOF
   # is byte-for-byte on the decoded value, the same way verify_options_match
   # itself is documented to compare (lib/verify.sh).
   local want='<!-- wp:etch/image {"id":42,"src":"https:\/\/b.example.com\/x.jpg"} -->'
-  run jq -e --arg want "$want" '.[0].post_id == 10 and .[0].post_type == "page" and .[0].post_content == $want and .[0].post_excerpt == ""' <<< "$output"
+  run jq -s -e --arg want "$want" '.[0].post_id == 10 and .[0].post_type == "page" and .[0].post_content == $want and .[0].post_excerpt == ""' <<< "$output"
   [ "$status" -eq 0 ]
 }
 
@@ -70,7 +70,7 @@ EOF
 EOF
   run php "$CLI" "$payload_file"
   [ "$status" -eq 0 ]
-  run jq -e '.[0].post_content | contains("\"id\":7")' <<< "$output"
+  run jq -s -e '.[0].post_content | contains("\"id\":7")' <<< "$output"
   [ "$status" -eq 0 ]
 }
 
@@ -88,7 +88,7 @@ EOF
 EOF
   run php "$CLI" "$payload_file"
   [ "$status" -eq 0 ]
-  run jq -e '.[0].post_content == "<!-- wp:navigation-link {\"url\":\"https://b.example.com/about\"} -->"' <<< "$output"
+  run jq -s -e '.[0].post_content == "<!-- wp:navigation-link {\"url\":\"https://b.example.com/about\"} -->"' <<< "$output"
   [ "$status" -eq 0 ]
 }
 
@@ -102,7 +102,7 @@ EOF
 EOF
   run php "$CLI" "$payload_file"
   [ "$status" -eq 0 ]
-  run jq -e '. == [{"post_id":30,"post_type":"page","post_content":"plain content, nothing to remap","post_excerpt":"an excerpt"}]' <<< "$output"
+  run jq -s -e '. == [{"post_id":30,"post_type":"page","post_content":"plain content, nothing to remap","post_excerpt":"an excerpt"}]' <<< "$output"
   [ "$status" -eq 0 ]
 }
 
@@ -118,7 +118,7 @@ EOF
 EOF
   run php "$CLI" "$payload_file"
   [ "$status" -eq 0 ]
-  run jq -e 'length == 2 and (map(.post_id) | sort) == [1,2]' <<< "$output"
+  run jq -s -e 'length == 2 and (map(.post_id) | sort) == [1,2]' <<< "$output"
   [ "$status" -eq 0 ]
 }
 
@@ -188,6 +188,6 @@ EOF
 EOF
   run php -d memory_limit=128M "$CLI" "$payload_file"
   [ "$status" -eq 0 ]
-  run jq -e 'length == 1000' <<< "$output"
+  run jq -s -e 'length == 1000' <<< "$output"
   [ "$status" -eq 0 ]
 }
