@@ -553,21 +553,6 @@ EOF
   [[ "$output" != *'"5":"905"'* ]] || false
 }
 
-# B1 (Viktor's review, execution-proven): mu-plugins/sitegraft-id-mapper.php's
-# wp_import_insert_term handler ALSO writes rows to id-map.tsv, tagged
-# `term:<taxonomy>` in column 3 -- these are real rows, not a hypothetical.
-# Before this fix, the map_json awk filter only excluded "attachment" rows,
-# so a term row survived into the substitution map -- and because the map is
-# built via jq's `{(.[0]): .[1]} | add`, the LAST row for a given OLD id wins
-# unconditionally. A term whose OLD id happens to numerically collide with a
-# migrated PAGE's OLD id (both sequences start at 1 on a fresh WordPress
-# install, so this is not a remote edge case on a small site) would silently
-# overwrite the correct page mapping with the term's NEW id instead --
-# exactly the "id":<old> ambiguity this whole function's header comment
-# spends twelve lines warning about, self-inflicted by its own map
-# construction. Proved live before this fix: a term row with old id 3
-# (colliding with a real page's old id 3) made a "kind":"post-type" link's
-# id come out as the TERM's new id, not the PAGE's.
 # Nit (Viktor's review): a duplicated id-map.tsv row for the same
 # wp_navigation post (a hand-edited or otherwise duplicated file) must not
 # make the embedded post-id list carry that id twice -- modules/etch.sh's
@@ -586,6 +571,29 @@ EOF
   [[ "$output" == *'$nav_ids = json_decode('"'"'["177"]'"'"', true);'* ]] || false
 }
 
+# B1 (Viktor's review, execution-proven), CORRECTED: this comment used to
+# claim mu-plugins/sitegraft-id-mapper.php's wp_import_insert_term handler
+# "ALSO writes rows to id-map.tsv ... these are real rows, not a
+# hypothetical" and that a real import had "Proved live" the collision
+# this test exercises. Both claims were wrong: that handler never produced
+# a usable term id-map -- it logged the literal string "Array" into every
+# row it wrote (see mu-plugins/sitegraft-id-mapper.php's own comment for
+# the full account) -- and has since been removed outright. This test
+# locks in something narrower, and still real: map_json's
+# `$3 !~ /^term:/` exclusion is the ONLY thing that keeps a term: row out
+# of the substitution map for any row shaped like a WORKING term map (a
+# real numeric id in column 2). The fixture below proves it precisely:
+# `3\t14\tterm:category`'s column 2 is a genuine digit string, "14" -- so
+# `$2 ~ /^[0-9]+$/` does NOT exclude it, checked directly against that same
+# guard. Without the `term:` exclusion, jq's `{(.[0]): .[1]} | add` lets
+# the LAST row for a given OLD id win, so this row would silently
+# overwrite page 3's correct 203 mapping with the term's id 14 instead --
+# exactly the "id":<old> ambiguity this whole function's header comment
+# spends twelve lines warning about. That failure mode is real for any
+# FUTURE term-row format (or a legacy id-map.tsv written before this fix)
+# that happens to carry a numeric id in column 2 -- precisely why the
+# exclusion stays even though today's handler produces no term: rows at
+# all.
 @test "core_wp_post_import's nav id-remap map excludes term: rows -- a colliding term id must never overwrite a real page mapping (B1)" {
   local run_dir="$BATS_TEST_TMPDIR/run"
   mkdir -p "$run_dir"

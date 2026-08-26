@@ -257,6 +257,23 @@ core_wp_post_import() {
     # function already treats as a graceful no-op for an unmatched old_id
     # (see the header comment above), so it gets the same treatment here.
     [ -f "$id_map_tsv" ] || continue
+    # This lookup has no `$3` type filter at all -- any id-map.tsv row
+    # whose column 1 numerically matches old_id wins, whatever column 3
+    # says. That mattered for real while mu-plugins/sitegraft-id-mapper.php's
+    # wp_import_insert_term handler still existed (see that file's own
+    # comment for why it never worked): its term: rows' column 1 held the
+    # newly-INSERTED post's id on B, not an old/pre-migration id -- but
+    # this lookup does not distinguish that, it only compares numbers. A
+    # numeric coincidence between old_id (A's own page_on_front/
+    # page_for_posts value) and such a row's column 1 would have made
+    # new_id come out as the literal string "Array" and flowed straight
+    # into `wp option update` below, unguarded by any digit check -- unlike
+    # the two id-map.tsv readers in lib/graft.sh that cast to (int) before
+    # calling get_post(). Checked directly: no digit guard exists on
+    # $new_id before that write. Moot now that the handler is gone, but the
+    # underlying gap -- this lookup trusting column 1 blindly, whatever
+    # produced it -- remains, which is why it's recorded here rather than
+    # only in the removed handler's own comment.
     new_id=$(awk -F'\t' -v old="$old_id" '$1==old{print $2}' "$id_map_tsv" 2>/dev/null)
     if [ -n "$new_id" ]; then
       # Step 6 dry-run audit: this was a raw, unwrapped write — the ONE real
@@ -451,12 +468,17 @@ _core_wp_fix_theme_mods() {
 # those `term:` rows explicitly (not just "attachment"), kept now as a
 # defensive guard for legacy id-map.tsv files written before this fix and
 # for any future term-row format -- not because current runs still produce
-# them. (Column 2 of a term: row was always the string "Array", never a
-# digit, so `map_json`'s own `$2 ~ /^[0-9]+$/` guard already excluded these
-# specific rows on its own, independent of the `term:` exclusion below --
-# checked directly, not assumed. The `term:` exclusion stays anyway,
-# belt-and-suspenders, since a differently-shaped garbage or future row
-# could in principle carry a numeric column 2.) A
+# them. (Column 2 of a term: row the removed handler actually wrote was
+# always the string "Array", never a digit, so `map_json`'s own
+# `$2 ~ /^[0-9]+$/` guard already excluded those SPECIFIC garbage rows on
+# its own, independent of the `term:` exclusion below -- checked directly,
+# not assumed. The `term:` exclusion is what actually matters going
+# forward, and it's not a hypothetical: tests/unit/test_core_wp_module.bats'
+# "excludes term: rows" test fixture is `3\t14\tterm:category`, whose
+# column 2 IS a genuine digit string, "14" -- `$2 ~ /^[0-9]+$/` does NOT
+# exclude that row; only `$3 !~ /^term:/` does. That's the real reason the
+# exclusion stays: a legacy id-map.tsv from before this fix, or any future
+# term-row format, could carry exactly that shape.) A
 # blind `"id":<old>(?!\d)` substitution run against id-map.tsv's POST ids --
 # the same sentinel technique graft_remap_attachment_ids already uses for
 # attachment ids -- would silently rewrite a category's term id whenever it
@@ -668,20 +690,23 @@ _core_wp_remap_nav_page_ids() {
   # (tests/unit/test_core_wp_module.bats, the "excludes term: rows" test),
   # not against real handler output -- checked directly, not assumed.
   #
-  # The `$3 !~ /^term:/` exclusion below is KEPT anyway, as a defensive
-  # guard for legacy id-map.tsv files written before this fix and for any
-  # future term-row format that might carry a real numeric id in column
-  # 2 -- not because current runs still produce rows it needs to catch.
-  # jq's `add` below lets the LAST row for a given OLD id win, so IF a
-  # term whose old id collided with a migrated page's old id (both id
-  # sequences start at 1 on a fresh WordPress site) ever carried the term's
-  # new id in column 2, it would silently overwrite the correct page
-  # mapping, corrupting a "kind":"post-type" reference that was never a
-  # term reference to begin with -- exactly what this exclusion guards
-  # against for a future format, even though today's `term:` rows can
-  # never trigger it: column 2 isn't numeric, so `$2 ~ /^[0-9]+$/` already
-  # excludes them on its own, checked directly against the handler's real
-  # (removed) behavior above.
+  # The `$3 !~ /^term:/` exclusion below is KEPT anyway, and this is the
+  # load-bearing reason, not a hypothetical: the "excludes term: rows"
+  # test's own fixture (tests/unit/test_core_wp_module.bats) is
+  # `3\t14\tterm:category` -- column 2 there IS a genuine digit string,
+  # "14", so `$2 ~ /^[0-9]+$/` does NOT exclude it; only `$3 !~ /^term:/`
+  # does. (Column 2 of a row the now-removed handler actually wrote was
+  # always the string "Array", never a digit, so the numeric guard alone
+  # WOULD have excluded those specific real-world garbage rows -- but that
+  # says nothing about a legacy id-map.tsv from before this fix, or any
+  # future term-row format, carrying a genuinely numeric column 2 the way
+  # the test fixture does.) jq's `add` below lets the LAST row for a given
+  # OLD id win, so a term row shaped like that fixture, whose old id
+  # collided with a migrated page's old id (both id sequences start at 1
+  # on a fresh WordPress site), would silently overwrite the correct page
+  # mapping with the term's new id -- corrupting a "kind":"post-type"
+  # reference that was never a term reference to begin with. Exactly what
+  # this exclusion exists to stop.
   map_json=$(awk -F'\t' '$3 != "attachment" && $3 !~ /^term:/ && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {printf "%s\t%s\n", $1, $2}' "$id_map_tsv" \
     | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t")) | map({(.[0]): .[1]}) | add // {}')
 
