@@ -61,3 +61,54 @@ setup() {
 # scanning whole tables (MAJOR-2 fix-pack). See
 # tests/unit/test_content_remap_functions.bats for where the remap logic's
 # real test coverage lives now.
+
+# --- dry-run-trap: _graft_exit_trap's own `rm -f` of the mu-plugin markers
+# was the ONE mutation in that trap never guarded by is_dry_run, unlike
+# graft_mark_step above (MAJOR-B), which exists specifically to prevent this
+# exact class of bug. Reachable live: leave a real, incomplete graft run
+# behind (graft.mu_plugin.done written, graft.mu_cleanup.done never written
+# — the normal state mid-run, since graft_mark_step for mu_cleanup only
+# fires after the mu-plugin is actually removed), then run `sitegraft graft
+# --dry-run` against that SAME run directory. Under dry-run,
+# graft_remove_mu_plugin only echoes (it's built on run_or_echo/
+# graft_remove_file), so nothing on B changes — but the exit trap's `rm -f`
+# at the end runs unconditionally and deletes graft.mu_plugin.done for
+# real. A dry run has now mutated the resumability state of a genuine,
+# still-incomplete run: the next REAL `sitegraft graft` sees mu_plugin as
+# NOT done and redeploys/reruns steps whose done-ness the operator could no
+# longer trust either way. Fixed the same way MAJOR-B fixed
+# graft_mark_step: `is_dry_run ||` in front of the mutation.
+@test "_graft_exit_trap deletes neither marker under SITEGRAFT_DRY_RUN=1 (dry-run-trap)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  # Real, incomplete run state: mu_plugin deployed, cleanup never ran.
+  graft_mark_step "$run_dir" mu_plugin
+  [ -e "${run_dir}/graft.mu_plugin.done" ]
+  [ ! -e "${run_dir}/graft.mu_cleanup.done" ]
+
+  # Stub out everything the trap talks to on B so this stays a unit test —
+  # no site, no wp-cli, no ssh. graft_remove_mu_plugin is overridden rather
+  # than left to run for real; SITE_B_WP_PATH is deliberately left unset so
+  # the trap's second (id/domain-remap payload cleanup) block is a no-op
+  # too, keeping this test scoped to the one mutation under test.
+  graft_remove_mu_plugin() { :; }
+
+  SITEGRAFT_GRAFT_RUN_DIR="$run_dir" SITEGRAFT_DRY_RUN=1 _graft_exit_trap
+
+  [ -e "${run_dir}/graft.mu_plugin.done" ]
+  [ ! -e "${run_dir}/graft.mu_cleanup.done" ]
+}
+
+@test "_graft_exit_trap still deletes both markers for real once dry-run is off (dry-run-trap: a real interrupted-graft cleanup must not be skipped)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  graft_mark_step "$run_dir" mu_plugin
+  [ -e "${run_dir}/graft.mu_plugin.done" ]
+
+  graft_remove_mu_plugin() { :; }
+
+  SITEGRAFT_GRAFT_RUN_DIR="$run_dir" _graft_exit_trap
+
+  [ ! -e "${run_dir}/graft.mu_plugin.done" ]
+  [ ! -e "${run_dir}/graft.mu_cleanup.done" ]
+}

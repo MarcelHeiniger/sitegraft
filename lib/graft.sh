@@ -1578,7 +1578,23 @@ _graft_exit_trap() {
     #
     # mu_cleanup is cleared too, for coherence: the pair means "deployed" /
     # "removed after being used", and after this branch neither is true.
-    rm -f "${rd}/graft.mu_plugin.done" "${rd}/graft.mu_cleanup.done" 2>/dev/null || true
+    #
+    # dry-run-trap: this `rm -f` used to run unconditionally, dry-run or
+    # not — the one mutation in this whole trap that graft_mark_step's own
+    # MAJOR-B guard (above, graft_step_done/graft_mark_step) did NOT cover,
+    # because it isn't a graft_mark_step call site at all, it's a raw `rm`.
+    # graft_remove_mu_plugin just above is dry-run-safe (built on
+    # run_or_echo via graft_remove_file), so under `--dry-run` this branch's
+    # condition can still be true (a real prior graft left mu_plugin.done
+    # and never reached mu_cleanup) while nothing on B actually changes —
+    # yet the `rm -f` here was deleting graft.mu_plugin.done on disk for
+    # real regardless. A `--dry-run` graft run against a real, incomplete
+    # run directory therefore mutated that run's resumability state: the
+    # next REAL `sitegraft graft` against the same run dir would see
+    # mu_plugin as NOT done and re-deploy/re-run steps whose actual
+    # completeness the operator could no longer trust either way. Same bug
+    # class as MAJOR-B, same fix: guard the mutation with is_dry_run.
+    is_dry_run || rm -f "${rd}/graft.mu_plugin.done" "${rd}/graft.mu_cleanup.done" 2>/dev/null || true
   fi
   # NIT-3 (review, Viktor): graft_remove_file for the id-remap/domain-remap
   # JSON payload and the pushed content-remap-functions.php only ever runs
