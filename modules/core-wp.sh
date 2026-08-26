@@ -261,19 +261,24 @@ core_wp_post_import() {
     # whose column 1 numerically matches old_id wins, whatever column 3
     # says. That mattered for real while mu-plugins/sitegraft-id-mapper.php's
     # wp_import_insert_term handler still existed (see that file's own
-    # comment for why it never worked): its term: rows' column 1 held the
-    # newly-INSERTED post's id on B, not an old/pre-migration id -- but
-    # this lookup does not distinguish that, it only compares numbers. A
-    # numeric coincidence between old_id (A's own page_on_front/
-    # page_for_posts value) and such a row's column 1 would have made
-    # new_id come out as the literal string "Array" and flowed straight
-    # into `wp option update` below, unguarded by any digit check -- unlike
-    # the two id-map.tsv readers in lib/graft.sh that cast to (int) before
-    # calling get_post(). Checked directly: no digit guard exists on
-    # $new_id before that write. Moot now that the handler is gone, but the
-    # underlying gap -- this lookup trusting column 1 blindly, whatever
-    # produced it -- remains, which is why it's recorded here rather than
-    # only in the removed handler's own comment.
+    # comment for the invariant that made a garbage term: row harmless
+    # almost everywhere, and why this lookup was the one place it wasn't):
+    # its term: rows' column 1 held the newly-INSERTED post's id on B, not
+    # an old/pre-migration id -- but this lookup does not distinguish that,
+    # it only compares numbers. A numeric coincidence between old_id (A's
+    # own page_on_front/page_for_posts value) and such a row's column 1
+    # would have made new_id come out as the literal string "Array" and
+    # flowed straight into `wp option update` below, unguarded by any
+    # digit check. lib/verify.sh's own page_on_front check
+    # (`expected_new_id=$(awk ... '$1==old{print $2}' ...)`) has the
+    # identical unguarded shape -- same collision, but a READ there
+    # (compared against B's live value, reported as a false HARD FAIL on
+    # mismatch), never a write. THIS lookup is the one place the same
+    # shape reached a live `wp option update`. Checked directly: no digit
+    # guard exists on $new_id before that write. Moot now that the handler
+    # is gone, but the underlying gap -- this lookup trusting column 1
+    # blindly, whatever produced it -- remains, which is why it's recorded
+    # here rather than only in the removed handler's own comment.
     new_id=$(awk -F'\t' -v old="$old_id" '$1==old{print $2}' "$id_map_tsv" 2>/dev/null)
     if [ -n "$new_id" ]; then
       # Step 6 dry-run audit: this was a raw, unwrapped write — the ONE real

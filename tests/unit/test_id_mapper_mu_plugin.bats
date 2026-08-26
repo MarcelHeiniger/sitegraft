@@ -1,29 +1,39 @@
 # tests/unit/test_id_mapper_mu_plugin.bats — locks in the decision behind
 # fix/id-mapper-drop-dead-term-hook: mu-plugins/sitegraft-id-mapper.php
 # registers a hook on wp_import_insert_post and, deliberately, NOTHING on
-# wp_import_insert_term any more.
+# wp_import_insert_term OR wp_import_term_meta any more.
 #
-# That handler used to exist, but it could never have worked:
-# wordpress-importer 0.9.5 fires wp_import_insert_term only from
-# process_post_term() (class-wp-import.php:1186), whose $term comes from
-# the WXR parser's inline <item><category> handling
+# That wp_import_insert_term handler used to exist, but it could never
+# have worked: wordpress-importer 0.9.5 fires wp_import_insert_term only
+# from process_post_term() (class-wp-import.php:1186), whose $term comes
+# from the WXR parser's inline <item><category> handling
 # (class-wxr-parser-simplexml.php:183-187) -- name/slug/domain only, no
 # original term_id. The handler logged the literal string "Array" into
 # every row it wrote (see mu-plugins/sitegraft-id-mapper.php's own
 # comment for the full account) and has been removed as dead code.
+# wp_import_term_meta (a FILTER, added via add_filter -- see that same
+# comment) DOES carry a real old->new term pair, for newly-created terms
+# only, and is still deliberately not used: it silently omits every term
+# that already existed on B, so a map built from it would look
+# authoritative while being quietly incomplete.
 #
-# What this test actually proves: the mu-plugin's add_action() call graph,
-# nothing about a real WordPress import. It loads the mu-plugin file under
-# a bare `php` CLI with tests/unit/fixtures/action-recorder-stub.php's
-# recording add_action() instead of a WordPress bootstrap -- same
+# What this test actually proves: the mu-plugin's add_action()/
+# add_filter() call graph, nothing about a real WordPress import. It loads
+# the mu-plugin file under a bare `php` CLI with
+# tests/unit/fixtures/action-recorder-stub.php's recording
+# add_action()/add_filter() instead of a WordPress bootstrap -- same
 # fixture-file convention tests/unit/fixtures/wpstub.php already uses for
 # WordPress-adjacent PHP in this repo, and for the same reason: keeping
 # the stub in its own file (see php_run()'s own comment below for why a
 # stub embedded inline in a bash `-r` string is a real, reproduced hazard,
-# not just a style choice). It is a guard against a future
-# contributor naively re-adding a wp_import_insert_term handler (the
-# "obvious" fix looks correct at a glance -- see the mu-plugin's own
-# comment for why it isn't), not a test of import behavior.
+# not just a style choice). It is a guard against a future contributor
+# naively re-adding a wp_import_insert_term handler OR a
+# wp_import_term_meta filter (both "obvious" fixes look correct at a
+# glance -- see the mu-plugin's own comment for why neither is), not a
+# test of import behavior. Without the stub's add_filter() alias (Viktor's
+# review, tour 2), an add_filter() re-add would have died on "Call to
+# undefined function add_filter()" instead of failing this test's own,
+# readable assertion.
 bats_require_minimum_version 1.5.0
 
 setup() {
@@ -87,4 +97,34 @@ php_run() {
   '
   [ "$status" -eq 0 ]
   [ "$output" = "0" ]
+}
+
+# Viktor's review, tour 2: the mu-plugin's own comment names
+# `wp_import_term_meta` (a FILTER) as the one route that DOES carry a real
+# old->new term pair, and explains why it's still not wired up. This test
+# is the second half of the lock the file above claims: not just "no
+# wp_import_insert_term action", but "no wp_import_term_meta filter"
+# either -- the specific route a future contributor persuaded by that
+# comment's own analysis might reach for next.
+@test "sitegraft-id-mapper.php registers NO filter on wp_import_term_meta" {
+  run php_run '
+    $term_meta_filters = array_filter( $GLOBALS["registered"], function ( $r ) {
+        return $r["hook"] === "wp_import_term_meta";
+    } );
+    echo count( $term_meta_filters );
+  '
+  [ "$status" -eq 0 ]
+  [ "$output" = "0" ]
+}
+
+# Belt-and-suspenders on the "exactly one hook" test above: confirms the
+# single registration is of TYPE action (add_action), not merely that its
+# hook name is right -- distinguishing the two only matters now that the
+# stub records both kinds into the same array.
+@test "sitegraft-id-mapper.php's one registration is an action, not a filter" {
+  run php_run '
+    echo $GLOBALS["registered"][0]["type"];
+  '
+  [ "$status" -eq 0 ]
+  [ "$output" = "action" ]
 }

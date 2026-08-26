@@ -1,7 +1,7 @@
 # Status — sitegraft
 
 **STATUS: in progress**  <!-- idea → in progress → live/production → maintenance → archived -->
-**Last updated: 2026-08-20** (Step 6 self-review)
+**Last updated: 2026-08-26** (PR #61 note appended; body below still reflects the 2026-08-20 Step 6 self-review)
 
 ## Summary
 
@@ -170,4 +170,9 @@ including the one real consequence found in review (a numeric-collision
 edge case in `modules/core-wp.sh`'s page_on_front/page_for_posts lookup,
 documented in that function's own comment; moot now that the handler is
 gone).
-- `SITEGRAFT_VERSION` bumped `1.0.0-rc6` → `1.0.0-rc7`.
+- `SITEGRAFT_VERSION` bumped `1.0.0-rc7` → `1.0.0-rc8` (not `rc6` → `rc7` as
+  first written here: PR #60 merged to `main` while this PR was in review and
+  independently bumped `rc6` → `rc7` for its own, unrelated fix. Rebasing onto
+  `main` landed both PRs on the identical `1.0.0-rc7` string with no merge
+  conflict to flag it — caught in review, not by tooling — so this PR's own
+  change is the one that moves the version again, to `rc8`).

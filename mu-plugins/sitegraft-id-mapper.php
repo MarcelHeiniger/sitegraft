@@ -60,15 +60,36 @@ add_action( 'wp_import_insert_post', function ( $post_id, $original_post_id, $po
 // at all. Every line it wrote came out as "<post_id>\tArray\tterm:Array"
 // (PHP's array-to-string coercion of $t and $term) -- worked out directly
 // from the real parameter order, not assumed. Those rows WERE consumed,
-// not ignored -- lib/graft.sh's graft_migrated_post_ids_json (no filter
-// at all) and its wp_navigation remap (filters only wp_navigation) both
-// fed them through, but harmlessly: the PHP side casts to (int) before
-// get_post(), so "Array" becomes 0, a null post, and a `continue`.
-// lib/verify.sh's DOMAIN_SCOPE count reads the same unfiltered list and
-// over-counted by one "post" per term: row -- harmless, but a real,
-// visible-in-the-report inflation. modules/core-wp.sh's
-// core_wp_post_import (its own comment, near the page_on_front/
-// page_for_posts lookup) is the one place this was NOT harmless: that
-// lookup has no type filter and no digit guard on what it finds, so a
-// numeric coincidence there could have written the literal string "Array"
-// into a live option.
+// not ignored.
+//
+// id-map.tsv has many readers spread across lib/ and modules/. Exactly
+// ONE of them, modules/core-wp.sh's map_json (in
+// _core_wp_remap_nav_page_ids), has ever filtered a `term:`-tagged row
+// out explicitly -- see that function's own comment for the history of
+// why. Every other reader never filtered by row type for this at all,
+// while this handler existed or since. What made a garbage row harmless
+// almost everywhere was never filtering: it was two properties of the
+// row itself. Column 2 ("Array") is not a digit string, so any reader
+// guarded by `$2 ~ /^[0-9]+$/` excluded it outright. And where nothing
+// guards the column, `(int) "Array"` is 0, and every PHP-side consumer
+// that resolves an id to a post (`get_post( (int) $post_id )`) gets null
+// and skips it via `if ( ! $post ) { continue; }`.
+//
+// This is NOT an exhaustive list -- three separate review rounds each
+// found one more reader the previous round's comment had missed (Viktor's
+// citations verified line-for-line against origin/main; see PR #61 for
+// the full account), which is itself the reason this paragraph states an
+// invariant instead of an inventory. Notable examples only:
+// lib/graft.sh's unfiltered graft_migrated_post_ids_json and its
+// wp_navigation-only-filtered sibling both hit the (int)/get_post() case
+// above. So does lib/verify.sh's DOMAIN_SCOPE count (a harmless
+// off-by-one) and its page_on_front check (a false HARD FAIL on a
+// numeric collision, not a corruption -- a read, never a write).
+// modules/etch.sh's component-ref remap is saved by its own
+// `$2 ~ /^[0-9]+$/` guard. lib/graft.sh's featured-image remap swallows
+// the resulting wp-cli failure via `|| true`, not a cast -- a third
+// mechanism, same harmless outcome. The one place this was NOT harmless
+// -- modules/core-wp.sh's core_wp_post_import (its own comment, near the
+// page_on_front/page_for_posts lookup) -- has neither property: no digit
+// guard, and no PHP-side (int) cast, because the write goes straight from
+// a bash string to `wp option update`.
