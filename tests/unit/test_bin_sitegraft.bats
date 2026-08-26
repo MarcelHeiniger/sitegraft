@@ -98,3 +98,37 @@ setup() {
   [[ "$output" != *"unknown flag for plan"* ]] || false
   [[ "$output" == *"profile not found: does-not-exist"* ]] || false
 }
+
+# --- MINOR-2 (review): graft/verify require `php` up front -----------------
+#
+# graft_integrity_gate and graft_verify_import_completeness (both
+# lib/graft.sh, both security-relevant WXR gates as of issue #53/#54's
+# fix-pack) now invoke `php` for every real graft. Before this, a PATH
+# missing php stayed invisible until the `export` step deep inside
+# phase_graft -- well AFTER backup, media sync, prune, and attachment
+# import had already mutated B -- instead of failing in the first second,
+# the same way a missing jq/rsync already does via the existing
+# require_cmd calls right next to this one.
+@test "sitegraft graft fails fast (before any mutation) when php is not on PATH" {
+  local isolated_bin="$BATS_TEST_TMPDIR/isolated-bin"
+  mkdir -p "$isolated_bin"
+  # jq/rsync symlinked in explicitly (their real location, /opt/homebrew/
+  # bin on this machine, ALSO holds php -- excluding that whole directory
+  # from PATH is what actually isolates php out, so its own required
+  # commands have to come back in some other way). /usr/bin:/bin still
+  # supplies jq (found there on this machine) and every coreutil bash/the
+  # script itself needs (cat, grep, sed, mkdir...) plus bash itself.
+  local real_rsync; real_rsync=$(command -v rsync)
+  ln -sf "$real_rsync" "${isolated_bin}/rsync"
+  PATH="${isolated_bin}:/usr/bin:/bin" run "$SITEGRAFT_BIN" graft --profile does-not-exist
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"php"* ]] || false
+}
+
+@test "sitegraft verify fails fast when php is not on PATH" {
+  local isolated_bin="$BATS_TEST_TMPDIR/isolated-bin"
+  mkdir -p "$isolated_bin"
+  PATH="${isolated_bin}:/usr/bin:/bin" run "$SITEGRAFT_BIN" verify --profile does-not-exist
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"php"* ]] || false
+}

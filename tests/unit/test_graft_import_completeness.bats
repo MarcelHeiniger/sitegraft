@@ -441,3 +441,62 @@ EOF
   [[ "$output" == *"1 of 2"* ]] || false
   [[ "$output" == *"page#102"* ]] || false
 }
+
+# --- issue #73: weighed for this caller too (review — "pèse-le pour ---
+# l'autre appelant"). The same underlying gap BLOCKER-1a/1b/1c/BLOCKER-2
+# exist to close for THIS function's own purpose (a real, present item
+# must never be silently unaccounted for) applies just as much to a
+# malformed item as to a garbled one: a WXR item missing wp:post_id
+# cannot be correlated against id-map.tsv at all, so it would otherwise
+# simply vanish from "expected" -- indistinguishable from "nothing to
+# check". Closed at the shared driver level (lib/php/wxr-item-ids-cli.php,
+# issue #73), which now refuses to succeed when it saw more <item>s than
+# it could parse as well-formed -- this function's own existing `rc != 0`
+# handling (already `return 2`, "this run's own data is not trustworthy
+# right now") already treats that the same as any other unparseable
+# export, no new bash-level logic needed here.
+
+@test "graft_verify_import_completeness returns 2 when the staged WXR carries a malformed item (no wp:post_id) alongside a real one (issue #73)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "${run_dir}/export"
+  cat > "${run_dir}/export/export.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+  xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/"
+  xmlns:content="http://purl.org/rss/1.0/modules/content/"
+  xmlns:wp="http://wordpress.org/export/1.2/">
+<channel><wp:wxr_version>1.2</wp:wxr_version>
+<item><wp:post_id>101</wp:post_id><wp:post_type>page</wp:post_type></item>
+<item><wp:post_type>injected_evil_type</wp:post_type></item>
+</channel></rss>
+EOF
+  printf '101\t5001\tpage\n' > "${run_dir}/id-map.tsv"
+  run graft_verify_import_completeness "$run_dir" "page"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"could not parse the staged WXR export"* ]] || false
+}
+
+# --- reviewer's own BLOCKER: same php-output-trust problem as
+# graft_integrity_gate's own equivalent test, applied to this function.
+
+_stub_php_with_stdout_noise() {
+  # shellcheck disable=SC2317  # invoked indirectly, as the `php` command, by graft_verify_import_completeness's own `php ...` call
+  php() {
+    echo 'PHP Deprecated:  something something in some/unrelated/file.php on line 1'
+    command php "$@"
+  }
+}
+
+@test "graft_verify_import_completeness returns 2 (never a silent PASS) when the operator's own php.ini writes noise to stdout ahead of the driver's real NDJSON" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "${run_dir}/export"
+  _write_wxr "${run_dir}/export/export.xml" "101:page" "102:page"
+  # Only 101 landed -- if the noise bug silently degraded this to
+  # "nothing was expected", this would incorrectly PASS instead of
+  # catching the genuine skip of 102.
+  printf '101\t5001\tpage\n' > "${run_dir}/id-map.tsv"
+  _stub_php_with_stdout_noise
+  run graft_verify_import_completeness "$run_dir" "page"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"did not return valid NDJSON"* ]] || false
+}

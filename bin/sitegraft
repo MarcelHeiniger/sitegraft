@@ -139,6 +139,15 @@ main() {
     graft)
       require_cmd jq || exit 1
       require_cmd rsync || exit 1
+      # MINOR-2 (review): graft_integrity_gate and graft_verify_import_
+      # completeness (both lib/graft.sh) now invoke `php` for every real
+      # graft — a SECURITY control (design doc §6.4 step 4) and issue #53's
+      # own completeness gate, not an optional feature. Without this check,
+      # a PATH missing php was invisible until the `export` step deep into
+      # phase_graft — well AFTER backup, media sync, prune, and attachment
+      # import had already mutated B — instead of failing fast, in the
+      # first second, the same way a missing jq/rsync already does.
+      require_cmd php || exit 1
       require_lib profile 1 || exit 1
       require_lib modules 1 || exit 1
       require_lib inventory 1 || exit 1
@@ -152,6 +161,10 @@ main() {
       ;;
     verify)
       require_cmd jq || exit 1
+      # MINOR-2 (review): lib/verify.sh's own content-equality guards
+      # (issue #52) also invoke `php` — same reasoning as the `graft` case
+      # just above.
+      require_cmd php || exit 1
       require_lib profile 1 || exit 1
       require_lib inventory 1 || exit 1
       require_lib backup 3 || exit 1

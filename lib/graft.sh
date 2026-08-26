@@ -468,10 +468,16 @@ graft_integrity_gate() {
   # bytes -- see that driver's own header for why this specific sentence
   # is finally true (an earlier draft of it, in this same fix-pack, said
   # so before this function was fixed, and was wrong until now).
+  # -d display_errors=stderr (review — reviewer's own BLOCKER, measured on
+  # this machine): sitegraft does not control the orchestrator's own
+  # php.ini, and `display_errors => STDOUT` is a common default -- ANY
+  # startup warning/notice/deprecation lands ahead of the driver's real
+  # NDJSON on stdout, silently corrupting $ndjson below. Belt: reduce the
+  # noise at its source.
   local ndjson rc stderr_file tmp_dir
   tmp_dir=$(sitegraft_mktemp_dir)
   stderr_file="${tmp_dir}/stderr"
-  ndjson=$(php "${SITEGRAFT_ROOT}/lib/php/wxr-item-ids-cli.php" "$file" 2>"$stderr_file") && rc=0 || rc=$?
+  ndjson=$(php -d display_errors=stderr "${SITEGRAFT_ROOT}/lib/php/wxr-item-ids-cli.php" "$file" 2>"$stderr_file") && rc=0 || rc=$?
   local err_text=""
   [ -s "$stderr_file" ] && err_text=$(cat "$stderr_file")
   if [ "$rc" -ne 0 ]; then
@@ -479,10 +485,34 @@ graft_integrity_gate() {
     return 1
   fi
 
+  # Suspenders (review, reviewer's own BLOCKER, MINOR-1): `-d
+  # display_errors=stderr` above cannot silence a wrapper's own banner or
+  # any other noise this codebase does not control, so $ndjson is
+  # validated as genuinely well-formed NDJSON -- via `jq -s` (slurp), same
+  # pattern lib/verify.sh's own _verify_wxr_items_remapped already uses
+  # for the identical php-driver-output-trust problem (issue #52's own
+  # guard) -- before anything below is allowed to trust it. Measured, not
+  # theoretical: the previous version parsed $ndjson with `jq -R -s -c
+  # 'split("\n") | map(... | fromjson ...)'`, which does not fail cleanly
+  # on one bad line -- a single stray non-JSON line made `found_types`
+  # become an EMPTY STRING (not the empty array `[]`), which then made
+  # BOTH the "zero found" fail-closed check below AND the leak comparison
+  # further down fail for the WRONG reason: `[ "" = "0" ]` is false (the
+  # fail-closed guard is skipped), then the leak comparison's own
+  # `[ "" != "0" ]` happens to read true anyway (MINOR-1) -- so this gate
+  # still aborted, by accident, with a message describing a leaked
+  # post_type that never existed, plus raw `jq: error` text on the
+  # operator's terminal. Explicit validation replaces that accident with
+  # an honest failure and message.
+  local result
+  result=$(printf '%s' "$ndjson" | jq -s -c '.' 2>/dev/null)
+  if [ -z "$result" ] || ! echo "$result" | jq -e . >/dev/null 2>&1; then
+    log_error "the WXR integrity-check driver did not return valid NDJSON for ${file}: ${ndjson}"
+    return 1
+  fi
+
   local found_types
-  found_types=$(printf '%s\n' "$ndjson" | jq -R -s -c '
-    split("\n") | map(select(length > 0) | fromjson.post_type) | unique
-  ')
+  found_types=$(echo "$result" | jq -c '[.[].post_type] | unique')
 
   # Fail CLOSED, not open: an `<item>` count >=1 (checked above) with ZERO
   # post_type actually extracted means the driver genuinely found no
@@ -1276,9 +1306,16 @@ graft_verify_import_completeness() {
   # any failure, which is not quite true of that specific case; corrected
   # there too) — harmless here specifically because $ndjson is never read
   # for real unless $rc is 0, checked immediately below.
+  # -d display_errors=stderr (review — the reviewer's own BLOCKER,
+  # measured on this machine): sitegraft does not control the
+  # orchestrator's own php.ini, and `display_errors => STDOUT` is a common
+  # default -- ANY startup warning/notice/deprecation (a stale PECL entry,
+  # an auto_prepend_file, an Xdebug banner) lands ahead of the driver's
+  # real NDJSON on stdout, silently corrupting $ndjson below. Belt: reduce
+  # the noise at its source.
   local ndjson rc stderr_file
   stderr_file="${tmp_dir}/stderr"
-  ndjson=$(php "${SITEGRAFT_ROOT}/lib/php/wxr-item-ids-cli.php" "${wxr_files[@]}" 2>"$stderr_file") && rc=0 || rc=$?
+  ndjson=$(php -d display_errors=stderr "${SITEGRAFT_ROOT}/lib/php/wxr-item-ids-cli.php" "${wxr_files[@]}" 2>"$stderr_file") && rc=0 || rc=$?
   local err_text=""
   [ -s "$stderr_file" ] && err_text=$(cat "$stderr_file")
   if [ "$rc" -ne 0 ]; then
@@ -1291,9 +1328,34 @@ graft_verify_import_completeness() {
     return 2
   fi
 
+  # Suspenders (review, reviewer's own BLOCKER — the same finding applies
+  # here as at graft_integrity_gate's identical call, see that function's
+  # own comment for the full mechanism and measurement): `-d
+  # display_errors=stderr` above cannot silence a wrapper's own banner or
+  # any other noise this codebase does not control, so $ndjson is
+  # validated as genuinely well-formed NDJSON — via `jq -s` (slurp), same
+  # pattern lib/verify.sh's own _verify_wxr_items_remapped already uses
+  # for the identical php-driver-output-trust problem (issue #52's own
+  # guard) — before anything below is allowed to trust it. Without this,
+  # a single stray non-JSON line made `expected_tmp` end up EMPTY
+  # (`printf | jq -r 'select(...)'` on a line `fromjson`/parsing can't
+  # handle simply produces nothing for it), so `expected_count` read 0 and
+  # this function returned 0 — "nothing was expected, PASS" — for a run
+  # that had staged real items and never actually verified a single one of
+  # them. `rc=2`, matching the "this run's own data is not trustworthy
+  # right now" contract this function's own header documents, not `rc=1`
+  # ("wordpress-importer skipped a real item") — a driver/toolchain output
+  # failure is not that.
+  local result
+  result=$(printf '%s' "$ndjson" | jq -s -c '.' 2>/dev/null)
+  if [ -z "$result" ] || ! echo "$result" | jq -e . >/dev/null 2>&1; then
+    log_error "the WXR completeness-check driver did not return valid NDJSON: ${ndjson}"
+    return 2
+  fi
+
   local expected_tmp="${tmp_dir}/expected.tsv"
-  printf '%s\n' "$ndjson" | jq -r '
-    select(.post_type != "attachment" and .post_type != "nav_menu_item")
+  echo "$result" | jq -r '
+    .[] | select(.post_type != "attachment" and .post_type != "nav_menu_item")
     | "\(.post_id)\t\(.post_type)"
   ' > "$expected_tmp"
 

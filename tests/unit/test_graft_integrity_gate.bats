@@ -139,29 +139,44 @@ EOF
   [[ "$output" == *"injected_evil_type"* ]]
 }
 
-# MINOR-2: fail CLOSED, not open, when >=1 <item> exists but zero post_type
-# could actually be parsed out of the file — the exact failure mode a
-# format the driver doesn't recognize (missing wp:post_id, an unexpected
-# shape, or otherwise) would produce: found_types silently [], leaked
-# always [], the gate rubber-stamps everything. This guard predates issue
-# #72's own move to the shared driver and must survive it unchanged — this
-# test is exactly what proves that: a real <item> with no wp:post_type AND
-# no wp:post_id (the shared driver's own "not well-formed, skip" case)
-# still hard-fails here, never silently passes.
-@test "graft_integrity_gate fails closed when items exist but no post_type could be parsed at all (MINOR-2)" {
-  local f="$BATS_TEST_TMPDIR/unparseable.xml"
-  _wxr_wrap '<item><wp:something_else>page</wp:something_else></item>' > "$f"
+# MINOR-2: fail CLOSED, not open, when >=1 <item> exists per the cheap raw
+# `grep -c '<item>'` pre-check but the shared STRUCTURAL driver finds ZERO
+# real <item> ELEMENTS at all. This guard predates issue #72's own move to
+# the shared driver and must survive it unchanged. issue #73's own new
+# fail-closed path (items_seen > items_emitted, inside the driver itself)
+# has since taken over every case where a real <item> element exists but
+# is malformed (missing wp:post_id and/or wp:post_type) — see the two
+# tests below this one for that, now more specific, path. What THIS guard
+# still uniquely covers is the raw-grep-vs-structural DISAGREEMENT itself:
+# the text "<item>" appearing in the file without there being a real
+# <item> ELEMENT there at all (e.g. as a literal substring inside another
+# element's own CDATA body) — grep's cheap pre-check sees it, the
+# structural driver correctly does not, and `found_types` really is `[]`
+# with items_seen genuinely 0 too (the driver succeeds, rc=0, with
+# nothing to report).
+@test "graft_integrity_gate fails closed when a raw grep '<item>' match does not correspond to a real <item> ELEMENT (MINOR-2)" {
+  local f="$BATS_TEST_TMPDIR/text-only-item.xml"
+  _wxr_wrap '<title><![CDATA[an example <item> mentioned in prose, not a real element]]></title>' > "$f"
   run graft_integrity_gate "$f" '["page","post"]'
   [ "$status" -eq 1 ]
   [[ "$output" == *"no <wp:post_type> could be parsed"* ]]
 }
 
-@test "graft_integrity_gate HARD FAILS (fail-closed, MINOR-2) when an item has wp:post_type but no wp:post_id — the shared driver's own well-formedness rule" {
+# issue #73 (superseding the OLD message this test used to assert before
+# the driver itself started catching this case — see that section's own
+# header comment above for the full mechanism): a single <item> with
+# wp:post_type but no wp:post_id now fails at the DRIVER level
+# (items_seen=1, items_emitted=0), wrapped by this function's own
+# existing `rc != 0` handling — never reaching the bash-level
+# "found_types empty" branch the test above still covers for a genuinely
+# different case.
+@test "graft_integrity_gate HARD FAILS (fail-closed) when an item has wp:post_type but no wp:post_id — the shared driver's own well-formedness rule (issue #73)" {
   local f="$BATS_TEST_TMPDIR/no-post-id.xml"
   _wxr_wrap '<item><wp:post_type>page</wp:post_type></item>' > "$f"
   run graft_integrity_gate "$f" '["page","post"]'
   [ "$status" -eq 1 ]
-  [[ "$output" == *"no <wp:post_type> could be parsed"* ]]
+  [[ "$output" == *"could not parse WXR file"* ]] || false
+  [[ "$output" == *"but only 0 could be parsed"* ]] || false
 }
 
 @test "graft_integrity_gate HARD FAILS when the WXR file cannot be parsed at all, never silently reads it as zero post_types" {
@@ -203,4 +218,72 @@ EOF
   # Never a raw XML fragment standing in for the leaked type name — the
   # previous grep/sed scan's exact failure mode on this shape.
   [[ "$output" != *"</item><item>"* ]] || false
+}
+
+# --- issue #73: the real DDEV harness bypass -------------------------------
+#
+# graft_integrity_gate is a SECURITY control (design doc §6.4 step 4): a
+# malformed <item> the shared driver silently dropped (missing wp:post_id
+# alongside wp:post_type — see wxr-content-functions.php's own
+# _sitegraft_wxr_item_from_node) was invisible to this gate's own leak
+# check, because `found_types` was never empty (a real, well-formed item
+# WAS also present in the file) — the pre-existing MINOR-2 fail-closed
+# guard ("zero types found at all") never triggered, since "some found,
+# one silently dropped" is a different case it was never written to
+# catch. Confirmed live against a real DDEV harness run before this fix:
+# a WXR carrying `<item><wp:post_type>injected_evil_type</wp:post_type>
+# </item>` (no wp:post_id) alongside a real, allowed `page` item made
+# this gate ACCEPT the file. The fix lives in the shared driver itself
+# (lib/php/wxr-item-ids-cli.php, issue #73 — see its own header): it now
+# refuses to succeed at all when it structurally saw more <item>s than it
+# could parse as well-formed, and this function's own existing `rc != 0`
+# handling (BLOCKER-1's original fail-closed path) already treats that
+# the same as any other unparseable file — no new bash-level logic needed
+# here, only this test proving the WHOLE chain closes the gap.
+
+@test "graft_integrity_gate HARD FAILS on a WXR carrying a forbidden post_type on a malformed (no-post_id) item, even alongside a real allowed item (issue #73 — the DDEV harness reproduction)" {
+  local f="$BATS_TEST_TMPDIR/harness-leak.xml"
+  cat > "$f" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+  xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/"
+  xmlns:content="http://purl.org/rss/1.0/modules/content/"
+  xmlns:wp="http://wordpress.org/export/1.2/">
+<channel><wp:wxr_version>1.2</wp:wxr_version>
+<item><wp:post_id>101</wp:post_id><wp:post_type>page</wp:post_type></item>
+<item><wp:post_type>injected_evil_type</wp:post_type></item>
+</channel></rss>
+EOF
+  run graft_integrity_gate "$f" '["page"]'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"could not parse WXR file"* ]] || false
+  [[ "$output" == *"but only 1 could be parsed"* ]] || false
+}
+
+# --- reviewer's own BLOCKER: the orchestrator's own php.ini can put noise --
+# on stdout, ahead of the driver's real NDJSON (display_errors => STDOUT is
+# a common default; sitegraft does not control it). Simulated here with a
+# `php` shell function that always prints a bogus line before delegating
+# to the real interpreter — the exact shape a stray warning/notice/
+# deprecation from the operator's own php.ini would produce.
+
+_stub_php_with_stdout_noise() {
+  # shellcheck disable=SC2317  # invoked indirectly, as the `php` command, by graft_integrity_gate's own `php ...` call
+  php() {
+    echo 'PHP Deprecated:  something something in some/unrelated/file.php on line 1'
+    command php "$@"
+  }
+}
+
+@test "graft_integrity_gate HARD FAILS (never silently passes) when the operator's own php.ini writes noise to stdout ahead of the driver's real NDJSON" {
+  local f="$BATS_TEST_TMPDIR/noisy-php.xml"
+  _wxr_wrap '<item><wp:post_id>101</wp:post_id><wp:post_type>page</wp:post_type></item>' > "$f"
+  _stub_php_with_stdout_noise
+  run graft_integrity_gate "$f" '["page"]'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"did not return valid NDJSON"* ]] || false
+  # NOT the old accidental failure mode (MINOR-1): a leak message naming a
+  # post_type that was never actually in the file, or raw `jq: error`
+  # text with no context.
+  [[ "$output" != *"outside the manifest allowlist"* ]] || false
 }
