@@ -2,12 +2,46 @@
 /**
  * lib/php/wxr-content-functions.php — parses a WordPress WXR export file
  * into its <item> entries (issue #52, lib/verify.sh's content-equality
- * guards). Pure PHP, no WordPress bootstrap: DOMDocument + XPath — the same
- * "directly testable with a bare `php` CLI" property
- * lib/php/content-remap-functions.php's own pure functions have (see that
- * file's own header for why that property matters here), and `require`d
- * alongside it by lib/php/verify-content-remap-cli.php, this file's only
- * production caller.
+ * guards). Pure PHP, no WordPress bootstrap: XMLReader — the same
+ * "directly testable with a bare `php` CLI" property lib/php/content-remap-
+ * functions.php's own pure functions have (see that file's own header for
+ * why that property matters here), and `require`d alongside it by
+ * lib/php/verify-content-remap-cli.php, this file's only production caller.
+ *
+ * Streamed with XMLReader, NOT DOMDocument::loadXML() on the whole
+ * document (issue #52 fix-pack, review finding M1 — measured, not assumed):
+ * building a full in-memory DOM tree costs roughly 3-8x the source file's
+ * bytes in peak RSS. An 18.7MB real export peaked at 161MB RSS; a 62MB
+ * export was FATAL at both 128M and 256M memory_limit — and still fatal
+ * when split into wp-cli's own default ~12MB-per-file chunks, because the
+ * DOM cost is per NODE, not per FILE, and the driver accumulated every
+ * file's parsed items into one array before ever calling json_encode.
+ * XMLReader walks the document node by node without ever materializing
+ * more than the CURRENT <item>'s own subtree (XMLReader::expand() builds a
+ * DOM fragment for exactly one node, discarded the moment the reader
+ * advances past it) — peak memory becomes roughly one item's size, not the
+ * whole file's, regardless of how many items or how large the file is.
+ *
+ * Two entry points, same underlying streamer:
+ *   - sitegraft_parse_wxr_items( string $xml_string ): the string-based
+ *     form kept for exactly the callers/tests that already have the bytes
+ *     in memory (still avoids DOMDocument's per-node multiplier — only the
+ *     one string itself is held, not a parsed tree of it).
+ *   - sitegraft_parse_wxr_items_from_file( string $file_path ): reads
+ *     directly off disk via XMLReader::open(), never holding the whole
+ *     file's bytes as a PHP string at all. This is what
+ *     lib/php/verify-content-remap-cli.php actually calls in production —
+ *     see that file's own comment.
+ * Both return an array of items on success, or `false` (review finding
+ * m1) — NEVER `[]` — when the input could not be parsed as XML at all
+ * (unreadable file, malformed document, or a document with no nodes
+ * whatsoever). `[]` is reserved for a document that DID parse and
+ * genuinely contains zero <item> elements (a real, valid WXR shape — e.g.
+ * an export whose selected post_types produced nothing). Before this fix
+ * both cases returned `[]`, indistinguishable from each other; a caller
+ * (lib/php/verify-content-remap-cli.php) that treated `[]` as "nothing to
+ * verify, carry on" could not tell "this file is corrupt" from "this file
+ * legitimately has nothing in it".
  *
  * Deliberately NOT a regex/grep-based extraction like graft_integrity_gate's
  * own <wp:post_type> scan (lib/graft.sh) — that shortcut is safe there
@@ -18,76 +52,204 @@
  * splitting it into two adjacent CDATA sections
  * ("before]]" . "]]><![CDATA[" . ">after") — a real, documented WXR export
  * behavior, not a hypothetical edge case, and exactly the shape a naive
- * `<!\[CDATA\[(.*?)\]\]>` regex truncates on. DOMDocument merges sibling
- * CDATA sections into one logical value via ->textContent, which is why
- * this file uses it instead of a regex (see this file's own test,
- * tests/unit/test_wxr_content_functions.bats, for the exact byte sequence
- * this reassembles).
+ * `<!\[CDATA\[(.*?)\]\]>` regex truncates on. DOM ->textContent (built for
+ * one <item> at a time via XMLReader::expand(), never for the whole
+ * document) merges sibling CDATA sections into one logical value, which is
+ * why this file uses DOM node traversal rather than a regex (see this
+ * file's own test, tests/unit/test_wxr_content_functions.bats, for the
+ * exact byte sequence this reassembles).
  *
- * Namespace URIs below (wp/content/excerpt) are WordPress's own, stable
- * across WXR 1.0/1.1/1.2 — not read from the document's own xmlns
- * declarations, on purpose: XPath's registerNamespace binds a PREFIX to a
- * URI for use in the query string, and this file's own queries are written
- * against the URIs it knows content:encoded/excerpt:encoded/wp:post_id
- * actually live at, not against whatever prefix a given export happened to
- * choose (WXR always uses these fixed URIs regardless of which prefix
- * string a producer picks for them).
+ * The three namespace URIs this file matches against (one each for
+ * wp:post_id/wp:post_type, content:encoded, excerpt:encoded) are three
+ * DIFFERENT URIs — not "the same" in any sense — but each one
+ * individually is WordPress's own and has not changed across any WXR
+ * version that has ever shipped (1.0 through 1.2). They are hardcoded
+ * here, not read from the document's own xmlns declarations, and that is
+ * safe: this file never registers a namespace PREFIX and queries against
+ * it (which would only match that literal prefix string) — it compares
+ * each child node's own resolved namespaceURI directly
+ * (_sitegraft_wxr_child_text, below), which DOM computes for us from
+ * whatever prefix binding the document actually declared. A document
+ * that declares these three URIs under different prefixes than
+ * wp:/content:/excerpt: still parses correctly here for exactly that
+ * reason.
+ *
+ * Entity safety (issue #52 fix-pack, execution-verified, not assumed):
+ * `LIBXML_NONET` blocks network-based external entity/DTD fetches;
+ * `LIBXML_NOENT` is never passed, so entities are never substituted in the
+ * first place — an XXE payload referencing a local file
+ * (`<!ENTITY xxe SYSTEM "file:///etc/passwd">` and `&xxe;` in a text node)
+ * comes back as the LITERAL, unexpanded entity reference text, never the
+ * file's contents, and an entity-expansion ("billion laughs") payload
+ * never actually expands, so it costs nothing to walk. Both are covered by
+ * this file's own tests, not merely asserted in this comment.
  */
 
 /**
- * sitegraft_parse_wxr_items( string $xml_string ): array
+ * sitegraft_parse_wxr_items( string $xml_string ): array|false
  *
- * Returns an array of ['post_id' => int, 'post_type' => string,
- * 'post_content' => string, 'post_excerpt' => string], one per <item> in
- * document order. An <item> missing wp:post_id or wp:post_type is skipped
- * outright — not guessed at (a malformed item is not this function's job to
- * repair); content:encoded/excerpt:encoded default to '' when the item
- * genuinely has none (e.g. an attachment item with no excerpt), which is a
- * real, valid WXR shape, not an error.
- *
- * Fails CLOSED on unparsable input: libxml errors are captured (never
- * printed/fatal) and an empty array is returned rather than a PHP warning
- * or exception reaching the caller — the caller (lib/verify.sh, via
- * lib/php/verify-content-remap-cli.php) is responsible for treating "found
- * zero items in a file that was supposed to have some" as its own
- * INCOMPLETE/HARD-FAIL signal; this function's contract is just "never
- * crash, never fabricate an item that wasn't really there."
+ * See this file's own header for the full contract (array of items on
+ * success, `false` — never `[]` — on anything that failed to parse).
  */
 function sitegraft_parse_wxr_items( $xml_string ) {
-	$doc = new DOMDocument();
-	$previous = libxml_use_internal_errors( true );
-	$ok = $doc->loadXML( (string) $xml_string, LIBXML_NONET );
-	libxml_clear_errors();
-	libxml_use_internal_errors( $previous );
-	if ( ! $ok ) {
-		return array();
-	}
-
-	$xpath = new DOMXPath( $doc );
-	$xpath->registerNamespace( 'wp', 'http://wordpress.org/export/1.2/' );
-	$xpath->registerNamespace( 'content', 'http://purl.org/rss/1.0/modules/content/' );
-	$xpath->registerNamespace( 'excerpt', 'http://wordpress.org/export/1.2/excerpt/' );
-
 	$items = array();
-	$item_nodes = $xpath->query( '//item' );
-	if ( ! $item_nodes ) {
-		return array();
-	}
-	foreach ( $item_nodes as $item_node ) {
-		$post_id_node   = $xpath->query( 'wp:post_id', $item_node )->item( 0 );
-		$post_type_node = $xpath->query( 'wp:post_type', $item_node )->item( 0 );
-		if ( ! $post_id_node || ! $post_type_node ) {
-			continue; // not a well-formed WXR <item> — skip rather than guess.
+	$ok = sitegraft_stream_wxr_items_from_string(
+		(string) $xml_string,
+		function ( $item ) use ( &$items ) {
+			$items[] = $item;
 		}
-		$content_node = $xpath->query( 'content:encoded', $item_node )->item( 0 );
-		$excerpt_node = $xpath->query( 'excerpt:encoded', $item_node )->item( 0 );
+	);
+	return $ok ? $items : false;
+}
 
-		$items[] = array(
-			'post_id'      => (int) trim( $post_id_node->textContent ),
-			'post_type'    => trim( $post_type_node->textContent ),
-			'post_content' => $content_node ? $content_node->textContent : '',
-			'post_excerpt' => $excerpt_node ? $excerpt_node->textContent : '',
-		);
+/**
+ * sitegraft_parse_wxr_items_from_file( string $file_path ): array|false
+ *
+ * Same contract as sitegraft_parse_wxr_items above, reading directly off
+ * disk (XMLReader::open()) rather than requiring the caller to hold the
+ * whole file's bytes as a PHP string first — the form
+ * lib/php/verify-content-remap-cli.php actually calls in production.
+ */
+function sitegraft_parse_wxr_items_from_file( $file_path ) {
+	$items = array();
+	$ok = sitegraft_stream_wxr_items_from_file(
+		$file_path,
+		function ( $item ) use ( &$items ) {
+			$items[] = $item;
+		}
+	);
+	return $ok ? $items : false;
+}
+
+/**
+ * sitegraft_stream_wxr_items_from_string( string $xml_string, callable $emit ): bool
+ * sitegraft_stream_wxr_items_from_file( string $file_path, callable $emit ): bool
+ *
+ * The actual streaming entry points: $emit is called once per <item>, with
+ * that item's array (see _sitegraft_wxr_item_from_node below for its
+ * shape), as soon as it is read — never all items held in memory by THIS
+ * layer. sitegraft_parse_wxr_items(_from_file) above are the array-
+ * collecting convenience wrappers most callers actually want; a caller
+ * that itself needs to stay memory-bounded across a very large export can
+ * call these directly and process each item as it arrives instead of
+ * collecting them all.
+ */
+function sitegraft_stream_wxr_items_from_string( $xml_string, callable $emit ) {
+	// PHP 8's XMLReader::XML() throws a ValueError (a real fatal, not
+	// something `@` silences) on an empty string rather than simply
+	// failing to open -- guarded explicitly so "empty input" fails closed
+	// the same way every other unparsable input does, never a crash.
+	if ( '' === $xml_string ) {
+		return false;
 	}
-	return $items;
+	$reader = new XMLReader();
+	$previous = libxml_use_internal_errors( true );
+	$opened = @$reader->XML( $xml_string, null, LIBXML_NONET );
+	return _sitegraft_stream_wxr_reader( $reader, $opened, $previous, $emit );
+}
+
+function sitegraft_stream_wxr_items_from_file( $file_path, callable $emit ) {
+	$reader = new XMLReader();
+	$previous = libxml_use_internal_errors( true );
+	$opened = @$reader->open( (string) $file_path, null, LIBXML_NONET );
+	return _sitegraft_stream_wxr_reader( $reader, $opened, $previous, $emit );
+}
+
+/**
+ * _sitegraft_stream_wxr_reader( XMLReader $reader, bool $opened, bool
+ * $previous_error_setting, callable $emit ): bool — shared driver loop for
+ * both entry points above. Fails CLOSED: any of "could not open/parse at
+ * all", "libxml recorded a real parse error along the way", or "the
+ * document had no nodes whatsoever" (an empty file — not the same as a
+ * well-formed-but-itemless one, which DOES have root/channel nodes before
+ * ever reaching an <item>) return false, never a partially-collected
+ * result presented as complete.
+ */
+function _sitegraft_stream_wxr_reader( XMLReader $reader, $opened, $previous_error_setting, callable $emit ) {
+	if ( ! $opened ) {
+		libxml_clear_errors();
+		libxml_use_internal_errors( $previous_error_setting );
+		return false;
+	}
+
+	$saw_any_node = false;
+	while ( true ) {
+		$advanced = @$reader->read();
+		if ( ! $advanced ) {
+			break;
+		}
+		$saw_any_node = true;
+		if ( $reader->nodeType === XMLReader::ELEMENT
+			&& $reader->localName === 'item'
+			&& $reader->namespaceURI === '' ) {
+			$node = $reader->expand();
+			if ( $node instanceof DOMNode ) {
+				$item = _sitegraft_wxr_item_from_node( $node );
+				if ( null !== $item ) {
+					$emit( $item );
+				}
+			}
+			// Move past this element's subtree without re-walking it node
+			// by node — next() advances to the element's next sibling,
+			// which is also what releases the DOM fragment expand() built
+			// for it.
+			@$reader->next();
+		}
+	}
+	$had_errors = count( libxml_get_errors() ) > 0;
+	libxml_clear_errors();
+	libxml_use_internal_errors( $previous_error_setting );
+	$reader->close();
+
+	if ( $had_errors || ! $saw_any_node ) {
+		return false;
+	}
+	return true;
+}
+
+/**
+ * _sitegraft_wxr_item_from_node( DOMNode $item_node ): array|null
+ *
+ * Extracts one <item>'s fields. Returns null (skip, don't guess) for an
+ * <item> missing wp:post_id or wp:post_type — the same "not a well-formed
+ * WXR <item>" refusal the previous DOMXPath-based version had.
+ * content:encoded/excerpt:encoded default to '' when genuinely absent
+ * (e.g. an attachment item with no excerpt) — a real, valid WXR shape, not
+ * an error.
+ */
+function _sitegraft_wxr_item_from_node( DOMNode $item_node ) {
+	$post_id_text = _sitegraft_wxr_child_text( $item_node, 'http://wordpress.org/export/1.2/', 'post_id' );
+	$post_type_text = _sitegraft_wxr_child_text( $item_node, 'http://wordpress.org/export/1.2/', 'post_type' );
+	if ( null === $post_id_text || null === $post_type_text ) {
+		return null;
+	}
+	$content = _sitegraft_wxr_child_text( $item_node, 'http://purl.org/rss/1.0/modules/content/', 'encoded' );
+	$excerpt = _sitegraft_wxr_child_text( $item_node, 'http://wordpress.org/export/1.2/excerpt/', 'encoded' );
+
+	return array(
+		'post_id'      => (int) trim( $post_id_text ),
+		'post_type'    => trim( $post_type_text ),
+		'post_content' => null !== $content ? $content : '',
+		'post_excerpt' => null !== $excerpt ? $excerpt : '',
+	);
+}
+
+/**
+ * _sitegraft_wxr_child_text( DOMNode $parent, string $namespace_uri,
+ * string $local_name ): string|null — the first direct child element of
+ * $parent matching ($namespace_uri, $local_name), or null if none exists.
+ * Direct DOM traversal, not XPath: expand()'s subtree is small (one
+ * <item>), so a plain childNodes walk is simpler than standing up a
+ * DOMXPath (which needs its own namespace registration) for the same
+ * result.
+ */
+function _sitegraft_wxr_child_text( DOMNode $parent, $namespace_uri, $local_name ) {
+	foreach ( $parent->childNodes as $child ) {
+		if ( XML_ELEMENT_NODE === $child->nodeType
+			&& $child->localName === $local_name
+			&& $child->namespaceURI === $namespace_uri ) {
+			return $child->textContent;
+		}
+	}
+	return null;
 }

@@ -807,9 +807,31 @@ EOF
   [ "$status" -eq 0 ]
 }
 
-@test "verify_migrated_content_changed_from_pregraft passes (nothing paired) when no skipped item's id has a pre-graft record" {
+# review finding B5 (issue #52 fix-pack): this used to be a PASS. It is
+# not one -- an item WAS skipped (999), and this guard could not confirm
+# ANYTHING about it (no pre-graft record for its id) -- so it must report
+# INCOMPLETE, not silently tick "0 of 1 confirmed changed" as if that were
+# equivalent to "nothing was skipped at all".
+@test "verify_migrated_content_changed_from_pregraft is INCOMPLETE (not a pass) when a skipped item exists but none of its ids has a pre-graft record" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   : > "${run_dir}/id-map.tsv"
+  local manifest
+  manifest=$(jq -n '{migrate: {"core-wp": {post_types: ["page"]}}, content_checksums_pre_graft: {}}')
+  _verify_wxr_items_remapped() { echo '[{"post_id":999,"post_type":"page","post_content":"x","post_excerpt":""}]'; }
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  run verify_migrated_content_changed_from_pregraft "$run_dir" "${run_dir}/id-map.tsv" "$manifest"
+  [ "$status" -eq 2 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
+# The genuine pass case B5 leaves untouched: nothing was skipped AT ALL
+# (every WXR item is already accounted for in id-map.tsv), so there is
+# truly nothing for this guard to examine -- distinct from the test above,
+# where something WAS skipped but could not be paired.
+@test "verify_migrated_content_changed_from_pregraft passes when nothing was skipped at all" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  printf '999	105	page
+' > "${run_dir}/id-map.tsv"
   local manifest
   manifest=$(jq -n '{migrate: {"core-wp": {post_types: ["page"]}}, content_checksums_pre_graft: {}}')
   _verify_wxr_items_remapped() { echo '[{"post_id":999,"post_type":"page","post_content":"x","post_excerpt":""}]'; }
@@ -1986,13 +2008,80 @@ XML
 # would have caught this run at all — exactly ADR 0008's point. Revert
 # afterward.
 
-@test "phase_verify's Result stays PASS when migrated content genuinely matches A's and nothing was skipped" {
+# Review finding B2: with the REAL SITEGRAFT_ROOT (needed so the real php
+# driver can be invoked), modules/etch.sh genuinely exists on disk, so a
+# migrated `page` is EXCLUDED from guard 1's strict equality claim (etch's
+# own post_import hook may also rewrite its content) -- this is the
+# correct, honest behavior, not a bug: guard 1 reports it as excluded
+# rather than falsely claiming byte-equality, and the run still passes
+# overall because guard 2 (which does not depend on B2's exclusion at all)
+# independently confirms nothing was skipped.
+@test "phase_verify's Result stays PASS when migrated content is excluded from guard 1's strict equality (etch's post_import hook) and nothing was skipped" {
   setup_phase_verify_fixture
   SITEGRAFT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
   export SITEGRAFT_ROOT
   command -v php >/dev/null 2>&1 || skip "php CLI not available in this environment"
 
   printf '16\t105\tpage\n' > "${RUN_DIR}/id-map.tsv" # genuinely imported, as new post 105
+  mkdir -p "${RUN_DIR}/export"
+  cat > "${RUN_DIR}/export/one.xml" <<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+  xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/"
+  xmlns:content="http://purl.org/rss/1.0/modules/content/"
+  xmlns:wp="http://wordpress.org/export/1.2/">
+<channel>
+<wp:wxr_version>1.2</wp:wxr_version>
+<item><wp:post_id>16</wp:post_id><wp:post_type>page</wp:post_type><content:encoded><![CDATA[<p>New design from A</p>]]></content:encoded><excerpt:encoded><![CDATA[]]></excerpt:encoded></item>
+</channel>
+</rss>
+XML
+
+  jq -n '{
+    frozen: true,
+    checksums_protected_pre_graft: {},
+    migrate: {"core-wp": {post_types: ["page"], option_keys: []}},
+    protect: {"_unclaimed": {tables: []}},
+    stack: {},
+    options: {search_replace: {from: "", to: ""}},
+    content_checksums_pre_graft: {}
+  }' > "${RUN_DIR}/manifest.json"
+
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1 $2" in
+      "post list") echo "SHOULD NOT BE CALLED — the only page in scope is excluded under B2, no live fetch is needed" ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  grep -q "Result: PASS" "${RUN_DIR}/verify-report.md"
+  grep -q "migrated content matches A's on B (0 of 0 compared; 1 post(s) excluded" "${RUN_DIR}/verify-report.md"
+  [[ "$(cat "${RUN_DIR}/verify-report.md")" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
+# The genuine strict-equality pass, isolated from B2's module-hook
+# exclusion by pointing SITEGRAFT_ROOT at a scratch tree with no modules/
+# directory at all -- _verify_module_post_import_may_rewrite (lib/verify.sh)
+# checks for modules/etch.sh and modules/core-wp.sh by file existence, so
+# a root with neither present has nothing to exclude, and guard 1 performs
+# a REAL byte-for-byte comparison end to end.
+@test "phase_verify's Result stays PASS with a real (non-excluded) content-equality comparison, when no module post_import hook could apply" {
+  setup_phase_verify_fixture
+  command -v php >/dev/null 2>&1 || skip "php CLI not available in this environment"
+  local real_root; real_root="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
+  local scratch_root="$BATS_TEST_TMPDIR/no-modules-root"
+  mkdir -p "${scratch_root}/lib/php"
+  cp "${real_root}/lib/php/verify-content-remap-cli.php" "${scratch_root}/lib/php/"
+  cp "${real_root}/lib/php/wxr-content-functions.php" "${scratch_root}/lib/php/"
+  cp "${real_root}/lib/php/content-remap-functions.php" "${scratch_root}/lib/php/"
+  SITEGRAFT_ROOT="$scratch_root"
+  export SITEGRAFT_ROOT
+
+  printf '16\t105\tpage\n' > "${RUN_DIR}/id-map.tsv"
   mkdir -p "${RUN_DIR}/export"
   cat > "${RUN_DIR}/export/one.xml" <<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -2060,9 +2149,19 @@ XML
   # proves it actually covers the two NEW checks too, not just the six that
   # existed before issue #52.
   setup_phase_verify_fixture
-  SITEGRAFT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
-  export SITEGRAFT_ROOT
   command -v php >/dev/null 2>&1 || skip "php CLI not available in this environment"
+  # Points at a modules/-free scratch tree, same as the isolated
+  # real-comparison test above, so this genuinely exercises guard 1's
+  # wp_remote read (and therefore the dry-run echo path this test is
+  # about) rather than short-circuiting on B2's module-hook exclusion.
+  local real_root; real_root="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
+  local scratch_root="$BATS_TEST_TMPDIR/no-modules-root"
+  mkdir -p "${scratch_root}/lib/php"
+  cp "${real_root}/lib/php/verify-content-remap-cli.php" "${scratch_root}/lib/php/"
+  cp "${real_root}/lib/php/wxr-content-functions.php" "${scratch_root}/lib/php/"
+  cp "${real_root}/lib/php/content-remap-functions.php" "${scratch_root}/lib/php/"
+  SITEGRAFT_ROOT="$scratch_root"
+  export SITEGRAFT_ROOT
 
   printf '16\t105\tpage\n' > "${RUN_DIR}/id-map.tsv"
   mkdir -p "${RUN_DIR}/export"
@@ -2110,4 +2209,204 @@ XML
     return 1
   fi
   grep -q "migrated content matches A's on B (1 of 1 compared)" "${RUN_DIR}/verify-report.md"
+}
+
+# --- review finding B1: --post_type/--post_status=any on the live fetch ----
+# `wp post list --post__in=...` with NO --post_type silently defaults to
+# post_type=post (WP_Query::get_posts()'s own final `else` branch,
+# wp-includes/class-wp-query.php). Every OTHER wp_remote stub in this file
+# ignores flags entirely (matches on the subcommand only), which is
+# structurally incapable of catching this class of bug -- these two tests
+# use a FLAG-AWARE stub that actually reproduces wp-cli's real
+# post_type-defaulting behavior, specifically so they can rot if the
+# --post_type argument is ever dropped again.
+
+@test "verify_migrated_content_changed_from_pregraft scopes its live fetch with --post_type (review finding B1) — flag-aware stub, execution-proven" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  : > "${run_dir}/id-map.tsv" # nothing imported -- id 16 (a page) was skipped
+  local manifest
+  manifest=$(jq -n '{migrate: {"core-wp": {post_types: ["page"]}}, content_checksums_pre_graft: {"16": "sha256:UNCHANGED"}}')
+  _verify_wxr_items_remapped() { echo '[{"post_id":16,"post_type":"page","post_content":"new from A","post_excerpt":""}]'; }
+  backup_content_checksum_of_row() { echo "UNCHANGED"; }
+
+  # A REALISTIC wp-cli emulation: B genuinely holds post ID 16 as a PAGE.
+  # `wp post list --post__in=... --format=json` WITHOUT --post_type
+  # defaults to post_type=post (WP_Query::get_posts()'s own final `else`
+  # branch) and would find NOTHING for a page -- this stub reproduces
+  # that real behavior instead of ignoring the flag the way most other
+  # stubs in this file do.
+  wp_remote() {
+    local alias_lc="$1"; shift
+    local requested_type="post" a
+    for a in "$@"; do
+      case "$a" in
+        --post_type=*) requested_type="${a#--post_type=}" ;;
+      esac
+    done
+    if [ "$requested_type" = "page" ]; then
+      echo '[{"ID":16,"post_content":"B'"'"'s own old front page","post_excerpt":""}]'
+    else
+      echo '[]'
+    fi
+  }
+
+  run verify_migrated_content_changed_from_pregraft "$run_dir" "${run_dir}/id-map.tsv" "$manifest"
+  [ "$status" -eq 1 ]
+  # Found id 16 and correctly confirmed it byte-identical to its pre-graft
+  # state -- NOT "vanished" (the wrong diagnosis a post_type-blind, empty
+  # response would produce instead of the real one).
+  [[ "$output" == *" 16 "* || "$output" == *": 16 "* ]] || false
+  [[ "$output" != *"vanished-from-b"* ]] || false
+}
+
+@test "verify_migrated_content_matches_source scopes its live fetch with --post_type (review finding B1) — flag-aware stub, execution-proven" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  printf '16\t105\tpage\n' > "${run_dir}/id-map.tsv" # genuinely imported, as new post 105
+  local manifest='{"migrate":{"core-wp":{"post_types":["page"]}}}'
+  _verify_wxr_items_remapped() { echo '[{"post_id":16,"post_type":"page","post_content":"B'"'"'s own old front page","post_excerpt":""}]'; }
+  # _verify_module_post_import_may_rewrite (B2) checks
+  # ${SITEGRAFT_ROOT}/modules/etch.sh|core-wp.sh -- unset here, so nothing
+  # is excluded and this test exercises the real comparison.
+  unset SITEGRAFT_ROOT
+
+  wp_remote() {
+    local alias_lc="$1"; shift
+    local requested_type="post" a
+    for a in "$@"; do
+      case "$a" in
+        --post_type=*) requested_type="${a#--post_type=}" ;;
+      esac
+    done
+    if [ "$requested_type" = "page" ]; then
+      echo '[{"ID":105,"post_content":"B'"'"'s own old front page","post_excerpt":""}]'
+    else
+      echo '[]'
+    fi
+  }
+
+  run verify_migrated_content_matches_source "$run_dir" "${run_dir}/id-map.tsv" "$manifest"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"CONTENT_MATCH:1:1:0"* ]] || false
+}
+
+# MUTATION PROOF (do this by hand, not part of the suite — same convention
+# tests/unit/test_content_remap_write.bats' own docblock uses): remove
+# `--post_type="$post_types_csv" --post_status=any` from EITHER guard's
+# `wp_remote b post list --post__in=...` call in lib/verify.sh and rerun
+# just these two tests:
+#   - the guard-2 test above goes from "found id 16, confirmed unchanged"
+#     to reporting it "(vanished-from-b)" instead — status stays 1 (review
+#     finding B4's fail-closed fix catches the empty response too), but
+#     for the WRONG reason, which is exactly what the assertion on
+#     "vanished-from-b" being ABSENT is there to catch.
+#   - the guard-1 test above flips from CONTENT_MATCH:1:1:0/exit 0 to a
+#     HARD FAIL ("105(not-found-on-b)") — the exact false-positive the
+#     review measured against the pre-fix code (`CONTENT_MATCH:0:1
+#     "105(not-found-on-b)"`).
+# Revert afterward.
+
+# --- review finding B2: module post_import hooks exclude content from ------
+# guard 1's strict equality claim.
+
+@test "verify_migrated_content_matches_source excludes a post whose type a module's post_import hook may rewrite, rather than false-hard-failing it (review finding B2)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  printf '5\t105\tpage\n' > "${run_dir}/id-map.tsv"
+  local manifest='{"migrate":{"core-wp":{"post_types":["page"]}}}'
+  # A's un-remapped WXR content still carries the OLD Etch component ref
+  # (14468) -- graft's own id/domain remap never rewrites "ref":N (only
+  # etch_post_import, lib/graft.sh's module hook, does that, AFTER this
+  # function's own remap step).
+  _verify_wxr_items_remapped() { echo '[{"post_id":5,"post_type":"page","post_content":"<!-- wp:etch/component {\"ref\":14468} -->","post_excerpt":""}]'; }
+  # B's live content is what a CORRECT graft produces: etch_post_import
+  # already rewrote the ref to 173. Comparing this against A's raw,
+  # un-module-remapped bytes would be a false mismatch -- which is exactly
+  # why this row must never reach the live fetch at all.
+  wp_remote() { echo "SHOULD NOT BE CALLED — the only row in scope is excluded before any live fetch"; }
+  SITEGRAFT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
+  export SITEGRAFT_ROOT
+  run verify_migrated_content_matches_source "$run_dir" "${run_dir}/id-map.tsv" "$manifest"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"CONTENT_MATCH:0:0:1"* ]] || false
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
+# MUTATION PROOF for B2 (executed and reverted below, not left in the
+# suite): commenting out the B2 partition in
+# verify_migrated_content_matches_source (lib/verify.sh) so EVERY id-map
+# row is treated as checkable makes the test above fail — the live fetch
+# now runs, wp_remote's "SHOULD NOT BE CALLED" stub response gets parsed
+# as B's content, fails to match, and the assertion on
+# CONTENT_MATCH:0:0:1 goes red. Proven by hand below, then reverted.
+
+# --- review finding B3: id-map.tsv's `term:`-tagged rows are excluded ------
+
+@test "verify_migrated_content_matches_source does not false-hard-fail on a term row in id-map.tsv (review finding B3)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  # A term row (mu-plugins/sitegraft-id-mapper.php's wp_import_insert_term
+  # handler writes exactly this shape) alongside a real, matched page row.
+  printf '5\t105\tpage\n9\t44\tterm:category\n' > "${run_dir}/id-map.tsv"
+  local manifest='{"migrate":{"core-wp":{"post_types":["page"]}}}'
+  _verify_wxr_items_remapped() { echo '[{"post_id":5,"post_type":"page","post_content":"hello","post_excerpt":""}]'; }
+  wp_remote() { echo '[{"ID":105,"post_content":"hello","post_excerpt":""}]'; }
+  run verify_migrated_content_matches_source "$run_dir" "${run_dir}/id-map.tsv" "$manifest"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"CONTENT_MATCH:1:1:0"* ]] || false
+  [[ "$output" != *"44"* ]] || false
+}
+
+@test "verify_migrated_content_changed_from_pregraft does not let a colliding term id mask a genuinely skipped page (review finding B3)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  # Term id 16 (a category, say) imported this run -- but post id 16 (A's
+  # front page) was SKIPPED. Without the term-row exclusion, this term row
+  # would make old_id 16 look "already imported", hiding the skip.
+  printf '16\t900\tterm:category\n' > "${run_dir}/id-map.tsv"
+  local manifest
+  manifest=$(jq -n '{migrate: {"core-wp": {post_types: ["page"]}}, content_checksums_pre_graft: {"16": "sha256:UNCHANGED"}}')
+  _verify_wxr_items_remapped() { echo '[{"post_id":16,"post_type":"page","post_content":"new from A","post_excerpt":""}]'; }
+  wp_remote() { echo '[{"ID":16,"post_content":"B'"'"'s own old front page","post_excerpt":""}]'; }
+  backup_content_checksum_of_row() { echo "UNCHANGED"; }
+  run verify_migrated_content_changed_from_pregraft "$run_dir" "${run_dir}/id-map.tsv" "$manifest"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"16"* ]] || false
+}
+
+# --- review finding B4: a failed live read is a HARD FAIL, never silent ----
+
+@test "verify_migrated_content_changed_from_pregraft fails closed (HARD FAIL) when the live read of B itself fails, never a silent pass (review finding B4)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  : > "${run_dir}/id-map.tsv"
+  local manifest
+  manifest=$(jq -n '{migrate: {"core-wp": {post_types: ["page"]}}, content_checksums_pre_graft: {"16": "sha256:UNCHANGED"}}')
+  _verify_wxr_items_remapped() { echo '[{"post_id":16,"post_type":"page","post_content":"x","post_excerpt":""}]'; }
+  wp_remote() { echo "could not connect to B" >&2; return 1; }
+  run verify_migrated_content_changed_from_pregraft "$run_dir" "${run_dir}/id-map.tsv" "$manifest"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"could not read B"* ]] || false
+}
+
+@test "verify_migrated_content_changed_from_pregraft treats a paired id absent from a SUCCESSFUL response as a finding (vanished from B), not a silent skip (review finding B4)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  : > "${run_dir}/id-map.tsv"
+  local manifest
+  manifest=$(jq -n '{migrate: {"core-wp": {post_types: ["page"]}}, content_checksums_pre_graft: {"16": "sha256:UNCHANGED"}}')
+  _verify_wxr_items_remapped() { echo '[{"post_id":16,"post_type":"page","post_content":"x","post_excerpt":""}]'; }
+  wp_remote() { echo '[]'; } # succeeded, but id 16 is simply not in the result
+  run verify_migrated_content_changed_from_pregraft "$run_dir" "${run_dir}/id-map.tsv" "$manifest"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"vanished-from-b"* ]] || false
+}
+
+# --- review finding B5: an unpairable/none-imported guard reports --------
+# INCOMPLETE, never a silent PASS.
+
+@test "verify_migrated_content_matches_source is INCOMPLETE, not a pass, when A's WXR had items but id-map.tsv matched none of them (review finding B5)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  : > "${run_dir}/id-map.tsv" # nothing imported at all
+  local manifest='{"migrate":{"core-wp":{"post_types":["page"]}}}'
+  _verify_wxr_items_remapped() { echo '[{"post_id":16,"post_type":"page","post_content":"x","post_excerpt":""}]'; }
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  run verify_migrated_content_matches_source "$run_dir" "${run_dir}/id-map.tsv" "$manifest"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"CONTENT_MATCH:none-imported:1"* ]] || false
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }

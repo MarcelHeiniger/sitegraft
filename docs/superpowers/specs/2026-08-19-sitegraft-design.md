@@ -517,6 +517,9 @@ Produced by `plan`, frozen, consumed as-is by `graft`. JSON, parsed via `jq`.
   },
   "checksums_protected_pre_graft": {
     "example-plugin": "sha256:…"
+  },
+  "content_checksums_pre_graft": {
+    "16": "sha256:…"
   }
 }
 ```
@@ -545,12 +548,30 @@ was `true` — its `acknowledged: true` is the only way `plan` ever freezes a
 manifest for a B with any custom-code signal raised; `signals` is a frozen copy
 of what `scan` found, kept for the record rather than re-read live at `graft` time.
 
+`content_checksums_pre_graft` (issue #52, ADR 0008's "Required regardless"
+list) is a pre-graft content-checksum snapshot of B's OWN posts, keyed by
+B's own post ID: a `sha256` of `{post_content, post_excerpt}` for every post
+of a `migrate.post_types` (attachment excluded — media is verified by file
+sync, never content equality). Computed by `backup_compute_content_checksums`
+(`lib/backup.sh`) at the same point `checksums_protected_pre_graft` is
+computed — the one moment `graft`'s own precondition (`backup.complete`)
+guarantees has already run, completely, before graft's first write to B.
+`verify`'s guard 2 (`verify_migrated_content_changed_from_pregraft`,
+`lib/verify.sh`) re-reads B after the graft and hard-fails if a post that
+should have changed is still byte-identical to this snapshot — the guard
+that, on its own, would have caught the defect issue #52 fixed (a
+collision-skipped item that `verify` used to report as `PASS`). A manifest
+with no `content_checksums_pre_graft` key at all predates this feature;
+`verify` reports that as INCOMPLETE, never a silent pass, once there is
+something skipped to check against it.
+
 Validation rules (`lib/manifest.sh :: manifest_validate`):
 - `frozen` must be `true` for `graft` to accept the manifest.
 - No post_type/table/option-key may appear in both `migrate` and `protect`
   (conflict → `plan` refuses to freeze).
-- `checksums_protected_pre_graft` is computed and written by the `backup` phase (not
-  by `plan`), and consumed by `verify`.
+- `checksums_protected_pre_graft` and `content_checksums_pre_graft` are both
+  computed and written by the `backup` phase (not by `plan`), and consumed
+  by `verify`.
 
 ## 5. Profile + credentials format
 

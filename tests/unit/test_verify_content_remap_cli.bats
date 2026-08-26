@@ -39,7 +39,6 @@ EOF
 {
   "wxr_files": ["${xml_file}"],
   "attachments": [{"old": "7", "new": "42"}],
-  "nav_post_type": "wp_navigation",
   "domain": {"from": "https://a.example.com", "to": "https://b.example.com"}
 }
 EOF
@@ -66,7 +65,6 @@ EOF
 {
   "wxr_files": ["${xml_file}"],
   "attachments": [{"old": "7", "new": "42"}],
-  "nav_post_type": "wp_navigation",
   "domain": {"from": "", "to": ""}
 }
 EOF
@@ -85,7 +83,6 @@ EOF
 {
   "wxr_files": ["${xml_file}"],
   "attachments": [],
-  "nav_post_type": "wp_navigation",
   "domain": {"from": "https://a.example.com", "to": "https://b.example.com"}
 }
 EOF
@@ -145,4 +142,52 @@ EOF
   printf 'not json' > "$payload_file"
   run php "$CLI" "$payload_file"
   [ "$status" -ne 0 ]
+}
+
+# review finding m1 (issue #52 fix-pack): a WXR file that exists and is
+# readable but is not valid XML must be a loud, distinguishable failure --
+# not silently treated the same as a file that parsed fine and genuinely
+# has zero items.
+@test "verify-content-remap-cli exits non-zero and says why when a listed WXR file is not valid XML" {
+  local xml_file="$BATS_TEST_TMPDIR/garbage.xml"
+  printf 'this is not xml at all <<<' > "$xml_file"
+  local payload_file="$BATS_TEST_TMPDIR/payload.json"
+  cat > "$payload_file" <<EOF
+{"wxr_files": ["${xml_file}"], "attachments": [], "domain": {"from": "", "to": ""}}
+EOF
+  run php "$CLI" "$payload_file"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"did not parse"* ]] || false
+  [[ "$output" == *"garbage.xml"* ]] || false
+}
+
+# review finding M1 (execution-verified, same measurement point the review
+# itself used): a 62MB WXR export was FATAL under the OLD
+# file_get_contents() + DOMDocument::loadXML() driver at BOTH 128M and
+# 256M memory_limit. This is the identical 62MB scenario against the NEW
+# streaming driver, at the identical two limits -- both now succeed
+# (measured peak RSS ~157MB regardless of the limit between 128M and 256M,
+# i.e. bounded by the export's own content size, not by a DOM multiplier
+# of it).
+@test "verify-content-remap-cli survives the exact 62MB/128M scenario that was fatal before this fix (review finding M1)" {
+  local xml_file="$BATS_TEST_TMPDIR/big62.xml"
+  {
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<rss version="2.0" xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:wp="http://wordpress.org/export/1.2/"><channel><wp:wxr_version>1.2</wp:wxr_version>\n'
+    local i chunk
+    chunk=$(head -c 62000 /dev/zero | tr '\0' 'x')
+    for i in $(seq 1 1000); do
+      printf '<item><wp:post_id>%d</wp:post_id><wp:post_type>page</wp:post_type><content:encoded><![CDATA[%s]]></content:encoded><excerpt:encoded><![CDATA[]]></excerpt:encoded></item>\n' "$i" "$chunk"
+    done
+    printf '</channel></rss>\n'
+  } > "$xml_file"
+
+  local payload_file="$BATS_TEST_TMPDIR/payload.json"
+  cat > "$payload_file" <<EOF
+{"wxr_files": ["${xml_file}"], "attachments": [], "domain": {"from": "", "to": ""}}
+EOF
+  run php -d memory_limit=128M "$CLI" "$payload_file"
+  [ "$status" -eq 0 ]
+  run jq -e 'length == 1000' <<< "$output"
+  [ "$status" -eq 0 ]
 }

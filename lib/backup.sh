@@ -1193,7 +1193,7 @@ backup_content_checksum_of_row() {
 # snapshot of <alias>'s OWN posts, for every post_type selected in
 # manifest.migrate (attachment excluded — attachments are migrated by file
 # sync, design doc §9, never verified by content equality), keyed by
-# <alias>'s own post ID. This is the "relevé" lib/verify.sh's guard 2
+# <alias>'s own post ID. This is the pre-graft baseline lib/verify.sh's guard 2
 # (verify_migrated_content_changed_from_pregraft) checks a post-graft
 # re-read against: a row whose checksum comes back IDENTICAL after the
 # graft ran was never actually touched — exactly the shape of the observed

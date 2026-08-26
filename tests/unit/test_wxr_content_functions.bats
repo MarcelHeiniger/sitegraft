@@ -1,9 +1,9 @@
 # tests/unit/test_wxr_content_functions.bats — lib/php/wxr-content-functions.php
-# (issue #52, lib/verify.sh's content-equality guard). Pure PHP (DOMDocument
-# + XPath), no WordPress bootstrap, no DDEV, no wp-cli — same
-# bare-`php`-CLI-testable property tests/unit/test_content_remap_functions.bats
-# already established for lib/php/content-remap-functions.php's own pure
-# functions, and for the same reason: this file is `require`d directly by
+# (issue #52, lib/verify.sh's content-equality guard). Pure PHP (XMLReader),
+# no WordPress bootstrap, no DDEV, no wp-cli — same bare-`php`-CLI-testable
+# property tests/unit/test_content_remap_functions.bats already established
+# for lib/php/content-remap-functions.php's own pure functions, and for the
+# same reason: this file is `require`d directly by
 # lib/php/verify-content-remap-cli.php in production, so these tests run the
 # literal same code that runs for real.
 setup() {
@@ -13,8 +13,8 @@ setup() {
 }
 
 # wxr_wrap <items_xml> — wraps one or more <item> blocks in a minimal but
-# real WXR envelope (the three namespaces this file's XPath queries
-# register: wp, content, excerpt) so every test exercises the same
+# real WXR envelope (the three namespaces this file's node-matching relies
+# on: wp, content, excerpt) so every test exercises the same
 # namespace-resolution path production faces, not a stripped-down fixture.
 wxr_wrap() {
   cat <<EOF
@@ -33,10 +33,11 @@ EOF
 
 # parse_file <items_xml> — writes wxr_wrap's output to a temp file and runs
 # a small PHP driver (reading the file, calling sitegraft_parse_wxr_items,
-# printing the result as JSON) so every test's XML travels through a real
-# file on disk (never embedded inside a `php -r` string, which would need
-# its own separate, error-prone layer of bash/PHP quoting for content that
-# is itself testing quoting-sensitive bytes like CDATA markers).
+# printing the result as JSON — `false` prints as the JSON literal `false`,
+# never mistaken for `[]`) so every test's XML travels through a real file
+# on disk (never embedded inside a `php -r` string, which would need its
+# own separate, error-prone layer of bash/PHP quoting for content that is
+# itself testing quoting-sensitive bytes like CDATA markers).
 parse_file() {
   local xml_file="$BATS_TEST_TMPDIR/in.xml"
   wxr_wrap "$1" > "$xml_file"
@@ -76,30 +77,44 @@ parse_file() {
   # "before]]>after" arrive as two sibling CDATA nodes under one
   # content:encoded element. A regex-based `<!\[CDATA\[(.*?)\]\]>` extraction
   # would stop at the FIRST "]]>" and silently truncate to "before]]" --
-  # this is exactly why this file uses DOMDocument (->textContent merges
-  # sibling CDATA sections into one logical string) instead of a regex.
+  # this is exactly why this file uses DOM ->textContent (via
+  # XMLReader::expand(), one <item> at a time) instead of a regex.
   run parse_file '<item><wp:post_id>5</wp:post_id><wp:post_type>page</wp:post_type><content:encoded><![CDATA[before]]]]><![CDATA[>after]]></content:encoded><excerpt:encoded><![CDATA[]]></excerpt:encoded></item>'
   [ "$status" -eq 0 ]
   run jq -e '.[0].post_content == "before]]>after"' <<< "$output"
   [ "$status" -eq 0 ]
 }
 
-@test "sitegraft_parse_wxr_items returns an empty array, not a fatal error, for a document with no items" {
+@test "sitegraft_parse_wxr_items returns an empty array, not false, for a well-formed document with no items" {
   run parse_file ''
   [ "$status" -eq 0 ]
   [ "$output" = "[]" ]
 }
 
-@test "sitegraft_parse_wxr_items returns an empty array (fails closed, never a fatal) on unparsable XML" {
-  local bad_file="$BATS_TEST_TMPDIR/bad.xml"
-  printf 'not xml at all <<<' > "$bad_file"
+# review finding m1 (issue #52 fix-pack): `[]` used to mean BOTH "parsed
+# fine, zero items" AND "could not parse this at all" -- indistinguishable
+# to a caller. Genuinely unparsable input must now come back as `false`
+# (the JSON literal, not the empty array), so lib/php/verify-content-
+# remap-cli.php can tell the two apart and surface the second as a real
+# error instead of silently treating it as "nothing to check".
+@test "sitegraft_parse_wxr_items returns false (never []), fails closed without a fatal, on unparsable XML" {
   run php -r "
     require '${PHP_LIB}';
-    \$items = sitegraft_parse_wxr_items(file_get_contents('${bad_file}'));
+    \$items = sitegraft_parse_wxr_items('not xml at all <<<');
     echo json_encode(\$items);
   "
   [ "$status" -eq 0 ]
-  [ "$output" = "[]" ]
+  [ "$output" = "false" ]
+}
+
+@test "sitegraft_parse_wxr_items returns false (never []) on a genuinely empty input" {
+  run php -r "
+    require '${PHP_LIB}';
+    \$items = sitegraft_parse_wxr_items('');
+    echo json_encode(\$items);
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "false" ]
 }
 
 @test "sitegraft_parse_wxr_items treats a missing excerpt:encoded element as an empty string, not a PHP error" {
@@ -113,4 +128,117 @@ parse_file() {
   run parse_file '<item><wp:post_type>page</wp:post_type><content:encoded><![CDATA[x]]></content:encoded></item>'
   [ "$status" -eq 0 ]
   [ "$output" = "[]" ]
+}
+
+# --- sitegraft_parse_wxr_items_from_file (production entry point) ----------
+
+@test "sitegraft_parse_wxr_items_from_file reads directly off disk and matches the string-based function's result" {
+  local xml_file="$BATS_TEST_TMPDIR/in.xml"
+  wxr_wrap '<item><wp:post_id>16</wp:post_id><wp:post_type>page</wp:post_type><content:encoded><![CDATA[<p>Hello</p>]]></content:encoded><excerpt:encoded><![CDATA[]]></excerpt:encoded></item>' > "$xml_file"
+  run php -r "
+    require '${PHP_LIB}';
+    \$items = sitegraft_parse_wxr_items_from_file('${xml_file}');
+    echo json_encode(\$items);
+  "
+  [ "$status" -eq 0 ]
+  run jq -e '. == [{"post_id":16,"post_type":"page","post_content":"<p>Hello</p>","post_excerpt":""}]' <<< "$output"
+  [ "$status" -eq 0 ]
+}
+
+@test "sitegraft_parse_wxr_items_from_file returns false for a nonexistent file" {
+  run php -r "
+    require '${PHP_LIB}';
+    \$items = sitegraft_parse_wxr_items_from_file('${BATS_TEST_TMPDIR}/does-not-exist.xml');
+    echo json_encode(\$items);
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "false" ]
+}
+
+# --- M1: memory (execution-verified, not assumed) ---------------------------
+# review finding M1: DOMDocument::loadXML() on a ~62MB export was FATAL
+# under a 128M and a 256M memory_limit. This proves the XMLReader-based
+# rewrite stays well under a constrained limit on a comparable synthetic
+# export, and that peak memory does not scale with item COUNT the way a
+# whole-document DOM would.
+@test "sitegraft_parse_wxr_items_from_file stays under a 32M memory_limit on a 20MB synthetic export (would have been fatal under DOMDocument)" {
+  local xml_file="$BATS_TEST_TMPDIR/big.xml"
+  {
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<rss version="2.0" xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:wp="http://wordpress.org/export/1.2/"><channel><wp:wxr_version>1.2</wp:wxr_version>\n'
+    local i chunk
+    chunk=$(head -c 20000 /dev/zero | tr '\0' 'x')
+    for i in $(seq 1 1000); do
+      printf '<item><wp:post_id>%d</wp:post_id><wp:post_type>page</wp:post_type><content:encoded><![CDATA[%s]]></content:encoded><excerpt:encoded><![CDATA[]]></excerpt:encoded></item>\n' "$i" "$chunk"
+    done
+    printf '</channel></rss>\n'
+  } > "$xml_file"
+  ls -la "$xml_file"
+
+  run php -d memory_limit=32M -r "
+    require '${PHP_LIB}';
+    \$count = 0;
+    \$ok = sitegraft_stream_wxr_items_from_file('${xml_file}', function (\$item) use (&\$count) { \$count++; });
+    if (!\$ok) { fwrite(STDERR, 'parse reported failure'); exit(1); }
+    if (\$count !== 1000) { fwrite(STDERR, \"expected 1000 items, got \$count\n\"); exit(1); }
+    echo 'OK peak=' . round(memory_get_peak_usage(true) / 1024 / 1024, 1) . 'MB';
+  "
+  [ "$status" -eq 0 ]
+  [[ "$output" == OK* ]] || false
+}
+
+# --- entity safety (execution-verified) -------------------------------------
+
+@test "sitegraft_parse_wxr_items never substitutes a local-file XXE entity into content" {
+  local xml_file="$BATS_TEST_TMPDIR/xxe.xml"
+  cat > "$xml_file" <<'XML'
+<?xml version="1.0"?>
+<!DOCTYPE rss [<!ENTITY xxe SYSTEM "file:///etc/hostname">]>
+<rss version="2.0" xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:wp="http://wordpress.org/export/1.2/">
+<channel><wp:wxr_version>1.2</wp:wxr_version>
+<item><wp:post_id>1</wp:post_id><wp:post_type>page</wp:post_type><content:encoded><![CDATA[leak: &xxe;]]></content:encoded><excerpt:encoded><![CDATA[]]></excerpt:encoded></item>
+</channel></rss>
+XML
+  run php -r "
+    require '${PHP_LIB}';
+    \$items = sitegraft_parse_wxr_items_from_file('${xml_file}');
+    if (\$items === false) { echo 'PARSE-FAILED-SAFELY'; exit(0); }
+    \$content = \$items[0]['post_content'] ?? '';
+    if (strpos(\$content, 'root') !== false || strpos(\$content, ':/bin/') !== false) {
+      fwrite(STDERR, 'XXE substituted local file content: ' . \$content);
+      exit(1);
+    }
+    echo 'SAFE:' . \$content;
+  "
+  [ "$status" -eq 0 ]
+  [[ "$output" == SAFE:* || "$output" == "PARSE-FAILED-SAFELY" ]] || false
+}
+
+@test "sitegraft_parse_wxr_items does not expand a nested entity-bomb payload" {
+  local xml_file="$BATS_TEST_TMPDIR/bomb.xml"
+  cat > "$xml_file" <<'XML'
+<?xml version="1.0"?>
+<!DOCTYPE rss [
+  <!ENTITY a "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa">
+  <!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">
+  <!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">
+  <!ENTITY d "&c;&c;&c;&c;&c;&c;&c;&c;&c;&c;">
+]>
+<rss version="2.0" xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:wp="http://wordpress.org/export/1.2/">
+<channel><wp:wxr_version>1.2</wp:wxr_version>
+<item><wp:post_id>1</wp:post_id><wp:post_type>page</wp:post_type><content:encoded><![CDATA[&d;]]></content:encoded><excerpt:encoded><![CDATA[]]></excerpt:encoded></item>
+</channel></rss>
+XML
+  run php -d memory_limit=64M -r "
+    require '${PHP_LIB}';
+    \$items = sitegraft_parse_wxr_items_from_file('${xml_file}');
+    \$content = (\$items === false) ? '' : (\$items[0]['post_content'] ?? '');
+    if (strlen(\$content) > 100000) {
+      fwrite(STDERR, 'entity bomb expanded: ' . strlen(\$content) . ' bytes');
+      exit(1);
+    }
+    echo 'OK:' . strlen(\$content) . ' bytes, ' . round(memory_get_peak_usage(true) / 1024 / 1024, 1) . 'MB peak';
+  "
+  [ "$status" -eq 0 ]
+  [[ "$output" == OK:* ]] || false
 }
