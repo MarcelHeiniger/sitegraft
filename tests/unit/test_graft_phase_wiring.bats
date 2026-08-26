@@ -415,3 +415,55 @@ EOF
   [[ "$output" == *"fresh run"* ]] || false
   [[ "$output" != *"WILL retry"* ]] || false
 }
+
+# --- foreign-file message clarity (review — the DDEV harness's OWN bug,
+# reproduced here at the phase_graft level, not sitegraft's): a test
+# fixture (assertion (e), tests/integration/ddev-harness.sh) wrote a
+# mutated WXR straight into a completed run's own export/ and never
+# cleaned it up, so the harness's OWN "re-running graft is a no-op"
+# resumability check died on it -- fail-closed working exactly as
+# designed, but the message it produced read as "your export is corrupt"
+# rather than naming the far more likely real cause. Fixed on the harness
+# side (it no longer writes there, see that file's own comment); this is
+# the phase_graft-level proof that the message itself now names the
+# foreign-file possibility for any operator who hits the identical shape
+# by hand.
+@test "BLOCKER-B message names the foreign-file possibility when export/ holds a file this run never produced, not just 'corrupt'" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "${run_dir}/export"
+  touch "${run_dir}/backup.complete"
+  cat > "${run_dir}/manifest.json" <<'EOF'
+{"migrate":{"core-wp":{"post_types":["page"],"option_keys":[]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}
+EOF
+  local step
+  for step in stack_sync media_sync mu_plugin prune import_attachments importer_setup export import fetch_id_map; do
+    touch "${run_dir}/graft.${step}.done"
+  done
+  # This run's own real export never happened to write anything (marker
+  # already done) -- what's actually sitting in export/ is a file nobody
+  # here produced, exactly the DDEV harness's own reproduction.
+  cat > "${run_dir}/export/leftover-from-somewhere-else.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+  xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/"
+  xmlns:content="http://purl.org/rss/1.0/modules/content/"
+  xmlns:wp="http://wordpress.org/export/1.2/">
+<channel><wp:wxr_version>1.2</wp:wxr_version>
+<item><wp:post_type>injected_evil_type</wp:post_type></item>
+</channel></rss>
+EOF
+
+  _major4_stub_everything_but_the_marker_block
+  # graft_verify_import_completeness is REAL here, same as the sibling
+  # BLOCKER-B test above -- it's exactly what's under test.
+
+  unset SITEGRAFT_DRY_RUN
+  run phase_graft --profile demo --run "$run_dir"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"was NOT produced by this run"* ]] || false
+  [[ "$output" == *"foreign or malformed"* ]] || false
+  # Still no marker touched, still no prune invoked -- the underlying
+  # BLOCKER-B fix is unaffected by this message-only change.
+  [ -f "${run_dir}/graft.import_attachments.done" ]
+  [[ "$output" != *"STUB: graft_prune_previous_run"* ]] || false
+}

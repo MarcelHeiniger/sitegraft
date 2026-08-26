@@ -1324,7 +1324,22 @@ graft_verify_import_completeness() {
     # is exactly as untrustworthy as one that is not there, and a caller
     # must not attempt the same prune-and-reimport retry issue #53's own
     # skipped-item failure (still 1, below) invites.
-    log_error "could not parse the staged WXR export to verify import completeness: ${err_text}"
+    # Enriched (review — coordinator's own harness run): the driver's own
+    # $err_text already names the specific offending file and, for a
+    # count-mismatch, the exact <item>-vs-parsed numbers (see lib/php/
+    # wxr-item-ids-cli.php's own header). What it can't tell an operator is
+    # WHY that file is there -- "corrupt" implies THIS run's own export
+    # step produced something bad, but the identical symptom follows from
+    # ANY .xml under ${staging} this run didn't produce at all (a
+    # hand-added file, a leftover test artifact, anything left behind by
+    # an earlier experiment against this same run_dir) -- this glob has no
+    # way to tell "ours" from "not ours" apart, by design (see this
+    # function's own header on why item-by-item structural parsing, not
+    # provenance tracking, is the fix issue #73 chose). Naming that
+    # explicitly here, not just at phase_graft's own wrapping message
+    # (BLOCKER-B), matters because `sitegraft verify` calls this function
+    # directly too, without that wrapper ever running.
+    log_error "could not parse the staged WXR export to verify import completeness: ${err_text} — if every .xml under ${staging} was written by THIS run's own export step, that points at real corruption; if anything else was ever added to that directory (by hand, or left over from an earlier run/experiment against this same run_dir), removing it is the fix instead."
     return 2
   fi
 
@@ -2414,7 +2429,24 @@ phase_graft() {
       # accurate (every step it claims complete really did complete) —
       # only its later, externally-removed DATA is missing, which
       # clearing steps this tool did nothing wrong in cannot fix.
-      log_error "run directory ${run_dir} is missing (or has an unreadable/corrupt) staged WXR export, but its own markers say every earlier step already completed. This cannot self-heal via a simple retry — a retry would delete the content this run already migrated onto B while never regenerating the missing file, per issue #53/#54's own fix-pack (see graft_verify_import_completeness's header). No resumability marker was changed by this failure. Start a fresh run (scan -> plan -> backup -> graft) against a clean run directory, or restore B from the pre-graft backup if you suspect real data loss."
+      # Enriched (review — a real occurrence, not hypothetical: the
+      # DDEV harness's own assertion (e) wrote a test fixture straight
+      # into run_dir/export/ and left it there; the NEXT `graft`
+      # invocation against that same run_dir hit exactly this branch,
+      # for exactly this reason — see tests/integration/ddev-harness.sh's
+      # own comment on that assertion for the fix on the harness side).
+      # "missing (or has an unreadable/corrupt) staged WXR export" was
+      # true but incomplete: an operator reading only that would assume
+      # THIS run's own export somehow got damaged, worrying (backup/
+      # import corruption) and pointing at the wrong fix (restore from
+      # backup) — when the far more likely real cause, given fail-closed
+      # rejects the WHOLE glob on ANY single bad file, is that something
+      # was ADDED to export/ that this run never produced: a hand-copied
+      # WXR, a leftover test artifact, anything from an earlier
+      # experiment against this same run_dir. Named explicitly, with the
+      # cheap recovery path (remove it, re-run) stated before the
+      # expensive ones.
+      log_error "run directory ${run_dir} is missing its staged WXR export, or has one that fails to parse, even though its own markers say every earlier step already completed. Before assuming real data loss: check ${run_dir}/export for anything that was NOT produced by this run's own export step (a hand-added file, a leftover test artifact, or anything left behind by an earlier experiment against this same run_dir) — every .xml found there is treated as part of this run's own export, and a single foreign or malformed one is enough to trigger this exact message. This cannot self-heal via a simple retry of 'sitegraft graft' — a retry would delete the content this run already migrated onto B while never regenerating (or removing) whatever is actually wrong in export/, per issue #53/#54's own fix-pack (see graft_verify_import_completeness's header). No resumability marker was changed by this failure. Once export/ genuinely holds only this run's own file(s) again, re-running 'sitegraft verify' (or graft) will re-check correctly with no further action needed; if it still fails, start a fresh run (scan -> plan -> backup -> graft) against a clean run directory, or restore B from the pre-graft backup if you suspect real data loss."
       return 1
     fi
 

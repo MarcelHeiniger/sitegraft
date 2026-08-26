@@ -500,3 +500,39 @@ _stub_php_with_stdout_noise() {
   [ "$status" -eq 2 ]
   [[ "$output" == *"did not return valid NDJSON"* ]] || false
 }
+
+# --- foreign-file message clarity (review — the DDEV harness's own bug,
+# not sitegraft's): a test fixture (assertion (e), tests/integration/
+# ddev-harness.sh) once wrote a mutated WXR straight into a real run_dir's
+# export/ and never cleaned it up; the NEXT graft/verify against that
+# same run_dir failed with a message that read as "your export got
+# corrupted" when the real cause was "a file that was never part of this
+# run's own output is sitting in export/ now". Fixed on the harness side
+# (it no longer writes there); this covers the message itself naming that
+# possibility, so an operator hitting the identical shape by hand (a
+# manually-copied WXR, a leftover from an earlier experiment against the
+# same run_dir) is not misled toward "restore from backup" when "remove
+# the extra file" is the actual, cheaper fix.
+@test "graft_verify_import_completeness's failure message names the foreign-file possibility, not just 'corrupt'" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "${run_dir}/export"
+  # A real, legitimate export this run staged...
+  _write_wxr "${run_dir}/export/export.xml" "101:page"
+  # ...plus a SECOND file this run never produced -- exactly the shape a
+  # hand-copied WXR, or a leftover test artifact, would take.
+  cat > "${run_dir}/export/leftover-from-somewhere-else.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+  xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/"
+  xmlns:content="http://purl.org/rss/1.0/modules/content/"
+  xmlns:wp="http://wordpress.org/export/1.2/">
+<channel><wp:wxr_version>1.2</wp:wxr_version>
+<item><wp:post_type>injected_evil_type</wp:post_type></item>
+</channel></rss>
+EOF
+  printf '101\t5001\tpage\n' > "${run_dir}/id-map.tsv"
+  run graft_verify_import_completeness "$run_dir" "page"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"leftover-from-somewhere-else.xml"* ]] || false
+  [[ "$output" == *"if anything else was ever added"* ]] || false
+}
