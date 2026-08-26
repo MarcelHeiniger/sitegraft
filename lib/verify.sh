@@ -798,7 +798,19 @@ verify_migrated_content_matches_source() {
   # checksums_pre_graft's own absence a few lines up in guard 2 below.
   local rewrites_file="${run_dir}/module-content-rewrites.tsv"
   if [ ! -f "$rewrites_file" ]; then
-    log_error "this run has no module-content-rewrites.tsv at all — it predates graft_run_module_post_import (lib/graft.sh) creating that file unconditionally, or a kill mid-hook lost it, so this guard cannot tell whether a module's post_import hook rewrote any of the ${total} post(s) in scope. Re-run backup and graft against a sitegraft version that records it."
+    # The honest advice here is NOT "re-run graft" (review round 4 nit):
+    # if THIS run dir's graft already completed under an older sitegraft
+    # version, graft.module_hooks.done is already on disk, so
+    # `graft_step_done "$run_dir" module_hooks` (lib/graft.sh's phase_graft)
+    # short-circuits and graft_run_module_post_import never runs again —
+    # re-running `sitegraft graft` against this SAME run dir will never
+    # produce this file, and this check would read INCOMPLETE forever. No
+    # write to B ever results from that (every graft step is marker-
+    # gated), so the cost is a wasted run and operator confusion, not
+    # damage — but the advice has to be right: start a fresh run
+    # (`sitegraft scan`/`plan`/`backup`/`graft` into a NEW run dir) instead
+    # of resuming this one.
+    log_error "this run has no module-content-rewrites.tsv at all — it predates graft_run_module_post_import (lib/graft.sh) creating that file unconditionally, or a kill mid-hook lost it, so this guard cannot tell whether a module's post_import hook rewrote any of the ${total} post(s) in scope. If this run dir's graft already completed under an older sitegraft version, re-running graft against it will NOT produce this file (the module_hooks step is already marked done and will be skipped) — start a fresh run (new scan/plan/backup/graft) instead."
     echo "CONTENT_MATCH:no-rewrite-record:${total}"
     return 2
   fi
@@ -1531,7 +1543,14 @@ phase_verify() {
         # module-rewritten" from "something was, and we lost the record",
         # so it refuses to guess in either direction rather than risk a
         # false HARD FAIL on a genuinely correct graft.
-        echo "- [ ] migrated content matches A's: **UNVERIFIED — no module-content-rewrites.tsv for this run (${content_match_output##*:} post(s) in scope) — cannot tell whether a module's post_import hook rewrote any of them** — see above" >> "$report"
+        #
+        # Review round 4 nit: "re-run graft" is generic advice this
+        # phase's own INCOMPLETE footer gives for every incomplete check,
+        # and it does NOT work for this one specifically when the cause is
+        # an old run dir -- see this check's own log_error for why (the
+        # module_hooks step marker is already set, so a resume skips it).
+        # Said explicitly here too, not just in the log.
+        echo "- [ ] migrated content matches A's: **UNVERIFIED — no module-content-rewrites.tsv for this run (${content_match_output##*:} post(s) in scope) — cannot tell whether a module's post_import hook rewrote any of them. If this run dir's graft already completed under an older sitegraft version, re-running graft will NOT fix this (see above) — start a fresh run** — see above" >> "$report"
         ;;
       *CONTENT_MATCH:0:0:*)
         # review finding B2, floor (part b): every row in scope was
