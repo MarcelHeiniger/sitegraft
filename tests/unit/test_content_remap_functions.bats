@@ -7,16 +7,28 @@
 # rebuilt graft_remap_attachment_ids/graft_search_replace_domain to stop
 # scanning whole tables, the two-pass sentinel substitution moved from an
 # inline bash-single-quoted PHP string (syntactically impossible to unit
-# test on its own) into lib/php/content-remap-functions.php — a plain,
-# WordPress-independent PHP file `require_once`'d by the real `wp eval`
-# calls. Before this file existed, the bash helper functions that USED to
-# build the substitution (graft_build_sentinel_commands,
+# test on its own) into lib/php/content-remap-functions.php, `require_once`'d
+# by the real `wp eval` calls. Before this file existed, the bash helper
+# functions that USED to build the substitution (graft_build_sentinel_commands,
 # graft_content_tables_csv) kept their own green unit tests years after
 # phase_graft stopped calling either of them — a false coverage signal on
 # exactly the logic (a remap that must never contaminate protected data)
 # where a coverage gap matters most. Both were removed; this file is where
 # the real substitution's real test coverage lives now, running the exact
 # same file production requires.
+#
+# ONLY the two pure remap functions (sitegraft_remap_attachment_refs,
+# sitegraft_remap_domain) live here — that is what makes running them
+# under a bare `php` CLI with nothing else required possible in the first
+# place (review, Kimi, NIT: this header used to describe the whole file
+# content-remap-functions.php lives in as "WordPress-independent", which
+# stopped being true once sitegraft_write_remapped_post (issue #43) was
+# added to it). That third function calls $wpdb->update() and
+# clean_post_cache() and is tested separately, under
+# tests/unit/fixtures/wpstub.php's stand-ins for those two calls — see
+# tests/unit/test_content_remap_write.bats, same convention
+# tests/unit/test_media_import_batch.bats already uses for the
+# WordPress-calling half of lib/php/media-import-functions.php.
 setup() {
   PHP_LIB="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)/lib/php/content-remap-functions.php"
   [ -f "$PHP_LIB" ] || skip "lib/php/content-remap-functions.php not found"
@@ -173,123 +185,6 @@ php_run() {
   run php_run '
     $found = sitegraft_domain_present("nothing relevant here at all", "https://a.example.com", "https:\/\/a.example.com");
     echo $found ? "FOUND-BUT-SHOULD-NOT-BE" : "OK";
-  '
-  [ "$status" -eq 0 ]
-  [[ "$output" == "OK" ]]
-}
-
-# --- sitegraft_write_remapped_post: issue #43 -------------------------------
-#
-# lib/graft.sh's two remap steps (graft_remap_attachment_ids,
-# graft_search_replace_domain) rewrite post_content/post_excerpt with
-# sitegraft_remap_attachment_refs/sitegraft_remap_domain (above), then used
-# to save the result with `wp_update_post( array( "ID" => ..., ... ) )`.
-#
-# wp_update_post() only calls wp_slash() on its $postarr when $postarr is
-# an OBJECT (wp-includes/post.php's `is_object( $postarr )` branch) — the
-# array form never gets slashed. wp_insert_post(), which wp_update_post()
-# delegates to for an existing ID, unconditionally runs
-# `$data = wp_unslash( $data )` immediately before the write regardless.
-# One unslash pass with no matching slash pass silently eats every literal
-# backslash in $content/$excerpt.
-#
-# That is exactly the shape sitegraft_remap_domain's own output takes: it
-# explicitly matches and rewrites the JSON-escaped `https:\/\/` form,
-# which is how a domain appears inside an Etch block's JSON attribute
-# comment — losing that escaping breaks parse_blocks()'s JSON decode
-# SILENTLY (no error, no crash, a block that renders without its
-# attributes).
-#
-# sitegraft_write_remapped_post fixes this by writing via $wpdb->update()
-# instead — no slash/unslash pass at all — the same choice, for the same
-# reason, modules/etch.sh's own Etch-component-reference remap already
-# makes (and calling clean_post_cache() afterward, replacing the
-# object-cache invalidation wp_update_post() would otherwise have done).
-#
-# MUTATION PROOF (do this by hand, not part of the suite): temporarily
-# change sitegraft_write_remapped_post's body (lib/php/content-remap-
-# functions.php) to call `wp_update_post( array( "ID" => $post_id,
-# "post_content" => $content, "post_excerpt" => $excerpt ) )` instead of
-# $wpdb->update(...), then rerun this file. The `wp_update_post` stub
-# defined below models the real array-vs-object slashing asymmetry
-# precisely (never slashes the array form, always unslashes before
-# "writing"), so that mutation reproduces issue #43 exactly: the
-# byte-for-byte assertion in the first test below fails, because the
-# written value comes back with its "\/" eaten down to "/". Revert
-# afterward — this is confirmation, not a permanent test path.
-@test "sitegraft_write_remapped_post writes via \$wpdb->update (not wp_update_post) -- content and excerpt keep their backslashes byte-for-byte (#43)" {
-  run php_run '
-    class FakeWpdb {
-      public $posts = "wp_posts";
-      public $last_update = null;
-      public function update( $table, $data, $where ) {
-        $this->last_update = array( "table" => $table, "data" => $data, "where" => $where );
-        return 1;
-      }
-    }
-    $GLOBALS["wpdb"] = new FakeWpdb();
-    $GLOBALS["cache_cleared"] = array();
-    function clean_post_cache( $id ) { $GLOBALS["cache_cleared"][] = $id; }
-
-    // Present only so the MUTATION PROOF above (see this test'\''s own
-    // docblock) can swap the production call back to the old form without
-    // also having to edit this test file: models real wp_update_post()'\''s
-    // array-vs-object slashing asymmetry -- the array form is never
-    // slashed, yet the write always unslashes, exactly the bug in #43.
-    function wp_unslash( $value ) { return is_string( $value ) ? stripslashes( $value ) : $value; }
-    function wp_update_post( $postarr ) {
-      global $wpdb;
-      $wpdb->last_update = array(
-        "table" => $wpdb->posts,
-        "data"  => array(
-          "post_content" => wp_unslash( $postarr["post_content"] ),
-          "post_excerpt" => wp_unslash( $postarr["post_excerpt"] ),
-        ),
-        "where" => array( "ID" => $postarr["ID"] ),
-      );
-      return $postarr["ID"];
-    }
-
-    // Exactly the shape sitegraft_remap_domain produces: the JSON-escaped
-    // domain form inside an Etch block'\''s JSON attribute comment.
-    $orig      = "<!-- wp:etch/image {\"src\":\"https:\/\/old.example.com\/x.jpg\"} -->";
-    $rewritten = "<!-- wp:etch/image {\"src\":\"https:\/\/new.example.com\/x.jpg\"} -->";
-
-    global $wpdb;
-    $changed = sitegraft_write_remapped_post( 105, $rewritten, "excerpt-unchanged", $orig, "excerpt-unchanged" );
-
-    if ( ! $changed ) { fwrite(STDERR, "reported no change when content differed\n"); exit(1); }
-    if ( $wpdb->last_update === null ) { fwrite(STDERR, "no write happened at all\n"); exit(1); }
-    if ( $wpdb->last_update["table"] !== "wp_posts" ) { fwrite(STDERR, "wrong table: " . $wpdb->last_update["table"] . "\n"); exit(1); }
-    if ( $wpdb->last_update["where"] !== array( "ID" => 105 ) ) { fwrite(STDERR, "wrong WHERE clause\n"); exit(1); }
-
-    $written = $wpdb->last_update["data"]["post_content"];
-    if ( $written !== $rewritten ) { fwrite(STDERR, "content not written byte-for-byte: got [$written] want [$rewritten]\n"); exit(1); }
-    if ( strpos( $written, "https:\/\/new.example.com" ) === false ) { fwrite(STDERR, "backslash was eaten: $written\n"); exit(1); }
-    if ( empty( $GLOBALS["cache_cleared"] ) || $GLOBALS["cache_cleared"][0] !== 105 ) {
-      fwrite(STDERR, "clean_post_cache was not called for post 105\n"); exit(1);
-    }
-    echo "OK";
-  '
-  [ "$status" -eq 0 ]
-  [[ "$output" == "OK" ]]
-}
-
-@test "sitegraft_write_remapped_post reports no change and never touches the DB or cache when content and excerpt are unchanged" {
-  run php_run '
-    class FakeWpdb {
-      public $update_called = false;
-      public function update( $table, $data, $where ) { $this->update_called = true; return 1; }
-    }
-    $GLOBALS["wpdb"] = new FakeWpdb();
-    function clean_post_cache( $id ) { fwrite(STDERR, "clean_post_cache should not have been called\n"); exit(1); }
-
-    global $wpdb;
-    $changed = sitegraft_write_remapped_post( 1, "same content", "same excerpt", "same content", "same excerpt" );
-
-    if ( $changed ) { fwrite(STDERR, "reported a change when nothing differed\n"); exit(1); }
-    if ( $wpdb->update_called ) { fwrite(STDERR, "\$wpdb->update was called despite no change\n"); exit(1); }
-    echo "OK";
   '
   [ "$status" -eq 0 ]
   [[ "$output" == "OK" ]]

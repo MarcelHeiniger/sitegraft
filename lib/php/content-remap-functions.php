@@ -1,18 +1,18 @@
 <?php
 /**
  * lib/php/content-remap-functions.php — the actual content-rewriting logic
- * behind `sitegraft graft`'s two remap steps (design doc §9.1/§9.4).
+ * behind `sitegraft graft`'s two remap steps (design doc §9.1/§9.4), plus
+ * (issue #43) the write-back that saves what they produce.
  *
  * Extracted into its own plain-PHP file (review, Viktor, NIT-1) specifically
- * so it can be unit-tested in real isolation via `php` directly, with zero
- * WordPress bootstrap — no DDEV, no wp-cli. Before this fix, the exact same
- * logic lived inline inside a bash single-quoted string passed to
- * `wp_remote b eval '...'` in lib/graft.sh: syntactically impossible to unit
- * test on its own, so the two bash helper functions that USED to build this
- * (graft_build_sentinel_commands, graft_content_tables_csv) kept their green
- * unit tests years after phase_graft stopped calling either of them — a
- * false coverage signal on exactly the logic (the remap that must never
- * contaminate protected data) where a coverage gap matters most.
+ * so it can be unit-tested in real isolation via `php` directly. Before this
+ * fix, the exact same logic lived inline inside a bash single-quoted string
+ * passed to `wp_remote b eval '...'` in lib/graft.sh: syntactically
+ * impossible to unit test on its own, so the two bash helper functions that
+ * USED to build this (graft_build_sentinel_commands, graft_content_tables_csv)
+ * kept their green unit tests years after phase_graft stopped calling either
+ * of them — a false coverage signal on exactly the logic (the remap that
+ * must never contaminate protected data) where a coverage gap matters most.
  *
  * At runtime, this file is pushed onto B (graft_push_remap_payload's sibling
  * transfer, see lib/graft.sh's graft_push_remap_lib) and `require_once`'d by
@@ -20,9 +20,19 @@
  * — production and the unit tests below run the exact same file, not a
  * hand-kept-in-sync copy.
  *
- * Both functions are pure string transforms: no WordPress function calls, no
- * database access, no side effects. That purity is what makes them directly
- * testable with a bare `php` CLI invocation.
+ * NOT every function below is WordPress-free (review, Kimi, NIT — this
+ * header used to claim "zero WordPress bootstrap" for the whole file, which
+ * stopped being true the moment sitegraft_write_remapped_post was added).
+ * sitegraft_remap_attachment_refs and sitegraft_remap_domain ARE pure
+ * string transforms — no WordPress function calls, no database access, no
+ * side effects — and that purity is what makes THEM directly testable with
+ * a bare `php` CLI invocation with nothing else required; their tests live
+ * in tests/unit/test_content_remap_functions.bats. sitegraft_write_remapped_post
+ * calls $wpdb->update() and clean_post_cache() and is tested the same way
+ * lib/php/media-import-functions.php's own WordPress-calling functions
+ * are: under tests/unit/fixtures/wpstub.php's in-memory stand-in for those
+ * calls, still via a bare `php` CLI and still with no real WordPress
+ * bootstrap — see tests/unit/test_content_remap_write.bats.
  */
 
 /**
@@ -118,7 +128,7 @@ function sitegraft_domain_present( $haystack, $domain, $escaped ) {
 }
 
 /**
- * sitegraft_write_remapped_post( int $post_id, string $content, string $excerpt, string $orig_content, string $orig_excerpt ): bool
+ * sitegraft_write_remapped_post( object $post, string $content, string $excerpt ): bool
  *
  * The write-back step shared by graft_remap_attachment_ids and
  * graft_search_replace_domain (lib/graft.sh): both call one of the two
@@ -127,6 +137,20 @@ function sitegraft_domain_present( $haystack, $domain, $escaped ) {
  * remap functions themselves were extracted — the previous inline form
  * could only be exercised end-to-end via the DDEV harness, so a regression
  * in the WRITE (as opposed to the rewrite) went uncovered by any unit test.
+ *
+ * $post is the SAME get_post() object both callers already fetched to
+ * build $content/$excerpt in the first place — deliberately, not the
+ * post's id plus its old/new content as four separate positional string
+ * arguments (review, Viktor, MAJOR-2, execution-proven): with $post_id,
+ * $content, $excerpt, $orig_content, $orig_excerpt, arguments 2/3 and 4/5
+ * are all plain strings and freely interchangeable at the call site.
+ * Viktor swapped $content and $excerpt at graft_remap_attachment_ids' own
+ * call — which would write the excerpt into every remapped post's
+ * post_content — and the full suite (38/38 tests touching this function)
+ * stayed green: every assertion matches the call site's TEXT
+ * (`sitegraft_write_remapped_post(`), none of it its ARGUMENTS. Reading
+ * $post->ID/post_content/post_excerpt directly closes that off
+ * structurally rather than by convention.
  *
  * Writes via $wpdb->update(), never wp_update_post() — the actual bug
  * behind issue #43. wp_update_post() only calls wp_slash() on its
@@ -149,26 +173,76 @@ function sitegraft_domain_present( $haystack, $domain, $escaped ) {
  * given are the raw bytes written — the same choice, for the same reason,
  * modules/etch.sh's own Etch-component-reference remap already makes.
  * clean_post_cache() replaces the object-cache invalidation
- * wp_update_post() would otherwise have done as a side effect.
+ * wp_update_post() would otherwise have done as a side effect — but only
+ * on an actual, successful write; see the failure handling below.
  *
- * Returns true iff a write actually happened (content or excerpt
- * differed from what was read) — callers use this to keep their own
- * "rewrote N post(s)" count accurate, same contract the old inline
- * `if ( $content !== $post->post_content || ... )` guard had.
+ * Skipping wp_update_post() also means skipping everything else it would
+ * have done, on purpose, in every case below except the last:
+ *
+ *   - post_modified/post_modified_gmt are NOT bumped (wp-includes/
+ *     post.php:4043-4045 sets these before the save in the code path this
+ *     replaces). Desired for a migration tool: it preserves each post's
+ *     timestamp as it existed on A rather than stamping it with the
+ *     moment `graft` happened to run.
+ *   - save_post, post_updated, edit_post and wp_after_insert_post do NOT
+ *     fire. Desired — but not free: a plugin hooked on save_post to
+ *     maintain a search index (Relevanssi, ElasticPress) will NOT
+ *     reindex a post this function rewrites. If B runs one of those, its
+ *     index needs a manual rebuild after `graft`.
+ *   - No revision is created (wp_save_post_revision never runs). Desired:
+ *     a remap is not an edit an operator needs a revision history entry
+ *     for.
+ *   - content_save_pre and the kses filters do NOT run on $content before
+ *     the write. Desired, and the strongest argument for skipping them
+ *     specifically for Etch's own block JSON: `wp eval` runs with no
+ *     current user set, so `current_user_can( 'unfiltered_html' )` is
+ *     false, and kses's default filters WOULD have been active on the
+ *     code path this replaces — a real risk of mangling a block's raw
+ *     JSON attributes, on every post this function ever touched, not a
+ *     newly introduced one.
+ *   - wp_transition_post_status does NOT fire — but this is not something
+ *     being traded away: this function never changes post_status, so no
+ *     transition would have fired under the old wp_update_post() code
+ *     either. Named here only so a reader doesn't have to wonder.
+ *
+ * Returns true iff a write actually happened: content or excerpt differed
+ * from $post's own AND $wpdb->update() reported success. A no-op (nothing
+ * differed) and a FAILED write both return false, and a failed write does
+ * NOT call clean_post_cache() — there is nothing to invalidate for a row
+ * that was never actually changed. Callers use this return value to keep
+ * their own "rewrote N post(s)" count accurate, and a post $wpdb->update()
+ * failed on was never actually rewritten, so it must not be counted
+ * (review, Viktor and Kimi independently, MAJOR-1).
+ *
+ * $wpdb->update()'s return value is NOT merely a formality to check:
+ * real WordPress core relies on it being meaningful. wp_insert_post()
+ * itself (wp-includes/post.php:5003, in the exact write-path this
+ * function replaces) does `false === $wpdb->update( ... )` and raises a
+ * WP_Error( 'db_update_error' ) on it — the identical failure this
+ * function now also checks for, explicitly rather than by delegation.
+ * $wpdb->update() returns false on a real DB error (a full disk, a
+ * charset/`strip_invalid_text_for_column()` rejection of some byte
+ * sequence in $content) — never merely on "zero rows matched", which
+ * returns int 0, not false; the `false === ` comparison below is strict
+ * for exactly that reason, matching wp_insert_post()'s own check byte for
+ * byte.
  */
-function sitegraft_write_remapped_post( $post_id, $content, $excerpt, $orig_content, $orig_excerpt ) {
-	if ( $content === $orig_content && $excerpt === $orig_excerpt ) {
+function sitegraft_write_remapped_post( $post, $content, $excerpt ) {
+	if ( $content === $post->post_content && $excerpt === $post->post_excerpt ) {
 		return false;
 	}
 	global $wpdb;
-	$wpdb->update(
+	$result = $wpdb->update(
 		$wpdb->posts,
 		array(
 			'post_content' => $content,
 			'post_excerpt' => $excerpt,
 		),
-		array( 'ID' => (int) $post_id )
+		array( 'ID' => (int) $post->ID )
 	);
-	clean_post_cache( (int) $post_id );
+	if ( false === $result ) {
+		return false;
+	}
+	clean_post_cache( (int) $post->ID );
 	return true;
 }

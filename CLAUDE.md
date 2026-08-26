@@ -63,7 +63,19 @@ that runs it (see `docs/infrastructure.md`).
   variable) on every user-visible behavior change.
 - **Never raw SQL filtered by hand for content.** Content = WXR (`wp export`/
   `wp import`). Options = `wp option get/update --format=json`, one at a time.
-  Plugin-owned tables = targeted `wp db export --tables=X,Y`.
+  Plugin-owned tables = targeted `wp db export --tables=X,Y`. **One narrow,
+  written exception:** the id/domain remap steps' write-back
+  (`sitegraft_write_remapped_post()`, `lib/php/content-remap-functions.php`)
+  uses `$wpdb->update()` directly on `post_content`/`post_excerpt` — on
+  purpose, and ONLY those two plain-TEXT columns, NEVER an arbitrary/
+  serialized value. `wp_update_post()` was tried first and is what issue #43
+  actually was: its array-form input is never `wp_slash()`'d, yet
+  `wp_insert_post()` always `wp_unslash()`s before writing regardless — a
+  guaranteed corruption for exactly the escaped-JSON content these two
+  remaps produce. Do not "fix" this back to `wp_update_post()`; that is how
+  #43 was introduced in the first place. See that function's own docblock
+  for the full reasoning (including which other `wp_update_post()`
+  side-effects are also, separately, being traded away on purpose).
 - **Never `sed`/raw regex on WordPress data.** Always `wp search-replace` (safe on
   serialized PHP).
 - **Never `scp`.** Always `rsync` for any file transfer.

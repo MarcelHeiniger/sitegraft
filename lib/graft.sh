@@ -1106,13 +1106,19 @@ graft_push_remap_payload() {
 # which would be unsafe generically (this codebase's own CLAUDE.md: "never
 # sed/raw regex on WordPress data") — post_content/post_excerpt specifically
 # are plain TEXT columns, never PHP-serialized, so a direct fetch/modify/
-# `wp_update_post()` write-back is safe for exactly these two fields. This
-# is why the scope is content-field-only: wp_postmeta values CAN be
+# write-back is safe for exactly these two fields. This is why the scope
+# is content-field-only: wp_postmeta values CAN be
 # serialized PHP, and safely rewriting an arbitrary serialized structure
 # needs WordPress's own maybe_unserialize()/maybe_serialize() round-trip —
 # out of scope here, same as design doc §11's existing position that a
 # CPT-specific meta reference is the relevant module's post_import hook's
 # job, not a generic core remap's.
+#
+# The write-back itself is $wpdb->update() (sitegraft_write_remapped_post,
+# in lib/php/content-remap-functions.php — read its own docblock for
+# exactly which WordPress write-path behavior it trades away on purpose,
+# and why), NOT wp_update_post(): wp_update_post()'s array-form/
+# object-form slashing asymmetry is what issue #43 actually was.
 #
 # The payload is pushed to a real file rather than embedded via bash string
 # interpolation into the PHP source: keeps the PHP body 100% static (no
@@ -1191,7 +1197,7 @@ graft_remap_attachment_ids() {
       if ( ! $post ) { continue; }
       $content = sitegraft_remap_attachment_refs( $payload["attachments"], $post->post_content );
       $excerpt = sitegraft_remap_attachment_refs( $payload["attachments"], $post->post_excerpt );
-      if ( sitegraft_write_remapped_post( $post_id, $content, $excerpt, $post->post_content, $post->post_excerpt ) ) {
+      if ( sitegraft_write_remapped_post( $post, $content, $excerpt ) ) {
         $count++;
       }
     }
@@ -1473,7 +1479,7 @@ graft_search_replace_domain() {
       if ( ! $post ) { continue; }
       $content = sitegraft_remap_domain( $post->post_content, $payload["from"], $payload["to"] );
       $excerpt = sitegraft_remap_domain( $post->post_excerpt, $payload["from"], $payload["to"] );
-      if ( sitegraft_write_remapped_post( $post_id, $content, $excerpt, $post->post_content, $post->post_excerpt ) ) {
+      if ( sitegraft_write_remapped_post( $post, $content, $excerpt ) ) {
         $count++;
       }
     }
