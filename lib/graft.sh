@@ -1583,17 +1583,28 @@ _graft_exit_trap() {
     # not — the one mutation in this whole trap that graft_mark_step's own
     # MAJOR-B guard (above, graft_step_done/graft_mark_step) did NOT cover,
     # because it isn't a graft_mark_step call site at all, it's a raw `rm`.
-    # graft_remove_mu_plugin just above is dry-run-safe (built on
-    # run_or_echo via graft_remove_file), so under `--dry-run` this branch's
+    # graft_remove_mu_plugin just above is dry-run-safe on both its paths
+    # (local: run_or_echo via graft_remove_file; SSH: its own direct
+    # `run_or_echo ssh -- ... rm -f`), so under `--dry-run` this branch's
     # condition can still be true (a real prior graft left mu_plugin.done
     # and never reached mu_cleanup) while nothing on B actually changes —
     # yet the `rm -f` here was deleting graft.mu_plugin.done on disk for
-    # real regardless. A `--dry-run` graft run against a real, incomplete
-    # run directory therefore mutated that run's resumability state: the
-    # next REAL `sitegraft graft` against the same run dir would see
-    # mu_plugin as NOT done and re-deploy/re-run steps whose actual
-    # completeness the operator could no longer trust either way. Same bug
-    # class as MAJOR-B, same fix: guard the mutation with is_dry_run.
+    # real regardless. Reviewed (Viktor, MAJOR-1) and reproduced by running
+    # this trap twice under --dry-run, old code vs new: under the old code
+    # the SECOND dry-run pass loses the "graft interrupted or failed —
+    # removing the mapping mu-plugin..." warning above AND the
+    # `[dry-run] rm .../sitegraft-id-mapper.php` line — both silently,
+    # because graft_step_done now (wrongly) reads mu_plugin as not-done —
+    # while the mu-plugin is, in fact, still live and logging on B the
+    # whole time. That's the actual damage: not a redeploy (which would be
+    # a harmless idempotent push), but a dry-run that stops being
+    # reproducible and quietly under-reports what's really running on B —
+    # exactly CLAUDE.md's "Resumability markers, --dry-run, and cleanup
+    # paths must not combine into a run that quietly does less than it
+    # claims." Only one step is at risk here (mu_plugin; mu_cleanup is
+    # already guaranteed absent by this branch's own `if` condition, so
+    # there's no second marker to lose) — fixed the same way MAJOR-B fixed
+    # graft_mark_step: guard the mutation with is_dry_run.
     is_dry_run || rm -f "${rd}/graft.mu_plugin.done" "${rd}/graft.mu_cleanup.done" 2>/dev/null || true
   fi
   # NIT-3 (review, Viktor): graft_remove_file for the id-remap/domain-remap
