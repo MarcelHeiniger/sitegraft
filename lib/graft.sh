@@ -1026,6 +1026,156 @@ graft_fetch_id_map() {
   fi
 }
 
+# graft_verify_import_completeness <run_dir> — issue #53. wordpress-importer
+# INSERTS, never updates. Verified directly against the shipped version
+# (0.9.5, what `wp plugin install wordpress-importer` pulls from wp.org —
+# fetched from
+# https://plugins.svn.wordpress.org/wordpress-importer/tags/0.9.5/class-wp-import.php
+# and cross-checked against wp-cli/import-command's own Import_Command.php,
+# which wraps it): WP_Import::process_posts() runs WordPress's own
+# post_exists( post_title, '', post_date, post_type ) for every item; on a
+# match it prints "<type> "<title>" already exists.", sets
+# $this->processed_posts[old_id] = $existing_post_id in PHP-process memory
+# ONLY, and moves on — it never calls wp_insert_post and never fires
+# wp_import_insert_post for that item, so the mapping mu-plugin
+# (mu-plugins/sitegraft-id-mapper.php, hooked on exactly that action) logs
+# no row for it at all. There is also no separate "this was skipped" signal
+# a caller could hook instead: the similarly-named wp_import_post_exists
+# action fires only from process_posts()'s UNRELATED "invalid post_type"
+# branch, never from the already-exists branch.
+#
+# The two avenues issue #53 itself names for instead COMPLETING the map for
+# a skipped item were checked against that same source, not assumed:
+#   - wp_import_post_data_raw fires for every item, but before the skip
+#     decision is made and with no post-existence information at all — it
+#     cannot distinguish a skip from a normal insert.
+#   - $this->processed_posts (which DOES carry old_id -> existing_post_id
+#     for a skipped item) is a private-in-effect property of the WP_Import
+#     instance wp-cli constructs; nothing exposes it back to the CLI
+#     invocation's caller, and wp-cli's own Import_Command reads it only to
+#     accumulate a total count internally, never to print or return it.
+# Neither exists in the shipped version. Failing loudly is therefore not
+# merely the acceptable floor issue #53 names — it is what's actually
+# available.
+#
+# What this checks, and deliberately NOT via wp-cli's own log text: WP-CLI's
+# import-command DOES hook wp_import_post_data_raw to print a per-item
+# "Processing post #<id> (...)" progress line (Import_Command::
+# add_wxr_filters(), same source), which would make a text-based check
+# possible in principle — but that text is one wp-cli version's choice of
+# wording, wp-cli's global --quiet suppresses WP_CLI::log entirely (silently
+# defeating a check built on it), and the already-exists message itself
+# passes through WordPress's own __() (wordpress-importer ships its own
+# translations) — parsing it would make this check's correctness depend on
+# the operator's locale. None of that data is trustworthy input for a
+# security/correctness gate.
+#
+# Instead this cross-references two things this codebase already computes
+# from STRUCTURE, exactly like graft_integrity_gate: the old post_ids
+# actually present in the WXR this run staged for import (same
+# <wp:post_id>/<wp:post_type> shape graft_integrity_gate already parses)
+# against the old_ids that actually landed in id-map.tsv (written by the
+# mu-plugin's own hook, fetched by graft_fetch_id_map just before this
+# runs). `attachment` is excluded from "expected" by name, for the
+# identical reason graft_integrity_gate already exempts it: WordPress's own
+# exporter unions every migrated post's attachments into this WXR
+# regardless of --post_type, graft_import_wxr passes --skip=attachment, and
+# graft_import_attachments migrates them through a completely separate path
+# that writes its OWN id-map.tsv rows (tagged "attachment") outside
+# wordpress-importer entirely — those items were never supposed to insert
+# through this path, so their absence from a wordpress-importer-sourced row
+# is not the defect this function exists to catch.
+graft_verify_import_completeness() {
+  local run_dir="$1"
+  is_dry_run && return 0
+  local staging="${run_dir}/export"
+  local id_map_tsv="${run_dir}/id-map.tsv"
+  local expected_tmp="${run_dir}/.import-completeness-expected.tmp"
+  local f
+  : > "$expected_tmp"
+  for f in "${staging}"/*.xml; do
+    [ -e "$f" ] || continue
+    # Same per-<item> extraction style as graft_integrity_gate (line-
+    # oriented, CDATA-tolerant even though a real wp-cli export emits both
+    # tags plain — see that function's own comment for why defense-in-depth
+    # is kept anyway): reset id/type at each <item>, capture whichever of
+    # the two tags is seen, emit "id<TAB>type" at </item> only when both
+    # were found and the type isn't the always-present, never-imported
+    # "attachment".
+    awk '
+      /<item>/ { id=""; type="" }
+      /<wp:post_id>/ {
+        line=$0
+        gsub(/<\/?wp:post_id>/, "", line)
+        gsub(/<!\[CDATA\[/, "", line); gsub(/\]\]>/, "", line)
+        gsub(/^[ \t]+|[ \t]+$/, "", line)
+        id=line
+      }
+      /<wp:post_type>/ {
+        line=$0
+        gsub(/<\/?wp:post_type>/, "", line)
+        gsub(/<!\[CDATA\[/, "", line); gsub(/\]\]>/, "", line)
+        gsub(/^[ \t]+|[ \t]+$/, "", line)
+        type=line
+      }
+      /<\/item>/ {
+        if (id != "" && type != "" && type != "attachment") print id "\t" type
+      }
+    ' "$f" >> "$expected_tmp"
+  done
+
+  local expected_count
+  expected_count=$(wc -l < "$expected_tmp" | tr -d ' ')
+  if [ "$expected_count" -eq 0 ]; then
+    rm -f "$expected_tmp"
+    return 0
+  fi
+
+  # old_ids that actually got a REAL insert through wordpress-importer:
+  # rows the mu-plugin logged (3rd column is a real post_type — attachment
+  # rows come from graft_import_attachments, never the mu-plugin; term rows
+  # are tagged "term:<name>" and are a different ID space entirely). Written
+  # to its own temp file, not passed via `awk -v` — BSD/macOS awk (verified
+  # live: the awk this reaches on macOS by default) rejects a `-v` value
+  # containing a literal newline outright ("newline in string"), which a
+  # multi-row id-map with more than one actual id always is.
+  local actual_tmp="${run_dir}/.import-completeness-actual.tmp"
+  : > "$actual_tmp"
+  [ -s "$id_map_tsv" ] && awk -F'\t' '$3 != "attachment" && $3 !~ /^term:/ {print $1}' "$id_map_tsv" > "$actual_tmp"
+
+  # NOT the classic `awk 'NR==FNR{...}'` two-file join — verified live: when
+  # the FIRST file (actual_tmp) has genuinely zero records (a fresh graft
+  # with no id-map.tsv at all yet, exactly the case an interrupted import
+  # produces), NR and FNR both start at 1 on the very first line of the
+  # SECOND file too, so `NR==FNR` reads true there as well and every
+  # "expected" row is wrongly swallowed as if it were an "actual" row —
+  # silently reporting a run that imported NOTHING as complete, the exact
+  # failure this function exists to catch. A plain per-row `grep -Fx`
+  # lookup has no such edge case.
+  local missing_tmp="${run_dir}/.import-completeness-missing.tmp"
+  : > "$missing_tmp"
+  local eid etype
+  while IFS=$'\t' read -r eid etype <&3; do
+    [ -n "$eid" ] || continue
+    grep -qxF "$eid" "$actual_tmp" 2>/dev/null || printf '%s\t%s\n' "$eid" "$etype" >> "$missing_tmp"
+  done 3< "$expected_tmp"
+
+  local missing
+  missing=$(cat "$missing_tmp")
+  rm -f "$expected_tmp" "$actual_tmp" "$missing_tmp"
+
+  [ -n "$missing" ] || return 0
+
+  local missing_count
+  missing_count=$(printf '%s\n' "$missing" | wc -l | tr -d ' ')
+  local missing_sample missing_suffix
+  missing_sample=$(printf '%s\n' "$missing" | head -20 | awk -F'\t' '{print $2"#"$1}' | paste -sd, -)
+  missing_suffix=""
+  [ "$missing_count" -gt 20 ] && missing_suffix=" (first 20 of ${missing_count} shown)"
+  log_error "wordpress-importer reported ${missing_count} of ${expected_count} item(s) as already existing on B (or otherwise never inserted) instead of migrating A's content: ${missing_sample}${missing_suffix} — per ADR 0008, every downstream remap (attachment ids inside content, featured images, page_on_front, module post_import hooks) has silently done nothing for these. Refusing to report success."
+  return 1
+}
+
 # --- Task 4.3: ID-map remap (two-pass sentinel technique) ------------------
 
 # graft_content_tables_csv and graft_build_sentinel_commands used to live
@@ -1766,6 +1916,15 @@ phase_graft() {
   }
   graft_step_done "$run_dir" import        || { graft_import_wxr "$run_dir"; graft_mark_step "$run_dir" import; }
   graft_step_done "$run_dir" fetch_id_map  || { graft_fetch_id_map "$run_dir"; graft_mark_step "$run_dir" fetch_id_map; }
+  # Issue #53: unconditional, no marker of its own. This is a correctness
+  # gate, not an expensive side-effecting step — it only reads the WXR files
+  # and id-map.tsv this run already staged/fetched, both still sitting in
+  # $run_dir regardless of how many times phase_graft has been invoked
+  # against it — so it re-verifies on every single call, including a resume
+  # where fetch_id_map's own marker is already set from an earlier pass.
+  # Same "always recheck, never trust a marker for a plain read-only
+  # assertion" shape graft_check_stack_precondition already uses above.
+  graft_verify_import_completeness "$run_dir" || return 1
   graft_step_done "$run_dir" mu_cleanup    || { graft_remove_mu_plugin; graft_mark_step "$run_dir" mu_cleanup; }
   graft_step_done "$run_dir" importer_cleanup || { graft_restore_importer_state "$run_dir"; graft_mark_step "$run_dir" importer_cleanup; }
   graft_step_done "$run_dir" remap_ids     || { graft_remap_attachment_ids "${run_dir}/id-map.tsv" "$run_dir"; graft_mark_step "$run_dir" remap_ids; }
