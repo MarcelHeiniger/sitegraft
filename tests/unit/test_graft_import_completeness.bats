@@ -359,32 +359,88 @@ EOF
 
 # --- fails CLOSED, never open (review, BLOCKER-1's remaining manifestations) -
 
-@test "graft_verify_import_completeness HARD FAILS (never silently passes) when post_types are selected but export/ has no .xml file at all (BLOCKER-1c)" {
+# Both HARD FAILS below now return 2, not 1 (review, BLOCKER-B): a missing
+# or unparseable staged export is NOT the same failure as issue #53's own
+# "wordpress-importer skipped a real, present item" (still 1 -- see the
+# tests above). phase_graft's own call site treats the two differently --
+# rc=1 clears resumability markers and invites a retry (prune + reimport
+# fixes it); rc=2 must not, because neither prune nor reimport can
+# regenerate a missing/corrupt local file, and retrying anyway would
+# delete B's already-migrated content for nothing while never actually
+# fixing what's wrong. See graft_verify_import_completeness's own header
+# for the full three-valued contract, and
+# tests/unit/test_graft_phase_wiring.bats for the phase_graft-level
+# acceptance test proving rc=2 leaves every marker untouched.
+
+@test "graft_verify_import_completeness returns 2 (NOT retryable) when post_types are selected but export/ has no .xml file at all (BLOCKER-1c / BLOCKER-B)" {
   local run_dir="$BATS_TEST_TMPDIR/run"
   mkdir -p "${run_dir}/export"
   # export/ exists but is genuinely empty -- an interrupted run resumed
   # past a step that never actually produced its file, or the file was
   # removed from underneath this run. Must not read as "nothing to check".
   run graft_verify_import_completeness "$run_dir" "page"
-  [ "$status" -eq 1 ]
+  [ "$status" -eq 2 ]
   [[ "$output" == *"page"* ]] || false
 }
 
-@test "graft_verify_import_completeness HARD FAILS when a listed WXR file is unreadable/malformed, never silently reads it as zero items" {
+@test "graft_verify_import_completeness returns 2 (NOT retryable) when a listed WXR file is unreadable/malformed, never silently reads it as zero items" {
   local run_dir="$BATS_TEST_TMPDIR/run"
   mkdir -p "${run_dir}/export"
   printf 'this is not xml at all' > "${run_dir}/export/export.xml"
   printf '101\t5001\tpage\n' > "${run_dir}/id-map.tsv"
   run graft_verify_import_completeness "$run_dir" "page"
-  [ "$status" -eq 1 ]
+  [ "$status" -eq 2 ]
 }
 
-@test "graft_verify_import_completeness HARD FAILS when ONE of several WXR files fails to parse, even if the others are fine" {
+@test "graft_verify_import_completeness returns 2 (NOT retryable) when ONE of several WXR files fails to parse, even if the others are fine" {
   local run_dir="$BATS_TEST_TMPDIR/run"
   mkdir -p "${run_dir}/export"
   _write_wxr "${run_dir}/export/export.000.xml" "101:page"
   printf 'not xml' > "${run_dir}/export/export.001.xml"
   printf '101\t5001\tpage\n' > "${run_dir}/id-map.tsv"
   run graft_verify_import_completeness "$run_dir" "page"
+  [ "$status" -eq 2 ]
+}
+
+# --- BLOCKER-A (review, issue #70) -- EXPECTED RED until #70 merges --------
+#
+# lib/php/wxr-content-functions.php's own streaming reader
+# (_sitegraft_stream_wxr_reader) silently drops the SECOND of two sibling
+# <item> elements when there is NO intervening whitespace/text node
+# between them (`</item><item>` with literally nothing between): its
+# `XMLReader::next()` positions the cursor ON that next sibling, but the
+# outer `while(true){ read(); ... }` loop then calls `read()` again on its
+# NEXT iteration, advancing PAST it instead of processing it. Confirmed
+# live, root-caused while building this fix-pack's own test fixtures (see
+# lib/php/wxr-item-ids-cli.php's own header for the full accounting) and
+# filed as issue #70 -- NOT fixed in this PR (this PR does not own that
+# file); a separate branch is expected to fix it and merge first, at which
+# point this test goes green on its own with no change needed here.
+#
+# This is exactly BLOCKER-1's own failure shape (a real, present, skipped
+# item silently exempted), reopened by the very parser this fix-pack
+# switched to in order to CLOSE BLOCKER-1 in the first place -- verified
+# with the identical assertions the BLOCKER-2 test above already uses,
+# only the WXR's own layout differs (adjacent, no separating whitespace,
+# instead of one item's own tags sharing a line).
+@test "graft_verify_import_completeness catches a skipped item even when it is a sibling <item> with NO whitespace before it (BLOCKER-A / issue #70 -- expected RED until #70 merges)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "${run_dir}/export"
+  cat > "${run_dir}/export/export.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+  xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/"
+  xmlns:content="http://purl.org/rss/1.0/modules/content/"
+  xmlns:wp="http://wordpress.org/export/1.2/">
+<channel><wp:wxr_version>1.2</wp:wxr_version><item><wp:post_id>101</wp:post_id><wp:post_type>page</wp:post_type></item><item><wp:post_id>102</wp:post_id><wp:post_type>page</wp:post_type></item></channel></rss>
+EOF
+  # 101 landed for real; 102 was skipped -- must report "1 of 2", naming
+  # page#102, exactly like the BLOCKER-2 test above. Today (pre-#70) the
+  # second <item> (102) is never even seen by the parser, so this run
+  # reports a false, silent PASS instead.
+  printf '101\t5001\tpage\n' > "${run_dir}/id-map.tsv"
+  run graft_verify_import_completeness "$run_dir" "page"
   [ "$status" -eq 1 ]
+  [[ "$output" == *"1 of 2"* ]] || false
+  [[ "$output" == *"page#102"* ]] || false
 }

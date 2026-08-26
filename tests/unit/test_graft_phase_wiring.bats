@@ -351,3 +351,67 @@ EOF
   [ -f "${run_dir}/graft.import_attachments.done" ]
   [ -f "${run_dir}/graft.import.done" ]
 }
+
+# --- BLOCKER-B (review): MAJOR-3 + BLOCKER-1c together used to form a
+# destructive, non-recoverable loop --------------------------------------
+#
+# A run that finished SUCCESSFULLY (every step through fetch_id_map marked
+# done); the operator later removes run_dir/export/*.xml (a real run dir's
+# largest files -- an unremarkable disk-cleanup action, not a bug). A
+# resume then: (1) graft_verify_import_completeness's own BLOCKER-1c
+# branch hard-fails on the missing export; (2) MAJOR-3's marker-clearing
+# used to fire on ANY nonzero return, clearing import_attachments.done/
+# import.done/fetch_id_map.done and telling the operator a retry WOULD
+# fix it; (3) a retry then trips graft_safety_step_done, reruns
+# graft_prune_previous_run FOR REAL -- deleting every post/attachment this
+# tool had already correctly migrated onto B -- and (4) still fails
+# afterward, because graft.export.done was never touched and the (now
+# permanently empty) export step stays marked done, never regenerating the
+# file the retry needed. Net: B's migrated content destroyed, run dir
+# still cannot recover. graft_verify_import_completeness now returns a
+# distinct code (2) for exactly this "my own staged data isn't here,
+# not a wordpress-importer skip" case, and phase_graft's own call site
+# refuses to clear any marker or invite a retry for it -- this is the
+# acceptance test for that fix.
+@test "BLOCKER-B acceptance: a completed run whose staged export vanished fails WITHOUT clearing markers or invoking prune" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "${run_dir}/export"
+  touch "${run_dir}/backup.complete"
+  cat > "${run_dir}/manifest.json" <<'EOF'
+{"migrate":{"core-wp":{"post_types":["page"],"option_keys":[]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}
+EOF
+  # Every step through fetch_id_map already completed for real -- but
+  # export/ is empty right now (its .xml file(s) removed since).
+  local step
+  for step in stack_sync media_sync mu_plugin prune import_attachments importer_setup export import fetch_id_map; do
+    touch "${run_dir}/graft.${step}.done"
+  done
+  printf '101\t5001\tpage\n' > "${run_dir}/id-map.tsv"
+
+  _major4_stub_everything_but_the_marker_block
+  # graft_verify_import_completeness is deliberately REAL here (not
+  # stubbed like the sibling MAJOR-4 tests above) -- it's exactly what's
+  # under test: its own BLOCKER-1c branch must return 2 for this run_dir
+  # shape, and phase_graft's call site must treat that 2 differently from
+  # the 1 those sibling tests exercise.
+
+  unset SITEGRAFT_DRY_RUN
+  run phase_graft --profile demo --run "$run_dir"
+  [ "$status" -eq 1 ]
+
+  # The acceptance criterion: NONE of the three retry markers were
+  # cleared, and prune (the STUB from _major4_stub_everything_but_the_
+  # marker_block, which prints "STUB: graft_prune_previous_run" whenever
+  # actually invoked) was NEVER called.
+  [ -f "${run_dir}/graft.import_attachments.done" ]
+  [ -f "${run_dir}/graft.import.done" ]
+  [ -f "${run_dir}/graft.fetch_id_map.done" ]
+  [[ "$output" != *"STUB: graft_prune_previous_run"* ]] || false
+
+  # The message says what actually happened and what to do -- never
+  # implies a retry will fix it (the OPPOSITE of the rc=1 message the
+  # MAJOR-3 tests above check for).
+  [[ "$output" == *"cannot self-heal"* ]] || false
+  [[ "$output" == *"fresh run"* ]] || false
+  [[ "$output" != *"WILL retry"* ]] || false
+}

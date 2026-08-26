@@ -488,3 +488,102 @@ EOF
   [ "$(cat "${run_dir}/id-map.tsv")" = "101	5001	page" ]
   [ "$(grep -c '^101' "${run_dir}/id-map.tsv")" -eq 1 ]
 }
+
+# --- BLOCKER-A acceptance (review, issue #70) -- EXPECTED RED until #70 ----
+# merges. Same real-subprocess shape as the BLOCKER-1/BLOCKER-2 acceptance
+# test above, changing ONLY the staged WXR's own layout: the two items are
+# direct siblings with NO whitespace/text node between `</item>` and the
+# next `<item>` -- exactly the shape lib/php/wxr-content-functions.php's
+# streaming reader silently drops the second of (see lib/php/
+# wxr-item-ids-cli.php's own header for the root cause). This is the
+# reviewer's own reproduction, applied to this branch's own fixture: take
+# the fixture directly above and change ONLY the layout.
+_write_fake_wp_success_with_skip_no_whitespace() {
+  local path="$1"
+  cat > "$path" <<'FAKEWP'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$WP_FAKE_CALL_LOG"
+wp_path=""
+for a in "$@"; do
+  case "$a" in --path=*) wp_path="${a#--path=}" ;; esac
+done
+sub=""
+for a in "$@"; do
+  case "$a" in
+    plugin|post|export|import|eval) sub="$a" ;;
+  esac
+done
+case "$sub" in
+  plugin) exit 0 ;;
+  post) exit 0 ;;
+  eval) echo '[]' ;;
+  export)
+    dir=""
+    for a in "$@"; do
+      case "$a" in --dir=*) dir="${a#--dir=}" ;; esac
+    done
+    mkdir -p "$dir"
+    # BLOCKER-A shape: two sibling <item>s with ZERO whitespace between
+    # `</item>` and the next `<item>` -- issue #70.
+    cat > "${dir}/export.xml" <<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+  xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/"
+  xmlns:content="http://purl.org/rss/1.0/modules/content/"
+  xmlns:wp="http://wordpress.org/export/1.2/">
+<channel><wp:wxr_version>1.2</wp:wxr_version><item><wp:post_id>101</wp:post_id><wp:post_type>page</wp:post_type></item><item><wp:post_id>102</wp:post_id><wp:post_type>page</wp:post_type></item></channel></rss>
+XML
+    exit 0
+    ;;
+  import)
+    mkdir -p "${wp_path}/wp-content"
+    printf '101\t5001\tpage\n' >> "${wp_path}/wp-content/sitegraft-id-map.log"
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac
+FAKEWP
+  chmod +x "$path"
+}
+
+@test "BLOCKER-A acceptance: a real graft run catches a skip on a whitespace-less sibling <item> (issue #70 -- expected RED until #70 merges)" {
+  local sitegraft_bin="${BATS_TEST_DIRNAME}/../../bin/sitegraft"
+  local fake_wp="$BATS_TEST_TMPDIR/fake-wp"
+  _write_fake_wp_success_with_skip_no_whitespace "$fake_wp"
+
+  export WP_FAKE_CALL_LOG="$BATS_TEST_TMPDIR/wp-calls.log"
+  : > "$WP_FAKE_CALL_LOG"
+
+  local site_a="$BATS_TEST_TMPDIR/site-a" site_b="$BATS_TEST_TMPDIR/site-b"
+  mkdir -p "${site_a}/wp-content/uploads" "${site_b}/wp-content/uploads" "${site_b}/wp-content/mu-plugins"
+
+  export SITEGRAFT_PROFILES_DIR="$BATS_TEST_TMPDIR/profiles"
+  mkdir -p "$SITEGRAFT_PROFILES_DIR"
+  cat > "${SITEGRAFT_PROFILES_DIR}/demo.conf" <<EOF
+SITE_A_ALIAS="a"
+SITE_A_WP_PATH="${site_a}"
+SITE_A_WP_CMD="${fake_wp}"
+SITE_B_ALIAS="b"
+SITE_B_WP_PATH="${site_b}"
+SITE_B_WP_CMD="${fake_wp}"
+SITEGRAFT_STATE_DIR="${BATS_TEST_TMPDIR}/state"
+EOF
+  mkdir -p "${BATS_TEST_TMPDIR}/state"
+
+  local run_dir="${BATS_TEST_TMPDIR}/state/demo-20260101T000000"
+  mkdir -p "$run_dir"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[]}' > "${run_dir}/scan-a.json"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[]}' > "${run_dir}/scan-b.json"
+  cat > "${run_dir}/manifest.json" <<'EOF'
+{"migrate":{"core-wp":{"post_types":["page"],"option_keys":[]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}
+EOF
+  touch "${run_dir}/backup.complete"
+
+  export SITEGRAFT_MODULES_DIR="$BATS_TEST_TMPDIR/empty-modules"
+  mkdir -p "$SITEGRAFT_MODULES_DIR"
+
+  run "$sitegraft_bin" graft --profile demo --run "$run_dir"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"1 of 2"* ]] || false
+  [[ "$output" == *"page#102"* ]] || false
+}

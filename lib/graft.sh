@@ -1130,15 +1130,30 @@ graft_fetch_id_map() {
 # `/<wp:post_id>/` or `/<wp:post_type>/`, with no notion of "this line is
 # actually inside a DIFFERENT element's own CDATA body" (a post_content
 # value containing the literal text `<wp:post_type>attachment</wp:post_type>`
-# silently exempted that item, last-assignment-wins) or of two items
-# sharing one physical line (wp-cli's real exporter does this routinely —
-# every `gsub` ran against the WHOLE line and clobbered both items' values
-# with a garbled fragment of the other). XMLReader parses actual document
-# STRUCTURE — an <item>'s own direct children, resolved by namespace URI —
-# so neither shape is reachable here by construction; see lib/php/
-# wxr-item-ids-cli.php's own header for the full accounting, and lib/php/
-# wxr-content-functions.php's header for the streaming/entity-safety
-# properties both callers of it now share.
+# silently exempted that item, last-assignment-wins) or of a single item's
+# OWN two tags sharing one physical line (demonstrated live, this fix-pack's
+# own test fixture — whether wp-cli's REAL exporter routinely produces
+# that specific shape is NOT independently verified here; every `gsub` ran
+# against the WHOLE line regardless of cause and clobbered that item's own
+# values with a garbled fragment of its own markup). XMLReader parses
+# actual document STRUCTURE — an <item>'s own direct children, resolved by
+# namespace URI — so neither shape is reachable here by construction; see
+# lib/php/wxr-item-ids-cli.php's own header for the full accounting
+# (including a REAL, confirmed structural gap this parser still has,
+# tracked as issue #70 — not fixed in this file, see that header), and
+# lib/php/wxr-content-functions.php's header for the streaming/entity-
+# safety properties both callers of it now share.
+#
+# Three-valued (review, BLOCKER-B, added this fix-pack): 0 = genuinely
+# complete, or nothing was ever expected; 1 = wordpress-importer skipped
+# a real, present, parseable item (issue #53's own defect) — RETRYABLE,
+# the WXR staged for this run is trustworthy and prune-then-reimport can
+# fix it; 2 = this run's own staged data is not trustworthy right now (no
+# .xml file where post_types were selected, or one present but unparseable)
+# — NOT retryable the same way, since neither prune nor reimport can
+# regenerate a missing/corrupt local file, and blindly running them anyway
+# would delete B's already-migrated content for nothing. See phase_graft's
+# own call site for how the two are handled differently.
 graft_verify_import_completeness() {
   local run_dir="$1" wxr_post_types_csv="${2:-}"
   is_dry_run && return 0
@@ -1165,11 +1180,44 @@ graft_verify_import_completeness() {
     # two only when that's also consistent with there being no work to do:
     # empty $wxr_post_types_csv, like an explicit "".
     if [ -n "$wxr_post_types_csv" ]; then
+      # Returns 2, not 1 (review, BLOCKER-B): a missing export is a
+      # DIFFERENT failure than issue #53's own "wordpress-importer skipped
+      # an item" (which returns 1, below) — the WXR this run staged is
+      # simply not there to check against anymore (an operator cleared
+      # run_dir/export/*.xml between runs — a real run dir's largest
+      # files — or an interrupted run resumed past a step that never
+      # produced it). Reported mechanically: phase_graft's own MAJOR-3
+      # marker-clearing (its call site of this function) treated EVERY
+      # nonzero return the same, and cleared import_attachments.done/
+      # import.done/fetch_id_map.done here too — a resume then found
+      # graft_safety_step_done false, reran graft_prune_previous_run
+      # (deleting every post this tool had migrated onto B, for real),
+      # and STILL failed afterward, because graft.export.done was never
+      # touched, so the (now-empty) export step stayed marked done and
+      # never regenerated the file this whole retry needed. Net effect: a
+      # successfully migrated B gets its content destroyed by a resume
+      # that could never have succeeded. A distinct return code lets the
+      # caller refuse to run that retry at all instead of guessing from
+      # this function's own return value alone.
       log_error "post_type(s) ${wxr_post_types_csv} were selected for migration but no WXR export was found under ${staging} to verify import completeness against — the export step never produced (or no longer has) a file here. Refusing to report success."
-      return 1
+      return 2
     fi
     return 0
   fi
+
+  # Temp files live under sitegraft_mktemp_dir (lib/core.sh), not under
+  # $run_dir (review, NIT-2 — including the php driver's own stderr
+  # capture just below, the other half of NIT-2 a previous pass at this
+  # fix left under $run_dir): $run_dir is a long-lived, resumable run
+  # directory an operator inspects between invocations, and a
+  # `${run_dir}/.import-completeness-*` file was only ever cleaned up on
+  # this function's own normal-return paths — an interruption (kill -9, a
+  # crash) between its creation and that cleanup left it behind
+  # indefinitely. sitegraft_mktemp_dir registers its directory in
+  # SITEGRAFT_TMP_REGISTRY, which bin/sitegraft's own sitegraft_cleanup
+  # EXIT trap sweeps on every exit, interrupted or not — this is that
+  # mechanism's first production caller in this file.
+  local tmp_dir; tmp_dir=$(sitegraft_mktemp_dir)
 
   # lib/php/wxr-item-ids-cli.php: one `php` invocation, NDJSON on stdout,
   # hard failure (never a silent empty result) the moment ANY listed file
@@ -1177,29 +1225,28 @@ graft_verify_import_completeness() {
   # stderr captured separately, same discipline lib/verify.sh's own
   # _verify_wxr_items_remapped uses for its identical php-driver call, for
   # the identical reason: stdout on success must never be contaminated by
-  # a diagnostic line the driver also happened to print.
+  # a diagnostic line the driver also happened to print. A file that
+  # fails to parse partway through a MULTI-file argv can still have
+  # streamed real NDJSON to stdout for the file(s) before it (review,
+  # MINOR-D — the driver's own header used to claim "NOTHING on stdout" on
+  # any failure, which is not quite true of that specific case; corrected
+  # there too) — harmless here specifically because $ndjson is never read
+  # for real unless $rc is 0, checked immediately below.
   local ndjson rc stderr_file
-  stderr_file="${run_dir}/.import-completeness-stderr.$$"
+  stderr_file="${tmp_dir}/stderr"
   ndjson=$(php "${SITEGRAFT_ROOT}/lib/php/wxr-item-ids-cli.php" "${wxr_files[@]}" 2>"$stderr_file") && rc=0 || rc=$?
   local err_text=""
   [ -s "$stderr_file" ] && err_text=$(cat "$stderr_file")
-  rm -f "$stderr_file"
   if [ "$rc" -ne 0 ]; then
+    # Also 2, not 1 (review, BLOCKER-B) — same reasoning as the missing-
+    # file branch above: a WXR this run staged that fails to parse at all
+    # is exactly as untrustworthy as one that is not there, and a caller
+    # must not attempt the same prune-and-reimport retry issue #53's own
+    # skipped-item failure (still 1, below) invites.
     log_error "could not parse the staged WXR export to verify import completeness: ${err_text}"
-    return 1
+    return 2
   fi
 
-  # Temp files live under sitegraft_mktemp_dir (lib/core.sh), not under
-  # $run_dir (review, NIT-2): $run_dir is a long-lived, resumable run
-  # directory an operator inspects between invocations, and the previous
-  # version's `${run_dir}/.import-completeness-*.tmp` files were only ever
-  # cleaned up on this function's own normal-return paths — an
-  # interruption (kill -9, a crash) between their creation and that cleanup
-  # left them behind indefinitely. sitegraft_mktemp_dir registers its
-  # directory in SITEGRAFT_TMP_REGISTRY, which bin/sitegraft's own
-  # sitegraft_cleanup EXIT trap sweeps on every exit, interrupted or not —
-  # this is that mechanism's first production caller in this file.
-  local tmp_dir; tmp_dir=$(sitegraft_mktemp_dir)
   local expected_tmp="${tmp_dir}/expected.tsv"
   printf '%s\n' "$ndjson" | jq -r '
     select(.post_type != "attachment" and .post_type != "nav_menu_item")
@@ -2172,7 +2219,20 @@ phase_graft() {
   # only got as far as fetch_id_map reruns it too, against a fresh id-map
   # this prune pass just cleaned.
   graft_safety_step_done "$run_dir" prune import_attachments import fetch_id_map || {
-    is_dry_run || rm -f "${run_dir}/graft.import_attachments.done" "${run_dir}/graft.import.done" "${run_dir}/graft.fetch_id_map.done"
+    # `|| true` on the `rm -f` itself, not just the `is_dry_run ||` in
+    # front of it (review, MINOR-E): this whole block is the RHS of a
+    # `||` tested against graft_safety_step_done, which is what exempts
+    # THAT command from `set -euo pipefail` — it does NOT extend to every
+    # command sequentially inside this `{ }` group. A real `rm -f` failure
+    # here (a read-only run_dir, e.g.) would abort phase_graft on the
+    # spot, skipping graft_prune_previous_run entirely with a bare,
+    # undiagnosed nonzero exit — silently worse than the marker simply
+    # staying set. Logged, not swallowed: losing the ability to clear a
+    # resumability marker is itself worth telling the operator about.
+    if ! is_dry_run; then
+      rm -f "${run_dir}/graft.import_attachments.done" "${run_dir}/graft.import.done" "${run_dir}/graft.fetch_id_map.done" \
+        || log_warn "could not clear one or more resumability markers under ${run_dir} before prune — a later resume may not rerun the steps prune is about to invalidate"
+    fi
     graft_prune_previous_run "$post_types_csv" "$run_dir"
     graft_mark_step "$run_dir" prune
   }
@@ -2206,9 +2266,54 @@ phase_graft() {
   # from "post_types WERE selected but the export is missing right now" —
   # see graft_verify_import_completeness's own header for why only this
   # call site (not every unit test of it) needs to pass it.
-  graft_verify_import_completeness "$run_dir" "$wxr_post_types_csv" || {
-    # MAJOR-3 (review): a gate failure used to be a dead end — the SAME
-    # markers phase_graft already trusts for resumability
+  # Captured via `if`, not `graft_verify_import_completeness ... || { ... }`
+  # (review, BLOCKER-B): the two failure modes below need genuinely
+  # DIFFERENT handling, which requires the real exit code, not merely
+  # "was it zero" — an `if CMD; then ... else ...; fi` is the `set -e`-safe
+  # way to capture `$?` from a tested command (same exemption `||` gives,
+  # applied to an if/else instead) without a second, untested statement
+  # that `set -euo pipefail` could abort on before `$?` is ever read.
+  # NOT `if ! graft_verify_import_completeness ...; then local verify_rc=$?`
+  # (caught by direct testing, not assumed): `!` negates the CONDITION's
+  # own exit status, so `$?` inside a negated `if`'s `then` branch is 0 (the
+  # negated/true status), never the tested command's REAL exit code — the
+  # exact class of bug this rewrite exists to avoid elsewhere in this file.
+  # Un-negated `if CMD; then :; else verify_rc=$?; fi` does not have that
+  # problem: `$?` in the `else` branch is CMD's own real status.
+  if graft_verify_import_completeness "$run_dir" "$wxr_post_types_csv"; then
+    :
+  else
+    local verify_rc=$?
+    if [ "$verify_rc" -eq 2 ]; then
+      # BLOCKER-B (review): rc=2 means the run's own staged data is not
+      # trustworthy right now (no .xml where post_types were selected, or
+      # one that failed to parse — see graft_verify_import_completeness's
+      # own header) — NOT the same thing as issue #53's "wordpress-importer
+      # skipped a real, present item" (rc=1, below). Reproduced
+      # mechanically end to end: a run that finished SUCCESSFULLY, whose
+      # operator later deleted run_dir/export/*.xml (a real run dir's
+      # largest files, and an unremarkable cleanup action), then reran
+      # `sitegraft graft` against that same run_dir. The rc=1 branch below
+      # clears import_attachments.done/import.done/fetch_id_map.done and
+      # tells the operator a retry WILL work — which is true for rc=1
+      # (the staged WXR is fine; only B's import state was wrong) and
+      # actively DESTRUCTIVE for rc=2: a retry would trip
+      # graft_safety_step_done, rerun graft_prune_previous_run for real
+      # (deleting every post/attachment this tool had already correctly
+      # migrated onto B), and STILL fail afterward, because
+      # graft.export.done is untouched by either branch and the (now
+      # permanently empty) export step stays marked done, never
+      # regenerating the file the retry needed. No marker is touched
+      # here, on purpose: the run_dir's own resumability state is still
+      # accurate (every step it claims complete really did complete) —
+      # only its later, externally-removed DATA is missing, which
+      # clearing steps this tool did nothing wrong in cannot fix.
+      log_error "run directory ${run_dir} is missing (or has an unreadable/corrupt) staged WXR export, but its own markers say every earlier step already completed. This cannot self-heal via a simple retry — a retry would delete the content this run already migrated onto B while never regenerating the missing file, per issue #53/#54's own fix-pack (see graft_verify_import_completeness's header). No resumability marker was changed by this failure. Start a fresh run (scan -> plan -> backup -> graft) against a clean run directory, or restore B from the pre-graft backup if you suspect real data loss."
+      return 1
+    fi
+
+    # MAJOR-3 (review): rc=1 — a gate failure used to be a dead end — the
+    # SAME markers phase_graft already trusts for resumability
     # (import_attachments.done, import.done, fetch_id_map.done) were all
     # still sitting there from the run that just failed THIS check, so a
     # second `sitegraft graft` against the same run directory skipped
@@ -2226,7 +2331,9 @@ phase_graft() {
     # run left on B and resetting both mapping logs (graft_prune_previous_run's
     # own header) — before import is re-attempted from a clean slate,
     # rather than colliding with itself the way issue #53 originally
-    # described.
+    # described. Correct ONLY because rc=1 here means the staged WXR
+    # itself is fine (BLOCKER-B, above, is exactly the case where it is
+    # NOT, and takes a different branch instead).
     #
     # The message states what is actually true on B right now, not what
     # would be nice to claim (review, MAJOR-3): a partially migrated set of
@@ -2241,10 +2348,22 @@ phase_graft() {
     # mu_cleanup, sits after this gate and is simply never reached; a known,
     # separate, narrower gap than the one this fix-pack closes, called out
     # here rather than silently claimed away.
-    is_dry_run || rm -f "${run_dir}/graft.import_attachments.done" "${run_dir}/graft.import.done" "${run_dir}/graft.fetch_id_map.done"
+    #
+    # `|| log_warn ...`, not a bare `is_dry_run || rm -f ...` (review,
+    # MINOR-E): this whole branch runs inside an `if`, which is what
+    # exempts the OUTER `graft_verify_import_completeness` test from
+    # `set -euo pipefail` — it does not extend to every command
+    # sequentially inside this branch. An `rm -f` that fails for real (a
+    # read-only run_dir, e.g.) would otherwise abort phase_graft right
+    # here, before `log_error` below ever runs, with a bare undiagnosed
+    # nonzero exit instead of the message this whole fix exists to show.
+    if ! is_dry_run; then
+      rm -f "${run_dir}/graft.import_attachments.done" "${run_dir}/graft.import.done" "${run_dir}/graft.fetch_id_map.done" \
+        || log_warn "could not clear one or more resumability markers under ${run_dir} — a retry may not behave as described below"
+    fi
     log_error "B right now: a partially migrated set of posts from this run (each still carrying _sitegraft_source_id), plus the attachment(s) this run already imported. The mapping mu-plugin is removed automatically as this process exits; wordpress-importer's own plugin state on B has NOT been restored yet — that only happens once this gate passes. Re-running 'sitegraft graft' against this SAME run directory WILL retry: prune deletes everything this run left on B, then the WXR import runs again from scratch. If the same item(s) get skipped again, this will keep failing the same way — restore B from the pre-graft backup recorded under ${run_dir} instead, or resolve why wordpress-importer considers them pre-existing on B before retrying."
     return 1
-  }
+  fi
   graft_step_done "$run_dir" mu_cleanup    || { graft_remove_mu_plugin; graft_mark_step "$run_dir" mu_cleanup; }
   graft_step_done "$run_dir" importer_cleanup || { graft_restore_importer_state "$run_dir"; graft_mark_step "$run_dir" importer_cleanup; }
   graft_step_done "$run_dir" remap_ids     || { graft_remap_attachment_ids "${run_dir}/id-map.tsv" "$run_dir"; graft_mark_step "$run_dir" remap_ids; }
