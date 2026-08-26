@@ -48,3 +48,8 @@ tests/test_helper/bats-assert/
 # OS / editor
 .DS_Store
 *.log
+*.orig
+*.rej
+*.bak
+*~
+*.swp

@@ -88,6 +88,25 @@ cleanup() {
   # Same tidiness for the bare-local deletion-semantics check's own scratch
   # dir (unset until that block runs, hence the guard).
   [ -n "${BARE_TEST_DIR:-}" ] && rm -rf "${BARE_TEST_DIR}"
+  # Same again for assertion (e)'s mutated-WXR fixture's own scratch dir
+  # (review — measured live: an earlier version of assertion (e) wrote
+  # this file straight into RUN_DIR/export/, RUN_DIR's own directory,
+  # never cleaned up. graft_verify_import_completeness (issue #53's own
+  # completeness gate, unconditional, no marker of its own) scans EVERY
+  # .xml under export/ on every subsequent `graft`/`verify` call against
+  # this run_dir -- including the very next one, a few lines below this
+  # assertion, checking that a resume is a no-op -- so the leftover
+  # mutated fixture made that check, and the harness as a whole, die under
+  # `set -e` with no FAIL: line at all. RUN_DIR itself is deliberately
+  # preserved after this harness exits (see this function's own comment on
+  # $STATE_DIR, just below) for an operator to inspect -- writing a test
+  # fixture there was never sound regardless of cleanup, since a `graft`
+  # run days later against that same kept run_dir would hit the identical
+  # failure. A scratch dir OUTSIDE RUN_DIR removes the invariant violation
+  # at its root, rather than depending on a cleanup step that can itself be
+  # skipped if some assertion between the fixture's creation and its rm
+  # exits first under `set -e`.
+  [ -n "${MUTATED_WXR_DIR:-}" ] && rm -rf "${MUTATED_WXR_DIR}"
   # Deliberately NOT touching $STATE_DIR here (Viktor's review raised this,
   # not adopted): its run directories hold the backups and pre-restore
   # snapshots this harness explicitly promises to keep, so wiping them on
@@ -1241,13 +1260,51 @@ if ! graft_integrity_gate "$REAL_WXR" "$ALLOWED_TYPES"; then
   echo "FAIL: the integrity gate rejected graft's own real, unmutated WXR export — sanity check failed, negative test below would be meaningless" >&2
   exit 1
 fi
-MUTATED_WXR="${RUN_DIR}/export/mutated-with-injected-post-type.xml"
+# Written OUTSIDE RUN_DIR/export/, into this harness's own scratch dir
+# (review — a real bug, measured live, not hypothetical): an earlier
+# version of this assertion wrote MUTATED_WXR straight into RUN_DIR's own
+# export/ directory and never removed it. graft_verify_import_completeness
+# (issue #53's own completeness gate) scans EVERY .xml under export/ on
+# every subsequent graft/verify call against this run_dir, unconditionally
+# -- including the very next assertion below, re-running graft to check
+# that a resume is a no-op past the completed markers -- so the leftover
+# fixture made THAT check die under `set -e`, with no FAIL: line, well
+# past this assertion's own "confirmed" line. Exactly the behavior a real
+# operator hand-copying a WXR into export/, or leaving a stray file behind
+# from an earlier experiment against the same run_dir, would also trigger
+# -- sitegraft's own fail-closed design (see graft_verify_import_
+# completeness's own comment, lib/graft.sh, on why) is doing its job
+# correctly there; the bug was this harness creating exactly that
+# situation against its own kept run_dir and never cleaning up after
+# itself. MUTATED_WXR_DIR is registered with this script's own cleanup()
+# trap (see that function's own comment) so it is removed on ANY exit,
+# not only the happy path -- the run_dir's export/ is never touched at
+# all now, so this assertion no longer depends on cleanup running in order
+# to leave a resumable run_dir behind it.
+MUTATED_WXR_DIR=$(mktemp -d)
+MUTATED_WXR="${MUTATED_WXR_DIR}/mutated-with-injected-post-type.xml"
 # `</channel>` and `</rss>` land on SEPARATE lines in a real wp-cli export
 # (verified live — an earlier version of this sed matched them as one line,
 # which never matches, silently making "mutated" an exact copy of the
 # original and this whole negative assertion vacuous). Targeting the
 # `</channel>` line alone is what actually lands the injected line.
-sed 's#</channel>#<item><wp:post_type>injected_evil_type</wp:post_type></item>\
+#
+# `<wp:post_id>999999</wp:post_id>` is load-bearing here (review, reviewer's
+# own NIT — measured against this harness's own log, not assumed): the
+# injected item used to carry ONLY wp:post_type, no wp:post_id at all. As
+# of issue #73's own well-formedness check, THAT shape never reaches
+# `found_types`/the allowlist comparison at all — graft_integrity_gate
+# aborts earlier, on the items_seen-vs-items_emitted mismatch (see that
+# function's own comment), and "injected_evil_type" never gets compared
+# against $ALLOWED_TYPES. The FAIL: branch below would still catch a
+# regression (either abort path makes the `if` here true), but the
+# "confirmed" line following it claimed the ALLOWLIST specifically caught
+# this — which was no longer the mechanism actually exercised. Adding a
+# real post_id makes this item well-formed, so it genuinely reaches
+# found_types and the allowlist comparison is what rejects it; (e2) below
+# covers the no-post_id/well-formedness-check path as its own, honestly
+# named assertion instead of silently riding on this one.
+sed 's#</channel>#<item><wp:post_id>999999</wp:post_id><wp:post_type>injected_evil_type</wp:post_type></item>\
 </channel>#' "$REAL_WXR" > "$MUTATED_WXR"
 grep -q 'injected_evil_type' "$MUTATED_WXR" || { echo "FAIL: the mutation itself did not land in ${MUTATED_WXR} — the sed pattern didn't match this wp-cli export's actual line structure, the negative assertion below would be meaningless" >&2; exit 1; }
 if graft_integrity_gate "$MUTATED_WXR" "$ALLOWED_TYPES"; then
@@ -1255,6 +1312,28 @@ if graft_integrity_gate "$MUTATED_WXR" "$ALLOWED_TYPES"; then
   exit 1
 fi
 echo "==> confirmed: the integrity gate aborts on a real WXR file leaking an out-of-allowlist post_type, and passes the same file before mutation"
+
+echo "==> (e2) asserting the integrity gate ABORTS on a real WXR file carrying a malformed (no wp:post_id) item, via the well-formedness check rather than the allowlist (issue #73)"
+# The (e)'s own ORIGINAL shape, kept as its own separate, honestly-named
+# assertion (review, reviewer's own NIT) rather than folded silently into
+# (e): a malformed item -- structurally an <item>, but missing wp:post_id
+# -- never reaches found_types at all (lib/php/wxr-content-functions.php's
+# own _sitegraft_wxr_item_from_node requires BOTH wp:post_id and
+# wp:post_type before it recognizes an item), so graft_integrity_gate's
+# items_seen-vs-items_emitted check (issue #73, lib/php/wxr-item-ids-
+# cli.php) is what aborts here, not the allowlist -- a genuinely different
+# mechanism from (e) above, proven against a real wp-cli export the same
+# way.
+MUTATED_MALFORMED_WXR="${MUTATED_WXR_DIR}/mutated-with-malformed-item.xml"
+sed 's#</channel>#<item><wp:post_type>injected_evil_type</wp:post_type></item>\
+</channel>#' "$REAL_WXR" > "$MUTATED_MALFORMED_WXR"
+grep -q 'injected_evil_type' "$MUTATED_MALFORMED_WXR" || { echo "FAIL: the mutation itself did not land in ${MUTATED_MALFORMED_WXR} — the sed pattern didn't match this wp-cli export's actual line structure, the negative assertion below would be meaningless" >&2; exit 1; }
+if graft_integrity_gate "$MUTATED_MALFORMED_WXR" "$ALLOWED_TYPES"; then
+  echo "FAIL: the integrity gate ACCEPTED a WXR file carrying a malformed <item> (wp:post_type with no wp:post_id) — the items_seen/items_emitted well-formedness check (issue #73) is not working, and a forbidden post_type on a malformed item could pass the allowlist gate silently" >&2
+  exit 1
+fi
+rm -rf "$MUTATED_WXR_DIR"
+echo "==> confirmed: the integrity gate also aborts on a malformed (no wp:post_id) item, via the well-formedness check rather than the allowlist"
 
 echo "==> re-running graft is a no-op past the completed markers (marker-gated resumability, design doc §6.4)"
 "${ROOT}/bin/sitegraft" graft --profile "$PROFILE" --run "$RUN_DIR" --allow-stack-mismatch

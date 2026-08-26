@@ -98,3 +98,75 @@ setup() {
   [[ "$output" != *"unknown flag for plan"* ]] || false
   [[ "$output" == *"profile not found: does-not-exist"* ]] || false
 }
+
+# --- MINOR-2 (review): graft/verify require `php` up front -----------------
+#
+# graft_integrity_gate and graft_verify_import_completeness (both
+# lib/graft.sh, both security-relevant WXR gates as of issue #53/#54's
+# fix-pack) now invoke `php` for every real graft. Before this, a PATH
+# missing php stayed invisible until the `export` step deep inside
+# phase_graft -- well AFTER backup, media sync, prune, and attachment
+# import had already mutated B -- instead of failing in the first second,
+# the same way a missing jq/rsync already does via the existing
+# require_cmd calls right next to this one.
+#
+# _build_php_free_path (review, CI-found regression -- reproduced live,
+# not assumed): the FIRST version of these two tests built PATH from
+# hardcoded directories ("/usr/bin:/bin" plus a symlinked rsync from
+# `command -v rsync`'s own real location), reasoning that excluding
+# `/opt/homebrew/bin` -- the one directory holding php on the machine that
+# wrote the test -- was what isolated php out. True only on THAT machine.
+# On the GitHub Actions Ubuntu runner, php lives in /usr/bin, which the
+# test's own hardcoded PATH keeps -- so php resolves fine, require_cmd php
+# passes, "php" never appears in $output, and the assertion fails. The
+# test encoded one developer's filesystem layout instead of the property
+# it exists to prove ("php is absent") -- exactly the class of bug this
+# whole fix-pack spent its nights on, this time caught by CI running
+# somewhere other than where the test was written.
+#
+# Deterministic instead: walk every directory actually in $PATH (whatever
+# they are, on whatever machine or CI runner this executes on) and symlink
+# every executable found in each -- except any literally named "php" --
+# into one isolated directory, first match per name wins (same precedence
+# order the real PATH already had). This carries over jq/rsync/bash/every
+# coreutil bin/sitegraft's own preamble needs (mktemp, at lib/core.sh's
+# own source time, for SITEGRAFT_TMP_REGISTRY, before either test's own
+# `graft`/`verify` case is ever reached) from wherever they actually live,
+# on any layout, while genuinely never placing php on the resulting PATH
+# regardless of which directory happens to hold it.
+_build_php_free_path() {
+  local target="$1"
+  mkdir -p "$target"
+  local old_ifs="$IFS" dir entry base
+  IFS=':'
+  # shellcheck disable=SC2086 # intentionally unquoted: splitting $PATH on IFS=':' is the whole point
+  for dir in $PATH; do
+    IFS="$old_ifs"
+    [ -n "$dir" ] && [ -d "$dir" ] || continue
+    for entry in "$dir"/*; do
+      [ -e "$entry" ] || continue
+      base=$(basename "$entry")
+      [ "$base" = "php" ] && continue
+      [ -e "${target}/${base}" ] && continue
+      ln -s "$entry" "${target}/${base}" 2>/dev/null || true
+    done
+    IFS=':'
+  done
+  IFS="$old_ifs"
+}
+
+@test "sitegraft graft fails fast (before any mutation) when php is not on PATH" {
+  local isolated_bin="$BATS_TEST_TMPDIR/isolated-bin"
+  _build_php_free_path "$isolated_bin"
+  PATH="$isolated_bin" run "$SITEGRAFT_BIN" graft --profile does-not-exist
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"php"* ]] || false
+}
+
+@test "sitegraft verify fails fast when php is not on PATH" {
+  local isolated_bin="$BATS_TEST_TMPDIR/isolated-bin"
+  _build_php_free_path "$isolated_bin"
+  PATH="$isolated_bin" run "$SITEGRAFT_BIN" verify --profile does-not-exist
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"php"* ]] || false
+}

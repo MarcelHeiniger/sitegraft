@@ -5,8 +5,12 @@
  * guards). Pure PHP, no WordPress bootstrap: XMLReader — the same
  * "directly testable with a bare `php` CLI" property lib/php/content-remap-
  * functions.php's own pure functions have (see that file's own header for
- * why that property matters here), and `require`d alongside it by
- * lib/php/verify-content-remap-cli.php, this file's only production caller.
+ * why that property matters here). Two production callers as of issue #72:
+ * lib/php/verify-content-remap-cli.php (`require`s it alongside content-
+ * remap-functions.php) and lib/php/wxr-item-ids-cli.php (behind
+ * lib/graft.sh's graft_integrity_gate and graft_verify_import_completeness
+ * — the security/completeness gates a hand-edited or malicious WXR file
+ * must not be able to quietly defeat).
  *
  * Streamed with XMLReader, NOT DOMDocument::loadXML() on the whole
  * document (issue #52 fix-pack, review finding M1 — measured, not assumed):
@@ -122,43 +126,68 @@ function sitegraft_parse_wxr_items_from_file( $file_path ) {
 }
 
 /**
- * sitegraft_stream_wxr_items_from_string( string $xml_string, callable $emit ): bool
- * sitegraft_stream_wxr_items_from_file( string $file_path, callable $emit ): bool
+ * sitegraft_stream_wxr_items_from_string( string $xml_string, callable $emit, &$items_seen = null ): bool
+ * sitegraft_stream_wxr_items_from_file( string $file_path, callable $emit, &$items_seen = null ): bool
  *
- * The actual streaming entry points: $emit is called once per <item>, with
- * that item's array (see _sitegraft_wxr_item_from_node below for its
- * shape), as soon as it is read — never all items held in memory by THIS
- * layer. sitegraft_parse_wxr_items(_from_file) above are the array-
- * collecting convenience wrappers most callers actually want; a caller
- * that itself needs to stay memory-bounded across a very large export can
- * call these directly and process each item as it arrives instead of
- * collecting them all.
+ * The actual streaming entry points: $emit is called once per WELL-FORMED
+ * <item> (one carrying both wp:post_id and wp:post_type — see
+ * _sitegraft_wxr_item_from_node below), with that item's array, as soon as
+ * it is read — never all items held in memory by THIS layer.
+ * sitegraft_parse_wxr_items(_from_file) above are the array-collecting
+ * convenience wrappers most callers actually want; a caller that itself
+ * needs to stay memory-bounded across a very large export can call these
+ * directly and process each item as it arrives instead of collecting them
+ * all.
+ *
+ * $items_seen (issue #73 — a real gate-bypass measured against a real
+ * harness, not a theoretical hardening): an optional by-reference OUT
+ * parameter, set to the number of `<item>` ELEMENTS this call encountered
+ * structurally, regardless of whether each one turned out well-formed
+ * enough to reach $emit. A caller that only reads $emit's own items has no
+ * way to tell "this document had 3 well-formed items and nothing else"
+ * apart from "this document had 3 well-formed items AND one malformed one
+ * that was silently dropped" — for a caller enforcing or verifying
+ * something SECURITY-relevant about every <item> in the file (e.g.
+ * lib/graft.sh's graft_integrity_gate, checking post_type against an
+ * allowlist), that distinction is the whole point: a malformed item is
+ * exactly where a value the allowlist was supposed to catch could be
+ * hiding. Comparing this against a running count of $emit's own calls
+ * lets such a caller fail closed on any mismatch, instead of only ever
+ * seeing the items that happened to parse. Omitted by a caller that
+ * doesn't pass a variable (the default, `null`) — every existing call
+ * site before this parameter existed keeps working unchanged; the
+ * driver internally always initializes it to `0` regardless, so a
+ * caller that DOES pass one never reads an uninitialized value even on a
+ * document with zero items or an early failure.
  */
-function sitegraft_stream_wxr_items_from_string( $xml_string, callable $emit ) {
+function sitegraft_stream_wxr_items_from_string( $xml_string, callable $emit, &$items_seen = null ) {
 	// PHP 8's XMLReader::XML() throws a ValueError (a real fatal, not
 	// something `@` silences) on an empty string rather than simply
 	// failing to open -- guarded explicitly so "empty input" fails closed
 	// the same way every other unparsable input does, never a crash.
+	$items_seen = 0;
 	if ( '' === $xml_string ) {
 		return false;
 	}
 	$reader = new XMLReader();
 	$previous = libxml_use_internal_errors( true );
 	$opened = @$reader->XML( $xml_string, null, LIBXML_NONET );
-	return _sitegraft_stream_wxr_reader( $reader, $opened, $previous, $emit );
+	return _sitegraft_stream_wxr_reader( $reader, $opened, $previous, $emit, $items_seen );
 }
 
-function sitegraft_stream_wxr_items_from_file( $file_path, callable $emit ) {
+function sitegraft_stream_wxr_items_from_file( $file_path, callable $emit, &$items_seen = null ) {
+	$items_seen = 0;
 	$reader = new XMLReader();
 	$previous = libxml_use_internal_errors( true );
 	$opened = @$reader->open( (string) $file_path, null, LIBXML_NONET );
-	return _sitegraft_stream_wxr_reader( $reader, $opened, $previous, $emit );
+	return _sitegraft_stream_wxr_reader( $reader, $opened, $previous, $emit, $items_seen );
 }
 
 /**
  * _sitegraft_stream_wxr_reader( XMLReader $reader, bool $opened, bool
- * $previous_error_setting, callable $emit ): bool — shared driver loop for
- * both entry points above. Fails CLOSED: any of "could not open/parse at
+ * $previous_error_setting, callable $emit, &$items_seen = null ): bool —
+ * shared driver loop for both entry points above (see their own docblock
+ * for what $items_seen is and why). Fails CLOSED: any of "could not open/parse at
  * all", "libxml recorded a FATAL parse error along the way", or "the
  * document had no nodes whatsoever" (an empty file — not the same as a
  * well-formed-but-itemless one, which DOES have root/channel nodes before
@@ -178,7 +207,10 @@ function sitegraft_stream_wxr_items_from_file( $file_path, callable $emit ) {
  * LIBXML_ERR_FATAL (level 3 — the document is genuinely unusable past
  * this point) fails the parse now.
  */
-function _sitegraft_stream_wxr_reader( XMLReader $reader, $opened, $previous_error_setting, callable $emit ) {
+function _sitegraft_stream_wxr_reader( XMLReader $reader, $opened, $previous_error_setting, callable $emit, &$items_seen = null ) {
+	if ( null === $items_seen ) {
+		$items_seen = 0;
+	}
 	if ( ! $opened ) {
 		libxml_clear_errors();
 		libxml_use_internal_errors( $previous_error_setting );
@@ -227,6 +259,15 @@ function _sitegraft_stream_wxr_reader( XMLReader $reader, $opened, $previous_err
 		if ( $reader->nodeType === XMLReader::ELEMENT
 			&& $reader->localName === 'item'
 			&& $reader->namespaceURI === '' ) {
+			// Counted for EVERY <item> element matched here, regardless of
+			// whether it turns out well-formed enough to $emit() below
+			// (review, issue #73 -- see this function's own header for why
+			// this exists and what it closed). Incremented in the exact
+			// branch that decides "this is an <item>", not by a second,
+			// independent traversal -- guaranteed to move in lockstep with
+			// $emit, never able to drift from it the way a separate
+			// item-counting pass could.
+			$items_seen++;
 			// @-suppressed like read()/next() above -- a truncated/unclosed
 			// document can make expand() emit a PHP-level warning on top of
 			// libxml's own recorded error; the explicit instanceof check right

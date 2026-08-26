@@ -395,3 +395,92 @@ XML
   run jq -e '. == [{"post_id":1,"post_type":"page","post_content":"hi","post_excerpt":""}]' <<< "$output"
   [ "$status" -eq 0 ]
 }
+
+# --- $items_seen (issue #73) -------------------------------------------
+#
+# A real gate-bypass, measured against a real DDEV harness run before
+# this fix, not a theoretical hardening: without a way to tell "N <item>
+# elements were structurally present" apart from "N well-formed items
+# were emitted", a caller enforcing something about EVERY item in a WXR
+# file (e.g. lib/graft.sh's graft_integrity_gate, an allowlist check) had
+# no way to notice a malformed <item> silently vanishing from its own
+# view of the file -- exactly where a value the allowlist exists to catch
+# could be hiding. See lib/php/wxr-item-ids-cli.php's own header for the
+# full mechanism and the real reproduction this closes.
+
+@test "sitegraft_stream_wxr_items_from_file reports items_seen equal to items_emitted when every item is well-formed" {
+  local xml_file="$BATS_TEST_TMPDIR/all-well-formed.xml"
+  wxr_wrap '<item><wp:post_id>1</wp:post_id><wp:post_type>page</wp:post_type></item>
+<item><wp:post_id>2</wp:post_id><wp:post_type>post</wp:post_type></item>' > "$xml_file"
+  run php -r "
+    require '${PHP_LIB}';
+    \$emitted = 0;
+    \$ok = sitegraft_stream_wxr_items_from_file('${xml_file}', function (\$item) use (&\$emitted) { \$emitted++; }, \$seen);
+    echo json_encode(['ok' => \$ok, 'seen' => \$seen, 'emitted' => \$emitted]);
+  "
+  [ "$status" -eq 0 ]
+  run jq -e '.ok == true and .seen == 2 and .emitted == 2' <<< "$output"
+  [ "$status" -eq 0 ]
+}
+
+@test "sitegraft_stream_wxr_items_from_file reports items_seen GREATER than items_emitted when one item is malformed (the exact harness reproduction)" {
+  local xml_file="$BATS_TEST_TMPDIR/one-malformed.xml"
+  # A real, well-formed item, plus a SECOND <item> carrying only
+  # wp:post_type -- no wp:post_id at all -- the exact shape the DDEV
+  # harness injected into a real wp-cli export to prove the leak gate
+  # bypassable.
+  wxr_wrap '<item><wp:post_id>101</wp:post_id><wp:post_type>page</wp:post_type></item>
+<item><wp:post_type>injected_evil_type</wp:post_type></item>' > "$xml_file"
+  run php -r "
+    require '${PHP_LIB}';
+    \$emitted = 0;
+    \$ok = sitegraft_stream_wxr_items_from_file('${xml_file}', function (\$item) use (&\$emitted) { \$emitted++; }, \$seen);
+    echo json_encode(['ok' => \$ok, 'seen' => \$seen, 'emitted' => \$emitted]);
+  "
+  [ "$status" -eq 0 ]
+  run jq -e '.ok == true and .seen == 2 and .emitted == 1' <<< "$output"
+  [ "$status" -eq 0 ]
+}
+
+@test "sitegraft_stream_wxr_items_from_file reports items_seen 0 for a genuinely itemless document" {
+  local xml_file="$BATS_TEST_TMPDIR/no-items.xml"
+  wxr_wrap '' > "$xml_file"
+  run php -r "
+    require '${PHP_LIB}';
+    \$emitted = 0;
+    \$ok = sitegraft_stream_wxr_items_from_file('${xml_file}', function (\$item) use (&\$emitted) { \$emitted++; }, \$seen);
+    echo json_encode(['ok' => \$ok, 'seen' => \$seen, 'emitted' => \$emitted]);
+  "
+  [ "$status" -eq 0 ]
+  run jq -e '.ok == true and .seen == 0 and .emitted == 0' <<< "$output"
+  [ "$status" -eq 0 ]
+}
+
+@test "sitegraft_stream_wxr_items_from_file called with no items_seen argument at all still works (every pre-existing caller)" {
+  local xml_file="$BATS_TEST_TMPDIR/plain.xml"
+  wxr_wrap '<item><wp:post_id>1</wp:post_id><wp:post_type>page</wp:post_type></item>' > "$xml_file"
+  run php -r "
+    require '${PHP_LIB}';
+    \$emitted = 0;
+    \$ok = sitegraft_stream_wxr_items_from_file('${xml_file}', function (\$item) use (&\$emitted) { \$emitted++; });
+    echo json_encode(['ok' => \$ok, 'emitted' => \$emitted]);
+  "
+  [ "$status" -eq 0 ]
+  run jq -e '.ok == true and .emitted == 1' <<< "$output"
+  [ "$status" -eq 0 ]
+}
+
+@test "sitegraft_stream_wxr_items_from_string also reports items_seen (the string-based entry point, same reader underneath)" {
+  local xml
+  xml=$(wxr_wrap '<item><wp:post_id>1</wp:post_id><wp:post_type>page</wp:post_type></item>
+<item><wp:post_type>injected_evil_type</wp:post_type></item>')
+  run php -r "
+    require '${PHP_LIB}';
+    \$emitted = 0;
+    \$ok = sitegraft_stream_wxr_items_from_string(file_get_contents('php://stdin'), function (\$item) use (&\$emitted) { \$emitted++; }, \$seen);
+    echo json_encode(['ok' => \$ok, 'seen' => \$seen, 'emitted' => \$emitted]);
+  " <<< "$xml"
+  [ "$status" -eq 0 ]
+  run jq -e '.ok == true and .seen == 2 and .emitted == 1' <<< "$output"
+  [ "$status" -eq 0 ]
+}
