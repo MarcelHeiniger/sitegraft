@@ -423,7 +423,7 @@ EOF
 # with the identical assertions the BLOCKER-2 test above already uses,
 # only the WXR's own layout differs (adjacent, no separating whitespace,
 # instead of one item's own tags sharing a line).
-@test "graft_verify_import_completeness catches a skipped item even when it is a sibling <item> with NO whitespace before it (BLOCKER-A / issue #70 -- expected RED until #70 merges)" {
+@test "graft_verify_import_completeness catches a skipped item even when it is a sibling <item> with NO whitespace before it (BLOCKER-A / issue #70)" {
   local run_dir="$BATS_TEST_TMPDIR/run"
   mkdir -p "${run_dir}/export"
   cat > "${run_dir}/export/export.xml" <<'EOF'

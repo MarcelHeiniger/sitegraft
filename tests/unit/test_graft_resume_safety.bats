@@ -546,7 +546,7 @@ FAKEWP
   chmod +x "$path"
 }
 
-@test "BLOCKER-A acceptance: a real graft run catches a skip on a whitespace-less sibling <item> (issue #70 -- expected RED until #70 merges)" {
+@test "BLOCKER-A acceptance: a real graft run catches a skip on a whitespace-less sibling <item> (issue #70)" {
   local sitegraft_bin="${BATS_TEST_DIRNAME}/../../bin/sitegraft"
   local fake_wp="$BATS_TEST_TMPDIR/fake-wp"
   _write_fake_wp_success_with_skip_no_whitespace "$fake_wp"
