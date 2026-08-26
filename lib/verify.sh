@@ -489,6 +489,290 @@ verify_nav_present() {
   echo "NAV:verified:${count}"
 }
 
+# _verify_wxr_items_remapped <run_dir> <id_map_tsv> <manifest_json> — issue
+# #52 shared helper behind both content-equality guards below. Parses A's
+# already-exported WXR file(s) (${run_dir}/export/*.xml, written by
+# graft_export_wxr, lib/graft.sh, and still on disk after the run) and
+# rewrites each item's content/excerpt with the SAME two remaps graft
+# itself applies (lib/php/content-remap-functions.php's
+# sitegraft_remap_attachment_refs/sitegraft_remap_domain) — entirely on the
+# orchestrator, via lib/php/verify-content-remap-cli.php (no network call
+# to A or B for this step; see that file's own header for the full
+# reasoning, and ADR 0008's "Required regardless" list for why this must
+# compare against "the value graft was supposed to produce", not A's raw
+# bytes).
+#
+# Three-valued, like verify_page_on_front/verify_domain_absent (see their
+# own header comments for the same reasoning): 0 + a JSON array on stdout =
+# genuinely parsed — including a legitimate, real "[]" when this run's
+# migrate selection has no non-attachment post_type at all, which is
+# nothing to check, not an error; 2 = INCOMPLETE, post_types ARE selected
+# but no WXR export was found in run_dir (an interrupted run resumed past
+# the export step — this function's own data source was never produced,
+# the same "0 of N" shape issue #23 already established elsewhere in this
+# file); 1 = HARD FAIL, the php driver itself could not run or did not
+# return valid JSON — the tool's own machinery is broken right now, not
+# merely "nothing was ready yet" (the identical fail-closed distinction
+# verify_domain_absent's own comment draws for its `wp eval` failure path).
+_verify_wxr_items_remapped() {
+  local run_dir="$1" id_map_tsv="$2" manifest="$3"
+
+  local post_types_csv
+  post_types_csv=$(echo "$manifest" | jq -r '[.migrate[].post_types[]?] | unique | map(select(. != "attachment")) | join(",")')
+  [ -n "$post_types_csv" ] || { echo '[]'; return 0; }
+
+  # Portable glob-existence check (bash 3.2, no nullglob — same idiom
+  # lib/graft.sh's own `for f in "${staging}"/*.xml` loops use): an
+  # unmatched glob is left as the literal pattern string, so `[ -e "$f" ]`
+  # is what tells "found nothing" apart from "found real file(s)".
+  local wxr_files=() f
+  for f in "${run_dir}"/export/*.xml; do
+    [ -e "$f" ] && wxr_files+=("$f")
+  done
+  if [ "${#wxr_files[@]}" -eq 0 ]; then
+    log_error "post_type(s) ${post_types_csv} are selected for migration but no WXR export was found under ${run_dir}/export — the export step never ran (an interrupted run resumed past it?), so migrated content cannot be verified against it"
+    return 2
+  fi
+
+  # id-map.tsv's own attachment rows ARE the attachment id-remap map
+  # graft_remap_attachment_ids builds from (lib/graft.sh) — reused
+  # verbatim, never a second, independently-drifting reconstruction of
+  # "which attachment IDs actually changed this run".
+  local attachments_json domain_from domain_to
+  attachments_json='[]'
+  [ -f "$id_map_tsv" ] && attachments_json=$(awk -F'\t' '$3=="attachment"{printf "%s\t%s\n", $1, $2}' "$id_map_tsv" \
+    | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {old: .[0], new: .[1]})')
+  domain_from=$(echo "$manifest" | jq -r '.options.search_replace.from // ""')
+  domain_to=$(echo "$manifest" | jq -r '.options.search_replace.to // ""')
+  # Same "null" -> "" mapping lib/graft.sh's own phase_graft applies to
+  # these same two manifest keys (a hand-written manifest — manifest_new
+  # always populates them, but a hand-edited one might carry a literal
+  # `null` — see phase_graft's own comment on this exact pair).
+  [ "$domain_from" = "null" ] && domain_from=""
+  [ "$domain_to" = "null" ] && domain_to=""
+
+  local wxr_files_json
+  wxr_files_json=$(printf '%s\n' "${wxr_files[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+  local payload_json payload_file
+  payload_json=$(jq -n --argjson files "$wxr_files_json" --argjson attachments "$attachments_json" \
+    --arg from "$domain_from" --arg to "$domain_to" \
+    '{wxr_files: $files, attachments: $attachments, nav_post_type: "wp_navigation", domain: {from: $from, to: $to}}')
+  payload_file="${run_dir}/.verify-content-payload.json"
+  printf '%s' "$payload_json" > "$payload_file"
+  chmod 600 "$payload_file" 2>/dev/null || true
+
+  # stderr captured SEPARATELY from stdout — stdout on success is the JSON
+  # result and must never be contaminated by a diagnostic line the driver
+  # also happened to print. `&&`/`||`, not a bare assignment (the same
+  # set -e pitfall verify_domain_absent's own comment documents at length).
+  local stderr_file="${run_dir}/.verify-content-stderr"
+  local result rc
+  result=$(php "${SITEGRAFT_ROOT}/lib/php/verify-content-remap-cli.php" "$payload_file" 2>"$stderr_file") && rc=0 || rc=$?
+  local err_text=""
+  [ -s "$stderr_file" ] && err_text=$(cat "$stderr_file")
+  rm -f "$payload_file" "$stderr_file"
+
+  if [ "$rc" -ne 0 ]; then
+    log_error "could not parse/remap A's exported WXR for the content-equality guard(s): ${err_text}"
+    return 1
+  fi
+  echo "$result" | jq -e . >/dev/null 2>&1 || {
+    log_error "the WXR content-remap driver did not return valid JSON: ${result}"
+    return 1
+  }
+  printf '%s' "$result"
+}
+
+# verify_migrated_content_matches_source <run_dir> <id_map_tsv> <manifest>
+# — issue #52 / ADR 0008's "Required regardless" list, guard 1: for every
+# post THIS run actually imported (every non-attachment row in
+# id-map.tsv), B's LIVE post_content/post_excerpt must equal A's after the
+# same domain and ID remaps graft itself applies
+# (_verify_wxr_items_remapped, above) — not A's raw bytes.
+#
+# Scope is deliberately id-map.tsv's own rows: an item wordpress-importer
+# SKIPPED never reaches id-map.tsv at all (ADR 0008's Context section;
+# issue #53), so it is never "migrated" by this function's own definition
+# of the word — that is exactly what verify_migrated_content_changed_
+# from_pregraft (below) exists to catch instead. The two guards are
+# deliberately complementary, not redundant: this one proves an imported
+# post got the RIGHT content; the other proves a post that was supposed to
+# change actually did.
+#
+# Marker convention matches verify_options_match's own OPTIONS_COMPARED
+# line: `CONTENT_MATCH:<compared>:<total>` on stdout, always, whether this
+# ultimately passes or hard-fails — <total> is every non-attachment
+# id-map.tsv row in scope; <compared> is how many actually had a B row
+# fetched AND a WXR item to compare against (a row missing either is
+# logged and treated as a mismatch below, never silently dropped from
+# <total>, and never silently counted as <compared> either).
+verify_migrated_content_matches_source() {
+  local run_dir="$1" id_map_tsv="$2" manifest="$3"
+
+  local post_types_csv
+  post_types_csv=$(echo "$manifest" | jq -r '[.migrate[].post_types[]?] | unique | map(select(. != "attachment")) | join(",")')
+  [ -n "$post_types_csv" ] || { echo "CONTENT_MATCH:not-selected"; return 0; }
+
+  local items_json rc
+  items_json=$(_verify_wxr_items_remapped "$run_dir" "$id_map_tsv" "$manifest") && rc=0 || rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+
+  local rows_json='[]'
+  [ -f "$id_map_tsv" ] && rows_json=$(awk -F'\t' '$3 != "attachment"{printf "%s\t%s\t%s\n", $1, $2, $3}' "$id_map_tsv" \
+    | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {old_id: (.[0]|tonumber), new_id: (.[1]|tonumber), post_type: .[2]})')
+
+  local total; total=$(echo "$rows_json" | jq 'length')
+  if [ "$total" -eq 0 ]; then
+    echo "CONTENT_MATCH:0:0"
+    return 0
+  fi
+
+  local new_ids_csv live_json
+  new_ids_csv=$(echo "$rows_json" | jq -r '[.[].new_id] | join(",")')
+  live_json=$(wp_remote b post list --post__in="$new_ids_csv" --fields=ID,post_content,post_excerpt --format=json 2>/dev/null || echo '[]')
+  echo "$live_json" | jq -e . >/dev/null 2>&1 || live_json='[]'
+
+  local compared=0 mismatched=""
+  local row old_id new_id expected_content expected_excerpt live_row actual_content actual_excerpt found
+  # fd 3, not stdin — same convention/reason as every other id-map.tsv-
+  # derived loop in this codebase (lib/graft.sh's own comment on this
+  # exact pattern): nothing in this loop shells out to ssh today, but
+  # matching the established convention up front costs nothing and keeps
+  # a future edit from silently reintroducing that class of bug.
+  while IFS= read -r row <&3; do
+    [ -n "$row" ] || continue
+    old_id=$(echo "$row" | jq -r '.old_id')
+    new_id=$(echo "$row" | jq -r '.new_id')
+    found=$(echo "$items_json" | jq --argjson id "$old_id" '[.[] | select(.post_id == $id)] | length')
+    if [ "$found" -eq 0 ]; then
+      mismatched="${mismatched}${new_id}(no-source-item) "
+      continue
+    fi
+    expected_content=$(echo "$items_json" | jq -r --argjson id "$old_id" '[.[] | select(.post_id == $id)][0].post_content')
+    expected_excerpt=$(echo "$items_json" | jq -r --argjson id "$old_id" '[.[] | select(.post_id == $id)][0].post_excerpt')
+    live_row=$(echo "$live_json" | jq -c --argjson id "$new_id" '[.[] | select(.ID == $id)][0] // empty')
+    if [ -z "$live_row" ]; then
+      mismatched="${mismatched}${new_id}(not-found-on-b) "
+      continue
+    fi
+    compared=$((compared + 1))
+    actual_content=$(echo "$live_row" | jq -r '.post_content')
+    actual_excerpt=$(echo "$live_row" | jq -r '.post_excerpt')
+    if [ "$actual_content" != "$expected_content" ] || [ "$actual_excerpt" != "$expected_excerpt" ]; then
+      mismatched="${mismatched}${new_id} "
+    fi
+  done 3<<< "$(echo "$rows_json" | jq -c '.[]')"
+
+  echo "CONTENT_MATCH:${compared}:${total}"
+  if [ -n "$mismatched" ]; then
+    log_error "migrated post content does not match A's (after the same remaps graft applies), post ID(s) on B: ${mismatched}"
+    return 1
+  fi
+}
+
+# verify_migrated_content_changed_from_pregraft <run_dir> <id_map_tsv>
+# <manifest> — issue #52 / ADR 0008's "Required regardless" list, guard 2:
+# the cheaper, non-normalizable guard that ALONE would have caught the
+# observed defect (this file's own module header; ADR 0008's Context
+# section). A WXR item wordpress-importer SKIPPED (never reaches
+# id-map.tsv — see verify_migrated_content_matches_source's own comment
+# and issue #53) leaves B's own pre-existing row untouched. If that row's
+# content checksum on B TODAY is IDENTICAL to the checksum
+# backup_compute_content_checksums recorded for it BEFORE the graft ran
+# (lib/backup.sh, manifest.content_checksums_pre_graft), the row was never
+# actually touched — confirmed-wrong, not merely unverified.
+#
+# Pairing is by POST ID, deliberately NOT a title+post_date+post_type
+# replication of wordpress-importer's own post_exists() matching: A and B
+# share IDs in the dominant real-world case ADR 0008 describes (both sites
+# are clones of one origin database — "A's front page and B's front page
+# were both ID 16"), which is exactly the case that produced the observed
+# defect. This is a DELIBERATE, DOCUMENTED scope limit, not an oversight:
+# for a from-scratch A whose IDs do not collide with B's at all, a skipped
+# item's old_id simply will not be a key in content_checksums_pre_graft,
+# and this guard reports nothing for it — neither a false pass nor a false
+# fail. That case is issue #53's job (surfacing an "already exists" skip
+# directly, at the source), not this guard's job to mis-detect via a
+# coincidental, wrong pairing.
+#
+# A run whose manifest has no content_checksums_pre_graft key AT ALL (a
+# run from before this feature existed) is INCOMPLETE (2), never a silent
+# pass: a relevé that cannot be produced after the fact is not a relevé —
+# see lib/backup.sh's backup_compute_content_checksums for where and why
+# it is captured, and why it cannot be reconstructed later.
+#
+# Marker convention: `CONTENT_UNCHANGED:<checked>:<skipped>` on stdout —
+# <skipped> is every WXR item (non-attachment) whose old_id is NOT in
+# id-map.tsv at all (i.e. not genuinely imported this run); <checked> is
+# how many of those ALSO had a pre-graft checksum recorded for that same
+# id (the only ones this guard can actually say anything about).
+verify_migrated_content_changed_from_pregraft() {
+  local run_dir="$1" id_map_tsv="$2" manifest="$3"
+
+  local post_types_csv
+  post_types_csv=$(echo "$manifest" | jq -r '[.migrate[].post_types[]?] | unique | map(select(. != "attachment")) | join(",")')
+  [ -n "$post_types_csv" ] || { echo "CONTENT_UNCHANGED:not-selected"; return 0; }
+
+  local items_json rc
+  items_json=$(_verify_wxr_items_remapped "$run_dir" "$id_map_tsv" "$manifest") && rc=0 || rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+
+  local imported_ids_json='[]'
+  [ -f "$id_map_tsv" ] && imported_ids_json=$(awk -F'\t' '$3 != "attachment"{print $1}' "$id_map_tsv" \
+    | jq -R -s -c 'split("\n") | map(select(length > 0) | tonumber)')
+
+  local skipped_json
+  skipped_json=$(jq -n --argjson items "$items_json" --argjson imported "$imported_ids_json" \
+    '([$items[] | select(.post_type != "attachment") | .post_id] | unique) - $imported')
+  local skipped_total; skipped_total=$(echo "$skipped_json" | jq 'length')
+
+  # The pre-graft snapshot is only REQUIRED once there is something to pair
+  # it against — a run with nothing skipped genuinely has nothing for this
+  # guard to say, snapshot or no snapshot, and must not be marked
+  # INCOMPLETE over a gap that would never have been consulted. A run with
+  # at least one skipped item AND no content_checksums_pre_graft key at
+  # all (this run's manifest predates the snapshot, lib/backup.sh's
+  # backup_compute_content_checksums) genuinely cannot say whether those
+  # items are unchanged — a relevé that cannot be produced after the fact
+  # is not a relevé.
+  if [ "$skipped_total" -gt 0 ] && ! echo "$manifest" | jq -e 'has("content_checksums_pre_graft")' >/dev/null 2>&1; then
+    log_error "${skipped_total} WXR item(s) selected for migration were not imported this run, and this run's manifest has no content_checksums_pre_graft to check them against — it predates the pre-graft content-checksum snapshot. Re-run backup and graft against a sitegraft version that records it."
+    return 2
+  fi
+
+  local pre_graft; pre_graft=$(echo "$manifest" | jq -c '.content_checksums_pre_graft // {}')
+
+  local paired_json
+  paired_json=$(jq -n --argjson skipped "$skipped_json" --argjson pre "$pre_graft" \
+    '[$skipped[] | select($pre[(.|tostring)] != null)]')
+  local checked; checked=$(echo "$paired_json" | jq 'length')
+
+  echo "CONTENT_UNCHANGED:${checked}:${skipped_total}"
+  [ "$checked" -gt 0 ] || return 0
+
+  local ids_csv live_json
+  ids_csv=$(echo "$paired_json" | jq -r 'join(",")')
+  live_json=$(wp_remote b post list --post__in="$ids_csv" --fields=ID,post_content,post_excerpt --format=json 2>/dev/null || echo '[]')
+  echo "$live_json" | jq -e . >/dev/null 2>&1 || live_json='[]'
+
+  local unchanged=""
+  local id live_row current_sum pre_sum
+  while IFS= read -r id <&3; do
+    [ -n "$id" ] || continue
+    live_row=$(echo "$live_json" | jq -c --argjson id "$id" '[.[] | select(.ID == $id)][0] // empty')
+    [ -n "$live_row" ] || continue
+    current_sum="sha256:$(backup_content_checksum_of_row "$live_row")"
+    pre_sum=$(echo "$pre_graft" | jq -r --arg id "$id" '.[$id]')
+    [ "$current_sum" = "$pre_sum" ] && unchanged="${unchanged}${id} "
+  done 3<<< "$(echo "$paired_json" | jq -c '.[]')"
+
+  if [ -n "$unchanged" ]; then
+    log_error "post(s) B already had, matching an item this run intended to migrate, are still byte-identical to their pre-graft state — the migration for these silently did not happen (an \"already exists\" import skip, or a write that never landed), post ID(s) on B: ${unchanged}"
+    return 1
+  fi
+}
+
 # verify_http_smoke <url> [expected_marker] — design doc §6.5: best-effort
 # (curl -sS -o /dev/null -w '%{http_code}') that B's root URL returns 200.
 # Deliberately best-effort, not a hard-fail gate on its own absence: a URL is
@@ -933,6 +1217,72 @@ phase_verify() {
         echo "- [ ] expected navigation: **UNVERIFIED — the check reported success without saying which of its outcomes applied** (a success path added without its marker — see lib/verify.sh's verify_nav_present)" >> "$report"
         incomplete=$((incomplete + 1))
         incomplete_names="${incomplete_names}navigation "
+        ;;
+    esac
+  fi
+
+  # --- migrated content matches A's, after the same remaps graft applies —
+  # issue #52 / ADR 0008's "Required regardless" list, guard 1. Three-valued
+  # exactly like page_on_front/navigation above (0/1/2, never folded). -------
+  local content_match_output="" content_match_rc=0
+  content_match_output=$(verify_migrated_content_matches_source "$run_dir" "$id_map_tsv" "$manifest" 2>>"$report") || content_match_rc=$?
+  if [ "$content_match_rc" -eq 1 ]; then
+    echo "- [ ] **HARD FAIL: migrated post content does not match A's (after remap) on B** — see above" >> "$report"
+    hard_fail=1
+  elif [ "$content_match_rc" -eq 2 ]; then
+    echo "- [ ] migrated content matches A's: **UNVERIFIED — no WXR export found for this run's migrate selection** (see above; not a hard fail on its own, but not a pass)" >> "$report"
+    incomplete=$((incomplete + 1))
+    incomplete_names="${incomplete_names}migrated-content "
+  else
+    case "$content_match_output" in
+      *CONTENT_MATCH:not-selected*)
+        echo "- [x] migrated content matches A's on B (not applicable — nothing was selected for content migration)" >> "$report"
+        ;;
+      *CONTENT_MATCH:*)
+        local cm_summary="${content_match_output##*CONTENT_MATCH:}"
+        local cm_compared="${cm_summary%%:*}" cm_total="${cm_summary##*:}"
+        if [ "$cm_total" -eq 0 ]; then
+          echo "- [x] migrated content matches A's on B (0 of 0 — nothing was actually imported this run)" >> "$report"
+        else
+          echo "- [x] migrated content matches A's on B (${cm_compared} of ${cm_total} compared)" >> "$report"
+        fi
+        ;;
+      *)
+        echo "- [ ] migrated content matches A's: **UNVERIFIED — the check reported success without saying which of its outcomes applied** (a success path added without its marker — see lib/verify.sh's verify_migrated_content_matches_source)" >> "$report"
+        incomplete=$((incomplete + 1))
+        incomplete_names="${incomplete_names}migrated-content "
+        ;;
+    esac
+  fi
+
+  # --- migrated content changed from its pre-graft state — issue #52 /
+  # ADR 0008's "Required regardless" list, guard 2. This is the check that,
+  # ON ITS OWN, would have caught the observed defect: a page wordpress-
+  # importer silently skipped stays byte-identical to what backup recorded
+  # for it before the graft ran. -----------------------------------------
+  local content_unchanged_output="" content_unchanged_rc=0
+  content_unchanged_output=$(verify_migrated_content_changed_from_pregraft "$run_dir" "$id_map_tsv" "$manifest" 2>>"$report") || content_unchanged_rc=$?
+  if [ "$content_unchanged_rc" -eq 1 ]; then
+    echo "- [ ] **HARD FAIL: a post B already had, matching an item this run intended to migrate, is still byte-identical to its pre-graft state** — see above" >> "$report"
+    hard_fail=1
+  elif [ "$content_unchanged_rc" -eq 2 ]; then
+    echo "- [ ] migrated content changed from its pre-graft state: **UNVERIFIED** — see above" >> "$report"
+    incomplete=$((incomplete + 1))
+    incomplete_names="${incomplete_names}content-unchanged "
+  else
+    case "$content_unchanged_output" in
+      *CONTENT_UNCHANGED:not-selected*)
+        echo "- [x] migrated content changed from its pre-graft state (not applicable — nothing was selected for content migration)" >> "$report"
+        ;;
+      *CONTENT_UNCHANGED:*)
+        local cu_summary="${content_unchanged_output##*CONTENT_UNCHANGED:}"
+        local cu_checked="${cu_summary%%:*}" cu_skipped="${cu_summary##*:}"
+        echo "- [x] migrated content changed from its pre-graft state (${cu_checked} of ${cu_skipped} skipped-but-paired post(s) confirmed changed)" >> "$report"
+        ;;
+      *)
+        echo "- [ ] migrated content changed from its pre-graft state: **UNVERIFIED — the check reported success without saying which of its outcomes applied** (a success path added without its marker — see lib/verify.sh's verify_migrated_content_changed_from_pregraft)" >> "$report"
+        incomplete=$((incomplete + 1))
+        incomplete_names="${incomplete_names}content-unchanged "
         ;;
     esac
   fi

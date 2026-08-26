@@ -1151,3 +1151,97 @@ exec "$@"')
   [ -f "${B_ROOT}/wp-content/themes/t/style.css" ]
   [ -f "${B_ROOT}/wp-content/themes/GRAFTED.css" ]
 }
+
+# --- backup_content_checksum_of_row / backup_compute_content_checksums -----
+# issue #52 / ADR 0008's "Required regardless" list: the pre-graft
+# content-checksum snapshot lib/verify.sh's guard 2
+# (verify_migrated_content_changed_from_pregraft) compares a post-graft
+# re-read against. Captured HERE, in backup — not in graft, not in verify —
+# because backup is the one phase graft's own precondition guard
+# (`[ -f "${run_dir}/backup.complete" ]`, phase_graft in lib/graft.sh)
+# GUARANTEES has already run, completely, before graft's first write to B.
+# See backup_compute_content_checksums' own header comment in lib/backup.sh
+# for the full reasoning.
+
+@test "backup_content_checksum_of_row is stable for identical content+excerpt" {
+  local row='{"ID":5,"post_content":"hello","post_excerpt":"world"}'
+  run backup_content_checksum_of_row "$row"
+  [ "$status" -eq 0 ]
+  local first="$output"
+  run backup_content_checksum_of_row "$row"
+  [ "$output" = "$first" ]
+}
+
+@test "backup_content_checksum_of_row does not collapse a content/excerpt boundary shift into the same checksum" {
+  # "ab"+"c" must never checksum the same as "a"+"bc" -- a plain string
+  # concatenation would have exactly this collision; this function encodes
+  # both fields as a JSON pair first (lib/backup.sh's own comment explains
+  # why), which is boundary-safe by construction.
+  run backup_content_checksum_of_row '{"ID":1,"post_content":"ab","post_excerpt":"c"}'
+  local sum1="$output"
+  run backup_content_checksum_of_row '{"ID":1,"post_content":"a","post_excerpt":"bc"}'
+  local sum2="$output"
+  [ "$sum1" != "$sum2" ]
+}
+
+@test "backup_content_checksum_of_row changes when post_content changes" {
+  run backup_content_checksum_of_row '{"ID":1,"post_content":"one","post_excerpt":""}'
+  local sum1="$output"
+  run backup_content_checksum_of_row '{"ID":1,"post_content":"two","post_excerpt":""}'
+  local sum2="$output"
+  [ "$sum1" != "$sum2" ]
+}
+
+@test "backup_content_checksum_of_row treats a missing post_excerpt key as an empty string, not an error" {
+  run backup_content_checksum_of_row '{"ID":1,"post_content":"x"}'
+  [ "$status" -eq 0 ]
+  [ -n "$output" ]
+}
+
+@test "backup_compute_content_checksums returns an empty object when no post_types are selected for migration" {
+  local manifest='{"migrate":{}}'
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  run backup_compute_content_checksums b "$manifest"
+  [ "$status" -eq 0 ]
+  [ "$output" = "{}" ]
+}
+
+@test "backup_compute_content_checksums excludes attachment from the post_type scope (media is verified by file sync, not content equality)" {
+  local manifest='{"migrate":{"core-wp":{"post_types":["page","attachment"]}}}'
+  local captured="$BATS_TEST_TMPDIR/captured-post-type"
+  wp_remote() {
+    local alias_lc="$1"; shift
+    for a in "$@"; do
+      case "$a" in
+        --post_type=*) printf '%s' "${a#--post_type=}" > "$captured" ;;
+      esac
+    done
+    echo '[]'
+  }
+  run backup_compute_content_checksums b "$manifest"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$captured")" = "page" ]
+}
+
+@test "backup_compute_content_checksums keys the result by post ID with a sha256:-prefixed checksum" {
+  local manifest='{"migrate":{"core-wp":{"post_types":["page"]}}}'
+  wp_remote() { echo '[{"ID":16,"post_content":"hello","post_excerpt":""},{"ID":17,"post_content":"world","post_excerpt":""}]'; }
+  run backup_compute_content_checksums b "$manifest"
+  [ "$status" -eq 0 ]
+  run jq -e '(.["16"] | startswith("sha256:")) and (.["17"] | startswith("sha256:")) and (.["16"] != .["17"])' <<< "$output"
+  [ "$status" -eq 0 ]
+}
+
+@test "backup_compute_content_checksums fails closed when B's post list cannot be read" {
+  local manifest='{"migrate":{"core-wp":{"post_types":["page"]}}}'
+  wp_remote() { return 1; }
+  run backup_compute_content_checksums b "$manifest"
+  [ "$status" -eq 1 ]
+}
+
+@test "backup_compute_content_checksums fails closed on a non-JSON reply from B" {
+  local manifest='{"migrate":{"core-wp":{"post_types":["page"]}}}'
+  wp_remote() { echo "not json"; }
+  run backup_compute_content_checksums b "$manifest"
+  [ "$status" -eq 1 ]
+}

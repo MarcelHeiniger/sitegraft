@@ -1163,6 +1163,106 @@ backup_compute_protected_checksums() {
   printf '%s' "$checksums"
 }
 
+# backup_content_checksum_of_row <post_json_row> — sha256 of one post's
+# post_content+post_excerpt, issue #52 / ADR 0008's "Required regardless"
+# list. <post_json_row> is a single element of a `wp post list --format=json
+# --fields=ID,post_content,post_excerpt` array (an object with those three
+# keys; a missing post_excerpt is treated as "", not an error — some callers
+# may hand this a row shape that never had one).
+#
+# Hashes a compact JSON PAIR of the two fields, never a plain string
+# concatenation of them: "ab"+"c" and "a"+"bc" must never collide onto the
+# same checksum, and jq's `-c` encoding is what makes the field boundary
+# unambiguous regardless of what bytes either field holds (newlines,
+# unicode, an embedded NUL-shaped byte sequence — none of it needs any
+# escaping of its own here, unlike a raw bash string join, which cannot
+# even represent a real NUL byte in a captured variable in the first
+# place). Same reasoning as backup_checksum's own normalization above:
+# ONE implementation, called both where the pre-graft snapshot is captured
+# (backup_compute_content_checksums, below — phase_backup) and where it is
+# recomputed post-graft (lib/verify.sh's verify_migrated_content_changed_
+# from_pregraft) — never two independently-drifting copies of "how do you
+# checksum a post's content".
+backup_content_checksum_of_row() {
+  local row_json="$1"
+  echo "$row_json" | jq -c '{c: (.post_content // ""), e: (.post_excerpt // "")}' | shasum -a 256 | awk '{print $1}'
+}
+
+# backup_compute_content_checksums <alias> <manifest_json> — issue #52 /
+# ADR 0008's "Required regardless" list: a pre-graft content-checksum
+# snapshot of <alias>'s OWN posts, for every post_type selected in
+# manifest.migrate (attachment excluded — attachments are migrated by file
+# sync, design doc §9, never verified by content equality), keyed by
+# <alias>'s own post ID. This is the "relevé" lib/verify.sh's guard 2
+# (verify_migrated_content_changed_from_pregraft) checks a post-graft
+# re-read against: a row whose checksum comes back IDENTICAL after the
+# graft ran was never actually touched — exactly the shape of the observed
+# defect (a colliding item wordpress-importer silently skipped instead of
+# importing, see ADR 0008's Context section and issue #52).
+#
+# Captured HERE, in backup — not in graft, not in verify — because backup is
+# the one phase graft's own precondition guard (`[ -f
+# "${run_dir}/backup.complete" ]`, phase_graft in lib/graft.sh) GUARANTEES
+# has already run, completely, before graft's first write to B. A record
+# that can only be produced after graft has already run is not a "before"
+# record at all — this has to be taken while the data it will later be a
+# baseline FOR still reflects B's genuinely pre-graft state. (It could in
+# principle be computed inside `graft` itself, right before graft's first
+# write — but backup already runs strictly earlier and is already the
+# phase that snapshots "protected data as it stood before this run", so
+# putting a second, independent pre-graft snapshot mechanism in a different
+# phase would only invite the two to drift on timing.)
+#
+# Stored on manifest.content_checksums_pre_graft by phase_backup below —
+# same single-source-of-truth pattern checksums_protected_pre_graft already
+# uses (one JSON value living in manifest.json, recomputed post-graft by
+# the exact same per-row checksum function, never a second hand-kept-in-
+# sync copy). A run whose manifest predates this feature simply has no
+# such key at all — lib/verify.sh's own guard is responsible for treating
+# that absence as INCOMPLETE, never as "confirmed unchanged" or a silent
+# pass; see that function's own comment.
+#
+# Returns `{}` (a real, valid, empty snapshot — not an error) when nothing
+# is selected for migration at all: an options-only run has no post content
+# to snapshot, and "computed a snapshot of zero post_types" is a known
+# fact, not a failure. Fails CLOSED (non-zero, logged) when B's post list
+# itself could not be read or did not come back as valid JSON — the
+# identical "a query error is not the same as a confirmed empty result"
+# discipline backup_compute_protected_checksums and lib/verify.sh's own
+# checks already apply throughout this codebase.
+backup_compute_content_checksums() {
+  local alias_lc="$1" manifest="$2"
+  local post_types_csv
+  post_types_csv=$(echo "$manifest" | jq -r '[.migrate[].post_types[]?] | unique | map(select(. != "attachment")) | join(",")')
+  [ -n "$post_types_csv" ] || { echo '{}'; return 0; }
+
+  local rows
+  rows=$(wp_remote "$alias_lc" post list --post_type="$post_types_csv" --post_status=any --fields=ID,post_content,post_excerpt --format=json 2>/dev/null) || {
+    log_error "could not list ${alias_lc}'s post(s) of type(s) ${post_types_csv} to compute the pre-graft content-checksum snapshot"
+    return 1
+  }
+  echo "$rows" | jq -e . >/dev/null 2>&1 || {
+    log_error "post list for the pre-graft content-checksum snapshot did not return valid JSON"
+    return 1
+  }
+
+  local checksums='{}'
+  local row id sum
+  # Read on fd 3, not stdin (same convention, same reason, as this file's
+  # own _unclaimed loop immediately above and lib/graft.sh's id-map loops):
+  # nothing inside this particular loop body shells out to ssh, so stdin
+  # isn't actually at risk here today, but a future edit that adds a
+  # wp_remote call inside the loop must not silently reintroduce that
+  # class of bug — matching the established pattern up front costs nothing.
+  while IFS= read -r row <&3; do
+    [ -n "$row" ] || continue
+    id=$(echo "$row" | jq -r '.ID')
+    sum=$(backup_content_checksum_of_row "$row")
+    checksums=$(echo "$checksums" | jq --arg id "$id" --arg s "sha256:${sum}" '.[$id] = $s')
+  done 3<<< "$(echo "$rows" | jq -c '.[]')"
+  printf '%s' "$checksums"
+}
+
 # phase_backup --profile <name> [--run <run-dir>] [--dry-run] — design doc
 # §6.3: full DB + wp-content backup of B, pulled to the orchestrator, BEFORE
 # graft ever writes anything to B. Requires a frozen manifest (`sitegraft
@@ -1281,6 +1381,21 @@ phase_backup() {
     local checksums
     checksums=$(backup_compute_protected_checksums b "$manifest") || { log_error "could not compute protected-data checksums — aborting before declaring the backup good"; return 1; }
     manifest=$(echo "$manifest" | jq --argjson c "$checksums" '.checksums_protected_pre_graft = $c')
+
+    # issue #52 / ADR 0008's "Required regardless" list: the pre-graft
+    # content-checksum snapshot lib/verify.sh's content-equality guards read
+    # back post-graft. Computed here, right alongside the protected-data
+    # checksums immediately above and for the identical reason — this is
+    # the one moment guaranteed to run, completely, before graft's first
+    # write to B (see backup_compute_content_checksums' own comment). A
+    # failure here aborts the backup the same way a failure to compute the
+    # protected checksums does: a backup that could not record what B
+    # looked like before the graft is not a backup this tool may declare
+    # good.
+    local content_checksums
+    content_checksums=$(backup_compute_content_checksums b "$manifest") || { log_error "could not compute the pre-graft content-checksum snapshot — aborting before declaring the backup good"; return 1; }
+    manifest=$(echo "$manifest" | jq --argjson c "$content_checksums" '.content_checksums_pre_graft = $c')
+
     echo "$manifest" > "${run_dir}/manifest.json"
     chmod 600 "${run_dir}/manifest.json" 2>/dev/null || true
   fi
