@@ -226,30 +226,145 @@ echo "==> running scan"
 RUN_DIR_CANDIDATES=$(ls -dt "${STATE_DIR}/${PROFILE}-"*)
 RUN_DIR="${RUN_DIR_CANDIDATES%%$'\n'*}"
 
+# assert_jq <jq filter> <json file> <failure message> — issue #64: every
+# assertion in this block used to be a bare `jq -e ... >/dev/null` under this
+# script's own `set -e`. A false result kills the WHOLE harness on the spot
+# (plan/backup/graft/verify never run) and, worse, tells the operator
+# nothing about which of the block's dozen-odd assertions was the one that
+# failed — diagnosed live for #64, where `jq -e '.nav_post_count == 2'` died
+# with no message at all in the log, three phases short of the harness's
+# actual job. Wraps the same jq -e call so every assertion here names the
+# fact it was checking, and the file it checked it against, before exiting.
+assert_jq() {
+  local filter="$1" json_file="$2" message="$3"
+  # F4 (review, second pass): the original `2>&1 >/dev/null` swallowed jq's
+  # OWN stderr entirely — in a fix-pack whose whole point is making
+  # failures informative, a genuinely corrupt or missing scan-a.json would
+  # have reported as e.g. "site A's scan does not list the etch_cfs post
+  # type", accusing the mu-plugin fixture of an error that was actually a
+  # jq parse failure. Captured and appended instead, so a real jq error
+  # (bad JSON, no such file) is distinguishable from a real "the field
+  # legitimately isn't there" — same jq -e exit codes (1/4/5, all non-zero,
+  # all still fatal here) as before, no guard weakened.
+  local err
+  if ! err=$(jq -e "$filter" "$json_file" 2>&1 >/dev/null); then
+    echo "FAIL: ${message} (jq filter: ${filter}, file: ${json_file}${err:+, jq: ${err}})" >&2
+    exit 1
+  fi
+}
+
 echo "==> asserting fixtures are visible in the scan output"
-jq -e '.post_types[] | select(.name=="etch_cfs")' "${RUN_DIR}/scan-a.json" >/dev/null
-jq -e '.post_types[] | select(.name=="fake_reservation")' "${RUN_DIR}/scan-b.json" >/dev/null
-jq -e '.classic_menus_detected == false' "${RUN_DIR}/scan-a.json" >/dev/null
+assert_jq '.post_types[] | select(.name=="etch_cfs")' "${RUN_DIR}/scan-a.json" \
+  "site A's scan does not list the etch_cfs post type — the fake-etch-cpts.php mu-plugin fixture may not have registered it before scan ran"
+assert_jq '.post_types[] | select(.name=="fake_reservation")' "${RUN_DIR}/scan-b.json" \
+  "site B's scan does not list the fake_reservation post type — the site-b-fake-plugin fixture's activation hook may not have run before scan"
+assert_jq '.classic_menus_detected == false' "${RUN_DIR}/scan-a.json" \
+  "site A's scan reports classic_menus_detected != false on a fresh block-theme install with no classic nav menus configured"
 
 echo "==> asserting m8's extra one-line coverage"
 # nav_uses_dynamic_page_list (M5): the wp:page-list post seeded on A above.
-jq -e '.nav_uses_dynamic_page_list == true' "${RUN_DIR}/scan-a.json" >/dev/null
+assert_jq '.nav_uses_dynamic_page_list == true' "${RUN_DIR}/scan-a.json" \
+  "site A's scan does not report nav_uses_dynamic_page_list == true — the seeded \"Main\" wp_navigation post's wp:page-list block content should have set this"
 # tables (design doc §12/§6.1): B's fake plugin's real table, prefix and all.
-jq -e '.tables[] | select(endswith("fakebooking_reservations"))' "${RUN_DIR}/scan-b.json" >/dev/null
+assert_jq '.tables[] | select(endswith("fakebooking_reservations"))' "${RUN_DIR}/scan-b.json" \
+  "site B's scan does not list a table ending in fakebooking_reservations — the fake-plugin fixture's own table may be missing"
 # custom_code_detected (§14): B's mu-plugin alone is a signal — must fire.
-jq -e '.custom_code_detected == true' "${RUN_DIR}/scan-b.json" >/dev/null
+assert_jq '.custom_code_detected == true' "${RUN_DIR}/scan-b.json" \
+  "site B's scan does not report custom_code_detected == true — the fake-plugin mu-plugin alone should be enough of a signal"
 # options (site-a-seed.sh): the Etch/ACSS-shaped options actually landed.
-jq -e '.options[] | select(.option_name=="etch_settings")' "${RUN_DIR}/scan-a.json" >/dev/null
-jq -e '.options[] | select(.option_name=="automatic_css_settings")' "${RUN_DIR}/scan-a.json" >/dev/null
+assert_jq '.options[] | select(.option_name=="etch_settings")' "${RUN_DIR}/scan-a.json" \
+  "site A's scan does not list the etch_settings option — site-a-seed.sh should have written it"
+assert_jq '.options[] | select(.option_name=="automatic_css_settings")' "${RUN_DIR}/scan-a.json" \
+  "site A's scan does not list the automatic_css_settings option — site-a-seed.sh should have written it"
 # active_theme.stylesheet: both sites resolved a real active theme.
-jq -e '.active_theme.stylesheet | length > 0' "${RUN_DIR}/scan-a.json" >/dev/null
-jq -e '.active_theme.stylesheet | length > 0' "${RUN_DIR}/scan-b.json" >/dev/null
-# nav_post_count (#17 fix-pack): site-a-seed.sh seeds exactly two
-# wp_navigation posts on A ("Main", dynamic, and "Footer", static) — the real
-# fact core_wp_post_types_dynamic's claim is gated on, distinct from
-# nav_uses_dynamic_page_list's shape question just above.
-jq -e '.nav_post_count == 2' "${RUN_DIR}/scan-a.json" >/dev/null
-jq -e '.nav_post_count == null' "${RUN_DIR}/scan-b.json" >/dev/null
+assert_jq '.active_theme.stylesheet | length > 0' "${RUN_DIR}/scan-a.json" \
+  "site A's scan resolved an empty active_theme.stylesheet"
+assert_jq '.active_theme.stylesheet | length > 0' "${RUN_DIR}/scan-b.json" \
+  "site B's scan resolved an empty active_theme.stylesheet"
+
+# nav_post_count (#17 fix-pack; hardened for #64): inventory_nav_post_count
+# (lib/inventory.sh) is a plain `count($navs)` over EVERY wp_navigation post
+# on A, and core_wp_post_types_dynamic (modules/core-wp.sh) gates its claim
+# ONLY on that being > 0 — it never reads, or cares about, any particular
+# total. Hardcoding this assertion as "== 2" was therefore never testing
+# production behavior: it was testing that site-a-seed.sh's own two fixture
+# posts ("Main", dynamic, and "Footer", static) existed AND that nothing
+# else on A ever created a third wp_navigation post — an assumption
+# WordPress itself broke (verified live, #64: a fresh WP 7.1 install's
+# default block theme materializes its OWN wp_navigation post on `wp core
+# install`, no fixture or sitegraft code involved, taking nav_post_count to
+# 3 and killing this script under `set -e`, silently, before
+# plan/backup/graft/verify ever ran).
+#
+# What is actually worth proving, independent of whatever else a future
+# WordPress version decides to seed alongside the fixtures: (a) scan's
+# nav_post_count is a CORRECT count of A's real wp_navigation posts —
+# checked below against an independent wp-cli query of A that does NOT
+# reuse inventory_nav_post_count's own get_posts() PHP (review, second
+# pass: that earlier version was character-for-character the same code as
+# lib/inventory.sh's own query, so agreement between them proved the
+# plumbing carried the value through correctly, never that the COUNT
+# itself was right — a bug shared by both copies would have agreed with
+# itself). `wp post list --format=count` is a genuinely different code
+# path (wp-cli's own WP_Query-based listing, not get_posts()) — verified
+# live to report the identical number as inventory_nav_post_count on a
+# real install, so it is now an actual second measurement, not a
+# restatement of the first — and (b) the two specific fixture posts every
+# later nav-related assertion in this file depends on (the
+# nav_uses_dynamic_page_list check just above, and the id-remap proof
+# against "Footer" further down) are genuinely present, by name, regardless
+# of how many navigation posts WordPress itself happens to add around them.
+# Mutation-proven: commenting out site-a-seed.sh's "Footer" wp_navigation
+# creation (§64 PR description carries the red run) makes the FOOTER check
+# below fail with a clear message, even though WordPress's own auto-created
+# nav still keeps nav_post_count > 0.
+LIVE_NAV_COUNT=$(ddev exec --raw -p "$PROJECT_A" -- wp post list --post_type=wp_navigation --post_status=any --format=count)
+SCANNED_NAV_COUNT=$(jq -r '.nav_post_count' "${RUN_DIR}/scan-a.json")
+if [ "$SCANNED_NAV_COUNT" != "$LIVE_NAV_COUNT" ]; then
+  echo "FAIL: scan-a.json's nav_post_count (${SCANNED_NAV_COUNT}) does not match a direct wp-cli count of site A's real wp_navigation posts (${LIVE_NAV_COUNT})" >&2
+  exit 1
+fi
+LIVE_NAV_TITLES=$(ddev exec --raw -p "$PROJECT_A" -- wp post list --post_type=wp_navigation --post_status=any --field=post_title)
+if ! grep -q '^Main$' <<< "$LIVE_NAV_TITLES"; then
+  echo "FAIL: site-a-seed.sh's dynamic fixture wp_navigation post (\"Main\") is missing from site A — live titles were: ${LIVE_NAV_TITLES}" >&2
+  exit 1
+fi
+if ! grep -q '^Footer$' <<< "$LIVE_NAV_TITLES"; then
+  echo "FAIL: site-a-seed.sh's static fixture wp_navigation post (\"Footer\") is missing from site A — live titles were: ${LIVE_NAV_TITLES}" >&2
+  exit 1
+fi
+assert_jq '.nav_post_count > 0' "${RUN_DIR}/scan-a.json" \
+  "site A's scan does not report a positive nav_post_count despite real wp_navigation posts existing — the exact fact core_wp_post_types_dynamic's claim is gated on"
+# B: A-only field (design doc §0 point 11/§6.1) — inventory_scan_site only
+# ever calls inventory_nav_post_count when alias_lc == "a" (lib/inventory.sh),
+# so this stays a hardcoded 'null' on B's scan regardless of what WordPress
+# or a theme seeds on B.
+#
+# Checked for #64's fragility pattern (review, second pass corrected the
+# METHOD here, not just the conclusion — a grep for the literal string
+# "scan-b.json" cannot establish this, since core_wp_post_types_dynamic
+# (modules/core-wp.sh:124) reads .nav_post_count from WHATEVER scan file
+# module_selection is called against, by parameter, not by a hardcoded
+# filename — and lib/plan.sh's plan_defaults genuinely can pass scan_b_json
+# to it (the `bucket=protect` branches, plan.sh:101 and :107). What
+# actually makes B's nav_post_count harmless is narrower than "nothing
+# reads it": core-wp declares neither a `tables` nor a `tables_dynamic`
+# function (plan.sh:98's `owns_tables` check), so plan.sh:101's
+# tables-owning protect branch can never select it for core-wp, and
+# core_wp_detect (modules/core-wp.sh:24-26, "does the scan list post type
+# page") matches any real WordPress install's scan-a.json unconditionally
+# (page is core, always registered) — so plan.sh:104's migrate branch
+# against scan_a_json always wins first in practice, leaving plan.sh:107's
+# scan_b_json fallback branch unreachable for core-wp. And even in the
+# edge case where it wasn't (a scan-a.json missing its post_types list
+# entirely — already fail-closed further upstream), nav_post_count stays
+# unconditionally null for B regardless of which branch calls it, so
+# core_wp_post_types_dynamic still claims nothing (its own null-guard,
+# modules/core-wp.sh:124). Inert by construction, not merely by accident —
+# but the construction is this three-part chain, not a bare absence of
+# readers.
+assert_jq '.nav_post_count == null' "${RUN_DIR}/scan-b.json" \
+  "site B's scan does not report nav_post_count == null — inventory_nav_post_count is A-only by design (lib/inventory.sh) and should never run against B"
 
 # Issue #17, closing the gap Nat's review found: proving core-wp's own
 # automatic CLAIM works — not merely that the id-remap mechanics work once
@@ -277,7 +392,7 @@ modules_discover
 NAV_CLAIM=$(module_selection core_wp post_types "${RUN_DIR}/scan-a.json")
 case "$NAV_CLAIM" in
   *wp_navigation*) : ;;
-  *) echo "FAIL: module_selection core_wp post_types did not claim wp_navigation against A's real scan (nav_post_count=2) — output: ${NAV_CLAIM}" >&2; exit 1 ;;
+  *) echo "FAIL: module_selection core_wp post_types did not claim wp_navigation against A's real scan (nav_post_count=${SCANNED_NAV_COUNT}) — output: ${NAV_CLAIM}" >&2; exit 1 ;;
 esac
 echo "==> confirmed: core-wp's own module_selection claims wp_navigation from a real scan showing navigation content present"
 
@@ -980,14 +1095,37 @@ NEW_ATTACH_ID=$(awk -F'\t' -v old="$OLD_ATTACH_ID" '$1==old && $3=="attachment"{
 [ "$NEW_ATTACH_ID" != "$OLD_ATTACH_ID" ]  # a real DDEV/WP install never reuses A's own ID space on a distinct B install
 IMAGE_BLOCK_ID=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=etch_cfs --title="Image Block CFS" --field=ID)
 IMAGE_BLOCK_CONTENT=$(ddev exec --raw -p "$PROJECT_B" -- wp post get "$IMAGE_BLOCK_ID" --field=post_content)
+# #64 fix-pack: these four checks used to match `*"\"id\":${ID}"*` and
+# `*"wp-image-${ID}"*` with no trailing boundary at all — the same
+# unanchored-prefix bug class the Footer nav-link check below is already
+# guarded against (see that check's own "N1" comment: a bare `"id":<N>`
+# glob has no digit boundary, so "id":6 is a literal PREFIX of "id":67,
+# meaning a genuinely WRONG id ending in the right digit(s) would have
+# wrongly PASSED the NEW-id checks below, and a genuinely correct id whose
+# neighbor happens to share a prefix could wrongly FAIL the OLD-id checks).
+# Fixed the same way, using this fixture's own exact shape instead of the
+# Footer's: site-a-seed.sh's `{\"id\":${ATTACH_ID}}` is a single-key JSON
+# object, so a real id value is TODAY always immediately followed by `}`
+# (never `,`, there being no second key) — and `class=\"wp-image-${ATTACH_ID}\"`
+# always immediately followed by the attribute's closing `"`.
+#
+# F3 (review, second pass): the NEGATIVE check right below (must NOT still
+# reference the OLD id) had only the `}` terminator, unlike N1's own
+# two-terminator form a few lines further down. If this fixture ever grows
+# a second JSON key, that terminator assumption breaks silently, and this
+# is the DANGEROUS direction for it to break in: a negative check that
+# stops matching anything fails OPEN (a silent pass on genuinely leftover
+# OLD-id content), not loud like the positive NEW-id check below would be.
+# Aligned on N1's own two-terminator form as a defensive match, even though
+# only `}` is reachable with the fixture's current single-key shape.
 case "$IMAGE_BLOCK_CONTENT" in
-  *"\"id\":${OLD_ATTACH_ID}"*|*"wp-image-${OLD_ATTACH_ID}"*)
+  *"\"id\":${OLD_ATTACH_ID},"*|*"\"id\":${OLD_ATTACH_ID}}"*|*"wp-image-${OLD_ATTACH_ID}\""*)
     echo "FAIL: B's imported content still references A's OLD attachment id (${OLD_ATTACH_ID}) — the sentinel ID remap did not fully rewrite it" >&2
     exit 1
     ;;
 esac
 case "$IMAGE_BLOCK_CONTENT" in
-  *"\"id\":${NEW_ATTACH_ID}"*) : ;;
+  *"\"id\":${NEW_ATTACH_ID}}"*) : ;;
   *) echo "FAIL: B's imported content does not reference the correctly remapped NEW attachment id (${NEW_ATTACH_ID}) — the remap dropped the reference instead of rewriting it" >&2; exit 1 ;;
 esac
 # NIT-1 (review, Viktor): symmetry with the "id":NEW check above — the
@@ -995,7 +1133,7 @@ esac
 # remap has to rewrite (design doc §9.1); asserting only "id":NEW passed
 # left that half of the remap's own output completely unverified.
 case "$IMAGE_BLOCK_CONTENT" in
-  *"wp-image-${NEW_ATTACH_ID}"*) : ;;
+  *"wp-image-${NEW_ATTACH_ID}\""*) : ;;
   *) echo "FAIL: B's imported content does not reference the correctly remapped NEW attachment id via the wp-image-X class either (expected wp-image-${NEW_ATTACH_ID})" >&2; exit 1 ;;
 esac
 case "$IMAGE_BLOCK_CONTENT" in
@@ -1039,15 +1177,38 @@ fi
 
 echo "==> (h) MAJOR-2: content-level confirmation that B's protected data (already proven byte-identical by (b)'s checksum, now carrying a real domain-string + colliding-attachment-ID payload) genuinely was not touched — not just that its checksum happens to match"
 FAKEBOOKING_SETTINGS_AFTER=$(ddev exec --raw -p "$PROJECT_B" -- wp option get fakebooking_settings --format=json)
-case "$FAKEBOOKING_SETTINGS_AFTER" in
-  *"${PROJECT_B}.ddev.site"*|*"${NEW_ATTACH_ID}"*)
-    echo "FAIL: fakebooking_settings was rewritten (contains B's domain or the NEW attachment id) even though the checksum matched — investigate immediately, this should never happen" >&2
+# #64 fix-pack: the ORIGINAL version of this check tested
+# `*"${NEW_ATTACH_ID}"*` — an UNANCHORED substring match of a short bare
+# numeral against the ENTIRE fakebooking_settings JSON blob, not against
+# the specific "decoy" field it claims to be checking. With
+# SITEGRAFT_HARNESS_ID set, B's own domain string
+# (sitegraft-test-b-<id>.ddev.site, embedded in this SAME blob's "note"
+# field, entirely unrelated to any id-remap) can coincidentally CONTAIN
+# NEW_ATTACH_ID's digits — reproduced live: run id "rosa64" contains the
+# digit "6", and this run's NEW_ATTACH_ID was "6", so the single most
+# consequential assertion in this harness ("a third party's protected data
+# was not touched") failed on a graft that had done nothing wrong. The
+# domain half of the same case arm had an identical, if less likely,
+# exposure: matching bare "${PROJECT_B}.ddev.site" without regard for
+# WHICH field it appeared in.
+#
+# Fixed by reading the actual "decoy" and "note" fields through jq instead
+# of grep-shaped substring matching against the raw blob — comparing
+# parsed JSON values leaves no digit-boundary question to get wrong,
+# because there is no substring search left to run at all.
+DECOY_AFTER=$(jq -r '.decoy' <<< "$FAKEBOOKING_SETTINGS_AFTER")
+if [ "$DECOY_AFTER" != "\"id\":${OLD_ATTACH_ID}" ]; then
+  echo "FAIL: fakebooking_settings.decoy no longer reads exactly \"id\":${OLD_ATTACH_ID} (got: ${DECOY_AFTER}) — protected option data was rewritten during graft even though the checksum matched — investigate immediately, this should never happen" >&2
+  exit 1
+fi
+NOTE_AFTER=$(jq -r '.note' <<< "$FAKEBOOKING_SETTINGS_AFTER")
+case "$NOTE_AFTER" in
+  *"$DOMAIN_B"*)
+    echo "FAIL: fakebooking_settings.note now contains B's domain (${DOMAIN_B}) even though the checksum matched — the domain search-replace touched protected data it must never reach — investigate immediately" >&2
     exit 1
     ;;
-esac
-case "$FAKEBOOKING_SETTINGS_AFTER" in
-  *"${PROJECT_A}.ddev.site"*) : ;;
-  *) echo "FAIL: fakebooking_settings no longer contains A's domain string at all — the fixture injection itself didn't survive, this assertion would be meaningless" >&2; exit 1 ;;
+  *"$DOMAIN_A"*) : ;;
+  *) echo "FAIL: fakebooking_settings.note no longer contains A's domain string at all (got: ${NOTE_AFTER}) — the fixture injection itself didn't survive, this assertion would be meaningless" >&2; exit 1 ;;
 esac
 echo "==> confirmed: protected data (wp_options AND wp_posts) carrying a real domain-string + colliding-ID payload is untouched by graft"
 
@@ -1207,11 +1368,21 @@ grep -q "HARD FAIL" "$VERIFY_REPORT"
 # "is still present" (`A's domain string ('https://...') is still present in
 # content graft imported: post:N`) — matching on the stable suffix only,
 # never the interpolated domain text itself.
+#
+# F2 (review, second pass): the hit list after "imported: " is
+# `implode(",", $hits)` (lib/verify.sh's verify_domain_absent) — a
+# comma-separated list, never free text — so a bare `*"post:${HERO_ID}"*`
+# substring match is exposed to the exact same unanchored-fragment class F1
+# below was fixed for: any OTHER line containing the literal text
+# "post:${HERO_ID}" (a doc reference, another hit sharing a numeric prefix)
+# would match too. Anchored on commas instead, matching the real implode
+# shape, same technique as F1.
 DOMAIN_HARD_FAIL_LINE=$(grep "is still present in content graft imported" "$VERIFY_REPORT")
 [ -n "$DOMAIN_HARD_FAIL_LINE" ]
-case "$DOMAIN_HARD_FAIL_LINE" in
-  *"post:${HERO_ID}"*) : ;;
-  *) echo "FAIL: the domain-absence hard fail did not name the actual leaking post (post:${HERO_ID})" >&2; exit 1 ;;
+DOMAIN_HITS=${DOMAIN_HARD_FAIL_LINE##*imported: }
+case ",${DOMAIN_HITS%%$'\n'*}," in
+  *",post:${HERO_ID},"*) : ;;
+  *) echo "FAIL: the domain-absence hard fail did not name the actual leaking post (post:${HERO_ID}) — line: ${DOMAIN_HARD_FAIL_LINE}" >&2; exit 1 ;;
 esac
 case "$DOMAIN_HARD_FAIL_LINE" in
   *"fakebooking"*)
@@ -1238,9 +1409,22 @@ ddev exec --raw -p "$PROJECT_B" -- wp post update "$FEATURED_PAGE_ID_B" --post_p
 "${ROOT}/bin/sitegraft" verify --profile "$PROFILE" --run "$RUN_DIR"
 ORPHAN_LINE=$(grep "orphan post_parent references found" "$VERIFY_REPORT")
 [ -n "$ORPHAN_LINE" ]
-case "$ORPHAN_LINE" in
-  *"${FEATURED_PAGE_ID_B}"*) : ;;
-  *) echo "FAIL: the orphan-found line did not name the actual orphaned page (${FEATURED_PAGE_ID_B})" >&2; exit 1 ;;
+# F1 (review, MAJOR): the line itself contains the literal string "§9.2"
+# (lib/verify.sh:914's own "design doc §9.2" parenthetical) — so a bare
+# `*"${FEATURED_PAGE_ID_B}"*` substring match passes UNCONDITIONALLY
+# whenever FEATURED_PAGE_ID_B is "9" or "2", with no coincidence against
+# any OTHER id required at all (unlike the digit-collision class F2/#64's
+# earlier commit fixed, this one doesn't even need a second id in the
+# picture). Proved against the real message text: FEATURED_PAGE_ID_B=9 and
+# =2 both read green even when the line names an entirely different post.
+# The real id list is space-separated (lib/verify.sh: `$(echo "$orphans" |
+# tr '\n' ' ')`, after the literal "): " that ends the §9.2 parenthetical)
+# — anchored on that instead, with the same padding-space technique F2 uses
+# with commas.
+ORPHAN_IDS=${ORPHAN_LINE##*: }
+case " ${ORPHAN_IDS} " in
+  *" ${FEATURED_PAGE_ID_B} "*) : ;;
+  *) echo "FAIL: the orphan-found line did not name the actual orphaned page (${FEATURED_PAGE_ID_B}) — line: ${ORPHAN_LINE}" >&2; exit 1 ;;
 esac
 if grep -q "Result: HARD FAIL" "$VERIFY_REPORT"; then
   echo "FAIL: a found orphan must be a non-blocking WARNING (design doc §9.2/§11), not a HARD FAIL" >&2
