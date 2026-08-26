@@ -226,30 +226,111 @@ echo "==> running scan"
 RUN_DIR_CANDIDATES=$(ls -dt "${STATE_DIR}/${PROFILE}-"*)
 RUN_DIR="${RUN_DIR_CANDIDATES%%$'\n'*}"
 
+# assert_jq <jq filter> <json file> <failure message> — issue #64: every
+# assertion in this block used to be a bare `jq -e ... >/dev/null` under this
+# script's own `set -e`. A false result kills the WHOLE harness on the spot
+# (plan/backup/graft/verify never run) and, worse, tells the operator
+# nothing about which of the block's dozen-odd assertions was the one that
+# failed — diagnosed live for #64, where `jq -e '.nav_post_count == 2'` died
+# with no message at all in the log, three phases short of the harness's
+# actual job. Wraps the same jq -e call so every assertion here names the
+# fact it was checking, and the file it checked it against, before exiting.
+assert_jq() {
+  local filter="$1" json_file="$2" message="$3"
+  if ! jq -e "$filter" "$json_file" >/dev/null 2>&1; then
+    echo "FAIL: ${message} (jq filter: ${filter}, file: ${json_file})" >&2
+    exit 1
+  fi
+}
+
 echo "==> asserting fixtures are visible in the scan output"
-jq -e '.post_types[] | select(.name=="etch_cfs")' "${RUN_DIR}/scan-a.json" >/dev/null
-jq -e '.post_types[] | select(.name=="fake_reservation")' "${RUN_DIR}/scan-b.json" >/dev/null
-jq -e '.classic_menus_detected == false' "${RUN_DIR}/scan-a.json" >/dev/null
+assert_jq '.post_types[] | select(.name=="etch_cfs")' "${RUN_DIR}/scan-a.json" \
+  "site A's scan does not list the etch_cfs post type — the fake-etch-cpts.php mu-plugin fixture may not have registered it before scan ran"
+assert_jq '.post_types[] | select(.name=="fake_reservation")' "${RUN_DIR}/scan-b.json" \
+  "site B's scan does not list the fake_reservation post type — the site-b-fake-plugin fixture's activation hook may not have run before scan"
+assert_jq '.classic_menus_detected == false' "${RUN_DIR}/scan-a.json" \
+  "site A's scan reports classic_menus_detected != false on a fresh block-theme install with no classic nav menus configured"
 
 echo "==> asserting m8's extra one-line coverage"
 # nav_uses_dynamic_page_list (M5): the wp:page-list post seeded on A above.
-jq -e '.nav_uses_dynamic_page_list == true' "${RUN_DIR}/scan-a.json" >/dev/null
+assert_jq '.nav_uses_dynamic_page_list == true' "${RUN_DIR}/scan-a.json" \
+  "site A's scan does not report nav_uses_dynamic_page_list == true — the seeded \"Main\" wp_navigation post's wp:page-list block content should have set this"
 # tables (design doc §12/§6.1): B's fake plugin's real table, prefix and all.
-jq -e '.tables[] | select(endswith("fakebooking_reservations"))' "${RUN_DIR}/scan-b.json" >/dev/null
+assert_jq '.tables[] | select(endswith("fakebooking_reservations"))' "${RUN_DIR}/scan-b.json" \
+  "site B's scan does not list a table ending in fakebooking_reservations — the fake-plugin fixture's own table may be missing"
 # custom_code_detected (§14): B's mu-plugin alone is a signal — must fire.
-jq -e '.custom_code_detected == true' "${RUN_DIR}/scan-b.json" >/dev/null
+assert_jq '.custom_code_detected == true' "${RUN_DIR}/scan-b.json" \
+  "site B's scan does not report custom_code_detected == true — the fake-plugin mu-plugin alone should be enough of a signal"
 # options (site-a-seed.sh): the Etch/ACSS-shaped options actually landed.
-jq -e '.options[] | select(.option_name=="etch_settings")' "${RUN_DIR}/scan-a.json" >/dev/null
-jq -e '.options[] | select(.option_name=="automatic_css_settings")' "${RUN_DIR}/scan-a.json" >/dev/null
+assert_jq '.options[] | select(.option_name=="etch_settings")' "${RUN_DIR}/scan-a.json" \
+  "site A's scan does not list the etch_settings option — site-a-seed.sh should have written it"
+assert_jq '.options[] | select(.option_name=="automatic_css_settings")' "${RUN_DIR}/scan-a.json" \
+  "site A's scan does not list the automatic_css_settings option — site-a-seed.sh should have written it"
 # active_theme.stylesheet: both sites resolved a real active theme.
-jq -e '.active_theme.stylesheet | length > 0' "${RUN_DIR}/scan-a.json" >/dev/null
-jq -e '.active_theme.stylesheet | length > 0' "${RUN_DIR}/scan-b.json" >/dev/null
-# nav_post_count (#17 fix-pack): site-a-seed.sh seeds exactly two
-# wp_navigation posts on A ("Main", dynamic, and "Footer", static) — the real
-# fact core_wp_post_types_dynamic's claim is gated on, distinct from
-# nav_uses_dynamic_page_list's shape question just above.
-jq -e '.nav_post_count == 2' "${RUN_DIR}/scan-a.json" >/dev/null
-jq -e '.nav_post_count == null' "${RUN_DIR}/scan-b.json" >/dev/null
+assert_jq '.active_theme.stylesheet | length > 0' "${RUN_DIR}/scan-a.json" \
+  "site A's scan resolved an empty active_theme.stylesheet"
+assert_jq '.active_theme.stylesheet | length > 0' "${RUN_DIR}/scan-b.json" \
+  "site B's scan resolved an empty active_theme.stylesheet"
+
+# nav_post_count (#17 fix-pack; hardened for #64): inventory_nav_post_count
+# (lib/inventory.sh) is a plain `count($navs)` over EVERY wp_navigation post
+# on A, and core_wp_post_types_dynamic (modules/core-wp.sh) gates its claim
+# ONLY on that being > 0 — it never reads, or cares about, any particular
+# total. Hardcoding this assertion as "== 2" was therefore never testing
+# production behavior: it was testing that site-a-seed.sh's own two fixture
+# posts ("Main", dynamic, and "Footer", static) existed AND that nothing
+# else on A ever created a third wp_navigation post — an assumption
+# WordPress itself broke (verified live, #64: a fresh WP 7.1 install's
+# default block theme materializes its OWN wp_navigation post on `wp core
+# install`, no fixture or sitegraft code involved, taking nav_post_count to
+# 3 and killing this script under `set -e`, silently, before
+# plan/backup/graft/verify ever ran).
+#
+# What is actually worth proving, independent of whatever else a future
+# WordPress version decides to seed alongside the fixtures: (a) scan's
+# nav_post_count is a CORRECT count of A's real wp_navigation posts —
+# checked below against an independent, direct wp-cli query of A, never a
+# second hardcoded literal — and (b) the two specific fixture posts every
+# later nav-related assertion in this file depends on (the
+# nav_uses_dynamic_page_list check just above, and the id-remap proof
+# against "Footer" further down) are genuinely present, by name, regardless
+# of how many navigation posts WordPress itself happens to add around them.
+# Mutation-proven: commenting out site-a-seed.sh's "Footer" wp_navigation
+# creation (§64 PR description carries the red run) makes the FOOTER check
+# below fail with a clear message, even though WordPress's own auto-created
+# nav still keeps nav_post_count > 0.
+LIVE_NAV_COUNT=$(ddev exec --raw -p "$PROJECT_A" -- wp eval '
+$navs = get_posts(array("post_type" => "wp_navigation", "numberposts" => -1, "post_status" => "any"));
+echo count($navs);
+')
+SCANNED_NAV_COUNT=$(jq -r '.nav_post_count' "${RUN_DIR}/scan-a.json")
+if [ "$SCANNED_NAV_COUNT" != "$LIVE_NAV_COUNT" ]; then
+  echo "FAIL: scan-a.json's nav_post_count (${SCANNED_NAV_COUNT}) does not match a direct wp-cli count of site A's real wp_navigation posts (${LIVE_NAV_COUNT})" >&2
+  exit 1
+fi
+LIVE_NAV_TITLES=$(ddev exec --raw -p "$PROJECT_A" -- wp eval '
+$navs = get_posts(array("post_type" => "wp_navigation", "numberposts" => -1, "post_status" => "any"));
+foreach ($navs as $n) { echo $n->post_title . "\n"; }
+')
+if ! grep -q '^Main$' <<< "$LIVE_NAV_TITLES"; then
+  echo "FAIL: site-a-seed.sh's dynamic fixture wp_navigation post (\"Main\") is missing from site A — live titles were: ${LIVE_NAV_TITLES}" >&2
+  exit 1
+fi
+if ! grep -q '^Footer$' <<< "$LIVE_NAV_TITLES"; then
+  echo "FAIL: site-a-seed.sh's static fixture wp_navigation post (\"Footer\") is missing from site A — live titles were: ${LIVE_NAV_TITLES}" >&2
+  exit 1
+fi
+assert_jq '.nav_post_count > 0' "${RUN_DIR}/scan-a.json" \
+  "site A's scan does not report a positive nav_post_count despite real wp_navigation posts existing — the exact fact core_wp_post_types_dynamic's claim is gated on"
+# B: A-only field (design doc §0 point 11/§6.1) — inventory_scan_site only
+# ever calls inventory_nav_post_count when alias_lc == "a" (lib/inventory.sh),
+# so this stays a hardcoded 'null' on B's scan regardless of what WordPress
+# or a theme seeds on B. Verified not to be #64's fragility pattern: nothing
+# in lib/ or modules/ ever reads nav_post_count from scan-b.json (grepped
+# across both directories), so there is no production logic gated on this
+# value for B either — it is inert on B by design, not merely by accident.
+assert_jq '.nav_post_count == null' "${RUN_DIR}/scan-b.json" \
+  "site B's scan does not report nav_post_count == null — inventory_nav_post_count is A-only by design (lib/inventory.sh) and should never run against B"
 
 # Issue #17, closing the gap Nat's review found: proving core-wp's own
 # automatic CLAIM works — not merely that the id-remap mechanics work once
