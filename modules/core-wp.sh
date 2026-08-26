@@ -431,17 +431,32 @@ _core_wp_fix_theme_mods() {
 # WHY THE "kind":"post-type" CHECK IS LOAD-BEARING, not decoration: a
 # navigation-link's `"id"` attribute is AMBIGUOUS on its own --
 # {"id":7,"kind":"taxonomy","type":"category"} carries a TERM id, not a post
-# id. CORRECTION (Viktor's review, B1): an earlier version of this comment
-# claimed "sitegraft migrates no term id-map at all" -- that is factually
-# wrong. mu-plugins/sitegraft-id-mapper.php's wp_import_insert_term handler
-# DOES log one, as id-map.tsv rows tagged `term:<taxonomy>` in column 3 --
-# theme_mods' nav_menu_locations (B2 above) is REMOVED rather than remapped
-# because nothing CONSUMES that term map for a content remap today, not
-# because it doesn't exist. It does, and _core_wp_remap_nav_page_ids's own
-# `map_json` below MUST exclude those rows explicitly (not just
-# "attachment"), or jq's `add` lets a term row's key silently overwrite a
-# real page mapping that happens to share the same OLD numeric id -- exactly
-# the collision this comment is otherwise warning about, self-inflicted. A
+# id. CORRECTION (Viktor's review, B1), ITSELF LATER CORRECTED: an earlier
+# version of this comment claimed "sitegraft migrates no term id-map at
+# all" and was called out as factually wrong -- mu-plugins/sitegraft-id-
+# mapper.php's wp_import_insert_term handler supposedly DID log one, as
+# id-map.tsv rows tagged `term:<taxonomy>` in column 3. That correction was
+# itself wrong: wordpress-importer 0.9.5 fires wp_import_insert_term only
+# from process_post_term() (class-wp-import.php:1186), whose $term argument
+# comes from the WXR parser's inline <item><category> handling
+# (class-wxr-parser-simplexml.php:183-187), which carries only name/slug/
+# domain -- no original term_id ever reaches this hook. The handler could
+# not have produced a real old->new term id-map; it wrote the literal
+# string "Array" (PHP's array-to-string coercion) into every term: row,
+# and has now been removed outright (see mu-plugins/sitegraft-id-mapper.php
+# for the full account). theme_mods' nav_menu_locations (B2 above) is
+# REMOVED rather than remapped because no usable term map has ever existed
+# to consume -- not because something merely fails to consume one that
+# does. _core_wp_remap_nav_page_ids's own `map_json` below still excludes
+# those `term:` rows explicitly (not just "attachment"), kept now as a
+# defensive guard for legacy id-map.tsv files written before this fix and
+# for any future term-row format -- not because current runs still produce
+# them. (Column 2 of a term: row was always the string "Array", never a
+# digit, so `map_json`'s own `$2 ~ /^[0-9]+$/` guard already excluded these
+# specific rows on its own, independent of the `term:` exclusion below --
+# checked directly, not assumed. The `term:` exclusion stays anyway,
+# belt-and-suspenders, since a differently-shaped garbage or future row
+# could in principle carry a numeric column 2.) A
 # blind `"id":<old>(?!\d)` substitution run against id-map.tsv's POST ids --
 # the same sentinel technique graft_remap_attachment_ids already uses for
 # attachment ids -- would silently rewrite a category's term id whenever it
@@ -642,15 +657,31 @@ _core_wp_remap_nav_page_ids() {
   # attachment reference to begin with (etch_post_import's own component-ref
   # remap excludes them from its map for the identical reason).
   local map_json
-  # B1 (Viktor's review, execution-proven): excluding "attachment" alone is
-  # NOT enough. mu-plugins/sitegraft-id-mapper.php's wp_import_insert_term
-  # handler writes id-map.tsv rows tagged `term:<taxonomy>` in column 3 --
-  # real rows, not hypothetical -- and jq's `add` below lets the LAST row
-  # for a given OLD id win. Without this second exclusion, a term whose old
-  # id collides with a migrated page's old id (both id sequences start at 1
-  # on a fresh WordPress site) silently overwrites the correct page mapping
-  # with the term's new id -- corrupting a "kind":"post-type" reference that
-  # was never a term reference to begin with. Proved live before this fix.
+  # B1 (Viktor's review, execution-proven), CORRECTED: the original claim
+  # behind this exclusion was wrong. mu-plugins/sitegraft-id-mapper.php's
+  # wp_import_insert_term handler never wrote a real term id-map row -- it
+  # wrote the literal string "Array" into column 2 (see that file for the
+  # full account) -- and has since been removed. It never produced the
+  # "real rows, not hypothetical" this comment used to claim, and "Proved
+  # live before this fix" was jq's `add` behavior demonstrated against a
+  # hand-crafted fixture row shaped like a WORKING term map
+  # (tests/unit/test_core_wp_module.bats, the "excludes term: rows" test),
+  # not against real handler output -- checked directly, not assumed.
+  #
+  # The `$3 !~ /^term:/` exclusion below is KEPT anyway, as a defensive
+  # guard for legacy id-map.tsv files written before this fix and for any
+  # future term-row format that might carry a real numeric id in column
+  # 2 -- not because current runs still produce rows it needs to catch.
+  # jq's `add` below lets the LAST row for a given OLD id win, so IF a
+  # term whose old id collided with a migrated page's old id (both id
+  # sequences start at 1 on a fresh WordPress site) ever carried the term's
+  # new id in column 2, it would silently overwrite the correct page
+  # mapping, corrupting a "kind":"post-type" reference that was never a
+  # term reference to begin with -- exactly what this exclusion guards
+  # against for a future format, even though today's `term:` rows can
+  # never trigger it: column 2 isn't numeric, so `$2 ~ /^[0-9]+$/` already
+  # excludes them on its own, checked directly against the handler's real
+  # (removed) behavior above.
   map_json=$(awk -F'\t' '$3 != "attachment" && $3 !~ /^term:/ && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {printf "%s\t%s\n", $1, $2}' "$id_map_tsv" \
     | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t")) | map({(.[0]): .[1]}) | add // {}')
 
