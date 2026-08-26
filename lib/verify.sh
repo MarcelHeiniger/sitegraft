@@ -741,7 +741,13 @@ _verify_wxr_items_remapped() {
 # despite content existing to import" must never render as the same tick
 # as "there was genuinely nothing to import" (`CONTENT_MATCH:0:0:0`,
 # still a real PASS, reserved for when A's own WXR export was ALSO empty
-# of these post_types).
+# of these post_types). A third marker,
+# `CONTENT_MATCH:no-rewrite-record:<total>`, and return code 2 (review
+# round 3, MAJOR), covers module-content-rewrites.tsv being entirely
+# ABSENT (not merely empty) — this run predates graft_run_module_post_
+# import (lib/graft.sh) creating it unconditionally, or a kill mid-hook
+# lost it — see this function's own B2 section below for why that must
+# never be read the same as "present and genuinely empty".
 verify_migrated_content_matches_source() {
   local run_dir="$1" id_map_tsv="$2" manifest="$3"
 
@@ -775,11 +781,28 @@ verify_migrated_content_matches_source() {
     return 0
   fi
 
-  # B2 (round 2's real fix): exclude by POST, never by post_type. A row
-  # missing this file entirely (no module ever wrote to it this run) is
-  # simply an empty exclusion set — every row stays checkable.
-  local rewritten_ids_json='[]'
+  # B2 (round 2's real fix): exclude by POST, never by post_type.
+  #
+  # Review round 3 (MAJOR): the file's mere ABSENCE is now checked
+  # SEPARATELY from it being present-but-empty — graft_run_module_post_
+  # import (lib/graft.sh) creates it unconditionally (dry-run excepted)
+  # before any hook runs, so PRESENT (even empty) means "this run's hooks
+  # were given the chance to record what they rewrote" and a real empty
+  # file is a genuine, trustworthy "nothing was rewritten" signal. ABSENT
+  # means this run predates that guarantee, or a kill mid-hook lost
+  # whatever it would have recorded (see that function's own comment) —
+  # this guard cannot tell the two apart, and must not guess "nothing
+  # excluded" the way an earlier version of this fix-pack did (that
+  # silently read a genuinely rewritten post's un-module-remapped bytes as
+  # a false HARD FAIL). Same has()-style treatment as manifest.content_
+  # checksums_pre_graft's own absence a few lines up in guard 2 below.
   local rewrites_file="${run_dir}/module-content-rewrites.tsv"
+  if [ ! -f "$rewrites_file" ]; then
+    log_error "this run has no module-content-rewrites.tsv at all — it predates graft_run_module_post_import (lib/graft.sh) creating that file unconditionally, or a kill mid-hook lost it, so this guard cannot tell whether a module's post_import hook rewrote any of the ${total} post(s) in scope. Re-run backup and graft against a sitegraft version that records it."
+    echo "CONTENT_MATCH:no-rewrite-record:${total}"
+    return 2
+  fi
+  local rewritten_ids_json='[]'
   [ -s "$rewrites_file" ] && rewritten_ids_json=$(jq -R -s -c \
     'split("\n") | map(select(length > 0) | select(test("^[0-9]+$")) | tonumber) | unique' \
     "$rewrites_file")
@@ -1500,6 +1523,15 @@ phase_verify() {
         # from it actually landed in id-map.tsv this run — the exact
         # shape of the observed defect, and must never render as a pass.
         echo "- [ ] migrated content matches A's: **UNVERIFIED — ${content_match_output##*none-imported:} item(s) were selected for migration but id-map.tsv has no matching row for any of them (nothing was actually imported this run)** — see above" >> "$report"
+        ;;
+      *CONTENT_MATCH:no-rewrite-record:*)
+        # review round 3, MAJOR: this run has no module-content-
+        # rewrites.tsv at all (predates graft recording it unconditionally,
+        # or a kill mid-hook lost it) -- guard 1 cannot tell "nothing was
+        # module-rewritten" from "something was, and we lost the record",
+        # so it refuses to guess in either direction rather than risk a
+        # false HARD FAIL on a genuinely correct graft.
+        echo "- [ ] migrated content matches A's: **UNVERIFIED — no module-content-rewrites.tsv for this run (${content_match_output##*:} post(s) in scope) — cannot tell whether a module's post_import hook rewrote any of them** — see above" >> "$report"
         ;;
       *CONTENT_MATCH:0:0:*)
         # review finding B2, floor (part b): every row in scope was

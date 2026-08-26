@@ -1551,6 +1551,28 @@ graft_record_module_content_rewrite() {
 
 graft_run_module_post_import() {
   local run_dir="$1" id_map_tsv="$2"
+  # issue #52 fix-pack, review round 3 (MAJOR): create the record file
+  # UNCONDITIONALLY (dry-run excepted, matching every other real write in
+  # this codebase) before any hook runs, even if no hook ends up rewriting
+  # a single post. Without this, the file's mere ABSENCE was ambiguous
+  # between three cases lib/verify.sh's guard 1 could not tell apart: this
+  # run genuinely predates the file (an upgrade path — graft ran under an
+  # older sitegraft, verify runs later as its own separate phase against
+  # that same run dir); a graft killed mid-hook (the append happens in
+  # bash AFTER a hook's whole `wp eval` returns, so a kill during that
+  # eval leaves posts already rewritten on B with nothing recorded); or
+  # nothing was legitimately rewritten at all. Guard 1 read "file absent"
+  # exactly like "file empty, hooks ran and rewrote nothing" and excluded
+  # nothing — the first two cases then read a genuinely correct graft's
+  # own module-rewritten content as a false HARD FAIL. Now: file present
+  # (even empty) means "this run's hooks were given the chance to
+  # record", file ABSENT means the run predates that guarantee and guard 1
+  # reports INCOMPLETE instead of guessing — the same has()-style
+  # distinction manifest.content_checksums_pre_graft's own absence already
+  # gets. A resume that skips a partially-run hook can still lose some IDs
+  # (case two, above) — that specific gap is issue #54's resume-ordering
+  # problem in a narrower window, not something this file alone can close.
+  is_dry_run || : >> "${run_dir}/module-content-rewrites.tsv"
   local mod
   for mod in $SITEGRAFT_MODULES; do
     module_has_fn "$mod" post_import || continue

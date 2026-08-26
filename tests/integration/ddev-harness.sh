@@ -1468,9 +1468,29 @@ grep -q "Result: PASS" "$VERIFY_REPORT"
 # that silently produced the wrong bytes). This is the only end-to-end
 # proof that guard 1 does anything at all -- the DOMAIN_SCANNED_POSTS-style
 # assertion above proves it examined something; this proves it can fail.
+#
+# Review round 3 (MINOR): the mutate/revert round-trip below writes via
+# $wpdb->update (a `wp eval`), never `wp post update` -- `wp post update`
+# is `wp_update_post()`, i.e. the EXACT array-form slashing bug issue #43
+# fixed in this codebase's own production write path
+# (sitegraft_write_remapped_post, lib/php/content-remap-functions.php):
+# the day this fixture's Home page carries real Etch content with
+# JSON-escaped backslashes, `wp post update` would silently corrupt it on
+# the REVERT step, and the final PASS assertion below would fail for a
+# reason with nothing to do with the product. The original content is also
+# round-tripped through B's own postmeta, server-side, rather than through
+# a bash variable: `$(...)` command substitution strips trailing newlines,
+# so capturing post_content into a shell variable and writing it back is
+# its own silent-corruption risk, independent of #43.
 echo "==> NEGATIVE CASE 4 (issue #52's own guard 1): mutating a migrated page's post_content directly on B, to prove verify_migrated_content_matches_source actually detects a real content mismatch rather than always reporting PASS"
-HOME_CONTENT_BEFORE=$(ddev exec --raw -p "$PROJECT_B" -- wp post get "$B_HOME_ID_FROM_MAP" --field=post_content)
-ddev exec --raw -p "$PROJECT_B" -- wp post update "$B_HOME_ID_FROM_MAP" --post_content="${HOME_CONTENT_BEFORE} <!-- corrupted by harness negative case 4 -->"
+ddev exec --raw -p "$PROJECT_B" -- wp eval "
+global \$wpdb;
+\$id = ${B_HOME_ID_FROM_MAP};
+\$post = get_post( \$id );
+update_post_meta( \$id, '_harness_negative_case_4_original', \$post->post_content );
+\$wpdb->update( \$wpdb->posts, array( 'post_content' => \$post->post_content . '<!-- corrupted by harness negative case 4 -->' ), array( 'ID' => \$id ) );
+clean_post_cache( \$id );
+"
 if "${ROOT}/bin/sitegraft" verify --profile "$PROFILE" --run "$RUN_DIR"; then
   echo "FAIL: verify reported success even though a migrated page's post_content on B no longer matches what graft produced from A — guard 1 (issue #52) is not actually comparing real content" >&2
   exit 1
@@ -1485,8 +1505,15 @@ esac
 grep -q "Result: HARD FAIL" "$VERIFY_REPORT"
 echo "==> confirmed: verify_migrated_content_matches_source genuinely detects a real content mismatch on a migrated page (post ${B_HOME_ID_FROM_MAP}) and names it"
 
-echo "==> reverting the injected content corruption and re-confirming verify passes clean again"
-ddev exec --raw -p "$PROJECT_B" -- wp post update "$B_HOME_ID_FROM_MAP" --post_content="$HOME_CONTENT_BEFORE"
+echo "==> reverting the injected content corruption (via \$wpdb->update, from B's own postmeta -- never through a bash variable or wp_update_post) and re-confirming verify passes clean again"
+ddev exec --raw -p "$PROJECT_B" -- wp eval "
+global \$wpdb;
+\$id = ${B_HOME_ID_FROM_MAP};
+\$original = get_post_meta( \$id, '_harness_negative_case_4_original', true );
+\$wpdb->update( \$wpdb->posts, array( 'post_content' => \$original ), array( 'ID' => \$id ) );
+delete_post_meta( \$id, '_harness_negative_case_4_original' );
+clean_post_cache( \$id );
+"
 "${ROOT}/bin/sitegraft" verify --profile "$PROFILE" --run "$RUN_DIR"
 grep -q "Result: PASS" "$VERIFY_REPORT"
 

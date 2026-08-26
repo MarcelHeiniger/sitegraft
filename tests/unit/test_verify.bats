@@ -714,6 +714,10 @@ EOF
 @test "verify_migrated_content_matches_source passes when B's live content equals the remapped WXR content for every id-map row" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   printf '5\t105\tpage\n' > "${run_dir}/id-map.tsv"
+  # review round 3 (MAJOR): graft_run_module_post_import now creates this
+  # file unconditionally, even when nothing gets rewritten -- present and
+  # empty means "hooks ran, recorded nothing", a real, trustworthy signal.
+  : > "${run_dir}/module-content-rewrites.tsv"
   local manifest='{"migrate":{"core-wp":{"post_types":["page"]}}}'
   _verify_wxr_items_remapped() { echo '[{"post_id":5,"post_type":"page","post_content":"hello","post_excerpt":""}]'; }
   wp_remote() { echo '[{"ID":105,"post_content":"hello","post_excerpt":""}]'; }
@@ -725,6 +729,7 @@ EOF
 @test "verify_migrated_content_matches_source hard-fails when B's live content does not equal the remapped WXR content" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   printf '5\t105\tpage\n' > "${run_dir}/id-map.tsv"
+  : > "${run_dir}/module-content-rewrites.tsv"
   local manifest='{"migrate":{"core-wp":{"post_types":["page"]}}}'
   _verify_wxr_items_remapped() { echo '[{"post_id":5,"post_type":"page","post_content":"hello","post_excerpt":""}]'; }
   wp_remote() { echo '[{"ID":105,"post_content":"DIFFERENT","post_excerpt":""}]'; }
@@ -2095,6 +2100,11 @@ XML
   command -v php >/dev/null 2>&1 || skip "php CLI not available in this environment"
 
   printf '16\t105\tpage\n' > "${RUN_DIR}/id-map.tsv"
+  # review round 3 (MAJOR): present-and-empty is what graft_run_module_
+  # post_import (lib/graft.sh) actually produces when nothing was
+  # module-rewritten -- an absent file is now INCOMPLETE, a different
+  # state this test is not about.
+  : > "${RUN_DIR}/module-content-rewrites.tsv"
   mkdir -p "${RUN_DIR}/export"
   cat > "${RUN_DIR}/export/one.xml" <<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -2165,12 +2175,14 @@ XML
   SITEGRAFT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
   export SITEGRAFT_ROOT
   command -v php >/dev/null 2>&1 || skip "php CLI not available in this environment"
-  # No module-content-rewrites.tsv exists for this run (review round 2's
-  # B2 fix), so this genuinely exercises guard 1's wp_remote read (and
-  # therefore the dry-run echo path this test is about) rather than
-  # short-circuiting on an exclusion.
 
   printf '16\t105\tpage\n' > "${RUN_DIR}/id-map.tsv"
+  # review round 3 (MAJOR): present-and-empty, not absent -- see the
+  # sibling PASS test above for why. This still genuinely exercises guard
+  # 1's wp_remote read (and therefore the dry-run echo path this test is
+  # about) rather than short-circuiting on an exclusion, since the file
+  # being empty means nothing is excluded.
+  : > "${RUN_DIR}/module-content-rewrites.tsv"
   mkdir -p "${RUN_DIR}/export"
   cat > "${RUN_DIR}/export/one.xml" <<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -2271,11 +2283,13 @@ XML
   printf '16\t105\tpage\n' > "${run_dir}/id-map.tsv" # genuinely imported, as new post 105
   local manifest='{"migrate":{"core-wp":{"post_types":["page"]}}}'
   _verify_wxr_items_remapped() { echo '[{"post_id":16,"post_type":"page","post_content":"B'"'"'s own old front page","post_excerpt":""}]'; }
-  # No ${run_dir}/module-content-rewrites.tsv exists (review round 2's B2
-  # fix: exclusion is by POST, via that file, not by post_type/module-file
-  # presence -- SITEGRAFT_ROOT is irrelevant to this guard now), so this
-  # row is genuinely checkable and this test exercises the real
+  # Present and empty (review round 3, MAJOR): a genuinely absent file
+  # now means INCOMPLETE, not "nothing excluded" -- see this file's own
+  # comment on graft_run_module_post_import (lib/graft.sh) creating it
+  # unconditionally. Empty here means "hooks ran, rewrote nothing", so
+  # this row is genuinely checkable and this test exercises the real
   # comparison.
+  : > "${run_dir}/module-content-rewrites.tsv"
 
   wp_remote() {
     local alias_lc="$1"; shift
@@ -2390,6 +2404,7 @@ XML
   # A term row (mu-plugins/sitegraft-id-mapper.php's wp_import_insert_term
   # handler writes exactly this shape) alongside a real, matched page row.
   printf '5\t105\tpage\n9\t44\tterm:category\n' > "${run_dir}/id-map.tsv"
+  : > "${run_dir}/module-content-rewrites.tsv"
   local manifest='{"migrate":{"core-wp":{"post_types":["page"]}}}'
   _verify_wxr_items_remapped() { echo '[{"post_id":5,"post_type":"page","post_content":"hello","post_excerpt":""}]'; }
   wp_remote() { echo '[{"ID":105,"post_content":"hello","post_excerpt":""}]'; }
@@ -2460,3 +2475,46 @@ XML
   [[ "$output" == *"CONTENT_MATCH:none-imported:1"* ]] || false
   [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }
+
+# --- review round 3 (MAJOR): module-content-rewrites.tsv's ABSENCE must ---
+# be INCOMPLETE, never "nothing excluded" (which used to false-hard-fail a
+# genuinely correct graft — a post a module hook DID rewrite, compared
+# against A's un-module-remapped bytes).
+
+@test "verify_migrated_content_matches_source returns INCOMPLETE when module-content-rewrites.tsv is entirely ABSENT, never comparing anything (review round 3, MAJOR)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  printf '5\t105\tpage\n' > "${run_dir}/id-map.tsv"
+  # No module-content-rewrites.tsv at all -- this run predates graft
+  # creating it unconditionally (or a kill mid-hook lost it).
+  local manifest='{"migrate":{"core-wp":{"post_types":["page"]}}}'
+  # A's un-remapped WXR content still carries the OLD Etch component ref
+  # -- if this guard wrongly treated "absent" as "nothing excluded" (round
+  # 2's behavior), it would compare this against B's correctly
+  # module-remapped live content and false-hard-fail.
+  _verify_wxr_items_remapped() { echo '[{"post_id":5,"post_type":"page","post_content":"<!-- wp:etch/component {\"ref\":14468} -->","post_excerpt":""}]'; }
+  wp_remote() { echo "SHOULD NOT BE CALLED — an absent record file means INCOMPLETE, before any live fetch"; }
+  run verify_migrated_content_matches_source "$run_dir" "${run_dir}/id-map.tsv" "$manifest"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"CONTENT_MATCH:no-rewrite-record:1"* ]] || false
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
+@test "verify_migrated_content_matches_source compares for real when module-content-rewrites.tsv is present but genuinely empty (review round 3, MAJOR)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  printf '5\t105\tpage\n' > "${run_dir}/id-map.tsv"
+  : > "${run_dir}/module-content-rewrites.tsv" # present, hooks ran, rewrote nothing
+  local manifest='{"migrate":{"core-wp":{"post_types":["page"]}}}'
+  _verify_wxr_items_remapped() { echo '[{"post_id":5,"post_type":"page","post_content":"hello","post_excerpt":""}]'; }
+  wp_remote() { echo '[{"ID":105,"post_content":"hello","post_excerpt":""}]'; }
+  run verify_migrated_content_matches_source "$run_dir" "${run_dir}/id-map.tsv" "$manifest"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"CONTENT_MATCH:1:1:0"* ]] || false
+}
+
+# MUTATION PROOF (executed by hand, restored below, not left in the suite):
+# reverting the `[ ! -f "$rewrites_file" ]` guard in
+# verify_migrated_content_matches_source (lib/verify.sh) back to treating
+# an absent file the same as an empty one (round 2's behavior) makes the
+# FIRST test above fail: status flips from 2 to 1 (a real HARD FAIL,
+# "105" not matching "14468" post-remap), and the "SHOULD NOT BE CALLED"
+# stub gets invoked for real. Proven by hand, then reverted.
