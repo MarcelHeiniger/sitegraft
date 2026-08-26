@@ -111,6 +111,75 @@ setup() {
   [ -f "${wp_content}/sitegraft-id-map.log" ]
 }
 
+# --- graft_prune_previous_run also strips run_dir/id-map.tsv (MAJOR-2) -----
+#
+# graft_reset_id_map_log (above) only ever clears B's own cumulative log —
+# it never touched ${run_dir}/id-map.tsv, the file graft_fetch_id_map has
+# already appended INTO on any earlier pass through this run_dir. Without
+# this, a prune rerun deletes the posts a stale row points at, on B, while
+# the row itself survives in id-map.tsv — graft_verify_import_completeness
+# would then read that stale row back as "already landed" for an old_id B
+# no longer has anything for, passing a gate it exists to fail.
+
+@test "graft_prune_previous_run strips non-attachment rows from run_dir/id-map.tsv, keeping attachment rows" {
+  local wp_content="$BATS_TEST_TMPDIR/site-b/wp-content"
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$wp_content" "$run_dir"
+  SITE_B_WP_PATH="$BATS_TEST_TMPDIR/site-b"
+  unset SITE_B_SSH_HOST
+  wp_remote() { :; }
+  printf '101\t5001\tpage\n7\t42\tattachment\n200\t9\tterm:category\n' > "${run_dir}/id-map.tsv"
+  graft_prune_previous_run "page" "$run_dir"
+  [ "$(cat "${run_dir}/id-map.tsv")" = "7	42	attachment" ]
+}
+
+@test "graft_prune_previous_run leaves a run_dir id-map.tsv holding ONLY attachment rows genuinely empty, not one blank line" {
+  local wp_content="$BATS_TEST_TMPDIR/site-b/wp-content"
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$wp_content" "$run_dir"
+  SITE_B_WP_PATH="$BATS_TEST_TMPDIR/site-b"
+  unset SITE_B_SSH_HOST
+  wp_remote() { :; }
+  printf '101\t5001\tpage\n200\t9\tterm:category\n' > "${run_dir}/id-map.tsv"
+  graft_prune_previous_run "page" "$run_dir"
+  [ ! -s "${run_dir}/id-map.tsv" ]
+}
+
+@test "graft_prune_previous_run does not touch run_dir/id-map.tsv under --dry-run" {
+  local wp_content="$BATS_TEST_TMPDIR/site-b/wp-content"
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$wp_content" "$run_dir"
+  SITE_B_WP_PATH="$BATS_TEST_TMPDIR/site-b"
+  unset SITE_B_SSH_HOST
+  SITEGRAFT_DRY_RUN=1
+  wp_remote() { :; }
+  printf '101\t5001\tpage\n' > "${run_dir}/id-map.tsv"
+  graft_prune_previous_run "page" "$run_dir"
+  [ "$(cat "${run_dir}/id-map.tsv")" = "101	5001	page" ]
+}
+
+@test "graft_prune_previous_run is unaffected by a run_dir with no id-map.tsv yet (first-ever run)" {
+  local wp_content="$BATS_TEST_TMPDIR/site-b/wp-content"
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$wp_content" "$run_dir"
+  SITE_B_WP_PATH="$BATS_TEST_TMPDIR/site-b"
+  unset SITE_B_SSH_HOST
+  wp_remote() { :; }
+  run graft_prune_previous_run "page" "$run_dir"
+  [ "$status" -eq 0 ]
+  [ ! -e "${run_dir}/id-map.tsv" ]
+}
+
+@test "graft_prune_previous_run called with no run_dir argument at all still works (every pre-existing caller/test)" {
+  local wp_content="$BATS_TEST_TMPDIR/site-b/wp-content"
+  mkdir -p "$wp_content"
+  SITE_B_WP_PATH="$BATS_TEST_TMPDIR/site-b"
+  unset SITE_B_SSH_HOST
+  wp_remote() { :; }
+  run graft_prune_previous_run "page"
+  [ "$status" -eq 0 ]
+}
+
 # --- end-to-end acceptance criterion: real subprocess, real `set -e` -------
 #
 # A fake `wp` executable stands in for wp-cli end to end (both A and B are
@@ -246,4 +315,176 @@ EOF
   prune_line_2=$(grep -n -- '--meta_key=_sitegraft_source_id' "$WP_FAKE_CALL_LOG" | sed -n '2p' | cut -d: -f1)
   import_line_2=$(grep -n -- '--skip=attachment' "$WP_FAKE_CALL_LOG" | sed -n '2p' | cut -d: -f1)
   [ "$prune_line_2" -lt "$import_line_2" ]
+}
+
+# --- BLOCKER-1/BLOCKER-2 acceptance: a real `sitegraft graft` run, real
+# `wp import` SUCCESS, one item silently skipped ---------------------------
+#
+# The two review blockers in this fix-pack were both about
+# graft_verify_import_completeness misreading the WXR it parses -- neither
+# is reachable through a fixture where `import` always fails (the existing
+# issue #54 acceptance test above never reaches this gate at all). This
+# fixture instead lets `import` SUCCEED while simulating exactly what
+# wordpress-importer 0.9.5 really does on a title/date/type collision
+# (issue #53's own defect): only ONE of two staged items gets a
+# wp_import_insert_post-sourced row in B's mapping log. The staged WXR
+# itself uses the BLOCKER-2 shape (an item's own wp:post_id/wp:post_type
+# sharing one physical line) so this is also the real end-to-end proof that
+# the gate reports the correct "1 of 2" / "page#102", by real post_id and
+# post_type, never a garbled XML fragment -- the previous awk-based scan's
+# exact failure mode on this shape.
+_write_fake_wp_success_with_skip() {
+  local path="$1"
+  cat > "$path" <<'FAKEWP'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$WP_FAKE_CALL_LOG"
+wp_path=""
+for a in "$@"; do
+  case "$a" in --path=*) wp_path="${a#--path=}" ;; esac
+done
+sub=""
+for a in "$@"; do
+  case "$a" in
+    plugin|post|export|import|eval) sub="$a" ;;
+  esac
+done
+case "$sub" in
+  plugin) exit 0 ;;   # is-installed / is-active -- always "yes"
+  post) exit 0 ;;     # post list -- prints nothing (no leftovers)
+  eval) echo '[]' ;;  # attachment-metadata collection: "A has no attachments"
+  export)
+    dir=""
+    for a in "$@"; do
+      case "$a" in --dir=*) dir="${a#--dir=}" ;; esac
+    done
+    mkdir -p "$dir"
+    # BLOCKER-2 shape: each item's own wp:post_id/wp:post_type share one
+    # physical line. Two items: 101 and 102.
+    cat > "${dir}/export.xml" <<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+  xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/"
+  xmlns:content="http://purl.org/rss/1.0/modules/content/"
+  xmlns:wp="http://wordpress.org/export/1.2/">
+<channel><wp:wxr_version>1.2</wp:wxr_version>
+<item>
+<wp:post_id>101</wp:post_id><wp:post_type>page</wp:post_type>
+</item>
+<item>
+<wp:post_id>102</wp:post_id><wp:post_type>page</wp:post_type>
+</item>
+</channel></rss>
+XML
+    exit 0
+    ;;
+  import)
+    # SUCCEEDS overall (exit 0, matching a real wordpress-importer run that
+    # completes without a fatal error) but simulates issue #53's real
+    # defect directly: only 101 fires wp_import_insert_post and gets a
+    # mu-plugin log row -- 102 is silently "already exists". There is no
+    # real WP/mu-plugin in this fixture, so the row is written here,
+    # exactly what mu-plugins/sitegraft-id-mapper.php's own hook would have
+    # written for a real insert.
+    mkdir -p "${wp_path}/wp-content"
+    printf '101\t5001\tpage\n' >> "${wp_path}/wp-content/sitegraft-id-map.log"
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac
+FAKEWP
+  chmod +x "$path"
+}
+
+@test "BLOCKER-1/BLOCKER-2 acceptance: a real graft run reports the true '1 of 2'/page#102, and a resume actually retries" {
+  local sitegraft_bin="${BATS_TEST_DIRNAME}/../../bin/sitegraft"
+  local fake_wp="$BATS_TEST_TMPDIR/fake-wp"
+  _write_fake_wp_success_with_skip "$fake_wp"
+
+  export WP_FAKE_CALL_LOG="$BATS_TEST_TMPDIR/wp-calls.log"
+  : > "$WP_FAKE_CALL_LOG"
+
+  local site_a="$BATS_TEST_TMPDIR/site-a" site_b="$BATS_TEST_TMPDIR/site-b"
+  mkdir -p "${site_a}/wp-content/uploads" "${site_b}/wp-content/uploads" "${site_b}/wp-content/mu-plugins"
+
+  export SITEGRAFT_PROFILES_DIR="$BATS_TEST_TMPDIR/profiles"
+  mkdir -p "$SITEGRAFT_PROFILES_DIR"
+  cat > "${SITEGRAFT_PROFILES_DIR}/demo.conf" <<EOF
+SITE_A_ALIAS="a"
+SITE_A_WP_PATH="${site_a}"
+SITE_A_WP_CMD="${fake_wp}"
+SITE_B_ALIAS="b"
+SITE_B_WP_PATH="${site_b}"
+SITE_B_WP_CMD="${fake_wp}"
+SITEGRAFT_STATE_DIR="${BATS_TEST_TMPDIR}/state"
+EOF
+  mkdir -p "${BATS_TEST_TMPDIR}/state"
+
+  local run_dir="${BATS_TEST_TMPDIR}/state/demo-20260101T000000"
+  mkdir -p "$run_dir"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[]}' > "${run_dir}/scan-a.json"
+  echo '{"active_theme":{"stylesheet":"t"},"plugins":[]}' > "${run_dir}/scan-b.json"
+  cat > "${run_dir}/manifest.json" <<'EOF'
+{"migrate":{"core-wp":{"post_types":["page"],"option_keys":[]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}
+EOF
+  touch "${run_dir}/backup.complete"
+
+  export SITEGRAFT_MODULES_DIR="$BATS_TEST_TMPDIR/empty-modules"
+  mkdir -p "$SITEGRAFT_MODULES_DIR"
+
+  # --- pass 1: a REAL import that succeeds, silently skipping 102. ---
+  run "$sitegraft_bin" graft --profile demo --run "$run_dir"
+  [ "$status" -eq 1 ]
+
+  # The acceptance criterion itself: the real, structurally-parsed count
+  # and name, not a garbled XML fragment (BLOCKER-1/BLOCKER-2).
+  [[ "$output" == *"1 of 2"* ]] || false
+  [[ "$output" == *"page#102"* ]] || false
+  [[ "$output" != *"<item>"* ]] || false
+  [[ "$output" != *"<wp:"* ]] || false
+
+  # MAJOR-3: the failure names B's real state and says a repeat WILL retry.
+  [[ "$output" == *"partially migrated"* ]] || false
+  [[ "$output" == *"WILL retry"* ]] || false
+
+  # MAJOR-2/MAJOR-3: the three markers a retry depends on are cleared...
+  [ ! -f "${run_dir}/graft.import_attachments.done" ]
+  [ ! -f "${run_dir}/graft.import.done" ]
+  [ ! -f "${run_dir}/graft.fetch_id_map.done" ]
+  # ...but the steps that already ran correctly and don't need to redo
+  # their (expensive) work are left alone.
+  [ -f "${run_dir}/graft.stack_sync.done" ]
+  [ -f "${run_dir}/graft.media_sync.done" ]
+  [ -f "${run_dir}/graft.prune.done" ]
+  [ -f "${run_dir}/graft.importer_setup.done" ]
+  [ -f "${run_dir}/graft.export.done" ]
+
+  # Only 101's row is on record after pass 1 -- 102 was never inserted.
+  [ "$(cat "${run_dir}/id-map.tsv")" = "101	5001	page" ]
+
+  local prune_calls_pass1 import_calls_pass1
+  prune_calls_pass1=$(grep -c -- '--meta_key=_sitegraft_source_id' "$WP_FAKE_CALL_LOG" || true)
+  import_calls_pass1=$(grep -c -- '--skip=attachment' "$WP_FAKE_CALL_LOG" || true)
+  [ "$prune_calls_pass1" -eq 1 ]
+  [ "$import_calls_pass1" -eq 1 ]
+
+  # --- pass 2: a resume against the SAME run directory. The message
+  # promised this WOULD retry -- prove it does, not merely that the
+  # markers changed. ---
+  run "$sitegraft_bin" graft --profile demo --run "$run_dir"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"1 of 2"* ]] || false
+  [[ "$output" == *"page#102"* ]] || false
+
+  local prune_calls_pass2 import_calls_pass2
+  prune_calls_pass2=$(grep -c -- '--meta_key=_sitegraft_source_id' "$WP_FAKE_CALL_LOG" || true)
+  import_calls_pass2=$(grep -c -- '--skip=attachment' "$WP_FAKE_CALL_LOG" || true)
+  [ "$prune_calls_pass2" -eq 2 ]
+  [ "$import_calls_pass2" -eq 2 ]
+
+  # MAJOR-2: id-map.tsv holds exactly ONE fresh "101" row after pass 2, not
+  # two (which a stale, un-stripped row from pass 1 would have produced,
+  # or which would have masked prune's own log reset on B never having run
+  # again).
+  [ "$(cat "${run_dir}/id-map.tsv")" = "101	5001	page" ]
+  [ "$(grep -c '^101' "${run_dir}/id-map.tsv")" -eq 1 ]
 }

@@ -2,23 +2,53 @@
 # (issue #53). wordpress-importer INSERTS, never updates: an item it reports
 # as "already exists" is skipped with no wp_import_insert_post fired at all
 # (verified live against the shipped 0.9.5 — see the function's own header
-# comment in lib/graft.sh for the exact source read and why the two
-# "complete the map instead" avenues issue #53 names do not exist there
-# either). This cross-references the WXR this run staged for import against
-# id-map.tsv (written by the mapping mu-plugin) and must fail the run when
-# an item never made it across.
+# comment in lib/graft.sh for the exact source read). Failing loudly on that
+# is still correct (a real completion path exists but is deliberately not
+# used yet — see lib/graft.sh's own header and issue #58 for why). This
+# cross-references the WXR this run staged for import against id-map.tsv
+# (written by the mapping mu-plugin) and must fail the run when an item
+# never made it across.
+#
+# Real end-to-end tests throughout: genuine WXR file(s) on disk, the genuine
+# php CLI driver (lib/php/wxr-item-ids-cli.php) — not a bash-level stub of
+# it, same reasoning tests/unit/test_verify.bats's own _verify_wxr_items_
+# remapped tests give for doing the same against verify-content-remap-cli.php.
 setup() {
   load '../../lib/core.sh'
   load '../../lib/graft.sh'
+  SITEGRAFT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
+  export SITEGRAFT_ROOT
+  command -v php >/dev/null 2>&1 || skip "php CLI not available in this environment"
 }
 
 # --- helpers ---------------------------------------------------------------
 
+# _write_wxr <file> <id:type> [<id:type> ...] — a REAL WXR shape: every
+# namespace the wp:/content:/excerpt: prefixes below actually use is
+# declared, exactly like a genuine `wp export` document (and
+# tests/unit/test_verify.bats's own wxr_item_xml fixture, lib/php/wxr-
+# content-functions.php's own bats tests). An earlier version of this
+# helper omitted the xmlns declarations entirely — harmless against the
+# previous line-oriented awk scan, which never looked at namespaces at
+# all, but the real XMLReader-based parser this function now calls
+# resolves `wp:post_id` against its DECLARED namespace URI, not against
+# the bare string "wp:post_id" — an undeclared "wp" prefix is a real
+# (non-fatal, level 2) libxml namespace error, and the element's localName
+# comes back as the literal "wp:post_id" with an EMPTY namespaceURI, which
+# matches nothing. Verified live: every test in this file silently found
+# ZERO items with the undeclared-namespace fixture, each masked by
+# whichever assertion direction happened to make "found nothing" look like
+# a pass (an empty "expected" set reads as "nothing to check", not "the
+# parser broke").
 _write_wxr() {
-  # _write_wxr <file> <id:type> [<id:type> ...]
   local file="$1"; shift
   {
-    printf '<rss><channel><wp:wxr_version>1.2</wp:wxr_version>\n'
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<rss version="2.0"\n'
+    printf '  xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/"\n'
+    printf '  xmlns:content="http://purl.org/rss/1.0/modules/content/"\n'
+    printf '  xmlns:wp="http://wordpress.org/export/1.2/">\n'
+    printf '<channel><wp:wxr_version>1.2</wp:wxr_version>\n'
     local pair id type
     for pair in "$@"; do
       id="${pair%%:*}"
@@ -36,14 +66,14 @@ _write_wxr() {
   mkdir -p "${run_dir}/export"
   _write_wxr "${run_dir}/export/export.xml" "101:page" "102:page"
   printf '101\t5001\tpage\n102\t5002\tpage\n' > "${run_dir}/id-map.tsv"
-  run graft_verify_import_completeness "$run_dir"
+  run graft_verify_import_completeness "$run_dir" "page"
   [ "$status" -eq 0 ]
 }
 
-@test "graft_verify_import_completeness passes when there are zero non-attachment items to check (nothing staged)" {
+@test "graft_verify_import_completeness passes when there are zero non-attachment items to check (nothing staged, nothing selected)" {
   local run_dir="$BATS_TEST_TMPDIR/run"
   mkdir -p "${run_dir}/export"
-  run graft_verify_import_completeness "$run_dir"
+  run graft_verify_import_completeness "$run_dir" ""
   [ "$status" -eq 0 ]
 }
 
@@ -56,7 +86,7 @@ _write_wxr() {
   # Only 101 actually landed -- 102 was skipped by wordpress-importer and
   # never fired wp_import_insert_post, so the mu-plugin never logged it.
   printf '101\t5001\tpage\n' > "${run_dir}/id-map.tsv"
-  run graft_verify_import_completeness "$run_dir"
+  run graft_verify_import_completeness "$run_dir" "page"
   [ "$status" -eq 1 ]
   [[ "$output" == *"1 of 2"* ]] || false
   [[ "$output" == *"page#102"* ]] || false
@@ -67,7 +97,7 @@ _write_wxr() {
   mkdir -p "${run_dir}/export"
   _write_wxr "${run_dir}/export/export.xml" "101:page"
   [ ! -e "${run_dir}/id-map.tsv" ]
-  run graft_verify_import_completeness "$run_dir"
+  run graft_verify_import_completeness "$run_dir" "page"
   [ "$status" -eq 1 ]
   [[ "$output" == *"1 of 1"* ]] || false
 }
@@ -77,7 +107,7 @@ _write_wxr() {
   mkdir -p "${run_dir}/export"
   _write_wxr "${run_dir}/export/export.xml" "101:page" "102:page" "103:post" "104:post"
   printf '101\t5001\tpage\n103\t5003\tpost\n' > "${run_dir}/id-map.tsv"
-  run graft_verify_import_completeness "$run_dir"
+  run graft_verify_import_completeness "$run_dir" "page,post"
   [ "$status" -eq 1 ]
   [[ "$output" == *"2 of 4"* ]] || false
   [[ "$output" == *"page#102"* ]] || false
@@ -95,7 +125,7 @@ _write_wxr() {
   # 999 (attachment) correctly has NO row here -- attachments are migrated
   # entirely outside this path (graft_import_attachments), never expected.
   printf '101\t5001\tpage\n' > "${run_dir}/id-map.tsv"
-  run graft_verify_import_completeness "$run_dir"
+  run graft_verify_import_completeness "$run_dir" "page"
   [ "$status" -eq 0 ]
 }
 
@@ -106,7 +136,7 @@ _write_wxr() {
   # A coincidental attachment row sharing the SAME old_id number must never
   # be read as satisfying post 101's own expectation.
   printf '101\t9999\tattachment\n' > "${run_dir}/id-map.tsv"
-  run graft_verify_import_completeness "$run_dir"
+  run graft_verify_import_completeness "$run_dir" "page"
   [ "$status" -eq 1 ]
   [[ "$output" == *"page#101"* ]] || false
 }
@@ -116,9 +146,39 @@ _write_wxr() {
   mkdir -p "${run_dir}/export"
   _write_wxr "${run_dir}/export/export.xml" "200:page"
   printf '200\t9\tterm:category\n' > "${run_dir}/id-map.tsv"
-  run graft_verify_import_completeness "$run_dir"
+  run graft_verify_import_completeness "$run_dir" "page"
   [ "$status" -eq 1 ]
   [[ "$output" == *"page#200"* ]] || false
+}
+
+# --- nav_menu_item exemption (review, MINOR-2) ------------------------------
+# process_posts() (wordpress-importer 0.9.5, ~line 782) special-cases
+# nav_menu_item BEFORE the generic insert path, dispatching to
+# process_menu_item() -> wp_update_nav_menu_item() instead of
+# wp_insert_post() -- wp_import_insert_post never fires for one, imported or
+# not, so the mu-plugin never logs a row for it regardless of success.
+# Unreachable via any shipped module today (nothing declares
+# nav_menu_item), but the exemption must already be correct for the day a
+# menus module does.
+
+@test "graft_verify_import_completeness does not false-positive on a nav_menu_item, which wordpress-importer never routes through wp_import_insert_post" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "${run_dir}/export"
+  _write_wxr "${run_dir}/export/export.xml" "101:page" "77:nav_menu_item"
+  printf '101\t5001\tpage\n' > "${run_dir}/id-map.tsv"
+  run graft_verify_import_completeness "$run_dir" "page,nav_menu_item"
+  [ "$status" -eq 0 ]
+}
+
+@test "graft_verify_import_completeness still catches a genuinely skipped page sitting next to an exempt nav_menu_item" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "${run_dir}/export"
+  _write_wxr "${run_dir}/export/export.xml" "101:page" "102:page" "77:nav_menu_item"
+  printf '101\t5001\tpage\n' > "${run_dir}/id-map.tsv"
+  run graft_verify_import_completeness "$run_dir" "page,nav_menu_item"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"1 of 2"* ]] || false
+  [[ "$output" == *"page#102"* ]] || false
 }
 
 # --- multi-file WXR export (design doc / graft_import_wxr's own comment:
@@ -130,7 +190,7 @@ _write_wxr() {
   _write_wxr "${run_dir}/export/export.000.xml" "101:page"
   _write_wxr "${run_dir}/export/export.001.xml" "102:page"
   printf '101\t5001\tpage\n102\t5002\tpage\n' > "${run_dir}/id-map.tsv"
-  run graft_verify_import_completeness "$run_dir"
+  run graft_verify_import_completeness "$run_dir" "page"
   [ "$status" -eq 0 ]
 }
 
@@ -140,7 +200,7 @@ _write_wxr() {
   _write_wxr "${run_dir}/export/export.000.xml" "101:page"
   _write_wxr "${run_dir}/export/export.001.xml" "102:page"
   printf '101\t5001\tpage\n' > "${run_dir}/id-map.tsv"
-  run graft_verify_import_completeness "$run_dir"
+  run graft_verify_import_completeness "$run_dir" "page"
   [ "$status" -eq 1 ]
   [[ "$output" == *"page#102"* ]] || false
 }
@@ -154,17 +214,23 @@ _write_wxr() {
   mkdir -p "$run_dir"
   [ ! -d "${run_dir}/export" ]
   SITEGRAFT_DRY_RUN=1
-  run graft_verify_import_completeness "$run_dir"
+  run graft_verify_import_completeness "$run_dir" "page"
   [ "$status" -eq 0 ]
 }
 
-# --- CDATA tolerance, matching graft_integrity_gate's own defense-in-depth -
+# --- CDATA tolerance -- and the exact BLOCKER-1(a) shape the previous awk
+# scan could not tell apart from a real, structural <wp:post_type> ----------
 
 @test "graft_verify_import_completeness also parses CDATA-wrapped wp:post_id/wp:post_type, if ever encountered" {
   local run_dir="$BATS_TEST_TMPDIR/run"
   mkdir -p "${run_dir}/export"
   cat > "${run_dir}/export/export.xml" <<'EOF'
-<rss><channel><wp:wxr_version>1.2</wp:wxr_version>
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+  xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/"
+  xmlns:content="http://purl.org/rss/1.0/modules/content/"
+  xmlns:wp="http://wordpress.org/export/1.2/">
+<channel><wp:wxr_version>1.2</wp:wxr_version>
 <item>
 <wp:post_id><![CDATA[303]]></wp:post_id>
 <wp:post_type><![CDATA[page]]></wp:post_type>
@@ -172,6 +238,153 @@ _write_wxr() {
 </channel></rss>
 EOF
   printf '303\t5303\tpage\n' > "${run_dir}/id-map.tsv"
-  run graft_verify_import_completeness "$run_dir"
+  run graft_verify_import_completeness "$run_dir" "page"
   [ "$status" -eq 0 ]
+}
+
+# BLOCKER-1(a) (review): a real page whose OWN post_content happens to
+# contain the literal text "<wp:post_type>attachment</wp:post_type>" (a
+# plausible real case -- content describing or copy-pasted from another
+# WXR export) must NOT be read as an attachment and exempted. The previous
+# awk scan assigned `type` unconditionally on any line matching
+# `/<wp:post_type>/`, wherever in the file that line sat, last write wins --
+# this exact fixture flipped a real unmapped page into the "already
+# handled, nothing to check" bucket. The real parser resolves an <item>'s
+# OWN direct <wp:post_type> child by namespace, never text sitting inside a
+# DIFFERENT element's CDATA body, so this must still be caught as missing.
+@test "graft_verify_import_completeness is not fooled by a literal <wp:post_type>attachment</wp:post_type> string inside an item's own post_content (BLOCKER-1a)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "${run_dir}/export"
+  cat > "${run_dir}/export/export.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+  xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/"
+  xmlns:content="http://purl.org/rss/1.0/modules/content/"
+  xmlns:wp="http://wordpress.org/export/1.2/">
+<channel><wp:wxr_version>1.2</wp:wxr_version>
+<item>
+<title><![CDATA[Item 102]]></title>
+<content:encoded><![CDATA[See how a WXR item looks: <item><wp:post_id>1</wp:post_id><wp:post_type>attachment</wp:post_type></item>]]></content:encoded>
+<wp:post_id>102</wp:post_id>
+<wp:post_type>page</wp:post_type>
+</item>
+</channel></rss>
+EOF
+  # 102 was skipped for real (no id-map row) -- the gate must still catch
+  # it as a missing "page", never read the CDATA-embedded text above as
+  # this item's real type.
+  : > "${run_dir}/id-map.tsv"
+  run graft_verify_import_completeness "$run_dir" "page"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"1 of 1"* ]] || false
+  [[ "$output" == *"page#102"* ]] || false
+}
+
+# BLOCKER-1(b) (review): wp:post_id/wp:post_type each split across MULTIPLE
+# lines (open tag, value, close tag each their own line) -- unreachable by
+# the previous line-oriented awk, which matched a whole value against a
+# single line. Real document structure, not line layout, drives the real
+# parser.
+@test "graft_verify_import_completeness parses wp:post_id/wp:post_type whose open tag, value, and close tag each sit on their own line (BLOCKER-1b)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "${run_dir}/export"
+  cat > "${run_dir}/export/export.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+  xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/"
+  xmlns:content="http://purl.org/rss/1.0/modules/content/"
+  xmlns:wp="http://wordpress.org/export/1.2/">
+<channel><wp:wxr_version>1.2</wp:wxr_version>
+<item>
+<wp:post_id>
+102
+</wp:post_id>
+<wp:post_type>
+page
+</wp:post_type>
+</item>
+</channel></rss>
+EOF
+  : > "${run_dir}/id-map.tsv"
+  run graft_verify_import_completeness "$run_dir" "page"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"1 of 1"* ]] || false
+  [[ "$output" == *"page#102"* ]] || false
+}
+
+# BLOCKER-2 (review): an item's OWN wp:post_id and wp:post_type sharing the
+# SAME physical line as each other -- a real shape wp-cli's own exporter
+# produces routinely. The previous awk's four rules all matched/gsub'd
+# against the WHOLE line ($0): a line containing BOTH tags fired every
+# rule, and each gsub only strips ITS OWN tag pair, leaving the OTHER
+# item's raw markup sitting inside the "cleaned" value -- id and type both
+# came out as garbled XML fragments instead of "101" / "page". Structural
+# parsing has no such failure mode: an <item>'s own children are read from
+# its own subtree by namespace, never by what else shares its line. Two
+# items are used here (one landed, one skipped) specifically so a
+# regression back to the awk's failure mode would show up as a WRONG
+# missing-count/name, not merely as "the file still parses".
+@test "graft_verify_import_completeness correctly parses an item whose own post_id/post_type tags share one physical line (BLOCKER-2)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "${run_dir}/export"
+  cat > "${run_dir}/export/export.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+  xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/"
+  xmlns:content="http://purl.org/rss/1.0/modules/content/"
+  xmlns:wp="http://wordpress.org/export/1.2/">
+<channel><wp:wxr_version>1.2</wp:wxr_version>
+<item>
+<wp:post_id>101</wp:post_id><wp:post_type>page</wp:post_type>
+</item>
+<item>
+<wp:post_id>102</wp:post_id><wp:post_type>page</wp:post_type>
+</item>
+</channel></rss>
+EOF
+  # 101 landed for real; 102 was skipped -- must report exactly "1 of 2",
+  # naming page#102 by its real, structurally-parsed value, never a
+  # garbled fragment of either tag's own markup.
+  printf '101\t5001\tpage\n' > "${run_dir}/id-map.tsv"
+  run graft_verify_import_completeness "$run_dir" "page"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"1 of 2"* ]] || false
+  [[ "$output" == *"page#102"* ]] || false
+  # Never a raw XML fragment standing in for a name -- the previous awk's
+  # failure mode on this exact shape printed something containing "<item>"
+  # or "<wp:" in the sample instead of a clean "type#id" pair.
+  [[ "$output" != *"<item>"* ]] || false
+  [[ "$output" != *"<wp:"* ]] || false
+}
+
+# --- fails CLOSED, never open (review, BLOCKER-1's remaining manifestations) -
+
+@test "graft_verify_import_completeness HARD FAILS (never silently passes) when post_types are selected but export/ has no .xml file at all (BLOCKER-1c)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "${run_dir}/export"
+  # export/ exists but is genuinely empty -- an interrupted run resumed
+  # past a step that never actually produced its file, or the file was
+  # removed from underneath this run. Must not read as "nothing to check".
+  run graft_verify_import_completeness "$run_dir" "page"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"page"* ]] || false
+}
+
+@test "graft_verify_import_completeness HARD FAILS when a listed WXR file is unreadable/malformed, never silently reads it as zero items" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "${run_dir}/export"
+  printf 'this is not xml at all' > "${run_dir}/export/export.xml"
+  printf '101\t5001\tpage\n' > "${run_dir}/id-map.tsv"
+  run graft_verify_import_completeness "$run_dir" "page"
+  [ "$status" -eq 1 ]
+}
+
+@test "graft_verify_import_completeness HARD FAILS when ONE of several WXR files fails to parse, even if the others are fine" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "${run_dir}/export"
+  _write_wxr "${run_dir}/export/export.000.xml" "101:page"
+  printf 'not xml' > "${run_dir}/export/export.001.xml"
+  printf '101\t5001\tpage\n' > "${run_dir}/id-map.tsv"
+  run graft_verify_import_completeness "$run_dir" "page"
+  [ "$status" -eq 1 ]
 }

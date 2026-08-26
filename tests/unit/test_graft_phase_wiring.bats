@@ -216,3 +216,138 @@ setup_no_op_module() {
   run graft_safety_step_done "$run_dir" prune
   [ "$status" -eq 0 ]
 }
+
+# --- MAJOR-4 (review): the `is_dry_run ||` guard in front of phase_graft's
+# own prune-safety marker-clearing (`rm -f
+# "${run_dir}/graft.import_attachments.done" "${run_dir}/graft.import.done"
+# "${run_dir}/graft.fetch_id_map.done"`, right where graft_safety_step_done
+# gates the prune block) had NO test of its own before this fix-pack. It
+# works (verified live: a real `graft --dry-run` leaves
+# graft.import_attachments.done intact and issues no real wp-cli calls),
+# but removing it left the rest of the suite entirely green — exactly the
+# class of bug this repo already shipped once (the identical guard on
+# graft_mark_step itself, MAJOR-B above, and on _graft_exit_trap's own
+# marker clear, "dry-run-trap" above). This is that same shape's test,
+# applied to phase_graft's OWN inline `rm -f`, which is not itself a
+# graft_mark_step call site and so was not covered by either of those.
+#
+# phase_graft is exercised directly here (not via bin/sitegraft) with every
+# heavy dependency it calls stubbed out, isolating the ONE branch under
+# test: entering the prune-safety block (forced by leaving fetch_id_map's
+# own marker unmarked) while SITEGRAFT_DRY_RUN=1. `run` is used even though
+# this is a same-process function call, not a subprocess — bats' `run`
+# forks a subshell to capture output, and phase_graft installs `trap
+# _graft_exit_trap EXIT` on entry; that trap firing inside `run`'s own
+# throwaway subshell (rather than this test's real process) is the exact,
+# documented-safe pattern lib/core.sh's own sitegraft_cleanup comment
+# describes ("verified live against bats' own run... the trap fires within
+# that subshell only").
+_major4_stub_everything_but_the_marker_block() {
+  profile_load() {
+    SITE_A_ALIAS=a; SITE_B_ALIAS=b
+    unset SITE_A_SSH_HOST SITE_B_SSH_HOST
+    return 0
+  }
+  modules_discover() { SITEGRAFT_MODULES=""; }
+  graft_sync_stack() { :; }
+  graft_check_stack_precondition() { return 0; }
+  graft_media_sync() { :; }
+  graft_deploy_mu_plugin() { :; }
+  graft_prune_previous_run() { echo "STUB: graft_prune_previous_run $*"; }
+  graft_import_attachments() { echo "STUB: graft_import_attachments called -- should not happen"; }
+  graft_ensure_importer() { :; }
+  graft_export_wxr() { echo "STUB: graft_export_wxr called -- should not happen"; }
+  graft_integrity_gate() { return 0; }
+  graft_import_wxr() { echo "STUB: graft_import_wxr called -- should not happen"; }
+  graft_fetch_id_map() { :; }
+  graft_remove_mu_plugin() { :; }
+  graft_restore_importer_state() { :; }
+  graft_remap_attachment_ids() { :; }
+  graft_remap_featured_images() { :; }
+  graft_search_replace_domain() { :; }
+  graft_migrate_options() { :; }
+  graft_run_module_post_import() { :; }
+}
+
+@test "phase_graft's prune-safety marker-clearing does not touch REAL markers under --dry-run (MAJOR-4)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  touch "${run_dir}/backup.complete"
+  cat > "${run_dir}/manifest.json" <<'EOF'
+{"migrate":{"core-wp":{"post_types":["page"],"option_keys":[]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}
+EOF
+  # Every step through `import` already completed for real on an earlier
+  # pass -- EXCEPT fetch_id_map, which never ran (interrupted right after
+  # import). graft_safety_step_done "$run_dir" prune import_attachments
+  # import fetch_id_map therefore reads false (fetch_id_map is missing),
+  # entering the marker-clearing block even though import_attachments and
+  # import genuinely finished.
+  local step
+  for step in stack_sync media_sync mu_plugin prune import_attachments importer_setup export import; do
+    touch "${run_dir}/graft.${step}.done"
+  done
+  [ ! -f "${run_dir}/graft.fetch_id_map.done" ]
+
+  _major4_stub_everything_but_the_marker_block
+
+  SITEGRAFT_DRY_RUN=1
+  run phase_graft --profile demo --run "$run_dir" --dry-run
+  [ "$status" -eq 0 ]
+
+  # The acceptance criterion: real, on-disk markers from the completed
+  # pass must survive a dry-run pass through this exact block. Removing
+  # `is_dry_run ||` from phase_graft's own `rm -f` here (MAJOR-4) makes
+  # this assertion fail -- confirmed by hand for this fix-pack.
+  [ -f "${run_dir}/graft.import_attachments.done" ]
+  [ -f "${run_dir}/graft.import.done" ]
+
+  # Sanity: the block really was entered (not vacuously skipped) --
+  # graft_prune_previous_run's own stub only prints if actually called.
+  [[ "$output" == *"STUB: graft_prune_previous_run"* ]] || false
+  # And nothing downstream of the (correctly still-marked-done)
+  # import_attachments/import steps re-ran for real.
+  [[ "$output" != *"should not happen"* ]] || false
+}
+
+@test "phase_graft's prune-safety marker-clearing DOES clear real markers once dry-run is off (MAJOR-4: a real interrupted-graft resume must not be skipped)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  touch "${run_dir}/backup.complete"
+  cat > "${run_dir}/manifest.json" <<'EOF'
+{"migrate":{"core-wp":{"post_types":["page"],"option_keys":[]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}
+EOF
+  local step
+  for step in stack_sync media_sync mu_plugin prune import_attachments importer_setup export import; do
+    touch "${run_dir}/graft.${step}.done"
+  done
+
+  _major4_stub_everything_but_the_marker_block
+  # graft_verify_import_completeness is real everywhere else in this suite
+  # (tests/unit/test_graft_import_completeness.bats) -- stubbed here only
+  # because this test has no real staged WXR/id-map.tsv to give it and
+  # isn't the one exercising that gate's own behavior.
+  graft_verify_import_completeness() { return 0; }
+
+  unset SITEGRAFT_DRY_RUN
+  run phase_graft --profile demo --run "$run_dir"
+  [ "$status" -eq 0 ]
+
+  # NOT marker-absence: once cleared, import_attachments/import legitimately
+  # RERUN (that's the entire point of clearing them) and, succeeding for
+  # real under a non-dry-run pass, immediately re-touch their own markers
+  # via graft_mark_step -- so both files are back on disk by the time
+  # phase_graft returns, exactly as they should be. The real acceptance
+  # criterion is that the STEPS THEMSELVES actually ran again, which the
+  # "should not happen" stubs from _major4_stub_everything_but_the_marker_
+  # block (still installed, un-overridden) prove directly: they only print
+  # if genuinely invoked. Under the MAJOR-4 bug (guard inverted or
+  # removed so `rm -f` never fires under dry-run OR, the mutation that
+  # actually matters here, a guard that ALSO wrongly suppresses it under a
+  # real run), these markers would stay "done" from the earlier pass,
+  # import_attachments/import would be skipped, and neither stub would ever
+  # print -- this assertion goes red exactly then.
+  [[ "$output" == *"STUB: graft_import_attachments called"* ]] || false
+  [[ "$output" == *"STUB: graft_import_wxr called"* ]] || false
+  [ -f "${run_dir}/graft.import_attachments.done" ]
+  [ -f "${run_dir}/graft.import.done" ]
+}
