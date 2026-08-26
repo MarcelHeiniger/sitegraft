@@ -76,12 +76,46 @@ parse_file() {
 # indents), the extra step lands ON that text node and the following
 # <item> is still reached; with NO node between them (a minified/re-
 # serialized/hand-edited WXR), the second <item> is stepped straight over
-# and silently vanishes -- no error, just a short result. These four
-# tests exercise that exact adjacency case and the sibling-node shapes
-# that can appear between two <item>s, per the issue's own acceptance
-# criteria.
+# and silently vanishes -- no error, just a short result. These FIVE
+# tests exercise that adjacency case and the sibling-node shapes that
+# can appear between two <item>s, per the issue's own acceptance
+# criteria -- but only the first two are actual regression tests for
+# the bug. Mutation-checked (restore the double advance, keep these
+# tests): the two-adjacent and three-adjacent tests immediately below
+# go red; the comment-node, single-item, and empty-channel tests that
+# follow stay green -- they already passed under the double-advance bug
+# (a comment node absorbs the extra step exactly like a text node does,
+# and neither a lone item nor an empty channel ever exercises the item
+# branch's next()-then-read() sequence at all). They're here as
+# acceptance-criteria coverage of those shapes, not as proof this bug
+# is fixed.
 @test "sitegraft_parse_wxr_items does not drop the second of two adjacent <item>s with no whitespace between them" {
   run parse_file '<item><wp:post_id>101</wp:post_id><wp:post_type>page</wp:post_type><content:encoded><![CDATA[first]]></content:encoded><excerpt:encoded><![CDATA[]]></excerpt:encoded></item><item><wp:post_id>102</wp:post_id><wp:post_type>page</wp:post_type><content:encoded><![CDATA[second]]></content:encoded><excerpt:encoded><![CDATA[]]></excerpt:encoded></item>'
+  [ "$status" -eq 0 ]
+  run jq -e 'length == 2 and .[0].post_id == 101 and .[1].post_id == 102' <<< "$output"
+  [ "$status" -eq 0 ]
+}
+
+# Review nit N2: the two tests above are the only ones that actually
+# discriminate this bug (see the comment block above them), and both go
+# through the STRING entry point (parse_file -> sitegraft_parse_wxr_items
+# via file_get_contents()). Production never calls that path for a real
+# graft -- lib/php/verify-content-remap-cli.php calls
+# sitegraft_parse_wxr_items_from_file() directly (this file's own
+# header). Both entry points share the same _sitegraft_stream_wxr_reader
+# driver, so there is no reason to expect a difference, but "no reason to
+# expect one" is not the same claim as "asserted" -- this duplicates the
+# discriminating two-adjacent-items case through the actual production
+# entry point, the same way the single-item and empty-channel tests
+# above already do.
+@test "sitegraft_parse_wxr_items_from_file does not drop the second of two adjacent <item>s with no whitespace between them (production entry point)" {
+  local xml_file="$BATS_TEST_TMPDIR/adjacent-no-ws-from-file.xml"
+  wxr_wrap '<item><wp:post_id>101</wp:post_id><wp:post_type>page</wp:post_type><content:encoded><![CDATA[first]]></content:encoded><excerpt:encoded><![CDATA[]]></excerpt:encoded></item><item><wp:post_id>102</wp:post_id><wp:post_type>page</wp:post_type><content:encoded><![CDATA[second]]></content:encoded><excerpt:encoded><![CDATA[]]></excerpt:encoded></item>' > "$xml_file"
+  run php -r "
+    require '${PHP_LIB}';
+    \$items = sitegraft_parse_wxr_items_from_file('${xml_file}');
+    echo json_encode(\$items);
+  "
   [ "$status" -eq 0 ]
   run jq -e 'length == 2 and .[0].post_id == 101 and .[1].post_id == 102' <<< "$output"
   [ "$status" -eq 0 ]
