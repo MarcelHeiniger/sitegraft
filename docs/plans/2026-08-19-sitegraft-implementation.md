@@ -955,7 +955,19 @@ wp_remote() {
   local path_var="SITE_${alias_uc}_WP_PATH"
   local cmd_var="SITE_${alias_uc}_WP_CMD"
   local host="${!host_var:-}"
-  local path="${!path_var:?missing ${path_var}}"
+  # Deliberately NOT `${!path_var:?missing ${path_var}}`. That looks like a
+  # safe guard but is not one here: on bash 3.2 (Apple's /bin/bash, verified
+  # live) a fatal parameter-expansion error raised *inside a function* under
+  # `set -e` exits the whole process reporting $?=0 to any EXIT trap, despite
+  # printing its message — so a profile missing this key would look like a
+  # clean success. Always use `${!var:-}` plus an explicit check and
+  # `return 1`, which propagates correctly. See lib/inventory.sh (wp_remote)
+  # and lib/backup.sh (backup_wp_cmd_literal) for the shipped form.
+  local path="${!path_var:-}"
+  if [ -z "$path" ]; then
+    log_error "missing ${path_var}"
+    return 1
+  fi
   local wp_cmd="${!cmd_var:-wp}"
 
   if [ -n "$host" ]; then
@@ -2251,7 +2263,19 @@ backup_wp_cmd_literal() {
   local path_var="SITE_${alias_uc}_WP_PATH"
   local cmd_var="SITE_${alias_uc}_WP_CMD"
   local host="${!host_var:-}"
-  local path="${!path_var:?missing ${path_var}}"
+  # Deliberately NOT `${!path_var:?missing ${path_var}}`. That looks like a
+  # safe guard but is not one here: on bash 3.2 (Apple's /bin/bash, verified
+  # live) a fatal parameter-expansion error raised *inside a function* under
+  # `set -e` exits the whole process reporting $?=0 to any EXIT trap, despite
+  # printing its message — so a profile missing this key would look like a
+  # clean success. Always use `${!var:-}` plus an explicit check and
+  # `return 1`, which propagates correctly. See lib/inventory.sh (wp_remote)
+  # and lib/backup.sh (backup_wp_cmd_literal) for the shipped form.
+  local path="${!path_var:-}"
+  if [ -z "$path" ]; then
+    log_error "missing ${path_var}"
+    return 1
+  fi
   local wp_cmd="${!cmd_var:-wp}"
 
   if [ -n "$host" ]; then
