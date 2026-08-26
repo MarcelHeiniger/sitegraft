@@ -1061,14 +1061,27 @@ NEW_ATTACH_ID=$(awk -F'\t' -v old="$OLD_ATTACH_ID" '$1==old && $3=="attachment"{
 [ "$NEW_ATTACH_ID" != "$OLD_ATTACH_ID" ]  # a real DDEV/WP install never reuses A's own ID space on a distinct B install
 IMAGE_BLOCK_ID=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=etch_cfs --title="Image Block CFS" --field=ID)
 IMAGE_BLOCK_CONTENT=$(ddev exec --raw -p "$PROJECT_B" -- wp post get "$IMAGE_BLOCK_ID" --field=post_content)
+# #64 fix-pack: these four checks used to match `*"\"id\":${ID}"*` and
+# `*"wp-image-${ID}"*` with no trailing boundary at all — the same
+# unanchored-prefix bug class the Footer nav-link check below is already
+# guarded against (see that check's own "N1" comment: a bare `"id":<N>`
+# glob has no digit boundary, so "id":6 is a literal PREFIX of "id":67,
+# meaning a genuinely WRONG id ending in the right digit(s) would have
+# wrongly PASSED the NEW-id checks below, and a genuinely correct id whose
+# neighbor happens to share a prefix could wrongly FAIL the OLD-id checks).
+# Fixed the same way, using this fixture's own exact shape instead of the
+# Footer's: site-a-seed.sh's `{\"id\":${ATTACH_ID}}` is a single-key JSON
+# object, so a real id value is always immediately followed by `}` (never
+# `,`, there being no second key) — and `class=\"wp-image-${ATTACH_ID}\"`
+# always immediately followed by the attribute's closing `"`.
 case "$IMAGE_BLOCK_CONTENT" in
-  *"\"id\":${OLD_ATTACH_ID}"*|*"wp-image-${OLD_ATTACH_ID}"*)
+  *"\"id\":${OLD_ATTACH_ID}}"*|*"wp-image-${OLD_ATTACH_ID}\""*)
     echo "FAIL: B's imported content still references A's OLD attachment id (${OLD_ATTACH_ID}) — the sentinel ID remap did not fully rewrite it" >&2
     exit 1
     ;;
 esac
 case "$IMAGE_BLOCK_CONTENT" in
-  *"\"id\":${NEW_ATTACH_ID}"*) : ;;
+  *"\"id\":${NEW_ATTACH_ID}}"*) : ;;
   *) echo "FAIL: B's imported content does not reference the correctly remapped NEW attachment id (${NEW_ATTACH_ID}) — the remap dropped the reference instead of rewriting it" >&2; exit 1 ;;
 esac
 # NIT-1 (review, Viktor): symmetry with the "id":NEW check above — the
@@ -1076,7 +1089,7 @@ esac
 # remap has to rewrite (design doc §9.1); asserting only "id":NEW passed
 # left that half of the remap's own output completely unverified.
 case "$IMAGE_BLOCK_CONTENT" in
-  *"wp-image-${NEW_ATTACH_ID}"*) : ;;
+  *"wp-image-${NEW_ATTACH_ID}\""*) : ;;
   *) echo "FAIL: B's imported content does not reference the correctly remapped NEW attachment id via the wp-image-X class either (expected wp-image-${NEW_ATTACH_ID})" >&2; exit 1 ;;
 esac
 case "$IMAGE_BLOCK_CONTENT" in
@@ -1120,15 +1133,38 @@ fi
 
 echo "==> (h) MAJOR-2: content-level confirmation that B's protected data (already proven byte-identical by (b)'s checksum, now carrying a real domain-string + colliding-attachment-ID payload) genuinely was not touched — not just that its checksum happens to match"
 FAKEBOOKING_SETTINGS_AFTER=$(ddev exec --raw -p "$PROJECT_B" -- wp option get fakebooking_settings --format=json)
-case "$FAKEBOOKING_SETTINGS_AFTER" in
-  *"${PROJECT_B}.ddev.site"*|*"${NEW_ATTACH_ID}"*)
-    echo "FAIL: fakebooking_settings was rewritten (contains B's domain or the NEW attachment id) even though the checksum matched — investigate immediately, this should never happen" >&2
+# #64 fix-pack: the ORIGINAL version of this check tested
+# `*"${NEW_ATTACH_ID}"*` — an UNANCHORED substring match of a short bare
+# numeral against the ENTIRE fakebooking_settings JSON blob, not against
+# the specific "decoy" field it claims to be checking. With
+# SITEGRAFT_HARNESS_ID set, B's own domain string
+# (sitegraft-test-b-<id>.ddev.site, embedded in this SAME blob's "note"
+# field, entirely unrelated to any id-remap) can coincidentally CONTAIN
+# NEW_ATTACH_ID's digits — reproduced live: run id "rosa64" contains the
+# digit "6", and this run's NEW_ATTACH_ID was "6", so the single most
+# consequential assertion in this harness ("a third party's protected data
+# was not touched") failed on a graft that had done nothing wrong. The
+# domain half of the same case arm had an identical, if less likely,
+# exposure: matching bare "${PROJECT_B}.ddev.site" without regard for
+# WHICH field it appeared in.
+#
+# Fixed by reading the actual "decoy" and "note" fields through jq instead
+# of grep-shaped substring matching against the raw blob — comparing
+# parsed JSON values leaves no digit-boundary question to get wrong,
+# because there is no substring search left to run at all.
+DECOY_AFTER=$(jq -r '.decoy' <<< "$FAKEBOOKING_SETTINGS_AFTER")
+if [ "$DECOY_AFTER" != "\"id\":${OLD_ATTACH_ID}" ]; then
+  echo "FAIL: fakebooking_settings.decoy no longer reads exactly \"id\":${OLD_ATTACH_ID} (got: ${DECOY_AFTER}) — protected option data was rewritten during graft even though the checksum matched — investigate immediately, this should never happen" >&2
+  exit 1
+fi
+NOTE_AFTER=$(jq -r '.note' <<< "$FAKEBOOKING_SETTINGS_AFTER")
+case "$NOTE_AFTER" in
+  *"$DOMAIN_B"*)
+    echo "FAIL: fakebooking_settings.note now contains B's domain (${DOMAIN_B}) even though the checksum matched — the domain search-replace touched protected data it must never reach — investigate immediately" >&2
     exit 1
     ;;
-esac
-case "$FAKEBOOKING_SETTINGS_AFTER" in
-  *"${PROJECT_A}.ddev.site"*) : ;;
-  *) echo "FAIL: fakebooking_settings no longer contains A's domain string at all — the fixture injection itself didn't survive, this assertion would be meaningless" >&2; exit 1 ;;
+  *"$DOMAIN_A"*) : ;;
+  *) echo "FAIL: fakebooking_settings.note no longer contains A's domain string at all (got: ${NOTE_AFTER}) — the fixture injection itself didn't survive, this assertion would be meaningless" >&2; exit 1 ;;
 esac
 echo "==> confirmed: protected data (wp_options AND wp_posts) carrying a real domain-string + colliding-ID payload is untouched by graft"
 
