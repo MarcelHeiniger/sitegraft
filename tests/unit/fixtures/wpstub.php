@@ -64,6 +64,28 @@
  *      something stricter than a real site guarantees; what it really
  *      pins is that sitegraft itself does not mangle the title.
  *
+ *   3. wpstub_wpdb::update() (issue #43) never actually mutates
+ *      $GLOBALS['wpstub']['posts'] -- it only RECORDS the call
+ *      ($GLOBALS['wpstub']['posts_written']) and returns success/failure.
+ *      Real $wpdb->update() writes the row. No test in this repo currently
+ *      needs a subsequent get_post()/get_post_field() call to observe a
+ *      write this stub made, so modelling the write itself would be
+ *      untested code in the stub -- exactly the thing this file's own
+ *      rule warns against building. If a future test needs that
+ *      round-trip, wire it through wpstub_add_attachment's existing
+ *      $GLOBALS['wpstub']['posts'] array rather than adding a second,
+ *      divergent copy of post storage.
+ *      Failure is real, not a formality: steered per-id via
+ *      $GLOBALS['wpstub']['wpdb_update_fail'], wpstub_wpdb::update()
+ *      returns the bare boolean `false` real core's `$wpdb->update()`
+ *      returns on a DB error. A SEPARATE steering array,
+ *      $GLOBALS['wpstub']['wpdb_update_zero'], returns int 0 instead --
+ *      real core's "matched, nothing changed" outcome, which is NOT a
+ *      failure (0 !== false) and must not be treated as one; see
+ *      sitegraft_write_remapped_post's own docblock in
+ *      lib/php/content-remap-functions.php for why that distinction is
+ *      load-bearing.
+ *
  * The `the_title` divergence is load-bearing, not decoration: real
  * WordPress runs get_the_title() through the `the_title` filter (core
  * hangs wptexturize, convert_chars and trim on it, and prefixes
@@ -100,6 +122,35 @@ $GLOBALS['wpstub'] = array(
 	// The write returns false AND stores nothing, which is what real failure
 	// looks like -- not merely a false return over a successful write.
 	'meta_write_fail'  => array(),
+	// --- $wpdb / clean_post_cache surface (issue #43) ----------------------
+	// Post IDs for which $wpdb->update() (the wpstub_wpdb stub below) should
+	// return false, as real core does on a genuine DB error -- a full disk,
+	// or process_fields()/strip_invalid_text_for_column() rejecting some
+	// byte sequence in the row being written. Steerable per-id, not global,
+	// so a test can prove ONE post's failure doesn't stop the loop from
+	// still writing the others.
+	'wpdb_update_fail' => array(),
+	// Post IDs for which $wpdb->update() should return int 0 -- real
+	// core's "the UPDATE ran, WHERE matched, but the new values were
+	// identical to what was already stored" outcome (or, less commonly, a
+	// genuinely unmatched WHERE). NOT a failure -- 0 !== false -- and
+	// modelled separately from wpdb_update_fail specifically so a test can
+	// prove production checks `false === $wpdb->update(...)` and not a
+	// loose falsy check that would treat this the same as a real error.
+	'wpdb_update_zero' => array(),
+	// Every $wpdb->update( $table, $data, $where ) call that was NOT made
+	// to fail, in order: array( 'table' => ..., 'data' => ..., 'where' => ... ).
+	// A call steered to fail via wpdb_update_fail above is deliberately NOT
+	// recorded here -- real $wpdb->update() still issues the SQL (and a
+	// caller could in principle observe partial effects of a failed query),
+	// but nothing this codebase's write path reads afterward depends on
+	// that, and recording it would blur the one thing a test actually
+	// needs to assert: whether the write that was supposed to happen did.
+	'posts_written'    => array(),
+	// Every clean_post_cache( $id ) call, in order. A call that follows a
+	// FAILED $wpdb->update() must never appear here -- see
+	// sitegraft_write_remapped_post's own docblock for why.
+	'cache_cleared'    => array(),
 );
 
 function wpstub_set_uploads( $dir ) {
@@ -387,6 +438,52 @@ function wp_generate_attachment_metadata( $id, $file ) {
 function wp_update_attachment_metadata( $id, $metadata ) {
 	$GLOBALS['wpstub']['metadata_written'][] = array( 'id' => (int) $id, 'metadata' => $metadata );
 	return update_post_meta( $id, '_wp_attachment_metadata', $metadata );
+}
+
+/**
+ * wpstub_wpdb — the tiny slice of $wpdb sitegraft_write_remapped_post()
+ * (lib/php/content-remap-functions.php, issue #43) actually calls:
+ * ->posts (the table-name property real $wpdb always exposes) and
+ * ->update(). See KNOWN DIVERGENCE 3 above for exactly what this does and
+ * does not model.
+ */
+class wpstub_wpdb {
+	public $posts = 'wp_posts';
+	// Real core's $wpdb->last_error is a public string property, populated
+	// by the query that just failed, and read directly by callers (not
+	// steered through some other accessor) -- modelled the same way here.
+	// Set on a steered failure below so a test doesn't have to poke it by
+	// hand to exercise sitegraft_write_remapped_post's own warning line
+	// (issue #43 fix-pack round two), the same way a real DB error would
+	// leave a real message behind for the caller to read.
+	public $last_error = '';
+
+	public function update( $table, $data, $where ) {
+		$post_id = isset( $where['ID'] ) ? (int) $where['ID'] : 0;
+		if ( in_array( $post_id, $GLOBALS['wpstub']['wpdb_update_fail'], true ) ) {
+			$this->last_error = 'wpstub: simulated update failure for post ' . $post_id;
+			return false;
+		}
+		$GLOBALS['wpstub']['posts_written'][] = array(
+			'table' => $table,
+			'data'  => $data,
+			'where' => $where,
+		);
+		if ( in_array( $post_id, $GLOBALS['wpstub']['wpdb_update_zero'], true ) ) {
+			return 0;
+		}
+		return 1;
+	}
+}
+$GLOBALS['wpdb'] = new wpstub_wpdb();
+
+/** Real core's clean_post_cache() also fires the 'clean_post_cache' action
+ * and clears several related caches (children, ancestors...); this stub
+ * only records that it was called, and for which id -- nothing in this
+ * repo's production code reads the object cache back, so that is the only
+ * observable contract a caller here can depend on. */
+function clean_post_cache( $id ) {
+	$GLOBALS['wpstub']['cache_cleared'][] = (int) $id;
 }
 
 // sitegraft_media_import_one does `require_once ABSPATH .

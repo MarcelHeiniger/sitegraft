@@ -1106,13 +1106,19 @@ graft_push_remap_payload() {
 # which would be unsafe generically (this codebase's own CLAUDE.md: "never
 # sed/raw regex on WordPress data") — post_content/post_excerpt specifically
 # are plain TEXT columns, never PHP-serialized, so a direct fetch/modify/
-# `wp_update_post()` write-back is safe for exactly these two fields. This
-# is why the scope is content-field-only: wp_postmeta values CAN be
+# write-back is safe for exactly these two fields. This is why the scope
+# is content-field-only: wp_postmeta values CAN be
 # serialized PHP, and safely rewriting an arbitrary serialized structure
 # needs WordPress's own maybe_unserialize()/maybe_serialize() round-trip —
 # out of scope here, same as design doc §11's existing position that a
 # CPT-specific meta reference is the relevant module's post_import hook's
 # job, not a generic core remap's.
+#
+# The write-back itself is $wpdb->update() (sitegraft_write_remapped_post,
+# in lib/php/content-remap-functions.php — read its own docblock for
+# exactly which WordPress write-path behavior it trades away on purpose,
+# and why), NOT wp_update_post(): wp_update_post()'s array-form/
+# object-form slashing asymmetry is what issue #43 actually was.
 #
 # The payload is pushed to a real file rather than embedded via bash string
 # interpolation into the PHP source: keeps the PHP body 100% static (no
@@ -1170,11 +1176,16 @@ graft_remap_attachment_ids() {
   remote_path=$(graft_push_remap_payload "$run_dir" "$payload_json" "sitegraft-id-remap-payload.json")
   lib_path=$(graft_push_remap_lib "$run_dir")
 
-  # The actual substitution (sitegraft_remap_attachment_refs) lives in
+  # The actual substitution (sitegraft_remap_attachment_refs) and the
+  # write-back (sitegraft_write_remapped_post) both live in
   # lib/php/content-remap-functions.php — required here, never re-embedded
-  # inline (review, Viktor, NIT-1: keeps production and
-  # tests/unit/test_content_remap_functions.bats running the literal same
-  # code, and the substitution logic itself independently unit-testable).
+  # inline (review, Viktor, NIT-1: keeps production and its own unit tests
+  # running the literal same code, and both independently unit-testable —
+  # the substitution in tests/unit/test_content_remap_functions.bats, the
+  # write-back in tests/unit/test_content_remap_write.bats). The write-back
+  # is $wpdb->update(), NOT wp_update_post() (issue #43) — see
+  # sitegraft_write_remapped_post's own docblock for why the array form of
+  # wp_update_post() silently ate every backslash this remap writes.
   run_or_echo wp_remote b eval '
     require_once WP_CONTENT_DIR . "/sitegraft-content-remap-functions.php";
     $payload_path = WP_CONTENT_DIR . "/sitegraft-id-remap-payload.json";
@@ -1187,8 +1198,7 @@ graft_remap_attachment_ids() {
       if ( ! $post ) { continue; }
       $content = sitegraft_remap_attachment_refs( $payload["attachments"], $post->post_content );
       $excerpt = sitegraft_remap_attachment_refs( $payload["attachments"], $post->post_excerpt );
-      if ( $content !== $post->post_content || $excerpt !== $post->post_excerpt ) {
-        wp_update_post( array( "ID" => $post_id, "post_content" => $content, "post_excerpt" => $excerpt ) );
+      if ( sitegraft_write_remapped_post( $post, array( "post_content" => $content, "post_excerpt" => $excerpt ) ) ) {
         $count++;
       }
     }
@@ -1453,6 +1463,11 @@ graft_search_replace_domain() {
 
   # sitegraft_remap_domain lives in lib/php/content-remap-functions.php —
   # same reasoning as graft_remap_attachment_ids' own require_once above.
+  # The write-back is $wpdb->update(), NOT wp_update_post() (issue #43) —
+  # see sitegraft_write_remapped_post's own docblock. This call site is the
+  # one issue #43 actually reproduces on: sitegraft_remap_domain matches
+  # and rewrites the JSON-escaped `https:\/\/` form, and the array form of
+  # wp_update_post() silently ate that backslash on every write.
   run_or_echo wp_remote b eval '
     require_once WP_CONTENT_DIR . "/sitegraft-content-remap-functions.php";
     $payload_path = WP_CONTENT_DIR . "/sitegraft-domain-remap-payload.json";
@@ -1465,8 +1480,7 @@ graft_search_replace_domain() {
       if ( ! $post ) { continue; }
       $content = sitegraft_remap_domain( $post->post_content, $payload["from"], $payload["to"] );
       $excerpt = sitegraft_remap_domain( $post->post_excerpt, $payload["from"], $payload["to"] );
-      if ( $content !== $post->post_content || $excerpt !== $post->post_excerpt ) {
-        wp_update_post( array( "ID" => $post_id, "post_content" => $content, "post_excerpt" => $excerpt ) );
+      if ( sitegraft_write_remapped_post( $post, array( "post_content" => $content, "post_excerpt" => $excerpt ) ) ) {
         $count++;
       }
     }

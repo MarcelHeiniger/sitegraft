@@ -7,16 +7,28 @@
 # rebuilt graft_remap_attachment_ids/graft_search_replace_domain to stop
 # scanning whole tables, the two-pass sentinel substitution moved from an
 # inline bash-single-quoted PHP string (syntactically impossible to unit
-# test on its own) into lib/php/content-remap-functions.php — a plain,
-# WordPress-independent PHP file `require_once`'d by the real `wp eval`
-# calls. Before this file existed, the bash helper functions that USED to
-# build the substitution (graft_build_sentinel_commands,
+# test on its own) into lib/php/content-remap-functions.php, `require_once`'d
+# by the real `wp eval` calls. Before this file existed, the bash helper
+# functions that USED to build the substitution (graft_build_sentinel_commands,
 # graft_content_tables_csv) kept their own green unit tests years after
 # phase_graft stopped calling either of them — a false coverage signal on
 # exactly the logic (a remap that must never contaminate protected data)
 # where a coverage gap matters most. Both were removed; this file is where
 # the real substitution's real test coverage lives now, running the exact
 # same file production requires.
+#
+# ONLY the two pure remap functions (sitegraft_remap_attachment_refs,
+# sitegraft_remap_domain) live here — that is what makes running them
+# under a bare `php` CLI with nothing else required possible in the first
+# place (review, Kimi, NIT: this header used to describe the whole file
+# content-remap-functions.php lives in as "WordPress-independent", which
+# stopped being true once sitegraft_write_remapped_post (issue #43) was
+# added to it). That third function calls $wpdb->update() and
+# clean_post_cache() and is tested separately, under
+# tests/unit/fixtures/wpstub.php's stand-ins for those two calls — see
+# tests/unit/test_content_remap_write.bats, same convention
+# tests/unit/test_media_import_batch.bats already uses for the
+# WordPress-calling half of lib/php/media-import-functions.php.
 setup() {
   PHP_LIB="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)/lib/php/content-remap-functions.php"
   [ -f "$PHP_LIB" ] || skip "lib/php/content-remap-functions.php not found"
