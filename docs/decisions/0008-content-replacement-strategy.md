@@ -343,7 +343,8 @@ Answer 2 makes this unavoidable rather than incidental: if `clean_import` is the
 dominant path and it reproduces A's slugs and hierarchy, then **the URLs of a
 client's live site change on every run of it**, and inbound links, bookmarks,
 search results and any hard-coded link in an external system break. sitegraft
-manages no redirects — there is no redirect code anywhere in the repo.
+manages no redirects — there is no redirect code anywhere in the repo. Marcel
+accepts that as the product's position; what follows is the shape it takes.
 
 The decision, in two halves:
 
@@ -354,20 +355,121 @@ The decision, in two halves:
   not a step in this one. If it is ever built it belongs in a
   `modules/<redirect-plugin>.sh`, under the same explicit-selection contract as
   every other module, and it is a separate decision.
-- **Reporting the URL changes is in scope, and is required for `clean_import`.**
-  sitegraft is the only party that knows both the old and the new path for every
-  page, and it knows them for free — it has both inventories. So `clean_import`
-  must emit a slug-change report into the run directory (old path → new path for
-  every matched page; old paths with no counterpart, which are the ones that
-  will 404), and `verify` must state in its summary how many public URLs changed
-  **and that no redirect was created for them.** Silence here would be the
-  familiar defect in a new place: the run succeeds, and the operator finds out
-  from a client's search console.
+- **Reporting the URLs that no longer exist is in scope, and is mandatory.**
+  sitegraft is the only party that sees both B before the graft and B after it,
+  and it sees them for free — it has both inventories. Every run must end by
+  writing a URL-change report to the run directory, and `verify` must state in
+  its summary how many public URLs changed **and that no redirect was created
+  for them.** Silence here would be the familiar defect in a new place: the run
+  succeeds, and the operator finds out from a client's search console.
 
 This is the honest split. "Redirects are your job" is a defensible limitation;
-"redirects are your job and we won't tell you which ones you need" is not. The
-report is also cheap and already owed — it is the cross-site `post_name` read
-that `docs/todo.md` lists for the design doc §11 slug warning.
+"redirects are your job and we won't tell you which ones you need" is not.
+
+#### The URL-change report is an action list, not a log
+
+The point of the artifact is that the operator walks it once and decides, URL by
+URL, between a 301 and an accepted removal. So it distinguishes three
+populations, because they do not call for the same decision:
+
+| Class | What it is | What the operator does |
+|---|---|---|
+| `moved` | A path on B before the graft that has an evident counterpart after it | Point a 301 at the proposed target, or override it |
+| `gone` | A path on B before the graft with **no** counterpart after it | Decide: 301 to something only they know, or 410 / accept the removal |
+| `new` | A path that exists only after the graft | No redirect. Listed for the sitemap and for re-indexing |
+
+**`gone` is the class that matters and the one a plain old→new mapping does not
+produce.** For those rows sitegraft proposes **no** target. It cannot: the
+replacement does not exist, so any suggestion would be a guess dressed as an
+answer — the exact defect this repo's first rule names. The operator is the only
+party who knows whether a retired service page should point at its successor,
+at a category, or nowhere at all.
+
+**Classification fails toward `gone`, never toward `moved`.** Deciding that
+B's old `/a/b` "became" A's `/c/d` is the same correspondence problem
+`in_place`'s pairing has, and with GUIDs unavailable it rests on the same
+title + post type heuristic, with the same failure mode. A wrong `moved` row
+hands the operator a plausible 301 to the wrong page and it will be applied
+without much scrutiny, because it looks decided. A row put in `gone` that was
+really a move only costs the operator one judgement call on a list they are
+reading anyway. So: only a correspondence sitegraft can justify is emitted as
+`moved`; everything doubtful goes to `gone` with no target, and the report says
+which signal produced each `moved` row.
+
+#### Format: headerless TSV, site-relative paths
+
+`class` TAB `old_path` TAB `new_path` TAB `post_type` TAB `title`, one row per
+URL, no header line, `-` for a field that has no value (`new_path` on a `gone`
+row, `old_path` on a `new` row). Tabs and newlines are stripped from the title.
+
+- **TSV, not JSON**, even though the manifest is JSON and `jq` is already a
+  dependency (ADR 0002). This artifact is a flat list of tuples whose consumer
+  is a rule generator: `awk -F'\t' '$1=="moved"'` turns it into server or plugin
+  redirect rules in one line. JSON would earn its place if the data were nested;
+  it is not.
+- **Headerless, fixed columns, class first** — the same shape as `id-map.tsv`
+  (`old_id` TAB `new_id` TAB `post_type`), which is the only artifact `graft`
+  writes today. One artifact convention in the run dir, not two. A header line
+  would break naive pipelines, and a `#` comment line invites every reader to
+  handle it differently; the column contract belongs in `docs/usage.md` and in
+  `verify`'s summary, not in the data.
+- **`-` rather than an empty field**, so the column count never varies and an
+  empty field can never be read as "absent" or "parse error".
+- **Site-relative paths, not absolute URLs.** Redirect rules are written against
+  paths, and keeping the domain out means the artifact stays correct if B's
+  domain is not what the run assumed.
+
+#### Where B's "before" URLs come from, and why it is a `graft` step
+
+They must be read **while they still exist** — after `backup`, before `clean`.
+A report that cannot be produced after the fact is not a report, and once
+`clean` has run, B's old paths exist nowhere but the backup.
+
+That read belongs to `graft`, not to `scan`, even though `scan` is already the
+two-site phase:
+
+- `scan` can have run days before `graft`, and B is a live site. An inventory
+  taken then describes a B that may no longer be the B about to be deleted.
+- The pairing (option 3) belongs in `scan` for the opposite reason: it is an
+  operator decision that has to be *frozen* into the manifest before anything
+  runs. This inventory is not a decision, it is evidence about the state being
+  destroyed, and evidence must be fresh.
+- Taking it immediately after `backup` also ties it to the snapshot a `restore`
+  would return to, which is the state the operator would be comparing against.
+
+Concretely: a `url_inventory` step in `graft`'s existing marker sequence,
+writing `urls-before.tsv`, and **`clean` refuses to run if that file is missing
+or empty** — the same fail-closed shape `graft` already uses when
+`clean.enabled` is set without an implementation. The resume-ordering fix listed
+under "Required regardless" applies to it directly: a resume must not skip
+`url_inventory` and then run `clean`.
+
+The final `url-changes.tsv` is produced at the **end** of `graft`, by diffing
+`urls-before.tsv` against B's URLs read back from B — not against A's, and not
+against what the import intended. It has to describe what B actually serves now,
+which is also what makes it checkable: `verify` re-reads B and asserts every
+`moved` target resolves, and that no `gone` path still resolves. That gives
+`verify` a falsifiable assertion instead of trusting `graft`'s own bookkeeping,
+which is the failure this ADR exists to fix.
+
+#### `in_place` produces the report too
+
+`in_place` keeps B's slugs and hierarchy, so in the normal case nothing moves
+and nothing disappears: the report should contain `new` rows only, for the
+A-only items that came in through the WXR import. The report is still produced,
+unconditionally, for two reasons.
+
+- **Proving it beats assuming it.** "This path changes no URLs" is a claim about
+  a run, and the artifact is what makes it true or false. A `gone` row under
+  `in_place` is structurally impossible — nothing is deleted — so `verify` must
+  **fail** if one appears. That turns a free by-product into a real check on the
+  in-place writer.
+- **The slug / parent / menu_order opt-in makes `in_place` a URL-changing path.**
+  This ADR already provides for that opt-in, and the moment it is selected the
+  report is not a formality: it is the thing that makes the opt-in reviewable,
+  and the same 301-or-410 walk applies. Building the report only for
+  `clean_import` would mean discovering it was needed in `in_place` on the first
+  run that used the opt-in.
 
 ### What `clean` owes the operator, beyond the confirmation
 
@@ -382,6 +484,9 @@ safety work is on the critical path and not deferrable within step 2:
   about to be force-deleted.
 - **Restore evidence, not a restore marker,** before the first destructive
   write.
+- **`urls-before.tsv`, captured before the first deletion,** with `clean`
+  refusing to run without it. It is the only moment at which B's outgoing URLs
+  can still be read from B.
 - **The resume ordering fix** (below), without which `clean` reproduces issue
   #10 inside its own fix.
 
@@ -394,8 +499,11 @@ framing; it does not start the implementation. Deferred to step 2:
   `graft`;
 - `clean` (option 1): the deletion pass, the typed confirmation, the
   protected-reference pre-flight report, the restore-rehearsal gate;
-- the slug-change report and `verify`'s "N URLs changed, no redirects created"
-  summary line;
+- the `url_inventory` step in `graft` (`urls-before.tsv`, gating `clean`), the
+  `url-changes.tsv` action list with its `moved`/`gone`/`new` classification,
+  `verify`'s "N URLs changed, no redirects created" summary line, and `verify`'s
+  assertions on it (every `moved` target resolves, no `gone` path resolves, no
+  `gone` row at all under `in_place`);
 - the pairing computation in `scan` and the in-place writer (option 3),
   including the operator review of slug-derived pairs;
 - `modules/etch.sh` declaring its meta keys — a dependency of the in-place path
@@ -453,7 +561,9 @@ Why they cannot wait for step 2:
 - **URL changes with no redirects (`clean_import`).** Not reversible in any
   useful sense once the site is back online and crawlers have seen it. The
   confirmation must state that inbound links to changed or removed paths will
-  404 and that sitegraft creates no redirects.
+  404, that sitegraft creates no redirects, and that `url-changes.tsv` is a
+  list the operator is expected to walk before B goes back online — a `gone`
+  row left undecided is a 404 shipped to a client.
 - **The in-place overwrite of a page's content and declared meta (`in_place`).**
   Reversible via WP revisions and the backup, but still a write to content
   default-deny protects. The frozen pairing must be presented and confirmed —
@@ -496,7 +606,12 @@ Why they cannot wait for step 2:
 - (+) The mode is an explicit operator decision with no default, so neither
   destroying B's content nor quietly under-delivering can happen by inaction.
 - (+) The URL-change report makes the redirect gap visible on every run instead
-  of leaving the operator to discover it from a client.
+  of leaving the operator to discover it from a client, and it is an action list
+  — the paths that no longer exist are named, so the 301-or-410 call can be made
+  URL by URL rather than reconstructed later from a crawl.
+- (+) `verify` gains falsifiable assertions from it (`moved` targets resolve,
+  `gone` paths do not, no `gone` row under `in_place`) instead of trusting
+  `graft`'s own account of what it did.
 - (+) The three "required regardless" fixes land first, so the next real run
   fails loudly instead of printing `PASS` over an empty migration — even before
   either path exists.
@@ -505,9 +620,13 @@ Why they cannot wait for step 2:
   references. The offline window bounds the *transient* risk, not this one.
 - (−) It depends on B genuinely being offline, which is a human procedure
   sitegraft can check for but cannot enforce.
-- (−) sitegraft changes live URLs and creates no redirects. That is now a stated
+- (−) sitegraft changes live URLs and creates no redirects. That is an accepted
   product limitation, not an oversight, and it is work the operator inherits on
-  every restructuring graft.
+  every restructuring graft: a `url-changes.tsv` to walk, and a decision to make
+  on every `gone` row that sitegraft deliberately declines to guess.
+- (−) The `moved`/`gone` split is heuristic, inherits the pairing's uncertainty,
+  and is biased toward `gone` — so it will hand the operator judgement calls on
+  URLs that did in fact simply move.
 - (−) `in_place`'s pairing lost its exact tier: slug + post type is a heuristic
   and every pair needs operator review, which is real operator time on every run
   of that mode.
