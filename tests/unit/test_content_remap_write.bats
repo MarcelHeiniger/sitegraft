@@ -20,6 +20,19 @@
 # always unslashes before writing regardless — silently eating every
 # backslash in content that (like sitegraft_remap_domain's own
 # JSON-escaped `https:\/\/` output) carries one by construction.
+#
+# $fields is a KEYED array ("post_content"/"post_excerpt"), not two more
+# positional strings (fix-pack round two, MAJOR-2 round two, Viktor,
+# execution-proven twice): round one of this fix-pack replaced
+# $post_id/$orig_content/$orig_excerpt with $post, which removed
+# arguments 4/5 of the original five, but left $content/$excerpt as two
+# adjacent, interchangeable strings -- and Viktor swapped them at
+# graft_remap_attachment_ids' own call site a second time, against that
+# exact form, with the full suite (41 tests across four files) staying
+# green throughout, because every assertion matched the call's TEXT,
+# never its arguments. See sitegraft_write_remapped_post's own docblock
+# for the full account of why a keyed array closes this at the one place
+# a swap is actually possible (the call site), not merely at this helper.
 setup() {
   REPO_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
   PHP_LIB="${REPO_ROOT}/lib/php/content-remap-functions.php"
@@ -39,14 +52,15 @@ php_run() {
 # MUTATION PROOF (do this by hand, not part of the suite): temporarily
 # change sitegraft_write_remapped_post's body (lib/php/content-remap-
 # functions.php) to call `wp_update_post( array( "ID" => $post->ID,
-# "post_content" => $content, "post_excerpt" => $excerpt ) )` instead of
-# $wpdb->update(...). Add, just for the experiment, a `wp_update_post()`
-# stub that models the real array-vs-object slashing asymmetry (never
-# slashes the array form, always unslashes before "writing" — see the
-# production docblock for the exact mechanism), then rerun this file: the
-# byte-for-byte assertion in the first test below fails, because the
-# written value comes back with its "\/" eaten down to "/". Revert
-# afterward — this is confirmation, not a permanent test path.
+# "post_content" => $fields["post_content"], "post_excerpt" =>
+# $fields["post_excerpt"] ) )` instead of $wpdb->update(...). Add, just for
+# the experiment, a `wp_update_post()` stub that models the real
+# array-vs-object slashing asymmetry (never slashes the array form, always
+# unslashes before "writing" — see the production docblock for the exact
+# mechanism), then rerun this file: the byte-for-byte assertion in the
+# first test below fails, because the written value comes back with its
+# "\/" eaten down to "/". Revert afterward — this is confirmation, not a
+# permanent test path.
 @test "sitegraft_write_remapped_post writes via \$wpdb->update -- content and excerpt keep their backslashes byte-for-byte (#43)" {
   run php_run '
     // Exactly the shape sitegraft_remap_domain produces: the JSON-escaped
@@ -58,7 +72,7 @@ php_run() {
     ];
     $rewritten_content = "<!-- wp:etch/image {\"src\":\"https:\/\/new.example.com\/x.jpg\"} -->";
 
-    $changed = sitegraft_write_remapped_post( $orig, $rewritten_content, "excerpt-unchanged" );
+    $changed = sitegraft_write_remapped_post( $orig, [ "post_content" => $rewritten_content, "post_excerpt" => "excerpt-unchanged" ] );
 
     if ( ! $changed ) { fwrite(STDERR, "reported no change when content differed\n"); exit(1); }
     $written = $GLOBALS["wpstub"]["posts_written"];
@@ -77,21 +91,24 @@ php_run() {
   [[ "$output" == "OK" ]]
 }
 
-@test "sitegraft_write_remapped_post writes \$content to post_content and \$excerpt to post_excerpt -- never swapped (Viktor, MAJOR-2)" {
-  # The old 5-positional-argument form ($post_id, $content, $excerpt,
-  # $orig_content, $orig_excerpt) let a caller swap arguments 2/3 (or 4/5)
-  # without any test noticing, because every assertion checking the
-  # generated PHP text matches the CALL SITE STRING, never its arguments.
-  # Reading $post->post_content/post_excerpt internally, and taking $post
-  # itself rather than four separate strings, is what closes that off.
-  # Distinguishable content/excerpt values here are the point: a swap
-  # would put "EXCERPT-VALUE" where "CONTENT-VALUE" belongs and vice versa.
+@test "sitegraft_write_remapped_post passes \$fields straight through to \$wpdb->update() as its \$data argument, unrepackaged" {
+  # This is a sanity check of the HELPER itself, not the swap-prevention
+  # claim (review, Kimi/coordinator: a prior version of this test's name
+  # overstated what it covers). The actual swap risk lives at the CALL
+  # SITE in lib/graft.sh, where a keyed array literal is what makes a swap
+  # self-evidently wrong to read -- guarded by the literal-string
+  # assertions in tests/unit/test_graft_remap.bats and
+  # test_graft_options.bats, not by anything this helper-level test can
+  # see. What this test DOES pin: sitegraft_write_remapped_post does not
+  # re-key, reorder, or otherwise touch $fields before handing it to
+  # $wpdb->update() -- the array a caller builds is the exact array that
+  # reaches the database.
   run php_run '
     $post = (object) [ "ID" => 7, "post_content" => "old content", "post_excerpt" => "old excerpt" ];
-    sitegraft_write_remapped_post( $post, "CONTENT-VALUE", "EXCERPT-VALUE" );
+    $fields = [ "post_content" => "CONTENT-VALUE", "post_excerpt" => "EXCERPT-VALUE" ];
+    sitegraft_write_remapped_post( $post, $fields );
     $written = $GLOBALS["wpstub"]["posts_written"][0]["data"];
-    if ( $written["post_content"] !== "CONTENT-VALUE" ) { fwrite(STDERR, "post_content got: " . $written["post_content"] . "\n"); exit(1); }
-    if ( $written["post_excerpt"] !== "EXCERPT-VALUE" ) { fwrite(STDERR, "post_excerpt got: " . $written["post_excerpt"] . "\n"); exit(1); }
+    if ( $written !== $fields ) { fwrite(STDERR, "data handed to \$wpdb->update() was not \$fields, unmodified\n"); exit(1); }
     echo "OK";
   '
   [ "$status" -eq 0 ]
@@ -101,7 +118,7 @@ php_run() {
 @test "sitegraft_write_remapped_post reports no change and never touches \$wpdb or the cache when content and excerpt are unchanged" {
   run php_run '
     $post = (object) [ "ID" => 1, "post_content" => "same content", "post_excerpt" => "same excerpt" ];
-    $changed = sitegraft_write_remapped_post( $post, "same content", "same excerpt" );
+    $changed = sitegraft_write_remapped_post( $post, [ "post_content" => "same content", "post_excerpt" => "same excerpt" ] );
     if ( $changed ) { fwrite(STDERR, "reported a change when nothing differed\n"); exit(1); }
     if ( ! empty( $GLOBALS["wpstub"]["posts_written"] ) ) { fwrite(STDERR, "\$wpdb->update was called despite no change\n"); exit(1); }
     if ( ! empty( $GLOBALS["wpstub"]["cache_cleared"] ) ) { fwrite(STDERR, "clean_post_cache was called despite no change\n"); exit(1); }
@@ -121,16 +138,21 @@ php_run() {
 # counted into "rewrote N post(s)" and had its cache cleared as if the
 # write had succeeded.
 @test "sitegraft_write_remapped_post does not report success or clear the cache when \$wpdb->update fails (#43 fix-pack, MAJOR-1)" {
+  # $output also carries the WARNING line the function now prints on this
+  # path (fix-pack round two, below) -- matched as a substring here rather
+  # than an exact match so this test stays focused on the return
+  # value/cache-clear contract; the warning text itself is pinned by its
+  # own dedicated test further down.
   run php_run '
     $GLOBALS["wpstub"]["wpdb_update_fail"] = [105];
     $post = (object) [ "ID" => 105, "post_content" => "old", "post_excerpt" => "" ];
-    $changed = sitegraft_write_remapped_post( $post, "new", "" );
+    $changed = sitegraft_write_remapped_post( $post, [ "post_content" => "new", "post_excerpt" => "" ] );
     if ( $changed ) { fwrite(STDERR, "reported success on a failed \$wpdb->update\n"); exit(1); }
     if ( ! empty( $GLOBALS["wpstub"]["cache_cleared"] ) ) { fwrite(STDERR, "clean_post_cache was called despite the write failing\n"); exit(1); }
     echo "OK";
   '
   [ "$status" -eq 0 ]
-  [[ "$output" == "OK" ]]
+  [[ "$output" == *"OK"* ]] || false
 }
 
 @test "sitegraft_write_remapped_post treats \$wpdb->update() returning int 0 (matched, nothing changed) as SUCCESS, not failure (strict false, not falsy 0)" {
@@ -147,11 +169,46 @@ php_run() {
   run php_run '
     $GLOBALS["wpstub"]["wpdb_update_zero"] = [42];
     $post = (object) [ "ID" => 42, "post_content" => "old", "post_excerpt" => "" ];
-    $changed = sitegraft_write_remapped_post( $post, "new", "" );
+    $changed = sitegraft_write_remapped_post( $post, [ "post_content" => "new", "post_excerpt" => "" ] );
     if ( ! $changed ) { fwrite(STDERR, "treated \$wpdb->update() returning 0 as a failure\n"); exit(1); }
     if ( $GLOBALS["wpstub"]["cache_cleared"] !== [42] ) { fwrite(STDERR, "clean_post_cache was not called on a successful (0-rows) write\n"); exit(1); }
     echo "OK";
   '
   [ "$status" -eq 0 ]
   [[ "$output" == "OK" ]]
+}
+
+# Fix-pack round two (coordinator, verified against Viktor's own finding):
+# CLAUDE.md's first rule, "fail closed" -- "a step that could not do its
+# job returns non-zero and says why." Round one made the failure
+# DETECTABLE (this function returns false), but the only thing either
+# caller in lib/graft.sh does with that is skip incrementing its own
+# counter: nothing is printed, nothing exits non-zero. Before the fix-pack
+# the counter over-reported (a failed write still counted); after round
+# one alone, it under-reports SILENTLY (a failed write is dropped with no
+# trace at all) -- detecting and then swallowing is the worse half of
+# "fail closed", not the whole of it. This pins the one piece actually in
+# scope for #43: the warning line itself. Whether `graft` as a whole
+# should exit non-zero on this is a separate, pre-existing gap (neither
+# `wp eval` snippet propagates its own exit status today) and is out of
+# scope here.
+@test "sitegraft_write_remapped_post prints a visible warning naming the post and \$wpdb->last_error when the write fails (#43 fix-pack round two)" {
+  run php_run '
+    $GLOBALS["wpstub"]["wpdb_update_fail"] = [105];
+    $post = (object) [ "ID" => 105, "post_content" => "old", "post_excerpt" => "" ];
+    sitegraft_write_remapped_post( $post, [ "post_content" => "new", "post_excerpt" => "" ] );
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARNING"* ]] || false
+  [[ "$output" == *"105"* ]] || false
+  [[ "$output" == *"wpstub: simulated update failure for post 105"* ]] || false
+}
+
+@test "sitegraft_write_remapped_post prints nothing on a successful write" {
+  run php_run '
+    $post = (object) [ "ID" => 1, "post_content" => "old", "post_excerpt" => "" ];
+    sitegraft_write_remapped_post( $post, [ "post_content" => "new", "post_excerpt" => "" ] );
+  '
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
 }

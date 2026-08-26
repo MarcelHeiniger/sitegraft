@@ -1179,10 +1179,11 @@ graft_remap_attachment_ids() {
   # The actual substitution (sitegraft_remap_attachment_refs) and the
   # write-back (sitegraft_write_remapped_post) both live in
   # lib/php/content-remap-functions.php — required here, never re-embedded
-  # inline (review, Viktor, NIT-1: keeps production and
-  # tests/unit/test_content_remap_functions.bats running the literal same
-  # code, and both independently unit-testable). The write-back is
-  # $wpdb->update(), NOT wp_update_post() (issue #43) — see
+  # inline (review, Viktor, NIT-1: keeps production and its own unit tests
+  # running the literal same code, and both independently unit-testable —
+  # the substitution in tests/unit/test_content_remap_functions.bats, the
+  # write-back in tests/unit/test_content_remap_write.bats). The write-back
+  # is $wpdb->update(), NOT wp_update_post() (issue #43) — see
   # sitegraft_write_remapped_post's own docblock for why the array form of
   # wp_update_post() silently ate every backslash this remap writes.
   run_or_echo wp_remote b eval '
@@ -1197,7 +1198,7 @@ graft_remap_attachment_ids() {
       if ( ! $post ) { continue; }
       $content = sitegraft_remap_attachment_refs( $payload["attachments"], $post->post_content );
       $excerpt = sitegraft_remap_attachment_refs( $payload["attachments"], $post->post_excerpt );
-      if ( sitegraft_write_remapped_post( $post, $content, $excerpt ) ) {
+      if ( sitegraft_write_remapped_post( $post, array( "post_content" => $content, "post_excerpt" => $excerpt ) ) ) {
         $count++;
       }
     }
@@ -1479,7 +1480,7 @@ graft_search_replace_domain() {
       if ( ! $post ) { continue; }
       $content = sitegraft_remap_domain( $post->post_content, $payload["from"], $payload["to"] );
       $excerpt = sitegraft_remap_domain( $post->post_excerpt, $payload["from"], $payload["to"] );
-      if ( sitegraft_write_remapped_post( $post, $content, $excerpt ) ) {
+      if ( sitegraft_write_remapped_post( $post, array( "post_content" => $content, "post_excerpt" => $excerpt ) ) ) {
         $count++;
       }
     }

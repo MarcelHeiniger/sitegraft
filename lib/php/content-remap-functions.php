@@ -128,7 +128,7 @@ function sitegraft_domain_present( $haystack, $domain, $escaped ) {
 }
 
 /**
- * sitegraft_write_remapped_post( object $post, string $content, string $excerpt ): bool
+ * sitegraft_write_remapped_post( object $post, array $fields ): bool
  *
  * The write-back step shared by graft_remap_attachment_ids and
  * graft_search_replace_domain (lib/graft.sh): both call one of the two
@@ -139,18 +139,36 @@ function sitegraft_domain_present( $haystack, $domain, $escaped ) {
  * in the WRITE (as opposed to the rewrite) went uncovered by any unit test.
  *
  * $post is the SAME get_post() object both callers already fetched to
- * build $content/$excerpt in the first place — deliberately, not the
- * post's id plus its old/new content as four separate positional string
- * arguments (review, Viktor, MAJOR-2, execution-proven): with $post_id,
- * $content, $excerpt, $orig_content, $orig_excerpt, arguments 2/3 and 4/5
- * are all plain strings and freely interchangeable at the call site.
- * Viktor swapped $content and $excerpt at graft_remap_attachment_ids' own
- * call — which would write the excerpt into every remapped post's
- * post_content — and the full suite (38/38 tests touching this function)
- * stayed green: every assertion matches the call site's TEXT
- * (`sitegraft_write_remapped_post(`), none of it its ARGUMENTS. Reading
- * $post->ID/post_content/post_excerpt directly closes that off
- * structurally rather than by convention.
+ * build $fields in the first place. $fields is a KEYED array —
+ * `array( "post_content" => $content, "post_excerpt" => $excerpt )` at
+ * both call sites — handed straight through to $wpdb->update() as its own
+ * $data argument below, unrepackaged, so the keys ARE the column names,
+ * not merely documentation of intent.
+ *
+ * This is the second round of MAJOR-2 (review, Viktor, execution-proven
+ * TWICE). Round one replaced $post_id/$orig_content/$orig_excerpt with
+ * $post, which really did remove arguments 4/5 of the original five —
+ * but the danger was never in 4/5. It was in 2/3: the resulting
+ * `sitegraft_write_remapped_post( $post, $content, $excerpt )` still took
+ * two adjacent, interchangeable strings, and this docblock used to claim
+ * that reading $post's own fields "closes that off structurally" — a
+ * claim the code did not back up. Viktor swapped $content and $excerpt at
+ * graft_remap_attachment_ids' own call site a SECOND time, against that
+ * exact form, and the full 41-test suite touching this function stayed
+ * green again: every assertion still matched the call's TEXT, and the
+ * round-one "never swapped" test exercised only this HELPER, never the
+ * call site where the swap actually happens. A keyed array closes it at
+ * the one place a swap is possible: `array( "post_content" => $excerpt,
+ * "post_excerpt" => $content )` reads as self-evidently wrong at the call
+ * site itself, where a positional swap reads as two equally plausible
+ * strings in some order — there is no name attached to catch it. A
+ * literal-string assertion on the call site's generated PHP
+ * (`tests/unit/test_graft_remap.bats`, `tests/unit/test_graft_options.bats`)
+ * is belt-and-suspenders on top of this, not the primary defense: it
+ * breaks on the first reformatting of the snippet and only ever covers
+ * the two call sites that exist today, where the keyed-array shape here
+ * is what makes a swap require an actively wrong-looking edit at ANY
+ * future call site, not just these two.
  *
  * Writes via $wpdb->update(), never wp_update_post() — the actual bug
  * behind issue #43. wp_update_post() only calls wp_slash() on its
@@ -160,7 +178,7 @@ function sitegraft_domain_present( $haystack, $domain, $escaped ) {
  * wp_insert_post() — which wp_update_post() delegates to for an existing
  * ID — unconditionally runs `$data = wp_unslash( $data )` immediately
  * before the actual write. One unslash pass with no matching slash pass
- * silently eats every literal backslash in $content/$excerpt.
+ * silently eats every literal backslash in $fields' values.
  *
  * That is not a corner case for what these two callers rewrite:
  * sitegraft_remap_domain (above) explicitly matches and rewrites the
@@ -222,25 +240,32 @@ function sitegraft_domain_present( $haystack, $domain, $escaped ) {
  * function now also checks for, explicitly rather than by delegation.
  * $wpdb->update() returns false on a real DB error (a full disk, a
  * charset/`strip_invalid_text_for_column()` rejection of some byte
- * sequence in $content) — never merely on "zero rows matched", which
+ * sequence in $fields) — never merely on "zero rows matched", which
  * returns int 0, not false; the `false === ` comparison below is strict
  * for exactly that reason, matching wp_insert_post()'s own check byte for
  * byte.
+ *
+ * A failed write is no longer silent (fix-pack round two — CLAUDE.md's
+ * "fail closed" rule: "a step that could not do its job returns non-zero
+ * and says why"): round one detected the failure and returned false, but
+ * the caller's only reaction is to skip incrementing its own counter —
+ * nothing is printed, nothing exits non-zero. `graft` would report
+ * "rewrote 3 post(s)" out of 5 in scope with no indication 2 were
+ * REJECTED rather than simply unchanged. This function now echoes one
+ * line naming the post and $wpdb->last_error on a failed write, so that
+ * at least shows up in the run's own output. Whether `graft` as a whole
+ * should exit non-zero when this happens is a separate, larger question
+ * — these two `wp eval` snippets don't propagate their own exit status
+ * today, a pre-existing gap and out of scope for issue #43.
  */
-function sitegraft_write_remapped_post( $post, $content, $excerpt ) {
-	if ( $content === $post->post_content && $excerpt === $post->post_excerpt ) {
+function sitegraft_write_remapped_post( $post, array $fields ) {
+	if ( $fields['post_content'] === $post->post_content && $fields['post_excerpt'] === $post->post_excerpt ) {
 		return false;
 	}
 	global $wpdb;
-	$result = $wpdb->update(
-		$wpdb->posts,
-		array(
-			'post_content' => $content,
-			'post_excerpt' => $excerpt,
-		),
-		array( 'ID' => (int) $post->ID )
-	);
+	$result = $wpdb->update( $wpdb->posts, $fields, array( 'ID' => (int) $post->ID ) );
 	if ( false === $result ) {
+		echo "sitegraft: WARNING post {$post->ID} write FAILED: {$wpdb->last_error}\n";
 		return false;
 	}
 	clean_post_cache( (int) $post->ID );

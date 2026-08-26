@@ -145,9 +145,22 @@ setup() {
   # never slashes the array form it's called with here, yet
   # wp_insert_post() unconditionally unslashes before writing, silently
   # eating every backslash the domain/id remap wrote. See
-  # tests/unit/test_content_remap_functions.bats for the execution-level
+  # tests/unit/test_content_remap_write.bats for the execution-level
   # proof this call site's actual generated PHP preserves them.
-  [[ "$output" == *"sitegraft_write_remapped_post("* ]] || false
+  #
+  # The KEYED form (fix-pack round two, MAJOR-2 round two, Viktor): asserted
+  # as the complete literal, not just the bare function name. A bare
+  # `sitegraft_write_remapped_post(` match is blind to arguments -- Viktor
+  # swapped $content/$excerpt at this exact call site TWICE (once against
+  # the original 5-positional-argument form, once against the first
+  # fix-pack's ($post, $content, $excerpt) form) and both times every test
+  # in this suite that only matched the function name stayed green. This is
+  # belt-and-suspenders on top of the real, structural fix (the keyed array
+  # itself, in lib/php/content-remap-functions.php's own
+  # sitegraft_write_remapped_post -- see its docblock for why that closes
+  # the swap off at the one place it's actually possible): this assertion
+  # re-reds if a future edit reverts to two bare positional strings here.
+  [[ "$output" == *'sitegraft_write_remapped_post( $post, array( "post_content" => $content, "post_excerpt" => $excerpt ) )'* ]] || false
   [[ "$output" != *"wp_update_post"* ]] || false
   # the substitution itself must live in the required file, not inline here
   [[ "$output" != *"preg_replace"* ]] || false

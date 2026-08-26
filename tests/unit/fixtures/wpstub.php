@@ -449,10 +449,19 @@ function wp_update_attachment_metadata( $id, $metadata ) {
  */
 class wpstub_wpdb {
 	public $posts = 'wp_posts';
+	// Real core's $wpdb->last_error is a public string property, populated
+	// by the query that just failed, and read directly by callers (not
+	// steered through some other accessor) -- modelled the same way here.
+	// Set on a steered failure below so a test doesn't have to poke it by
+	// hand to exercise sitegraft_write_remapped_post's own warning line
+	// (issue #43 fix-pack round two), the same way a real DB error would
+	// leave a real message behind for the caller to read.
+	public $last_error = '';
 
 	public function update( $table, $data, $where ) {
 		$post_id = isset( $where['ID'] ) ? (int) $where['ID'] : 0;
 		if ( in_array( $post_id, $GLOBALS['wpstub']['wpdb_update_fail'], true ) ) {
+			$this->last_error = 'wpstub: simulated update failure for post ' . $post_id;
 			return false;
 		}
 		$GLOBALS['wpstub']['posts_written'][] = array(
