@@ -426,34 +426,78 @@ graft_integrity_gate() {
   local file="$1" allowed_json="$2"
   [ -s "$file" ] || { log_error "WXR file is empty: ${file}"; return 1; }
   grep -q '<wp:wxr_version>' "$file" || { log_error "no <wp:wxr_version> marker in: ${file}"; return 1; }
+  # A cheap, line-oriented LOWER BOUND, not an exact count (issue #72 --
+  # see this function's own header below for the full story): `grep -c`
+  # counts matching LINES, and two <item>s sharing one physical line (the
+  # exact shape issue #70/#72 both exist because of) still count as one
+  # line here. Kept as-is, deliberately: it is used ONLY for the "does at
+  # least one <item> exist at all" fast-fail immediately below (still
+  # correct for that purpose -- a real <item> anywhere in the file always
+  # makes at least one line match) and for a diagnostic number in the
+  # fail-closed message further down. NEVER for the actual security
+  # decision, which now runs entirely through the structural parser below
+  # -- unlike the post_type extraction this same imprecision used to also
+  # drive, which is exactly what issue #72 closes.
   local item_count; item_count=$(grep -c '<item>' "$file" || true)
   [ "$item_count" -ge 1 ] || { log_error "no <item> found in: ${file}"; return 1; }
 
-  # CDATA-tolerant on purpose, even though it's NOT what triggers against a
-  # real `wp export`: verified live (a real WP 7.1 / wp-cli export, both by
-  # direct output inspection and by reading wp-cli's own
-  # WP_Export_WXR_Formatter.php source — the `wp:post_type` line uses the
-  # plain ->tag() form, not ->contains->cdata(), unlike title/content/meta_value,
-  # which DO get CDATA-wrapped) that `<wp:post_type>` is emitted as plain
-  # text, not `<wp:post_type><![CDATA[...]]></wp:post_type>` — so `[^<]*`
-  # matches it today without any changes. Widened to `.*` plus a CDATA-marker
-  # strip anyway, purely as defense-in-depth against a wp-cli version, a
-  # different export path (e.g. wp-admin's own native exporter, which does
-  # CDATA-wrap this field), or a hand-edited WXR ever changing that shape —
-  # cheap to add, and this is a security control, not a place to bet on one
-  # observed version's behavior never changing.
-  local found_types leaked
-  found_types=$(grep -o '<wp:post_type>.*</wp:post_type>' "$file" \
-    | sed -E 's#</?wp:post_type>##g; s#<!\[CDATA\[##g; s#\]\]>##g' \
-    | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
+  # issue #72: this used to be its own `grep -o '<wp:post_type>.*</wp:post_type>'
+  # | sed` scan -- a THIRD independent reader of the same WXR file format
+  # in this codebase (graft_verify_import_completeness, lib/graft.sh, and
+  # lib/php/wxr-content-functions.php's own two production callers already
+  # made two; this made three), and a greedy one: `grep -o` matches
+  # per LINE, so two <item>s sharing one physical line (exactly
+  # graft_verify_import_completeness's own former BLOCKER-2 shape, closed
+  # by switching THAT function to the driver below) let `.*` span across
+  # BOTH items' tags, extracting one garbled "type" string covering
+  # everything between the FIRST `<wp:post_type>` and the LAST
+  # `</wp:post_type>` on the line. Not theoretical -- measured live: a
+  # manifest allowing only "page" against two real, valid, allowed
+  # `<item>` elements (each a genuine `<wp:post_type>page</wp:post_type>`)
+  # aborted the whole graft with "WXR contains post_type(s) outside the
+  # manifest allowlist: page</item><item><wp:post_id>102</wp:post_id>page"
+  # -- BEFORE graft_verify_import_completeness's own gate, several steps
+  # later in phase_graft, ever got a chance to run, for a reason that had
+  # nothing to do with what the WXR actually did or didn't contain.
+  #
+  # Replaced with lib/php/wxr-item-ids-cli.php -- the SAME structural,
+  # namespace-aware driver graft_verify_import_completeness already uses
+  # (issue #53/#54's own fix-pack). One WXR reader for "what post_types
+  # does this file's items carry" now, in the one place that still needed
+  # its own answer to it, not three that can silently disagree on the same
+  # bytes -- see that driver's own header for why this specific sentence
+  # is finally true (an earlier draft of it, in this same fix-pack, said
+  # so before this function was fixed, and was wrong until now).
+  local ndjson rc stderr_file tmp_dir
+  tmp_dir=$(sitegraft_mktemp_dir)
+  stderr_file="${tmp_dir}/stderr"
+  ndjson=$(php "${SITEGRAFT_ROOT}/lib/php/wxr-item-ids-cli.php" "$file" 2>"$stderr_file") && rc=0 || rc=$?
+  local err_text=""
+  [ -s "$stderr_file" ] && err_text=$(cat "$stderr_file")
+  if [ "$rc" -ne 0 ]; then
+    log_error "could not parse WXR file to check its post_type(s) against the manifest allowlist: ${file}: ${err_text}"
+    return 1
+  fi
+
+  local found_types
+  found_types=$(printf '%s\n' "$ndjson" | jq -R -s -c '
+    split("\n") | map(select(length > 0) | fromjson.post_type) | unique
+  ')
 
   # Fail CLOSED, not open: an `<item>` count >=1 (checked above) with ZERO
-  # post_type actually extracted means the regex above didn't recognize
-  # this file's shape at all — exactly the silent "leaked is always []"
-  # failure mode commit 770e4c1's jq fix (below) exists to prevent, just
-  # one layer up (a parsing gap instead of a comparison-logic gap). Refusing
-  # here means a future export-format change this regex doesn't understand
-  # aborts loudly instead of the gate quietly rubber-stamping everything.
+  # post_type actually extracted means the driver genuinely found no
+  # well-formed <item> at all (missing wp:post_id alongside wp:post_type --
+  # see lib/php/wxr-content-functions.php's own _sitegraft_wxr_item_
+  # from_node, which requires BOTH before recognizing an item), or hit a
+  # future export-format change this parser doesn't understand yet --
+  # exactly the silent "leaked is always []" failure mode commit 770e4c1's
+  # jq fix (below) exists to prevent, just one layer up (a parsing gap
+  # instead of a comparison-logic gap). This guard predates issue #72's own
+  # fix and is UNCHANGED by it on purpose -- moving to a different
+  # extraction mechanism must not lose the fail-closed behavior that was
+  # the whole point of BLOCKER-1 in the first place. Refusing here means a
+  # future export-format change this driver doesn't understand aborts
+  # loudly instead of this gate quietly rubber-stamping everything.
   if [ "$(echo "$found_types" | jq 'length')" = "0" ]; then
     log_error "no <wp:post_type> could be parsed out of a WXR file that has ${item_count} <item>(s): ${file} — refusing to trust an integrity gate that found nothing to check"
     return 1
@@ -483,7 +527,7 @@ graft_integrity_gate() {
   # reason is specific and does not generalize: `attachment` is tolerated in
   # the file only because the importer is known to skip it. Any other
   # unexpected post type must still fail this gate.
-  local allowed_plus_skipped
+  local allowed_plus_skipped leaked
   allowed_plus_skipped=$(jq -n --argjson a "$allowed_json" '($a + ["attachment"]) | unique')
   leaked=$(jq -n --argjson found "$found_types" --argjson allowed "$allowed_plus_skipped" \
     '[$found[] as $x | select(($allowed | index($x)) | not) | $x]')

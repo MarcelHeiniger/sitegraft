@@ -6,14 +6,23 @@
  * locally, no WordPress bootstrap, no round-trip to A or B" shape
  * lib/php/verify-content-remap-cli.php already has for issue #52's guards
  * (see that file's own header) — this is the second production caller of
- * lib/php/wxr-content-functions.php. NOT the only caller of a WXR parser
- * in this codebase, though: lib/graft.sh's own graft_integrity_gate still
- * runs its own separate, narrower `grep -o ... | sed` scan of the same
- * kind of file, for a different check, and is unaffected by (and not
- * unified with) anything in this file — a real, acknowledged gap between
- * two WXR readers in this repo, not something this fix-pack closes (review,
- * MAJOR-C — an earlier draft of this comment claimed "not a third parser",
- * which overstated what actually changed).
+ * lib/php/wxr-content-functions.php. lib/graft.sh's own graft_integrity_
+ * gate is the THIRD (issue #72) — it used to run its own separate,
+ * narrower `grep -o ... | sed` scan of the same kind of file, for a
+ * different check, until that scan's own greediness across two <item>s
+ * sharing one physical line produced a garbled "leaked post_type" that
+ * aborted a graft before graft_verify_import_completeness's own gate
+ * (the one THIS driver was originally built for) ever got a chance to
+ * run — measured live, not theoretical; see graft_integrity_gate's own
+ * comment for the exact reproduction. Fixed by pointing it at THIS same
+ * file too. Two review rounds of this fix-pack each claimed "one parser
+ * now" before that was actually true (MAJOR-C, round 2, caught the
+ * FIRST such claim as unverified/false; issue #72, filed after a
+ * REBASE onto a separate fix for issue #70 made the second one
+ * measurably false in exactly the way it warned about) — it is true as
+ * of issue #72's own fix, both this file's THREE current callers use it,
+ * and none of them run a second, independently-drifting reimplementation
+ * of "what does this WXR item's own post_type say" any more.
  *
  * Replaces graft_verify_import_completeness's own former awk-based, line-
  * oriented scan of the staged WXR — that scan was BOTH review blockers in

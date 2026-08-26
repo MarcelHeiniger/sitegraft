@@ -216,8 +216,20 @@ case "$sub" in
       case "$a" in --dir=*) dir="${a#--dir=}" ;; esac
     done
     mkdir -p "$dir"
+    # issue #72: xmlns:wp declared (an earlier version of this fixture
+    # omitted it, harmless against the awk/grep-based readers this
+    # codebase used to have, but graft_integrity_gate now parses this
+    # file through the same namespace-aware structural driver
+    # graft_verify_import_completeness uses -- an undeclared "wp" prefix
+    # resolves to no namespace at all, and neither post_id nor post_type
+    # would be recognized).
     cat > "${dir}/export.xml" <<'XML'
-<rss><channel><wp:wxr_version>1.2</wp:wxr_version>
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+  xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/"
+  xmlns:content="http://purl.org/rss/1.0/modules/content/"
+  xmlns:wp="http://wordpress.org/export/1.2/">
+<channel><wp:wxr_version>1.2</wp:wxr_version>
 <item><wp:post_id>101</wp:post_id><wp:post_type>page</wp:post_type></item>
 </channel></rss>
 XML
@@ -489,15 +501,23 @@ EOF
   [ "$(grep -c '^101' "${run_dir}/id-map.tsv")" -eq 1 ]
 }
 
-# --- BLOCKER-A acceptance (review, issue #70) -- EXPECTED RED until #70 ----
-# merges. Same real-subprocess shape as the BLOCKER-1/BLOCKER-2 acceptance
-# test above, changing ONLY the staged WXR's own layout: the two items are
-# direct siblings with NO whitespace/text node between `</item>` and the
-# next `<item>` -- exactly the shape lib/php/wxr-content-functions.php's
-# streaming reader silently drops the second of (see lib/php/
-# wxr-item-ids-cli.php's own header for the root cause). This is the
-# reviewer's own reproduction, applied to this branch's own fixture: take
-# the fixture directly above and change ONLY the layout.
+# --- BLOCKER-A acceptance (review, issue #70 -- FIXED on a separate branch,
+# PR #71, merged and rebased onto here). Same real-subprocess shape as the
+# BLOCKER-1/BLOCKER-2 acceptance test above, changing ONLY the staged
+# WXR's own layout: the two items are direct siblings with NO whitespace/
+# text node between `</item>` and the next `<item>` -- the exact shape
+# lib/php/wxr-content-functions.php's streaming reader used to silently
+# drop the second of (see lib/php/wxr-item-ids-cli.php's own header for
+# the fuller history). This test went green on its own the moment #71
+# landed -- kept exactly as originally written, as its own regression
+# guard. It was also, briefly, red for an UNRELATED reason after that
+# rebase: graft_integrity_gate (lib/graft.sh) ran its own separate,
+# greedy `grep -o | sed` scan of the same WXR and mis-parsed this exact
+# adjacent-<item> shape as a leaked post_type, aborting the graft before
+# this test's own completeness gate ever ran -- issue #72, fixed by
+# pointing that function at the same shared driver this file's own
+# fixture already exercises; see graft_integrity_gate's own comment and
+# tests/unit/test_graft_integrity_gate.bats for that fix's own coverage.
 _write_fake_wp_success_with_skip_no_whitespace() {
   local path="$1"
   cat > "$path" <<'FAKEWP'

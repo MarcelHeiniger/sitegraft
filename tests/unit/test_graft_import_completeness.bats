@@ -402,27 +402,24 @@ EOF
   [ "$status" -eq 2 ]
 }
 
-# --- BLOCKER-A (review, issue #70) -- EXPECTED RED until #70 merges --------
+# --- BLOCKER-A (review, issue #70 -- FIXED, see below) ---------------------
 #
 # lib/php/wxr-content-functions.php's own streaming reader
-# (_sitegraft_stream_wxr_reader) silently drops the SECOND of two sibling
-# <item> elements when there is NO intervening whitespace/text node
-# between them (`</item><item>` with literally nothing between): its
-# `XMLReader::next()` positions the cursor ON that next sibling, but the
-# outer `while(true){ read(); ... }` loop then calls `read()` again on its
-# NEXT iteration, advancing PAST it instead of processing it. Confirmed
-# live, root-caused while building this fix-pack's own test fixtures (see
-# lib/php/wxr-item-ids-cli.php's own header for the full accounting) and
-# filed as issue #70 -- NOT fixed in this PR (this PR does not own that
-# file); a separate branch is expected to fix it and merge first, at which
-# point this test goes green on its own with no change needed here.
-#
-# This is exactly BLOCKER-1's own failure shape (a real, present, skipped
-# item silently exempted), reopened by the very parser this fix-pack
-# switched to in order to CLOSE BLOCKER-1 in the first place -- verified
-# with the identical assertions the BLOCKER-2 test above already uses,
-# only the WXR's own layout differs (adjacent, no separating whitespace,
-# instead of one item's own tags sharing a line).
+# (_sitegraft_stream_wxr_reader) used to silently drop the SECOND of two
+# sibling <item> elements when there was NO intervening whitespace/text
+# node between them (`</item><item>` with literally nothing between): its
+# `XMLReader::next()` positioned the cursor ON that next sibling, but the
+# outer `while(true){ read(); ... }` loop then called `read()` again on
+# its NEXT iteration, advancing PAST it instead of processing it. This was
+# exactly BLOCKER-1's own failure shape (a real, present, skipped item
+# silently exempted), reopened by the very parser this fix-pack switched
+# to in order to CLOSE BLOCKER-1 in the first place. Confirmed live,
+# root-caused while building this fix-pack's own test fixtures, filed as
+# issue #70 and fixed on a separate branch (PR #71, merged, rebased onto
+# here) -- this test went green on its own the moment that landed, with no
+# change needed here; kept exactly as originally written as the
+# regression guard for it. See lib/php/wxr-item-ids-cli.php's own header
+# for the fuller history.
 @test "graft_verify_import_completeness catches a skipped item even when it is a sibling <item> with NO whitespace before it (BLOCKER-A / issue #70)" {
   local run_dir="$BATS_TEST_TMPDIR/run"
   mkdir -p "${run_dir}/export"
