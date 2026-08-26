@@ -27,3 +27,23 @@ module function's presence is checked with `type -t`.
 - (−) If the tool grows a lot (dozens of modules), the lack of an associative
   array could become awkward — not applicable in v1 (3 modules), to be revisited
   if the module count outgrows what flat lists handle comfortably.
+- (−) The cost is not only missing features. Some constructs *exist* on 3.2 but
+  misbehave, which is worse, because nothing announces them. The one that has
+  bitten this repo is bash's `:?` required-parameter expansion: raised inside a
+  function under `set -euo pipefail`, it kills the whole process while reporting
+  `$?=0`, so an EXIT trap and any caller see a clean success.
+
+      $ cat q.sh
+      set -euo pipefail
+      trap 'echo "EXIT trap saw \$?=$?" >&2' EXIT
+      f() { local pv="NOPE"; local p="${!pv:?missing $pv}"; echo unreachable; }
+      f
+      $ /bin/bash q.sh; echo "process exit code: $?"     # GNU bash 3.2.57(1)
+      q.sh: line 3: !pv: missing NOPE
+      EXIT trap saw $?=0
+      process exit code: 0
+
+  Use `${!var:-}` plus an explicit check and `return 1` instead. This class is
+  now enforced by `tests/lint/no-fatal-parameter-expansion.sh`, run by
+  `bats tests/unit/` and by CI — added after the form survived for months in
+  `docs/plans/`, where it read as a reference implementation to copy.

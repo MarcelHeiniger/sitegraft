@@ -55,6 +55,7 @@ jobs:
           shellcheck lib/*.sh
           shellcheck modules/*.sh modules/*.sh.example
           shellcheck tests/integration/*.sh tests/integration/fixtures/*.sh
+          shellcheck tests/lint/*.sh
 
   unit-tests:
     name: Unit tests (bats)
