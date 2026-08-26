@@ -1288,15 +1288,52 @@ MUTATED_WXR="${MUTATED_WXR_DIR}/mutated-with-injected-post-type.xml"
 # which never matches, silently making "mutated" an exact copy of the
 # original and this whole negative assertion vacuous). Targeting the
 # `</channel>` line alone is what actually lands the injected line.
-sed 's#</channel>#<item><wp:post_type>injected_evil_type</wp:post_type></item>\
+#
+# `<wp:post_id>999999</wp:post_id>` is load-bearing here (review, reviewer's
+# own NIT — measured against this harness's own log, not assumed): the
+# injected item used to carry ONLY wp:post_type, no wp:post_id at all. As
+# of issue #73's own well-formedness check, THAT shape never reaches
+# `found_types`/the allowlist comparison at all — graft_integrity_gate
+# aborts earlier, on the items_seen-vs-items_emitted mismatch (see that
+# function's own comment), and "injected_evil_type" never gets compared
+# against $ALLOWED_TYPES. The FAIL: branch below would still catch a
+# regression (either abort path makes the `if` here true), but the
+# "confirmed" line following it claimed the ALLOWLIST specifically caught
+# this — which was no longer the mechanism actually exercised. Adding a
+# real post_id makes this item well-formed, so it genuinely reaches
+# found_types and the allowlist comparison is what rejects it; (e2) below
+# covers the no-post_id/well-formedness-check path as its own, honestly
+# named assertion instead of silently riding on this one.
+sed 's#</channel>#<item><wp:post_id>999999</wp:post_id><wp:post_type>injected_evil_type</wp:post_type></item>\
 </channel>#' "$REAL_WXR" > "$MUTATED_WXR"
 grep -q 'injected_evil_type' "$MUTATED_WXR" || { echo "FAIL: the mutation itself did not land in ${MUTATED_WXR} — the sed pattern didn't match this wp-cli export's actual line structure, the negative assertion below would be meaningless" >&2; exit 1; }
 if graft_integrity_gate "$MUTATED_WXR" "$ALLOWED_TYPES"; then
   echo "FAIL: the integrity gate ACCEPTED a WXR file carrying a post_type outside the manifest allowlist — the leak gate is not working (this is a security control, design doc §6.4 step 4)" >&2
   exit 1
 fi
-rm -rf "$MUTATED_WXR_DIR"
 echo "==> confirmed: the integrity gate aborts on a real WXR file leaking an out-of-allowlist post_type, and passes the same file before mutation"
+
+echo "==> (e2) asserting the integrity gate ABORTS on a real WXR file carrying a malformed (no wp:post_id) item, via the well-formedness check rather than the allowlist (issue #73)"
+# The (e)'s own ORIGINAL shape, kept as its own separate, honestly-named
+# assertion (review, reviewer's own NIT) rather than folded silently into
+# (e): a malformed item -- structurally an <item>, but missing wp:post_id
+# -- never reaches found_types at all (lib/php/wxr-content-functions.php's
+# own _sitegraft_wxr_item_from_node requires BOTH wp:post_id and
+# wp:post_type before it recognizes an item), so graft_integrity_gate's
+# items_seen-vs-items_emitted check (issue #73, lib/php/wxr-item-ids-
+# cli.php) is what aborts here, not the allowlist -- a genuinely different
+# mechanism from (e) above, proven against a real wp-cli export the same
+# way.
+MUTATED_MALFORMED_WXR="${MUTATED_WXR_DIR}/mutated-with-malformed-item.xml"
+sed 's#</channel>#<item><wp:post_type>injected_evil_type</wp:post_type></item>\
+</channel>#' "$REAL_WXR" > "$MUTATED_MALFORMED_WXR"
+grep -q 'injected_evil_type' "$MUTATED_MALFORMED_WXR" || { echo "FAIL: the mutation itself did not land in ${MUTATED_MALFORMED_WXR} — the sed pattern didn't match this wp-cli export's actual line structure, the negative assertion below would be meaningless" >&2; exit 1; }
+if graft_integrity_gate "$MUTATED_MALFORMED_WXR" "$ALLOWED_TYPES"; then
+  echo "FAIL: the integrity gate ACCEPTED a WXR file carrying a malformed <item> (wp:post_type with no wp:post_id) — the items_seen/items_emitted well-formedness check (issue #73) is not working, and a forbidden post_type on a malformed item could pass the allowlist gate silently" >&2
+  exit 1
+fi
+rm -rf "$MUTATED_WXR_DIR"
+echo "==> confirmed: the integrity gate also aborts on a malformed (no wp:post_id) item, via the well-formedness check rather than the allowlist"
 
 echo "==> re-running graft is a no-op past the completed markers (marker-gated resumability, design doc §6.4)"
 "${ROOT}/bin/sitegraft" graft --profile "$PROFILE" --run "$RUN_DIR" --allow-stack-mismatch

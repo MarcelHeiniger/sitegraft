@@ -63,22 +63,25 @@
  * the streaming/memory and entity-safety properties this inherits for
  * free.
  *
- * A REAL, CONFIRMED gap this inherited parser still has (issue #70, found
- * while building this fix-pack's own test fixtures, NOT fixed in this
- * file or by this PR): _sitegraft_stream_wxr_reader's XMLReader::next() +
- * outer while(true){read();...} loop silently drops the SECOND of two
- * sibling <item> elements when there is NO intervening whitespace/text
- * node between them (`</item><item>` with literally nothing between —
- * real `wp export` output is always pretty-printed with a newline there,
- * so this has no practical effect against a genuine wp-cli export, but it
- * IS reachable via any other WXR producer, or a hand-edited/minified
- * file). Concretely: graft_verify_import_completeness would silently pass
- * a run where the SECOND of two such adjacent items was genuinely skipped
- * by wordpress-importer — the exact failure mode this whole fix-pack
- * exists to catch, reopened by the parser this fix-pack switched to. A
- * fix for #70 is expected to land on `main` separately; this file's own
- * tests include the case that will go green once it does, and stay red
- * (by design, not by mistake) until then.
+ * A real, confirmed gap this inherited parser HAD (issue #70, found while
+ * building this fix-pack's own test fixtures — fixed separately, PR #71,
+ * merged as commit 1c52ba4, since rebased onto this branch, NOT part of
+ * this PR's own diff): _sitegraft_stream_wxr_reader's XMLReader::next() +
+ * outer while(true){read();...} loop used to silently drop the SECOND of
+ * two sibling <item> elements when there was NO intervening whitespace/
+ * text node between them (`</item><item>` with literally nothing between
+ * — real `wp export` output is always pretty-printed with a newline
+ * there, so this had no practical effect against a genuine wp-cli export,
+ * but it WAS reachable via any other WXR producer, or a hand-edited/
+ * minified file). Concretely: graft_verify_import_completeness would have
+ * silently passed a run where the SECOND of two such adjacent items was
+ * genuinely skipped by wordpress-importer — the exact failure mode this
+ * whole fix-pack exists to catch, briefly reopened by the parser this
+ * fix-pack switched to, in the window between this file's own first
+ * commit and #71 landing. This file's own tests
+ * (tests/unit/test_graft_import_completeness.bats, tests/unit/
+ * test_graft_resume_safety.bats) include the case that exercises exactly
+ * this shape — now passing, and kept as #70's own regression guard.
  *
  * Usage: `php wxr-item-ids-cli.php <wxr-file> [<wxr-file> ...]`. Prints
  * NDJSON to stdout on success — one compact `{"post_id":N,"post_type":
