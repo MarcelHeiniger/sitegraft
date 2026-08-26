@@ -1318,6 +1318,27 @@ fi
 echo "==> confirmed: the domain-absence check reports the real scope it examined (${DOMAIN_SCANNED_POSTS} post(s) + ${DOMAIN_SCANNED_OPTIONS} option(s)), not a bare tick"
 grep -q "no orphan post_parent references" "$VERIFY_REPORT"
 grep -q "expected navigation is present" "$VERIFY_REPORT"
+
+# issue #52 fix-pack, review round 2: same "a tick alone is not proof, name
+# a non-zero scope" discipline the domain-absence assertion above already
+# applies, extended to guard 1 (migrated content matches A's on B). A
+# HARD-coded etch module ships with every real checkout and rewrites Etch
+# component refs across every non-attachment migrated post (modules/
+# etch.sh's etch_post_import) -- round 1 of this fix-pack excluded by
+# post_type instead of by post, which meant EVERY migrated post on a real
+# install was excluded, always, and this line ticked `- [x]` with
+# `(0 of 0 compared; N post(s) excluded ...)` while genuinely comparing
+# nothing. This harness passed GREEN on that defect (it never asserted a
+# non-zero `compared` count) -- exactly the gap this assertion closes.
+CONTENT_MATCH_LINE=$(grep "migrated content matches A's on B" "$VERIFY_REPORT")
+[ -n "$CONTENT_MATCH_LINE" ]
+CONTENT_MATCH_COMPARED=$(printf '%s' "$CONTENT_MATCH_LINE" | sed -n 's/.*(\([0-9][0-9]*\) of [0-9][0-9]* compared.*/\1/p')
+if [ -z "$CONTENT_MATCH_COMPARED" ] || [ "$CONTENT_MATCH_COMPARED" -lt 1 ]; then
+  echo "FAIL: guard 1's content-match line ticked its box without a non-zero 'compared' count on a real graft (a verify whose content guard excluded everything would look identical to one that actually compared something): ${CONTENT_MATCH_LINE}" >&2
+  exit 1
+fi
+echo "==> confirmed: guard 1 (migrated content matches A's on B) reports a non-zero compared count (${CONTENT_MATCH_COMPARED}), not a bare tick over an all-excluded scope"
+
 grep -q "Result: PASS" "$VERIFY_REPORT"
 echo "==> confirmed: verify report shows every positive check passed, on real migrated WordPress data (not stubs)"
 
@@ -1434,6 +1455,65 @@ echo "==> confirmed: the orphan post_parent check genuinely detects a real orpha
 
 echo "==> reverting the injected orphan and re-confirming verify passes clean again"
 ddev exec --raw -p "$PROJECT_B" -- wp post update "$FEATURED_PAGE_ID_B" --post_parent=0
+"${ROOT}/bin/sitegraft" verify --profile "$PROFILE" --run "$RUN_DIR"
+grep -q "Result: PASS" "$VERIFY_REPORT"
+
+# issue #52 fix-pack, review round 2: the one assertion above that a HARD
+# FAIL harness for #52's own content guards was missing entirely. B_HOME_
+# ID_FROM_MAP (resolved earlier via id-map.tsv, same technique as the
+# Footer/page_on_front assertions) is a page THIS run genuinely migrated
+# -- mutating its live post_content on B directly, bypassing graft
+# entirely, is exactly the shape of defect guard 1 exists to catch (a
+# remap that landed wrong, a #43-shaped backslash corruption, any write
+# that silently produced the wrong bytes). This is the only end-to-end
+# proof that guard 1 does anything at all -- the DOMAIN_SCANNED_POSTS-style
+# assertion above proves it examined something; this proves it can fail.
+#
+# Review round 3 (MINOR): the mutate/revert round-trip below writes via
+# $wpdb->update (a `wp eval`), never `wp post update` -- `wp post update`
+# is `wp_update_post()`, i.e. the EXACT array-form slashing bug issue #43
+# fixed in this codebase's own production write path
+# (sitegraft_write_remapped_post, lib/php/content-remap-functions.php):
+# the day this fixture's Home page carries real Etch content with
+# JSON-escaped backslashes, `wp post update` would silently corrupt it on
+# the REVERT step, and the final PASS assertion below would fail for a
+# reason with nothing to do with the product. The original content is also
+# round-tripped through B's own postmeta, server-side, rather than through
+# a bash variable: `$(...)` command substitution strips trailing newlines,
+# so capturing post_content into a shell variable and writing it back is
+# its own silent-corruption risk, independent of #43.
+echo "==> NEGATIVE CASE 4 (issue #52's own guard 1): mutating a migrated page's post_content directly on B, to prove verify_migrated_content_matches_source actually detects a real content mismatch rather than always reporting PASS"
+ddev exec --raw -p "$PROJECT_B" -- wp eval "
+global \$wpdb;
+\$id = ${B_HOME_ID_FROM_MAP};
+\$post = get_post( \$id );
+update_post_meta( \$id, '_harness_negative_case_4_original', \$post->post_content );
+\$wpdb->update( \$wpdb->posts, array( 'post_content' => \$post->post_content . '<!-- corrupted by harness negative case 4 -->' ), array( 'ID' => \$id ) );
+clean_post_cache( \$id );
+"
+if "${ROOT}/bin/sitegraft" verify --profile "$PROFILE" --run "$RUN_DIR"; then
+  echo "FAIL: verify reported success even though a migrated page's post_content on B no longer matches what graft produced from A — guard 1 (issue #52) is not actually comparing real content" >&2
+  exit 1
+fi
+grep -q "HARD FAIL" "$VERIFY_REPORT"
+CONTENT_HARD_FAIL_LINE=$(grep "migrated post content does not match A's" "$VERIFY_REPORT")
+[ -n "$CONTENT_HARD_FAIL_LINE" ]
+case "$CONTENT_HARD_FAIL_LINE" in
+  *"${B_HOME_ID_FROM_MAP}"*) : ;;
+  *) echo "FAIL: guard 1's hard-fail line did not name the actual corrupted page (${B_HOME_ID_FROM_MAP}): ${CONTENT_HARD_FAIL_LINE}" >&2; exit 1 ;;
+esac
+grep -q "Result: HARD FAIL" "$VERIFY_REPORT"
+echo "==> confirmed: verify_migrated_content_matches_source genuinely detects a real content mismatch on a migrated page (post ${B_HOME_ID_FROM_MAP}) and names it"
+
+echo "==> reverting the injected content corruption (via \$wpdb->update, from B's own postmeta -- never through a bash variable or wp_update_post) and re-confirming verify passes clean again"
+ddev exec --raw -p "$PROJECT_B" -- wp eval "
+global \$wpdb;
+\$id = ${B_HOME_ID_FROM_MAP};
+\$original = get_post_meta( \$id, '_harness_negative_case_4_original', true );
+\$wpdb->update( \$wpdb->posts, array( 'post_content' => \$original ), array( 'ID' => \$id ) );
+delete_post_meta( \$id, '_harness_negative_case_4_original' );
+clean_post_cache( \$id );
+"
 "${ROOT}/bin/sitegraft" verify --profile "$PROFILE" --run "$RUN_DIR"
 grep -q "Result: PASS" "$VERIFY_REPORT"
 

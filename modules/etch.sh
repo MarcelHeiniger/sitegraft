@@ -273,7 +273,10 @@ EOF
 # (hooks run unconditionally, including under --dry-run — a write here would
 # have to be wrapped, see modules/motopress.sh.example).
 etch_post_import() {
-  # shellcheck disable=SC2034 # run_dir (one of this hook's 3 documented parameters, design doc Sec3.2) is genuinely unused by this implementation -- same pattern as modules/motopress.sh.example's state_dir, kept for contract fidelity, not a real cross-file case
+  # run_dir (design doc Sec3.2's 3rd hook parameter) is used below (issue
+  # #52 fix-pack, review round 2): graft_record_module_content_rewrite
+  # writes into it, so this is no longer the unused parameter the previous
+  # comment here documented.
   local run_dir="$1" id_map_tsv="$2" wp_cmd_b="$3"
 
   local ai_key
@@ -337,13 +340,17 @@ etch_post_import() {
   # substitution, and running B's content back through the save filters
   # (block re-parsing, kses, slashing) would be a second, unrequested
   # transformation. clean_post_cache keeps the object cache honest afterwards.
+  # issue #52 fix-pack, review round 2 (B2): the PHP body now echoes the
+  # ACTUAL post ID it rewrote, one per line, instead of a bare unused
+  # count ("$changed" was computed but never read by anything on the bash
+  # side) -- graft_record_module_content_rewrite (lib/graft.sh) is what
+  # turns that into the record lib/verify.sh's guard 1 excludes by.
   local php
   php=$(cat <<PHP
 global \$wpdb;
 \$map = json_decode('${map_json}', true);
 \$ids = json_decode('${ids_json}', true);
-if ( ! is_array( \$map ) || ! is_array( \$ids ) ) { echo "0"; return; }
-\$changed = 0;
+if ( ! is_array( \$map ) || ! is_array( \$ids ) ) { return; }
 foreach ( \$ids as \$pid ) {
 	\$content = get_post_field( 'post_content', \$pid );
 	if ( ! is_string( \$content ) || '' === \$content ) { continue; }
@@ -357,16 +364,39 @@ foreach ( \$ids as \$pid ) {
 	if ( \$content !== \$before ) {
 		\$wpdb->update( \$wpdb->posts, array( 'post_content' => \$content ), array( 'ID' => \$pid ) );
 		clean_post_cache( \$pid );
-		\$changed++;
+		echo \$pid . "\n";
 	}
 }
-echo \$changed;
 PHP
 )
 
   log_info "etch post_import: remapping Etch component references across $(printf '%s' "$ids_json" | jq 'length') migrated post(s)..."
+  # `&&`/`||`, not a bare assignment -- run_or_echo's own real exit status
+  # (the eval call's) must survive as THIS function's return value, the
+  # same as it did before this restructuring; without it, the while loop
+  # a few lines below becomes the last command bash evaluates, and a
+  # `while read` over an EMPTY here-string returns 1 (its own EOF), which
+  # would silently turn a successful, no-op run into a false failure --
+  # execution-proven (existing tests broke on exactly this before the fix).
+  local rewritten_ids rc
   # shellcheck disable=SC2086 # intentionally unquoted: wp_cmd_b may be a multi-word wrapper (e.g. ddev exec ... wp) and must word-split, same pattern as this repo's other documented run_or_echo call sites
-  run_or_echo $wp_cmd_b eval "$php"
+  rewritten_ids=$(run_or_echo $wp_cmd_b eval "$php") && rc=0 || rc=$?
+  # Under --dry-run, run_or_echo never ran the real eval -- $rewritten_ids
+  # is its own "[dry-run] ..." echo text, printed here (unchanged CLI
+  # contract: an operator running --dry-run still sees what would have
+  # run) rather than fed to graft_record_module_content_rewrite, which
+  # would otherwise try to parse that text as a post ID and correctly
+  # refuse it (digit-only guard), but silently -- printing it is the
+  # existing, tested behavior this preserves.
+  if is_dry_run; then
+    [ -n "$rewritten_ids" ] && printf '%s\n' "$rewritten_ids"
+  else
+    local pid
+    while IFS= read -r pid; do
+      [ -n "$pid" ] && graft_record_module_content_rewrite "$run_dir" "$pid"
+    done <<< "$rewritten_ids"
+  fi
+  return "$rc"
 }
 
 # design doc §12: Etch is one of the three rendering-stack components whose

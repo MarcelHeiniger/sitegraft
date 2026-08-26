@@ -127,6 +127,51 @@ EOF
   [[ "$backup_output" == *"to restore this backup"* ]] || false
 }
 
+# issue #52 / ADR 0008's "Required regardless" list: phase_backup must also
+# record the pre-graft content-checksum snapshot lib/verify.sh's content
+# guards read back after graft runs — same moment, same manifest, same
+# reasoning as checksums_protected_pre_graft immediately above.
+@test "phase_backup records a pre-graft content-checksum snapshot keyed by post ID for the selected post_types" {
+  jq '.migrate = {"core-wp": {"post_types": ["page"], "option_keys": []}}' "${RUN_DIR}/manifest.json" > "${RUN_DIR}/manifest.json.tmp" && mv "${RUN_DIR}/manifest.json.tmp" "${RUN_DIR}/manifest.json"
+  wp_remote() {
+    local alias_lc="$1"; shift
+    for a in "$@"; do
+      case "$a" in
+        post) : ;;
+      esac
+    done
+    case "$*" in
+      *"post list"*) echo '[{"ID":16,"post_content":"old front page","post_excerpt":""}]' ;;
+      *) echo "INSERT INTO wp_fakebooking_reservations VALUES (1);" ;;
+    esac
+  }
+  run phase_backup --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  run jq -e '.content_checksums_pre_graft["16"] | startswith("sha256:")' "${RUN_DIR}/manifest.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "phase_backup aborts, before completion, when the pre-graft content-checksum snapshot cannot be computed" {
+  jq '.migrate = {"core-wp": {"post_types": ["page"], "option_keys": []}}' "${RUN_DIR}/manifest.json" > "${RUN_DIR}/manifest.json.tmp" && mv "${RUN_DIR}/manifest.json.tmp" "${RUN_DIR}/manifest.json"
+  wp_remote() {
+    case "$*" in
+      *"post list"*) return 1 ;;
+      *) echo "INSERT INTO wp_fakebooking_reservations VALUES (1);" ;;
+    esac
+  }
+  run phase_backup --profile t --run "$RUN_DIR"
+  [ "$status" -eq 1 ]
+  [ ! -f "${RUN_DIR}/backup.complete" ]
+}
+
+@test "phase_backup --dry-run writes no content-checksum snapshot either" {
+  jq '.migrate = {"core-wp": {"post_types": ["page"], "option_keys": []}}' "${RUN_DIR}/manifest.json" > "${RUN_DIR}/manifest.json.tmp" && mv "${RUN_DIR}/manifest.json.tmp" "${RUN_DIR}/manifest.json"
+  run phase_backup --profile t --run "$RUN_DIR" --dry-run
+  [ "$status" -eq 0 ]
+  run jq -e 'has("content_checksums_pre_graft") | not' "${RUN_DIR}/manifest.json"
+  [ "$status" -eq 0 ]
+}
+
 # issue #14: the wp-content manifest is what lets restore.sh put a
 # containerized B back to exactly its pre-graft state. Without it the
 # generated restore.sh refuses to remove anything at all, so a phase_backup

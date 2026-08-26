@@ -125,3 +125,35 @@ setup() {
 
   [ ! -e "${run_dir}/graft.mu_plugin.done" ]
 }
+
+# --- graft_run_module_post_import creates module-content-rewrites.tsv -----
+# unconditionally (issue #52 fix-pack, review round 3, MAJOR) — lib/verify.
+# sh's guard 1 reads this file's mere PRESENCE (even empty) as "this run's
+# hooks were given the chance to record what they rewrote"; its absence
+# used to be ambiguous with "hooks ran and rewrote nothing", which let a
+# genuinely correct graft's module-rewritten content read as a false HARD
+# FAIL.
+setup_no_op_module() {
+  # A module discovered with a post_import hook that changes nothing, so
+  # this exercises the "created even when nothing gets rewritten" case,
+  # not merely "created when something does".
+  SITEGRAFT_MODULES="noop"
+  noop_post_import() { :; }
+}
+
+@test "graft_run_module_post_import creates module-content-rewrites.tsv even when no hook rewrites anything (review round 3, MAJOR)" {
+  setup_no_op_module
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  graft_run_module_post_import "$run_dir" "${run_dir}/id-map.tsv"
+  [ -f "${run_dir}/module-content-rewrites.tsv" ]
+  [ ! -s "${run_dir}/module-content-rewrites.tsv" ]
+}
+
+@test "graft_run_module_post_import does NOT create module-content-rewrites.tsv under SITEGRAFT_DRY_RUN=1" {
+  setup_no_op_module
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  SITEGRAFT_DRY_RUN=1 graft_run_module_post_import "$run_dir" "${run_dir}/id-map.tsv"
+  [ ! -f "${run_dir}/module-content-rewrites.tsv" ]
+}

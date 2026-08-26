@@ -279,7 +279,7 @@ core_wp_post_import() {
   done
 
   _core_wp_fix_theme_mods "$run_dir" "$id_map_tsv" "$wp_cmd_b"
-  _core_wp_remap_nav_page_ids "$id_map_tsv" "$wp_cmd_b"
+  _core_wp_remap_nav_page_ids "$run_dir" "$id_map_tsv" "$wp_cmd_b"
 }
 
 # B2 (third review round), and the same class of bug as page_on_front just
@@ -581,7 +581,10 @@ function sitegraft_core_wp_remap_nav_link_ids( $map, $content ) {
 PHP
 }
 
-# _core_wp_remap_nav_page_ids <id_map_tsv> <wp_cmd_b> -- issue #17's id-remap.
+# _core_wp_remap_nav_page_ids <run_dir> <id_map_tsv> <wp_cmd_b> -- issue #17's
+# id-remap. <run_dir> (issue #52 fix-pack, review round 2) is where
+# graft_record_module_content_rewrite (lib/graft.sh) records the post IDs
+# this function actually rewrote -- see that function's own comment.
 # A wp_navigation post's navigation-link content holds POST ids for the
 # pages/posts it links to, and those ids change on import -- the same class
 # of problem design doc §9.3 documents for page_on_front and B2 documents
@@ -610,7 +613,7 @@ PHP
 # no separate "is it dynamic" branch is needed here, the pattern simply
 # never matches anything in that content.
 _core_wp_remap_nav_page_ids() {
-  local id_map_tsv="$1" wp_cmd_b="$2"
+  local run_dir="$1" id_map_tsv="$2" wp_cmd_b="$3"
   # Same guard, same reason, as graft_remap_attachment_ids/
   # graft_remap_featured_images: id-map.tsv genuinely not existing yet
   # (a first-time --dry-run, graft_fetch_id_map never creates it under
@@ -662,12 +665,14 @@ _core_wp_remap_nav_page_ids() {
   # $nav_ids_json are built entirely from id-map.tsv's own digit-only old/new
   # id columns (the awk filters above require `~ /^[0-9]+$/` on both), so
   # neither can ever contain a single quote to break out of the literal.
+  # issue #52 fix-pack, review round 2 (B2): echoes the ACTUAL post ID
+  # rewritten, one per line, instead of a bare unused count -- same change,
+  # same reason, as modules/etch.sh's own etch_post_import.
   php=$(cat <<PHP
 ${remap_fn}
 \$map = json_decode('${map_json}', true);
 \$nav_ids = json_decode('${nav_ids_json}', true);
-if ( ! is_array( \$map ) || ! is_array( \$nav_ids ) ) { echo "0"; return; }
-\$changed = 0;
+if ( ! is_array( \$map ) || ! is_array( \$nav_ids ) ) { return; }
 global \$wpdb;
 foreach ( \$nav_ids as \$pid ) {
 	\$pid = (int) \$pid;
@@ -677,16 +682,34 @@ foreach ( \$nav_ids as \$pid ) {
 	if ( \$new_content !== \$content ) {
 		\$wpdb->update( \$wpdb->posts, array( 'post_content' => \$new_content ), array( 'ID' => \$pid ) );
 		clean_post_cache( \$pid );
-		\$changed++;
+		echo \$pid . "\n";
 	}
 }
-echo \$changed;
 PHP
 )
 
   log_info "core-wp post_import: remapping navigation-link page/post ids across $(printf '%s' "$nav_ids_json" | jq 'length') migrated wp_navigation post(s)..."
+  # `&&`/`||`, not a bare assignment -- see modules/etch.sh's
+  # etch_post_import for why this matters: this call is also the LAST
+  # statement in this function (and in core_wp_post_import, its only
+  # caller), so its own real exit status must survive as the return value
+  # instead of the while loop below's (a `while read` over an EMPTY
+  # here-string returns 1, its own EOF, regardless of whether anything
+  # actually went wrong).
+  local rewritten_ids rc
   # run_or_echo, for the same reason every other write in this file uses it:
   # module post_import hooks run unconditionally, dry-run included.
   # shellcheck disable=SC2086 # intentionally unquoted: wp_cmd_b may be a multi-word wrapper (e.g. ddev exec ... wp) and must word-split
-  run_or_echo $wp_cmd_b eval "$php"
+  rewritten_ids=$(run_or_echo $wp_cmd_b eval "$php") && rc=0 || rc=$?
+  # Same dry-run-visibility preservation as etch_post_import's own
+  # identical restructuring -- see that function's own comment.
+  if is_dry_run; then
+    [ -n "$rewritten_ids" ] && printf '%s\n' "$rewritten_ids"
+  else
+    local pid
+    while IFS= read -r pid; do
+      [ -n "$pid" ] && graft_record_module_content_rewrite "$run_dir" "$pid"
+    done <<< "$rewritten_ids"
+  fi
+  return "$rc"
 }
