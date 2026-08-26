@@ -61,3 +61,67 @@ setup() {
 # scanning whole tables (MAJOR-2 fix-pack). See
 # tests/unit/test_content_remap_functions.bats for where the remap logic's
 # real test coverage lives now.
+
+# --- dry-run-trap: _graft_exit_trap's own `rm -f` of the mu-plugin markers
+# was the ONE mutation in that trap never guarded by is_dry_run, unlike
+# graft_mark_step above (MAJOR-B), which exists specifically to prevent this
+# exact class of bug. The on-disk state this exercises — mu_plugin.done
+# written, mu_cleanup.done never written — is NOT the ordinary state of an
+# in-flight graft: this very trap fires and clears it on every gracefully
+# handled exit (verified: SIGINT/SIGTERM/SIGHUP all reach it, same as a
+# normal successful/failed run). It's left behind only by `kill -9`, an
+# OOM/crash, a run directory written by a pre-fix sitegraft, or a second
+# invocation racing the first one on the same run dir — rare, but exactly
+# the case this trap's whole branch exists to handle, so it's what these
+# tests set up directly rather than trying to reproduce the crash itself.
+# Given that state, running `sitegraft graft --dry-run` against the same
+# run directory used to delete graft.mu_plugin.done for real even though
+# graft_remove_mu_plugin (dry-run-safe, built on run_or_echo) touched
+# nothing on B — see the fix's own comment in lib/graft.sh for what a
+# second dry-run pass then silently stopped reporting. Fixed the same way
+# MAJOR-B fixed graft_mark_step: `is_dry_run ||` in front of the mutation.
+@test "_graft_exit_trap deletes neither marker under SITEGRAFT_DRY_RUN=1 (dry-run-trap)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  # mu_plugin deployed, cleanup never ran — see the comment above for why
+  # this state, though rare, is exactly what this branch exists to handle.
+  graft_mark_step "$run_dir" mu_plugin
+  [ -e "${run_dir}/graft.mu_plugin.done" ]
+  # (mu_cleanup.done is never written by this fixture, so a matching
+  # `[ ! -e ... ]` here would pass unconditionally, before or after the
+  # fix — the trap's own `if` guard above already requires it absent to
+  # even enter this branch. Omitted per review, NIT-1: it doesn't prove
+  # anything a mutation on the code under test could ever fail.)
+
+  # Stub out everything the trap talks to on B so this stays a unit test —
+  # no site, no wp-cli, no ssh. graft_remove_mu_plugin is overridden rather
+  # than left to run for real. SITE_B_WP_PATH is unset explicitly, because
+  # profile_load (lib/profile.sh) exports it for every real sitegraft
+  # invocation — an inherited value from the surrounding shell would make
+  # the trap's second block (the id/domain-remap payload cleanup below)
+  # run graft_remove_file against a real path instead of the no-op this
+  # test intends (review, MAJOR-1: an inherited SITE_B_WP_PATH pointing at
+  # a real site directory made this exact suite delete real files there).
+  unset SITE_B_WP_PATH
+  graft_remove_mu_plugin() { :; }
+
+  SITEGRAFT_GRAFT_RUN_DIR="$run_dir" SITEGRAFT_DRY_RUN=1 _graft_exit_trap
+
+  [ -e "${run_dir}/graft.mu_plugin.done" ]
+}
+
+@test "_graft_exit_trap still deletes the marker for real once dry-run is off (dry-run-trap: a real interrupted-graft cleanup must not be skipped)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  graft_mark_step "$run_dir" mu_plugin
+  [ -e "${run_dir}/graft.mu_plugin.done" ]
+
+  # See the sibling test above for why SITE_B_WP_PATH is unset explicitly
+  # rather than merely never assigned (review, MAJOR-1).
+  unset SITE_B_WP_PATH
+  graft_remove_mu_plugin() { :; }
+
+  SITEGRAFT_GRAFT_RUN_DIR="$run_dir" _graft_exit_trap
+
+  [ ! -e "${run_dir}/graft.mu_plugin.done" ]
+}
