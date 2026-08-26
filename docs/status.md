@@ -1,7 +1,7 @@
 # Status — sitegraft
 
 **STATUS: in progress**  <!-- idea → in progress → live/production → maintenance → archived -->
-**Last updated: 2026-08-20** (Step 6 self-review)
+**Last updated: 2026-08-26** (PR #61 note appended; body below still reflects the 2026-08-20 Step 6 self-review)
 
 ## Summary
 
@@ -155,3 +155,24 @@ commit's own message and the design doc's inline status notes):
 - `modules/acss.sh` deliberately NOT created — its own design doc spec (§3.4)
   already instructs not to guess the unverified legacy ACSS slug, and Step 6 is
   a polish pass, not the place to do that real-world verification.
+
+## PR #61 (2026-08-26) — dead wp_import_insert_term hook removed
+
+`mu-plugins/sitegraft-id-mapper.php`'s `wp_import_insert_term` handler never
+produced a usable old->new term id-map: wordpress-importer 0.9.5 fires that
+hook only for the inline per-post `<item><category>` path
+(class-wp-import.php:1166-1186), whose `$term` carries name/slug/domain but
+no original term_id — structurally, not as a bug, so there was nothing to
+fix. Removed the handler outright (YAGNI); double review (Viktor + Kimi,
+independent) confirmed the removal and found no path that makes the hook
+usable. `docs/status.md` note only — see PR #61 for the full account,
+including the one real consequence found in review (a numeric-collision
+edge case in `modules/core-wp.sh`'s page_on_front/page_for_posts lookup,
+documented in that function's own comment; moot now that the handler is
+gone).
+- `SITEGRAFT_VERSION` bumped `1.0.0-rc7` → `1.0.0-rc8` (not `rc6` → `rc7` as
+  first written here: PR #60 merged to `main` while this PR was in review and
+  independently bumped `rc6` → `rc7` for its own, unrelated fix. Rebasing onto
+  `main` landed both PRs on the identical `1.0.0-rc7` string with no merge
+  conflict to flag it — caught in review, not by tooling — so this PR's own
+  change is the one that moves the version again, to `rc8`).

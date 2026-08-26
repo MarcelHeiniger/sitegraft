@@ -2827,6 +2827,11 @@ graft_remove_mu_plugin() {
 
 - [ ] **Step 4: Write `mu-plugins/sitegraft-id-mapper.php`** (verbatim from design doc §7)
 
+> **PR #61 (2026-08-26): the `wp_import_insert_term` handler below was removed
+> as dead code — it never produced a usable term id-map (see design doc §7's
+> own correction, and `mu-plugins/sitegraft-id-mapper.php`, for why). Do not
+> copy it verbatim from here any more.**
+
 ```php
 <?php
 /**

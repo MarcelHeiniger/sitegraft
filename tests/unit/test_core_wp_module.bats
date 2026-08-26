@@ -139,6 +139,53 @@ EOF
   [ ! -f "$BATS_TEST_TMPDIR/calls.log" ]
 }
 
+# --- PR #61 follow-up: core_wp_post_import's lookup has no `$3` type filter,
+# so column 2 of any id-map.tsv row whose column 1 matches old_id reaches
+# `wp option update` verbatim. Dropping the wp_import_insert_term handler
+# stops this version from WRITING such rows, but an id-map.tsv already on
+# disk still carries them, and graft's step-idempotency markers make
+# resuming onto one a real path. These two tests pin the write side shut.
+#
+# Both fixtures use column 2 = "Array" because that is literally what the
+# removed handler wrote (PHP's array-to-string coercion), not an invented
+# shape.
+
+@test "core_wp_post_import refuses to write a non-numeric new id to B (legacy term: row from a pre-fix id-map.tsv)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '"5"' > "${run_dir}/option-page_on_front.value"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  # Column 1 is 5 because the removed handler put the newly-INSERTED post's
+  # id on B there, which can collide with A's own page_on_front value.
+  printf '5\tArray\tterm:category\n' > "$tsv"
+  wp_cmd_b_stub() { echo "wp_cmd_b_stub $*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  run core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
+  # The point of the test: nothing reached B at all. Without the guard this
+  # is `wp option update page_on_front Array` against the live site.
+  [ ! -f "$BATS_TEST_TMPDIR/calls.log" ]
+  [[ "$output" == *"non-numeric new id"* ]] || false
+  # Not silent, and not the "no corresponding entry" message either — that
+  # one belongs to the genuinely-absent case and must stay distinguishable.
+  [[ "$output" != *"has no corresponding entry"* ]] || false
+}
+
+@test "core_wp_post_import refuses the write when a legacy term: row collides with a real page row (awk emits both)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '"5"' > "${run_dir}/option-page_on_front.value"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  # The lookup prints every matching row, so new_id here is the two-line
+  # string "105\nArray" — not one value or the other. Writing that to B is
+  # worse than either alone.
+  printf '5\t105\tpage\n5\tArray\tterm:category\n' > "$tsv"
+  wp_cmd_b_stub() { echo "wp_cmd_b_stub $*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  run core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
+  [ ! -f "$BATS_TEST_TMPDIR/calls.log" ]
+  [[ "$output" == *"non-numeric new id"* ]] || false
+}
+
 # Fix-pack bug found live (DDEV harness, MAJOR-B's new graft --dry-run
 # assertion, running end to end for the first time against a genuinely
 # fresh run directory — same root cause and same fix as
@@ -603,21 +650,6 @@ EOF
   [[ "$output" != *'"5":"905"'* ]] || false
 }
 
-# B1 (Viktor's review, execution-proven): mu-plugins/sitegraft-id-mapper.php's
-# wp_import_insert_term handler ALSO writes rows to id-map.tsv, tagged
-# `term:<taxonomy>` in column 3 -- these are real rows, not a hypothetical.
-# Before this fix, the map_json awk filter only excluded "attachment" rows,
-# so a term row survived into the substitution map -- and because the map is
-# built via jq's `{(.[0]): .[1]} | add`, the LAST row for a given OLD id wins
-# unconditionally. A term whose OLD id happens to numerically collide with a
-# migrated PAGE's OLD id (both sequences start at 1 on a fresh WordPress
-# install, so this is not a remote edge case on a small site) would silently
-# overwrite the correct page mapping with the term's NEW id instead --
-# exactly the "id":<old> ambiguity this whole function's header comment
-# spends twelve lines warning about, self-inflicted by its own map
-# construction. Proved live before this fix: a term row with old id 3
-# (colliding with a real page's old id 3) made a "kind":"post-type" link's
-# id come out as the TERM's new id, not the PAGE's.
 # Nit (Viktor's review): a duplicated id-map.tsv row for the same
 # wp_navigation post (a hand-edited or otherwise duplicated file) must not
 # make the embedded post-id list carry that id twice -- modules/etch.sh's
@@ -636,6 +668,29 @@ EOF
   [[ "$output" == *'$nav_ids = json_decode('"'"'["177"]'"'"', true);'* ]] || false
 }
 
+# B1 (Viktor's review, execution-proven), CORRECTED: this comment used to
+# claim mu-plugins/sitegraft-id-mapper.php's wp_import_insert_term handler
+# "ALSO writes rows to id-map.tsv ... these are real rows, not a
+# hypothetical" and that a real import had "Proved live" the collision
+# this test exercises. Both claims were wrong: that handler never produced
+# a usable term id-map -- it logged the literal string "Array" into every
+# row it wrote (see mu-plugins/sitegraft-id-mapper.php's own comment for
+# the full account) -- and has since been removed outright. This test
+# locks in something narrower, and still real: map_json's
+# `$3 !~ /^term:/` exclusion is the ONLY thing that keeps a term: row out
+# of the substitution map for any row shaped like a WORKING term map (a
+# real numeric id in column 2). The fixture below proves it precisely:
+# `3\t14\tterm:category`'s column 2 is a genuine digit string, "14" -- so
+# `$2 ~ /^[0-9]+$/` does NOT exclude it, checked directly against that same
+# guard. Without the `term:` exclusion, jq's `{(.[0]): .[1]} | add` lets
+# the LAST row for a given OLD id win, so this row would silently
+# overwrite page 3's correct 203 mapping with the term's id 14 instead --
+# exactly the "id":<old> ambiguity this whole function's header comment
+# spends twelve lines warning about. That failure mode is real for any
+# FUTURE term-row format (or a legacy id-map.tsv written before this fix)
+# that happens to carry a numeric id in column 2 -- precisely why the
+# exclusion stays even though today's handler produces no term: rows at
+# all.
 @test "core_wp_post_import's nav id-remap map excludes term: rows -- a colliding term id must never overwrite a real page mapping (B1)" {
   local run_dir="$BATS_TEST_TMPDIR/run"
   mkdir -p "$run_dir"

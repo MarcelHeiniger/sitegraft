@@ -957,6 +957,21 @@ path, rather than resting on a DDEV-only round-trip that can never exercise it.
 
 ## 7. The mapping mu-plugin — `mu-plugins/sitegraft-id-mapper.php`
 
+> **CORRECTION, PR #61 (2026-08-26), placed BEFORE the code below on
+> purpose — read this first, do not copy the code block as current.** The
+> `wp_import_insert_term` handler in the code below is REMOVED from the
+> real file and must not be re-added. It never worked: wordpress-importer
+> 0.9.5 fires that hook only for a post's inline `<item><category>` terms
+> (`class-wp-import.php`'s `process_post_term()`), whose data is
+> name/slug/domain only — no original term_id ever reaches that hook, so
+> there is no old->new term id-map it can build, structurally, regardless
+> of how the handler reads its arguments. The code block is kept verbatim
+> below for historical accuracy — this is what Step 4 actually shipped,
+> and what Steps 4-6 were built against — not as something to copy. For
+> the current file and the full verified account (including why the one
+> hook that *would* carry a real id-map, `wp_import_term_meta`, is also
+> not a fix), see `mu-plugins/sitegraft-id-mapper.php` and PR #61 itself.
+
 ```php
 <?php
 /**
@@ -981,6 +996,11 @@ add_action( 'wp_import_insert_term', function ( $term_id, $term, $original_id ) 
 Log format (`id-map.tsv` after retrieval): `old_id<TAB>new_id<TAB>post_type`, one
 line per imported post/term. This is the single source of truth for every
 post-import ID remap.
+
+> **This claim is also corrected by PR #61**: it was only ever true for
+> posts. No `term:`-tagged line was ever a usable id-map row (see the
+> correction above) — `id-map.tsv` has been post-only since PR #61, and
+> arguably always should have been read that way.
 
 ## 8. `wp import`'s default behavior around media (important)
 
