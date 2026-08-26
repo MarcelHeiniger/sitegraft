@@ -116,3 +116,59 @@ function sitegraft_remap_domain( $content, $from, $to ) {
 function sitegraft_domain_present( $haystack, $domain, $escaped ) {
 	return strpos( $haystack, $domain ) !== false || strpos( $haystack, $escaped ) !== false;
 }
+
+/**
+ * sitegraft_write_remapped_post( int $post_id, string $content, string $excerpt, string $orig_content, string $orig_excerpt ): bool
+ *
+ * The write-back step shared by graft_remap_attachment_ids and
+ * graft_search_replace_domain (lib/graft.sh): both call one of the two
+ * pure remap functions above, then need to save the result and invalidate
+ * the object cache. Extracted here (issue #43) for the same reason the
+ * remap functions themselves were extracted — the previous inline form
+ * could only be exercised end-to-end via the DDEV harness, so a regression
+ * in the WRITE (as opposed to the rewrite) went uncovered by any unit test.
+ *
+ * Writes via $wpdb->update(), never wp_update_post() — the actual bug
+ * behind issue #43. wp_update_post() only calls wp_slash() on its
+ * $postarr when $postarr is an OBJECT (wp-includes/post.php's
+ * `is_object( $postarr )` branch); called with a plain array, as both
+ * call sites here used to, $postarr is never slashed, yet
+ * wp_insert_post() — which wp_update_post() delegates to for an existing
+ * ID — unconditionally runs `$data = wp_unslash( $data )` immediately
+ * before the actual write. One unslash pass with no matching slash pass
+ * silently eats every literal backslash in $content/$excerpt.
+ *
+ * That is not a corner case for what these two callers rewrite:
+ * sitegraft_remap_domain (above) explicitly matches and rewrites the
+ * JSON-escaped `https:\/\/` form, which is exactly how a domain shows up
+ * inside an Etch block's JSON attribute comment. Losing that escaping
+ * breaks parse_blocks()'s JSON decode SILENTLY — no error, no crash, a
+ * block that renders without its attributes.
+ *
+ * $wpdb->update() performs no slash/unslash pass at all — the raw bytes
+ * given are the raw bytes written — the same choice, for the same reason,
+ * modules/etch.sh's own Etch-component-reference remap already makes.
+ * clean_post_cache() replaces the object-cache invalidation
+ * wp_update_post() would otherwise have done as a side effect.
+ *
+ * Returns true iff a write actually happened (content or excerpt
+ * differed from what was read) — callers use this to keep their own
+ * "rewrote N post(s)" count accurate, same contract the old inline
+ * `if ( $content !== $post->post_content || ... )` guard had.
+ */
+function sitegraft_write_remapped_post( $post_id, $content, $excerpt, $orig_content, $orig_excerpt ) {
+	if ( $content === $orig_content && $excerpt === $orig_excerpt ) {
+		return false;
+	}
+	global $wpdb;
+	$wpdb->update(
+		$wpdb->posts,
+		array(
+			'post_content' => $content,
+			'post_excerpt' => $excerpt,
+		),
+		array( 'ID' => (int) $post_id )
+	);
+	clean_post_cache( (int) $post_id );
+	return true;
+}

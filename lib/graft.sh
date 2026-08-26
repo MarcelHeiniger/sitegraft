@@ -1170,11 +1170,15 @@ graft_remap_attachment_ids() {
   remote_path=$(graft_push_remap_payload "$run_dir" "$payload_json" "sitegraft-id-remap-payload.json")
   lib_path=$(graft_push_remap_lib "$run_dir")
 
-  # The actual substitution (sitegraft_remap_attachment_refs) lives in
+  # The actual substitution (sitegraft_remap_attachment_refs) and the
+  # write-back (sitegraft_write_remapped_post) both live in
   # lib/php/content-remap-functions.php — required here, never re-embedded
   # inline (review, Viktor, NIT-1: keeps production and
   # tests/unit/test_content_remap_functions.bats running the literal same
-  # code, and the substitution logic itself independently unit-testable).
+  # code, and both independently unit-testable). The write-back is
+  # $wpdb->update(), NOT wp_update_post() (issue #43) — see
+  # sitegraft_write_remapped_post's own docblock for why the array form of
+  # wp_update_post() silently ate every backslash this remap writes.
   run_or_echo wp_remote b eval '
     require_once WP_CONTENT_DIR . "/sitegraft-content-remap-functions.php";
     $payload_path = WP_CONTENT_DIR . "/sitegraft-id-remap-payload.json";
@@ -1187,8 +1191,7 @@ graft_remap_attachment_ids() {
       if ( ! $post ) { continue; }
       $content = sitegraft_remap_attachment_refs( $payload["attachments"], $post->post_content );
       $excerpt = sitegraft_remap_attachment_refs( $payload["attachments"], $post->post_excerpt );
-      if ( $content !== $post->post_content || $excerpt !== $post->post_excerpt ) {
-        wp_update_post( array( "ID" => $post_id, "post_content" => $content, "post_excerpt" => $excerpt ) );
+      if ( sitegraft_write_remapped_post( $post_id, $content, $excerpt, $post->post_content, $post->post_excerpt ) ) {
         $count++;
       }
     }
@@ -1453,6 +1456,11 @@ graft_search_replace_domain() {
 
   # sitegraft_remap_domain lives in lib/php/content-remap-functions.php —
   # same reasoning as graft_remap_attachment_ids' own require_once above.
+  # The write-back is $wpdb->update(), NOT wp_update_post() (issue #43) —
+  # see sitegraft_write_remapped_post's own docblock. This call site is the
+  # one issue #43 actually reproduces on: sitegraft_remap_domain matches
+  # and rewrites the JSON-escaped `https:\/\/` form, and the array form of
+  # wp_update_post() silently ate that backslash on every write.
   run_or_echo wp_remote b eval '
     require_once WP_CONTENT_DIR . "/sitegraft-content-remap-functions.php";
     $payload_path = WP_CONTENT_DIR . "/sitegraft-domain-remap-payload.json";
@@ -1465,8 +1473,7 @@ graft_search_replace_domain() {
       if ( ! $post ) { continue; }
       $content = sitegraft_remap_domain( $post->post_content, $payload["from"], $payload["to"] );
       $excerpt = sitegraft_remap_domain( $post->post_excerpt, $payload["from"], $payload["to"] );
-      if ( $content !== $post->post_content || $excerpt !== $post->post_excerpt ) {
-        wp_update_post( array( "ID" => $post_id, "post_content" => $content, "post_excerpt" => $excerpt ) );
+      if ( sitegraft_write_remapped_post( $post_id, $content, $excerpt, $post->post_content, $post->post_excerpt ) ) {
         $count++;
       }
     }

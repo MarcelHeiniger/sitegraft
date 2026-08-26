@@ -140,7 +140,15 @@ setup() {
   [[ "$output" == *"require_once"* ]] || false
   [[ "$output" == *"sitegraft-content-remap-functions.php"* ]] || false
   [[ "$output" == *"sitegraft_remap_attachment_refs("* ]] || false
-  [[ "$output" == *"wp_update_post"* ]] || false
+  # issue #43: writes via the shared sitegraft_write_remapped_post()
+  # ($wpdb->update, never wp_update_post()) — wp_update_post( array(...) )
+  # never slashes the array form it's called with here, yet
+  # wp_insert_post() unconditionally unslashes before writing, silently
+  # eating every backslash the domain/id remap wrote. See
+  # tests/unit/test_content_remap_functions.bats for the execution-level
+  # proof this call site's actual generated PHP preserves them.
+  [[ "$output" == *"sitegraft_write_remapped_post("* ]] || false
+  [[ "$output" != *"wp_update_post"* ]] || false
   # the substitution itself must live in the required file, not inline here
   [[ "$output" != *"preg_replace"* ]] || false
   [[ "$output" != *"search-replace"* ]] || false
