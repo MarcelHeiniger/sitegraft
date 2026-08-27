@@ -614,3 +614,77 @@ MANIFESTEOF
   [ "$register_line" -lt "$import_line" ]
   [ "$import_line" -lt "$migrate_line" ]
 }
+
+# --- BLOCKER (issue #16 fix-pack review, Viktor): moving domain_from/
+# domain_to and graft_verify_domain_remap_usable's own `|| return 1` ahead
+# of `SITEGRAFT_GRAFT_RUN_DIR="$run_dir"; trap _graft_exit_trap EXIT` (as
+# the fix-pack's first draft did, to give the new
+# graft_migrate_post_type_defining_options consumer domain_from/domain_to
+# in time) would disarm mu-plugin cleanup on this exact refusal path: a
+# `return 1` before the trap is installed skips the trap entirely, so a
+# mapping mu-plugin already live on B from an earlier, interrupted run
+# stays there UNWATCHED — precisely what issue #54's trap exists to
+# prevent. Reproduced live by the reviewer against that first draft
+# (RESULT=trap-DID-NOT-fire) before the trap was moved back above the
+# domain block. This test is the regression guard: mu_plugin.done present,
+# mu_cleanup.done absent (a genuinely live, unwatched mu-plugin — the exact
+# state issue #54 is about), and a real, reachable domain-guard refusal
+# (issue #73: domain_from real, domain_to the literal 'unknown').
+_issue16_stub_everything_but_trap_and_domain_check() {
+  profile_load() {
+    SITE_A_ALIAS=a; SITE_B_ALIAS=b
+    unset SITE_A_SSH_HOST SITE_B_SSH_HOST SITE_B_WP_PATH
+    return 0
+  }
+  modules_discover() { SITEGRAFT_MODULES=""; }
+  graft_sync_stack() { echo "STUB: graft_sync_stack called -- should NOT happen, the domain guard must abort before this"; }
+  graft_check_stack_precondition() { echo "STUB: graft_check_stack_precondition called -- should NOT happen"; return 0; }
+  graft_media_sync() { echo "STUB: graft_media_sync called -- should NOT happen"; }
+  graft_deploy_mu_plugin() { echo "STUB: graft_deploy_mu_plugin called -- should NOT happen"; }
+  graft_migrate_post_type_defining_options() { echo "STUB: graft_migrate_post_type_defining_options called -- should NOT happen"; }
+  graft_prune_previous_run() { echo "STUB: graft_prune_previous_run called -- should NOT happen"; }
+  graft_import_attachments() { echo "STUB: graft_import_attachments called -- should NOT happen"; }
+  graft_ensure_importer() { echo "STUB: graft_ensure_importer called -- should NOT happen"; }
+  graft_export_wxr() { echo "STUB: graft_export_wxr called -- should NOT happen"; }
+  graft_import_wxr() { echo "STUB: graft_import_wxr called -- should NOT happen"; }
+  graft_search_replace_domain() { echo "STUB: graft_search_replace_domain called -- should NOT happen, the top-level guard must abort before this"; }
+  graft_migrate_options() { echo "STUB: graft_migrate_options called -- should NOT happen, the top-level guard must abort before this"; }
+  graft_run_module_post_import() { echo "STUB: graft_run_module_post_import called -- should NOT happen"; }
+  # The one function under test: a real, interrupted-run mapping mu-plugin
+  # actually gets torn off B when the trap fires.
+  graft_remove_mu_plugin() { echo "CLEANUP: mu-plugin removed from B"; }
+}
+
+@test "phase_graft's domain-remap refusal still runs mu-plugin cleanup — the trap must be armed BEFORE the domain guard can return 1 (issue #16 fix-pack, BLOCKER)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  touch "${run_dir}/backup.complete"
+  # domain_from real, domain_to the literal 'unknown' -- issue #73's own
+  # broken-remap reproduction, guaranteed to make
+  # graft_verify_domain_remap_usable refuse.
+  cat > "${run_dir}/manifest.json" <<'MANIFESTEOF'
+{"migrate":{"core-wp":{"post_types":["page"],"option_keys":["show_on_front"]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"https://a.example.com","to":"unknown"}}}
+MANIFESTEOF
+  # A mapping mu-plugin from an earlier, killed-mid-run pass: deployed,
+  # never cleaned up. This is the ONLY marker set -- every step this test
+  # stubs is stubbed to prove it is NEVER reached, not to let it "complete".
+  graft_mark_step "$run_dir" mu_plugin
+  [ -e "${run_dir}/graft.mu_plugin.done" ]
+  [ ! -e "${run_dir}/graft.mu_cleanup.done" ]
+
+  _issue16_stub_everything_but_trap_and_domain_check
+
+  run phase_graft --profile demo --run "$run_dir"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unknown"* ]] || false
+  # The actual regression assertion: cleanup ran despite the refusal.
+  [[ "$output" == *"CLEANUP: mu-plugin removed from B"* ]] || false
+  # And nothing past the domain guard was ever reached.
+  [[ "$output" != *"-- should NOT happen"* ]] || false
+  # _graft_exit_trap's own documented behavior on this branch: CLEAR the
+  # deploy marker (not mark cleanup done) since the mu-plugin was just
+  # taken off B while the run is incomplete -- see that function's own
+  # comment for why marking it "done" instead would be the wrong lie.
+  [ ! -e "${run_dir}/graft.mu_plugin.done" ]
+  [ ! -e "${run_dir}/graft.mu_cleanup.done" ]
+}

@@ -113,3 +113,30 @@ setup() {
   run graft_migrate_post_type_defining_options "$run_dir" "$manifest"
   [ "$status" -eq 0 ]
 }
+
+# --- NIT (review, Viktor): a selected option-key name beginning with a
+# dash. `grep -qxF "$key"` (no `--`) reads such a key as one of grep's OWN
+# flags rather than the pattern to match -- the lookup then finds nothing
+# regardless of what selected_keys actually contains, and the operator is
+# told a key "is not selected" when it plainly was. Nothing upstream
+# (module_selection, manifest_validate) rejects a leading dash in an
+# option-key name, so this is reachable, not just theoretical.
+@test "graft_migrate_post_type_defining_options pre-migrates a selected key that begins with a dash" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"etch":{"post_types":["fotos"],"option_keys":["-v"]}}}'
+  etch_post_type_defining_option_keys() { printf -- '-v\n'; }
+  SITEGRAFT_DRY_RUN=1
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then
+      echo '"stub-value"'
+    else
+      echo "[dry-run] wp_remote b $*"
+    fi
+  }
+  run graft_migrate_post_type_defining_options "$run_dir" "$manifest"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"not pre-migrating it"* ]] || false
+  [ -f "${run_dir}/option--v.value" ]
+}

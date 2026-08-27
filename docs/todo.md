@@ -1,7 +1,7 @@
 # Todo — sitegraft
 
 > Current backlog. Prioritized. Reflects the live state after Step 6 (polish).
-> **Last sync: 2026-08-23**
+> **Last sync: 2026-08-27**
 
 ## Next steps (priority)
 

@@ -2050,7 +2050,15 @@ graft_migrate_post_type_defining_options() {
     selected_keys=$(echo "$manifest" | jq -r --arg m "$mod" '.migrate[$m].option_keys[]?')
     while IFS= read -r key <&4; do
       [ -n "$key" ] || continue
-      if printf '%s\n' "$selected_keys" | grep -qxF "$key"; then
+      # NIT (review, Viktor): `-- "$key"`, not a bare `"$key"` -- a key
+      # beginning with a dash (e.g. "-v") would otherwise be read by grep
+      # as one of ITS OWN flags rather than the pattern to match, and this
+      # branch would always take the "not selected" path regardless of
+      # what selected_keys actually contains -- an operator would be told
+      # the plan never selected a key that, in fact, was right there.
+      # Nothing upstream (module_selection, manifest_validate) rejects a
+      # leading dash in an option-key name, so this cannot be assumed away.
+      if printf '%s\n' "$selected_keys" | grep -qxF -- "$key"; then
         _graft_migrate_one_option_key "$run_dir" "$key" "$domain_from" "$domain_to" || return 1
       else
         log_info "graft: '${mod}' names '${key}' as post-type-defining, but this plan does not have it selected among that module's option keys — not pre-migrating it. If that leaves a post type this plan DOES migrate content for still unregistered on B, the import-completeness gate (issue #53) will fail loud rather than let the content vanish silently."
@@ -2534,6 +2542,28 @@ phase_graft() {
   # attachment the same way as any other migrated content.
   local wxr_post_types_csv; wxr_post_types_csv=$(echo "$manifest" | jq -r '[.migrate[].post_types[]? | select(. != "attachment")] | join(",")')
 
+  # BLOCKER (issue #16 fix-pack review, Viktor): this arm/trap pair MUST be
+  # installed before the domain block just below it, not after. The domain
+  # block ends in `graft_verify_domain_remap_usable ... || return 1` — a
+  # real, reachable refusal (issue #73: a stale remap_domain marker plus a
+  # broken domain_to, or simply an operator re-running against a run_dir
+  # whose B briefly went unreachable mid-scan). On `main`, that guard sat
+  # AFTER this trap was armed, so a refusal there still ran
+  # _graft_exit_trap on the way out and cleaned up the mapping mu-plugin
+  # (issue #54) if a previous pass had left it deployed and live on B. This
+  # fix-pack originally moved the domain block up ahead of the trap
+  # (needed so graft_migrate_post_type_defining_options, the new pre-import
+  # consumer below, has domain_from/domain_to ready) but left the trap
+  # itself behind it — reproduced live (Viktor, fixture): with the trap
+  # below the guard, a refusal here left the mu-plugin on B UNWATCHED,
+  # exactly what issue #54's trap exists to prevent. No such regression
+  # exists once the trap is armed first: _graft_exit_trap is itself a
+  # no-op unless graft.mu_plugin.done is already on disk (its own `if`
+  # guard, above), so arming it here changes nothing for a fresh run —
+  # only a resumed one that has something worth cleaning up.
+  SITEGRAFT_GRAFT_RUN_DIR="$run_dir"
+  trap _graft_exit_trap EXIT
+
   # Issue #16 fix-pack: moved up from immediately before the old
   # remap_domain/migrate_options block (further down) to right after the
   # manifest is available, and computed BEFORE either of those two AND
@@ -2560,11 +2590,10 @@ phase_graft() {
   # definition) for the full reasoning. Called unconditionally, before
   # ANY of its three consumers now (graft_migrate_post_type_defining_options,
   # graft_search_replace_domain, graft_migrate_options), so no resume
-  # marker can ever skip it.
+  # marker can ever skip it. The trap above is ALREADY armed by the time
+  # this can refuse, so a refusal here still runs mu-plugin cleanup — see
+  # this block's own comment above the trap for why that ordering matters.
   graft_verify_domain_remap_usable "$domain_from" "$domain_to" || return 1
-
-  SITEGRAFT_GRAFT_RUN_DIR="$run_dir"
-  trap _graft_exit_trap EXIT
 
   # design doc §6.4 step 0a/0b (Marcel's revision of finding B1): sync whatever
   # plan approved for copying, THEN enforce the hard precondition on whatever
@@ -2831,6 +2860,27 @@ phase_graft() {
     graft_search_replace_domain "$domain_from" "$domain_to" "${run_dir}/id-map.tsv" "$run_dir"
     graft_mark_step "$run_dir" remap_domain
   }
+  # Issue #16 fix-pack (review, Viktor): every key
+  # graft_migrate_post_type_defining_options already pushed to B, well
+  # above, is migrated AGAIN here — graft_migrate_options still reads the
+  # manifest's full, unfiltered option_keys list, deliberately not
+  # subtracting the ones the earlier pass already handled (see that
+  # function's own header for why: one place decides "is this option
+  # selected", not two that could disagree). Writing an unchanged value
+  # twice is a no-op TODAY, measured: `wp option update` on an identical
+  # value still exits 0, and nothing between the two writes touches the
+  # option again — not wordpress-importer (WXR carries no wp_options
+  # rows), not Etch (etch_cpts is only written from its own admin/REST
+  # actions, never read-modify-written by anything graft or its mu-plugin
+  # runs), not any `_post_import` hook (etch_post_import rewrites
+  # `post_content`/`post_excerpt`, never `wp_options`). But that is a
+  # property of what happens to run between the two calls, not of this
+  # function pair itself — nothing here forces it to stay true. A future
+  # step inserted between graft_migrate_post_type_defining_options and
+  # this line that writes to one of the SAME option keys (a new module
+  # hook, a new remap pass) would have its own write silently overwritten
+  # by this second, later pass reading A's value again from scratch.
+  # Worth remembering if this file grows a new step in that gap.
   graft_step_done "$run_dir" migrate_options || { graft_migrate_options "$run_dir" "$manifest" "$domain_from" "$domain_to"; graft_mark_step "$run_dir" migrate_options; }
   graft_step_done "$run_dir" module_hooks  || { graft_run_module_post_import "$run_dir" "${run_dir}/id-map.tsv"; graft_mark_step "$run_dir" module_hooks; }
 
