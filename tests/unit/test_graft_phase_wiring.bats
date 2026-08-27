@@ -538,3 +538,79 @@ MANIFESTEOF
   # never ran, so it must not be marked done.
   [ ! -f "${run_dir}/graft.migrate_options.done" ]
 }
+
+# --- Issue #16: the actual defect was never "which post types get
+# selected" (etch_post_types_dynamic already got that right — see its own
+# header comment) but WHEN the option that defines them reaches B. Before
+# this fix, graft_migrate_options (which carries etch_cpts) ran AFTER
+# graft_import_wxr, so B's WordPress boot never saw the definition before
+# the WXR import needed it, and wordpress-importer treated the type as
+# unknown for the whole import. The fix is this ordering, proven directly
+# here rather than trusted from graft_migrate_post_type_defining_options'
+# own unit tests (tests/unit/test_graft_post_type_defining_options.bats),
+# which cover its internal behavior but not WHERE phase_graft calls it.
+_issue16_stub_everything_but_ordering() {
+  profile_load() {
+    SITE_A_ALIAS=a; SITE_B_ALIAS=b
+    unset SITE_A_SSH_HOST SITE_B_SSH_HOST
+    return 0
+  }
+  modules_discover() { SITEGRAFT_MODULES="etch"; }
+  graft_sync_stack() { :; }
+  graft_check_stack_precondition() { return 0; }
+  graft_media_sync() { :; }
+  graft_deploy_mu_plugin() { :; }
+  graft_migrate_post_type_defining_options() { echo "ORDER: register_post_type_options"; }
+  graft_prune_previous_run() { :; }
+  graft_import_attachments() { :; }
+  graft_ensure_importer() { :; }
+  graft_export_wxr() { :; }
+  graft_integrity_gate() { return 0; }
+  graft_import_wxr() { echo "ORDER: import"; }
+  graft_fetch_id_map() { :; }
+  graft_verify_import_completeness() { return 0; }
+  graft_remove_mu_plugin() { :; }
+  graft_restore_importer_state() { :; }
+  graft_remap_attachment_ids() { :; }
+  graft_remap_featured_images() { :; }
+  graft_search_replace_domain() { :; }
+  graft_migrate_options() { echo "ORDER: migrate_options"; }
+  graft_run_module_post_import() { :; }
+}
+
+@test "phase_graft calls graft_migrate_post_type_defining_options before graft_import_wxr, and before graft_migrate_options (issue #16 — the fix IS this ordering)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  touch "${run_dir}/backup.complete"
+  cat > "${run_dir}/manifest.json" <<'MANIFESTEOF'
+{"migrate":{"etch":{"post_types":["fotos"],"option_keys":["etch_cpts"]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}
+MANIFESTEOF
+
+  _issue16_stub_everything_but_ordering
+
+  # SITEGRAFT_DRY_RUN=1 so the export step's "did graft_export_wxr actually
+  # produce an .xml file" check (unrelated to what this test is about) is
+  # skipped rather than failing against the stubbed no-op graft_export_wxr
+  # above — same reasoning the MAJOR-4 tests above use SITEGRAFT_DRY_RUN=1
+  # for. It has no bearing on the ordering under test: every function this
+  # test cares about (graft_migrate_post_type_defining_options,
+  # graft_import_wxr, graft_migrate_options) is stubbed to unconditionally
+  # echo, dry-run or not.
+  SITEGRAFT_DRY_RUN=1
+  run phase_graft --profile demo --run "$run_dir" --dry-run
+  [ "$status" -eq 0 ]
+
+  local register_line=-1 import_line=-1 migrate_line=-1 i
+  for i in "${!lines[@]}"; do
+    case "${lines[$i]}" in
+      "ORDER: register_post_type_options") register_line=$i ;;
+      "ORDER: import") import_line=$i ;;
+      "ORDER: migrate_options") migrate_line=$i ;;
+    esac
+  done
+  [ "$register_line" -ge 0 ]
+  [ "$import_line" -ge 0 ]
+  [ "$migrate_line" -ge 0 ]
+  [ "$register_line" -lt "$import_line" ]
+  [ "$import_line" -lt "$migrate_line" ]
+}

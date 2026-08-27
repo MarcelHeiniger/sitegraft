@@ -1857,7 +1857,7 @@ graft_migrate_options() {
   # function had NO guard of its own before this fix-pack — it received
   # the same domain_from/domain_to pair as graft_search_replace_domain,
   # unchecked. phase_graft (below) now runs
-  # graft_domain_remap_unusable_reason unconditionally before either
+  # graft_domain_remap_unusable_reason unconditionally before any
   # consumer, which is the real fix (see phase_graft's own comment); this
   # is the second line of defense for any future direct call to this
   # function that skips phase_graft.
@@ -1885,76 +1885,178 @@ graft_migrate_options() {
   # body runs wp-cli over ssh and must leave fd 0 alone.
   while IFS= read -r key <&3; do
     [ -n "$key" ] || continue
-    case "$key" in
-      *,*|*[[:space:]]*)
-        log_error "graft: manifest option key '${key}' contains a comma or whitespace — refusing to migrate options from a manifest that cannot be read unambiguously (such a name would word-split into two different keys and run 'wp option update' against names nobody planned, on B's live database). This manifest did not come from 'sitegraft plan' unmodified; rebuild it."
-        return 1
-        ;;
-    esac
-    local value get_rc=0
-    # Fix-pack bug found live (DDEV harness, running MAJOR-B's new
-    # graft --dry-run assertion end to end for the first time): wp_remote
-    # (lib/inventory.sh) wraps EVERY call in run_or_echo, including a plain
-    # READ from A — it has no notion of "this particular call is
-    # non-destructive, run it for real". Under --dry-run this read used to
-    # return the literal text "[dry-run] wp_remote a option get ..."
-    # instead of A's real value, which then went straight into `jq` a few
-    # lines below (the domain-rewrite pass) as if it were valid JSON — jq
-    # fails on it (not valid JSON), and under this codebase's `set -euo
-    # pipefail` that failure aborted the whole graft with a bare, unlogged
-    # "exit 5", not even a friendly error message. `SITEGRAFT_DRY_RUN=0`
-    # prefixed onto just this one call is a genuine, temporary shell
-    # variable override for the duration of this single function call
-    # (real bash behavior for a function invocation, not merely an
-    # external-process env var) — it does not affect SITEGRAFT_DRY_RUN
-    # anywhere else, including the real write below (`run_or_echo
-    # wp_remote b option update ...`), which stays correctly simulated.
-    # This mirrors the same principle scan's own M6 fix and verify's own
-    # MAJOR-A fix already establish: reads needed to compute a correct
-    # dry-run PREVIEW must run for real; only writes get simulated.
-    # N3 (third review round): this used to be `... || echo 'null'`, which
-    # wrote the LITERAL string `null` for any key A does not have, and then
-    # pushed it to B — ERASING B's own value. Reproduced: a site A without
-    # Etch's Loop Manager has no `etch_cfs`, but `etch_option_keys` is a
-    # static allowlist that names it regardless, so graft ran
-    # `option update etch_cfs null` on B. core_wp_option_keys_dynamic's own
-    # header comment already warned about exactly this mechanism ("claiming a
-    # key A does not have would BLANK B's own theme_mods") — documented
-    # there, unguarded here. A key A does not have is nothing to migrate, so
-    # it is skipped, out loud, and no `option-<key>.value` file is left
-    # behind for a post_import hook to act on either.
-    value=$(SITEGRAFT_DRY_RUN=0 wp_remote a option get "$key" --format=json 2>/dev/null) || get_rc=$?
-    if [ "$get_rc" -ne 0 ]; then
-      log_warn "graft: A has no '${key}' option (wp option get exited ${get_rc}) — leaving B's own value untouched. Migrating nothing is the only safe reading: writing the literal 'null' here, which is what this used to do, would have ERASED whatever B had under that key."
-      continue
-    fi
-    if [ -n "$domain_from" ]; then
-      # jq's own decode/encode round-trip, deliberately NOT a bash/sed
-      # string or regex replace: `value` is valid JSON text (from
-      # `--format=json`), which can spell the exact same domain string two
-      # different ways depending on nesting/re-encoding (plain "https://..."
-      # vs. JSON-escaped "https:\/\/..."). Walking the DECODED structure and
-      # doing a plain, non-regex substring split/join on every string leaf
-      # (jq's `split($x) | join($y)` idiom — never `gsub`, which IS regex
-      # and would need its own dot-escaping) handles both forms in one pass
-      # for free, since jq re-serializes consistently regardless of which
-      # form the input used. Also sidesteps a real bug found while building
-      # this: bash's `${var//pattern/replacement}` treats a LITERAL
-      # backslash in `pattern` as glob escape syntax, not as a character to
-      # match — a hand-rolled "plain + escaped" bash double-pass here
-      # silently failed to rewrite the escaped form at all (reproduced live
-      # via this function's own test).
-      local rewritten
-      rewritten=$(printf '%s' "$value" | jq -c --arg from "$domain_from" --arg to "$domain_to" \
-        'def replace_domain: if type == "string" then split($from) | join($to) else . end; walk(replace_domain)' 2>/dev/null)
-      [ -n "$rewritten" ] && value="$rewritten"
-    fi
-    printf '%s' "$value" > "${run_dir}/option-${key}.value"
-    case "$key" in
-      page_on_front|page_for_posts) continue ;; # remapped by core_wp_post_import, §9.3
-    esac
-    run_or_echo wp_remote b option update "$key" "$value" --format=json
+    _graft_migrate_one_option_key "$run_dir" "$key" "$domain_from" "$domain_to" || return 1
   done 3<<< "$keys"
+}
+
+# _graft_migrate_one_option_key <run_dir> <key> [domain_from] [domain_to] —
+# the actual per-key body graft_migrate_options ran inline until issue
+# #16's fix-pack pulled it out. Now shared with
+# graft_migrate_post_type_defining_options (just below), which needs the
+# EXACT same guarded behaviour — the "A has no such key, don't blank B"
+# check (N3, third review round), the domain-remap of the option's own
+# VALUE (MAJOR-2 fix-pack, design doc §9.4), and the page_on_front/
+# page_for_posts redirect to core_wp_post_import (§9.3) — for the handful
+# of keys it pre-migrates before the WXR import runs. One function means
+# neither call site can drift from the other's guards; the caller is
+# still the one responsible for checking graft_domain_remap_unusable_reason
+# ONCE before its own loop starts (issue #73) — this function does not
+# repeat that check per key.
+#
+# Returns 1 only for a key shape that cannot be migrated at all (comma or
+# whitespace — see the case block below). "A has no such key" is a
+# legitimate, logged skip, not a failure — it returns 0.
+_graft_migrate_one_option_key() {
+  local run_dir="$1" key="$2" domain_from="${3:-}" domain_to="${4:-}"
+  case "$key" in
+    *,*|*[[:space:]]*)
+      log_error "graft: manifest option key '${key}' contains a comma or whitespace — refusing to migrate options from a manifest that cannot be read unambiguously (such a name would word-split into two different keys and run 'wp option update' against names nobody planned, on B's live database). This manifest did not come from 'sitegraft plan' unmodified; rebuild it."
+      return 1
+      ;;
+  esac
+  local value get_rc=0
+  # Fix-pack bug found live (DDEV harness, running MAJOR-B's new
+  # graft --dry-run assertion end to end for the first time): wp_remote
+  # (lib/inventory.sh) wraps EVERY call in run_or_echo, including a plain
+  # READ from A — it has no notion of "this particular call is
+  # non-destructive, run it for real". Under --dry-run this read used to
+  # return the literal text "[dry-run] wp_remote a option get ..."
+  # instead of A's real value, which then went straight into `jq` a few
+  # lines below (the domain-rewrite pass) as if it were valid JSON — jq
+  # fails on it (not valid JSON), and under this codebase's `set -euo
+  # pipefail` that failure aborted the whole graft with a bare, unlogged
+  # "exit 5", not even a friendly error message. `SITEGRAFT_DRY_RUN=0`
+  # prefixed onto just this one call is a genuine, temporary shell
+  # variable override for the duration of this single function call
+  # (real bash behavior for a function invocation, not merely an
+  # external-process env var) — it does not affect SITEGRAFT_DRY_RUN
+  # anywhere else, including the real write below (`run_or_echo
+  # wp_remote b option update ...`), which stays correctly simulated.
+  # This mirrors the same principle scan's own M6 fix and verify's own
+  # MAJOR-A fix already establish: reads needed to compute a correct
+  # dry-run PREVIEW must run for real; only writes get simulated.
+  # N3 (third review round): this used to be `... || echo 'null'`, which
+  # wrote the LITERAL string `null` for any key A does not have, and then
+  # pushed it to B — ERASING B's own value. Reproduced: a site A without
+  # Etch's Loop Manager has no `etch_cfs`, but `etch_option_keys` is a
+  # static allowlist that names it regardless, so graft ran
+  # `option update etch_cfs null` on B. core_wp_option_keys_dynamic's own
+  # header comment already warned about exactly this mechanism ("claiming a
+  # key A does not have would BLANK B's own theme_mods") — documented
+  # there, unguarded here. A key A does not have is nothing to migrate, so
+  # it is skipped, out loud, and no `option-<key>.value` file is left
+  # behind for a post_import hook to act on either.
+  value=$(SITEGRAFT_DRY_RUN=0 wp_remote a option get "$key" --format=json 2>/dev/null) || get_rc=$?
+  if [ "$get_rc" -ne 0 ]; then
+    log_warn "graft: A has no '${key}' option (wp option get exited ${get_rc}) — leaving B's own value untouched. Migrating nothing is the only safe reading: writing the literal 'null' here, which is what this used to do, would have ERASED whatever B had under that key."
+    return 0
+  fi
+  if [ -n "$domain_from" ]; then
+    # jq's own decode/encode round-trip, deliberately NOT a bash/sed
+    # string or regex replace: `value` is valid JSON text (from
+    # `--format=json`), which can spell the exact same domain string two
+    # different ways depending on nesting/re-encoding (plain "https://..."
+    # vs. JSON-escaped "https:\/\/..."). Walking the DECODED structure and
+    # doing a plain, non-regex substring split/join on every string leaf
+    # (jq's `split($x) | join($y)` idiom — never `gsub`, which IS regex
+    # and would need its own dot-escaping) handles both forms in one pass
+    # for free, since jq re-serializes consistently regardless of which
+    # form the input used. Also sidesteps a real bug found while building
+    # this: bash's `${var//pattern/replacement}` treats a LITERAL
+    # backslash in `pattern` as glob escape syntax, not as a character to
+    # match — a hand-rolled "plain + escaped" bash double-pass here
+    # silently failed to rewrite the escaped form at all (reproduced live
+    # via this function's own test).
+    local rewritten
+    rewritten=$(printf '%s' "$value" | jq -c --arg from "$domain_from" --arg to "$domain_to" \
+      'def replace_domain: if type == "string" then split($from) | join($to) else . end; walk(replace_domain)' 2>/dev/null)
+    [ -n "$rewritten" ] && value="$rewritten"
+  fi
+  printf '%s' "$value" > "${run_dir}/option-${key}.value"
+  case "$key" in
+    page_on_front|page_for_posts) return 0 ;; # remapped by core_wp_post_import, §9.3
+  esac
+  run_or_echo wp_remote b option update "$key" "$value" --format=json
+}
+
+# graft_migrate_post_type_defining_options <run_dir> <manifest>
+# [domain_from] [domain_to] — issue #16's actual fix.
+#
+# Migrating an option that DEFINES a post type (etch_cpts, for a module
+# like Etch that registers post types dynamically from its own settings)
+# is only half the job if it lands on B no earlier than
+# graft_migrate_options does — which runs AFTER graft_import_wxr. B's
+# WordPress never re-boots between "the option arrives" and "wp import
+# reads the WXR", so the type stays unregistered for the entire import,
+# wordpress-importer treats every post of it as belonging to an unknown
+# type, and issue #53's completeness gate (the only reason this was ever
+# NOTICED — before it existed, `verify` reported PASS on a partial import)
+# is what actually catches the resulting skip.
+#
+# The fix is ordering, not content selection (issue #16's OWN dynamic
+# post-type selection, etch_post_types_dynamic, already worked correctly —
+# see that function's own header). Called from phase_graft BEFORE
+# graft_import_wxr, this migrates ONLY the option keys a module names via
+# its own optional <mod>_post_type_defining_option_keys() hook (etch.sh's
+# own comment on that function has the full contract) — never a module's
+# entire option_keys claim, and never by guessing from a key's name. Every
+# key it touches goes through _graft_migrate_one_option_key, so it is
+# bound by the identical guards graft_migrate_options itself enforces:
+# the #73 domain-remap usability gate (checked once, below, before this
+# function's own loop — same discipline graft_migrate_options uses before
+# ITS loop), the "A has no such key" skip, and the domain rewrite of the
+# option's own value. graft_migrate_options still runs this same key
+# again later, as always — writing an identical value twice is a
+# harmless no-op, and keeping ONE post-import pass that migrates every
+# selected option key (rather than subtracting the pre-migrated ones from
+# it) means there is only ever one place that decides "is this option
+# selected", not two that could disagree.
+#
+# A key a module names here that plan's operator deselected (the option
+# is not actually in this module's manifest.migrate[mod].option_keys) is
+# skipped with a note, not an error — deselecting the option while
+# keeping the post type selected is the operator's own call, and issue
+# #53's completeness gate still fails loud if that leaves the type
+# unregistered and its content unimportable, exactly as it would for any
+# other cause of the same failure.
+graft_migrate_post_type_defining_options() {
+  local run_dir="$1" manifest="$2" domain_from="${3:-}" domain_to="${4:-}"
+
+  # Same belt-and-braces reasoning as graft_migrate_options' own guard
+  # just above: phase_graft already runs graft_verify_domain_remap_usable
+  # unconditionally before this function is ever called, but a future
+  # direct call that skips phase_graft must not be able to bypass it.
+  if [ -n "$domain_from" ]; then
+    local options_unusable_reason
+    options_unusable_reason=$(graft_domain_remap_unusable_reason "$domain_from" "$domain_to")
+    if [ -n "$options_unusable_reason" ]; then
+      log_error "graft: refusing to pre-migrate post-type-defining options — ${options_unusable_reason}. Pushing a migrated option's value through this remap anyway would write a broken domain string into B's LIVE options and report success (issue #73). Rebuild the manifest: set SITE_A_URL/SITE_B_URL in the profile to each site's real public domain and re-run 'sitegraft plan' -- plan_defaults reads those in PREFERENCE to scan's own home_url guess, which a proxied/tunneled/local-dev site (DDEV's own *.ddev.site, an SSH tunnel, a reverse proxy) can get wrong in a way no re-scan fixes. Failing that: re-run 'sitegraft scan' if a value is genuinely missing, or hand-edit scan-a.json/scan-b.json's home_url yourself if scan ran cleanly but simply recorded the wrong domain."
+      return 1
+    fi
+  fi
+
+  local mods mod
+  mods=$(echo "$manifest" | jq -r '.migrate | keys[]?')
+  while IFS= read -r mod <&3; do
+    [ -n "$mod" ] || continue
+    module_has_fn "$mod" post_type_defining_option_keys || continue
+    local declared_keys rc=0
+    declared_keys=$("${mod}_post_type_defining_option_keys") || {
+      rc=$?
+      log_error "module '${mod}': ${mod}_post_type_defining_option_keys() exited ${rc} — refusing to continue without knowing which of its option keys must reach B before the WXR import runs (an error is not an empty list)"
+      return 1
+    }
+    local selected_keys key
+    selected_keys=$(echo "$manifest" | jq -r --arg m "$mod" '.migrate[$m].option_keys[]?')
+    while IFS= read -r key <&4; do
+      [ -n "$key" ] || continue
+      if printf '%s\n' "$selected_keys" | grep -qxF "$key"; then
+        _graft_migrate_one_option_key "$run_dir" "$key" "$domain_from" "$domain_to" || return 1
+      else
+        log_info "graft: '${mod}' names '${key}' as post-type-defining, but this plan does not have it selected among that module's option keys — not pre-migrating it. If that leaves a post type this plan DOES migrate content for still unregistered on B, the import-completeness gate (issue #53) will fail loud rather than let the content vanish silently."
+      fi
+    done 4<<< "$declared_keys"
+  done 3<<< "$mods"
 }
 
 # design doc §9.4: two passes (plain + JSON-escaped, since Etch stores some
@@ -2432,6 +2534,35 @@ phase_graft() {
   # attachment the same way as any other migrated content.
   local wxr_post_types_csv; wxr_post_types_csv=$(echo "$manifest" | jq -r '[.migrate[].post_types[]? | select(. != "attachment")] | join(",")')
 
+  # Issue #16 fix-pack: moved up from immediately before the old
+  # remap_domain/migrate_options block (further down) to right after the
+  # manifest is available, and computed BEFORE either of those two AND
+  # before graft_migrate_post_type_defining_options — the new consumer
+  # this fix-pack adds, which runs much earlier (before graft_import_wxr,
+  # so a post type etch_cpts declares is registered on B in time for the
+  # WXR import that follows). The two values themselves are unchanged.
+  local domain_from domain_to
+  domain_from=$(echo "$manifest" | jq -r '.options.search_replace.from')
+  domain_to=$(echo "$manifest" | jq -r '.options.search_replace.to')
+  # NIT-4 (review, Viktor): `jq -r` on a manifest missing
+  # .options.search_replace.from/to (a hand-written manifest — manifest_new
+  # always populates this key in the normal scan/plan flow, so this never
+  # happens there) prints the literal 4-character string "null", not an
+  # empty string — which would pass every `[ -n "$domain_from" ]` guard
+  # downstream and get search-replaced as if "null" were a real domain.
+  # Normalized to "" here, same treatment as any other genuinely-missing
+  # value in this codebase.
+  [ "$domain_from" = "null" ] && domain_from=""
+  [ "$domain_to" = "null" ] && domain_to=""
+
+  # MAJOR-1 (issue #73, second review round) — see
+  # graft_verify_domain_remap_usable's own header comment (just above its
+  # definition) for the full reasoning. Called unconditionally, before
+  # ANY of its three consumers now (graft_migrate_post_type_defining_options,
+  # graft_search_replace_domain, graft_migrate_options), so no resume
+  # marker can ever skip it.
+  graft_verify_domain_remap_usable "$domain_from" "$domain_to" || return 1
+
   SITEGRAFT_GRAFT_RUN_DIR="$run_dir"
   trap _graft_exit_trap EXIT
 
@@ -2444,6 +2575,23 @@ phase_graft() {
 
   graft_step_done "$run_dir" media_sync    || { graft_media_sync "$run_dir"; graft_mark_step "$run_dir" media_sync; }
   graft_step_done "$run_dir" mu_plugin     || { graft_deploy_mu_plugin; graft_mark_step "$run_dir" mu_plugin; }
+  # Issue #16: must run before graft_import_wxr (several steps down) —
+  # any later than that and the WXR import runs against a B whose
+  # WordPress boot has not yet seen the option that registers this
+  # content's own post type, and wordpress-importer treats the type as
+  # unknown for the whole import (see graft_migrate_post_type_defining_
+  # options' own header for the full mechanism and why issue #53's
+  # completeness gate is what actually caught this on a real site).
+  # Placed right after mu_plugin, ahead of prune/import_attachments, for
+  # the same reason media_sync/mu_plugin already sit here: "prepare B"
+  # steps that have to land before B's content changes, not steps that
+  # themselves depend on run_dir/id-map.tsv state (this one only needs
+  # the manifest, already parsed above, and domain_from/domain_to,
+  # already computed and verified above).
+  graft_step_done "$run_dir" register_post_type_options || {
+    graft_migrate_post_type_defining_options "$run_dir" "$manifest" "$domain_from" "$domain_to"
+    graft_mark_step "$run_dir" register_post_type_options
+  }
   # prune MUST run before import_attachments (bug found live): prune deletes
   # every post carrying _sitegraft_source_id as leftover from a PREVIOUS
   # run — import_attachments sets that exact meta on whatever it creates,
@@ -2674,26 +2822,11 @@ phase_graft() {
   # own comment. Runs after remap_ids (same id-map.tsv dependency, no
   # ordering requirement between the two beyond both needing it populated).
   graft_step_done "$run_dir" remap_featured_images || { graft_remap_featured_images "${run_dir}/id-map.tsv"; graft_mark_step "$run_dir" remap_featured_images; }
-  local domain_from domain_to
-  domain_from=$(echo "$manifest" | jq -r '.options.search_replace.from')
-  domain_to=$(echo "$manifest" | jq -r '.options.search_replace.to')
-  # NIT-4 (review, Viktor): `jq -r` on a manifest missing
-  # .options.search_replace.from/to (a hand-written manifest — manifest_new
-  # always populates this key in the normal scan/plan flow, so this never
-  # happens there) prints the literal 4-character string "null", not an
-  # empty string — which would pass every `[ -n "$domain_from" ]` guard
-  # downstream and get search-replaced as if "null" were a real domain.
-  # Normalized to "" here, same treatment as any other genuinely-missing
-  # value in this codebase.
-  [ "$domain_from" = "null" ] && domain_from=""
-  [ "$domain_to" = "null" ] && domain_to=""
-
-  # MAJOR-1 (issue #73, second review round) — see
-  # graft_verify_domain_remap_usable's own header comment (just above its
-  # definition) for the full reasoning. Called unconditionally, before
-  # either consumer, so no resume marker can ever skip it.
-  graft_verify_domain_remap_usable "$domain_from" "$domain_to" || return 1
-
+  # domain_from/domain_to were computed, normalized and verified usable
+  # (graft_verify_domain_remap_usable) once, near the top of this
+  # function — before graft_migrate_post_type_defining_options, the
+  # earliest of this manifest's three domain-remap consumers, ever ran.
+  # Reused as-is here for the other two.
   graft_step_done "$run_dir" remap_domain  || {
     graft_search_replace_domain "$domain_from" "$domain_to" "${run_dir}/id-map.tsv" "$run_dir"
     graft_mark_step "$run_dir" remap_domain
