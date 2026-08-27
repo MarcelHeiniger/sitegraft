@@ -1236,6 +1236,54 @@ _verify_component_prop_run_captured_php() {
   [[ "$output" == *"CHK:888:1"* ]] || false
   [[ "$output" == *"PAIR:105:888:bild"* ]] || false
 }
+
+# --- issue #86 THIRD fix-pack (independent review, round 3): NIT F -- the
+# MALFORMED-before-NESTED priority the bash half already implemented was
+# unreachable, because the PHP used to return on NESTED before the
+# citing-post loop that builds $malformed ever ran. Citing posts are now
+# always scanned first; NESTED is only echoed (and only after MALFORMED)
+# once that scan is done -- so a site that is BOTH composed AND carrying
+# unparseable content now correctly fails CLOSED instead of settling for
+# the softer INCOMPLETE.
+
+@test "verify_component_prop_references_resolve: captured PHP execution-proof -- NIT F, a site both composed AND carrying a malformed block reports MALFORMED, never NESTED" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t400\tpage\n8\t500\twp_block\n7\t600\twp_block\n' > "$tsv"
+  local capture="$BATS_TEST_TMPDIR/php.txt"
+  wp_remote() { shift; case "$1" in eval) printf '%s' "$2" > "$capture" ;; esac; }
+  verify_component_prop_references_resolve "$run_dir" "$tsv" >/dev/null 2>&1 || true
+  [ -s "$capture" ]
+  # post 400: a truncated (malformed) call site. Component 500's own body
+  # calls component 600 (composition, depth > 1) -- the reviewer's own
+  # exact reproduction shape.
+  run _verify_component_prop_run_captured_php "$capture" \
+    400 '<!-- wp:etch/component {"ref":500,"attributes":{"bild":"888" -->' \
+    500 '<!-- wp:etch/component {"ref":600,"attributes":{}} -->' \
+    600 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.bild}"}} -->'
+  [[ "$output" == *"MALFORMED:400"* ]] || false
+  [[ "$output" != *"NESTED"* ]] || false
+}
+
+@test "verify_component_prop_references_resolve: NIT F -- a MALFORMED marker alongside a NESTED one hard-fails (rc 1), never settles for INCOMPLETE (rc 2)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t400\tpage\n8\t500\twp_block\n' > "$tsv"
+  wp_remote() {
+    shift
+    case "$1" in
+      # A stub standing in for PHP output that includes BOTH markers --
+      # the exact shape the fixed PHP can now actually produce, and the
+      # exact shape the bash half's own priority claim needs to be real.
+      eval) printf 'MALFORMED:400\nNESTED:500\n' ;;
+      *) echo "UNEXPECTED CALL: $*" >&2; return 1 ;;
+    esac
+  }
+  run --separate-stderr verify_component_prop_references_resolve "$run_dir" "$tsv"
+  [ "$status" -eq 1 ]
+  [[ "$stderr" == *"400"* ]] || false
+  [[ "$stderr" == *"balanced JSON"* ]] || false
+}
 # --- verify_http_smoke --------------------------------------------------------
 
 @test "verify_http_smoke is a no-op (passes) when no URL is configured" {

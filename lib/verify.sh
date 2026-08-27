@@ -865,10 +865,19 @@ PHP
 # operator reads this report, and issue #86's own requirement — "the SAME
 # pass must make verify able to see the case" — held at depth 1 and did
 # NOT hold at depth 2 before this fix (a genuinely dangling id through such
-# a composition read back as a green "0 found to check"). Detected
-# up front, during discovery, before any citing post is even scanned (the
-# same "cannot fully vouch, stop rather than partially reconcile"
-# simplicity verify_page_on_front's own INCOMPLETE case already uses).
+# a composition read back as a green "0 found to check").
+#
+# Detected during discovery, but NOT short-circuited there (a LATER
+# ordering fix, same review, next round): citing posts are still scanned
+# for MALFORMED blocks even when composition was found, and MALFORMED, if
+# present, is reported and returned INSTEAD of NESTED — a site that is
+# BOTH composed AND carrying content this guard cannot even parse fails
+# CLOSED (HARD FAIL), rather than settling for the softer "cannot fully
+# vouch" INCOMPLETE a nested-only site gets. An earlier version returned
+# on NESTED before the citing-post loop ran at all, which made that
+# priority declared but unreachable — see verify_component_prop_
+# references_resolve's own MALFORMED-handling comment below for the full
+# account.
 #
 # Three-valued, like verify_page_on_front/verify_migrated_content_matches_
 # source (see their own header comments) — NOT two-valued as the first
@@ -1011,16 +1020,6 @@ foreach ( \$component_ids as \$cid ) {
 		}
 	}
 }
-if ( ! empty( \$nested ) ) {
-	foreach ( \$nested as \$ncid ) {
-		echo 'NESTED:' . \$ncid . "\n";
-	}
-	return;
-}
-if ( empty( \$component_prop_map ) ) {
-	echo "NONE\n";
-	return;
-}
 \$pairs = array();
 \$malformed = array();
 foreach ( \$citing_ids as \$pid ) {
@@ -1060,6 +1059,16 @@ if ( ! empty( \$malformed ) ) {
 	}
 	return;
 }
+if ( ! empty( \$nested ) ) {
+	foreach ( \$nested as \$ncid ) {
+		echo 'NESTED:' . \$ncid . "\n";
+	}
+	return;
+}
+if ( empty( \$component_prop_map ) ) {
+	echo "NONE\n";
+	return;
+}
 if ( empty( \$pairs ) ) {
 	echo "NONE\n";
 	return;
@@ -1090,14 +1099,27 @@ PHP
     return 0
   fi
 
-  # Fix-pack (Viktor's review of PR #87, blocker 1): a MALFORMED line means
-  # sitegraft_json_span (the PHP above) could not parse at least one
-  # wp:etch/component call site on B as balanced JSON -- the discovery/
-  # scan simply could not be trusted for that post. Checked BEFORE the
-  # NESTED case below, and both BEFORE the normal CHK/PAIR parse: a read
-  # that could not run correctly is UNKNOWN, the same fail-closed
-  # discipline every other guard in this file follows, and takes priority
-  # over the (softer) INCOMPLETE outcome NESTED produces.
+  # Fix-pack (Viktor's review of PR #87, blocker 1; ordering fixed in a
+  # later round, see below): a MALFORMED line means sitegraft_json_span
+  # (the PHP above) could not parse at least one wp:etch/component call
+  # site on B as balanced JSON -- the discovery/scan simply could not be
+  # trusted for that post. Checked BEFORE the NESTED case below, and both
+  # BEFORE the normal CHK/PAIR parse: a read that could not run correctly
+  # is UNKNOWN, the same fail-closed discipline every other guard in this
+  # file follows, and takes priority over the (softer) INCOMPLETE outcome
+  # NESTED produces.
+  #
+  # That priority is REAL, not merely declared here: an earlier version of
+  # this PHP short-circuited on NESTED (return) BEFORE the citing-post
+  # loop that populates $malformed even ran, so the two markers could
+  # never appear together and this bash-side ordering was unreachable in
+  # practice -- a site both composed AND carrying a truncated block read
+  # back as INCOMPLETE, never the HARD FAIL it should have been. The PHP
+  # above now always scans the citing posts (populating $malformed) before
+  # it decides what to report, so $nested -- collected earlier, during
+  # component discovery -- and $malformed can both be set at once, and the
+  # PHP echoes MALFORMED and returns first when it is. That is what gives
+  # this bash-side ordering something real to prioritize between.
   if printf '%s
 ' "$out" | grep -q '^MALFORMED:'; then
     local malformed_posts
