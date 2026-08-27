@@ -338,8 +338,35 @@ _plan_normalize_remap_url() {
   case "$url" in
     ''|unknown) printf '%s' "$url"; return 0 ;;
   esac
-  if [[ "$url" =~ ^([a-zA-Z][a-zA-Z0-9+.-]*://[^/?#]+) ]]; then
-    printf '%s' "${BASH_REMATCH[1]}"
+  # BLOCKER (fourth review round): this used to emit BASH_REMATCH[1] from
+  # the SAME absolute-URL regex below, which stops capturing at the first
+  # `/` — that kills a trailing slash, which is the point, but it ALSO
+  # discards a real PATH, which is not. `wp option get home` returns the
+  # path on a subdirectory install (design doc §785, lib/inventory.sh's
+  # own header comment, test_inventory.bats' own fixtures all use
+  # "https://a.example.com/wp") — a documented, common, fully-supported
+  # site shape this codebase already models everywhere else. Reached with
+  # NO profile involved at all: scan's own home_url on a subdirectory
+  # install is enough on its own, so this used to be reachable on every
+  # single subdirectory-install migration, not just a malformed profile
+  # value. Every downstream URL built from the truncated `from`
+  # (verify_domain_absent's own search included) then silently agrees
+  # with the corrupted, path-stripped remap and reports green.
+  #
+  # Fixed by keeping the regex for what it is actually good at —
+  # VALIDATING that the value is an absolute URL with a real scheme — and
+  # emitting `${url%/}` (strip at most ONE trailing slash, bash's own
+  # parameter-expansion suffix removal) instead of the truncating
+  # capture group. That keeps the two rules independent: a trailing
+  # slash is a formatting artifact (removed), a path is real routing
+  # information (kept). Deliberately `${url%/}`, not a loop or `%%/`: a
+  # value with a path AND a trailing slash
+  # ("https://a.example.com/blog/") must normalize to
+  # "https://a.example.com/blog" (path kept, ONE slash removed), not to
+  # the origin alone — collapsing it further would silently re-hide this
+  # exact defect behind a second transformation.
+  if [[ "$url" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*://[^/?#]+ ]]; then
+    printf '%s' "${url%/}"
     return 0
   fi
   log_error "plan: refusing to build a domain remap — ${label} ('${url}') does not parse as an absolute URL with a scheme (e.g. https://example.com). Feeding this straight into graft's raw string search-replace would corrupt every migrated URL it partially matches instead of rewriting it (issue #73, BLOCKER-1). Fix the value — in the profile if this is SITE_A_URL/SITE_B_URL, or by re-running 'sitegraft scan' if it's a scan-recorded home_url — and try again."

@@ -449,6 +449,69 @@ EOF
   echo "$output" | jq -e '.options.search_replace.to == "https://b.example.com"' >/dev/null
 }
 
+# --- BLOCKER, fourth review round: _plan_normalize_remap_url's regex
+# capture stopped at the first `/` — killing a trailing slash, the point,
+# but ALSO discarding a real PATH, which is not. `wp option get home`
+# RETURNS the path on a subdirectory install (design doc §785,
+# lib/inventory.sh's own header comment, test_inventory.bats' own
+# fixtures — "https://a.example.com/wp") — a documented, common,
+# fully-supported site shape. No profile, no operator typo needed: A's
+# scanned home_url alone on a subdirectory install used to be enough to
+# silently corrupt every link on B. None of the earlier BLOCKER-1 tests
+# used a URL with a path — this is that coverage.
+
+@test "plan_defaults keeps A's real path when home_url is a subdirectory install (BLOCKER, #73, no profile involved at all)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://a.example.com/blog"}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://b.example.com"}' > "$b"
+  unset SITE_A_URL SITE_B_URL
+  run --separate-stderr plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.from == "https://a.example.com/blog"' >/dev/null
+}
+
+@test "plan_defaults keeps B's real path when home_url is a subdirectory install (BLOCKER, #73, the other direction)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://a.example.com"}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://b.example.com/blog"}' > "$b"
+  unset SITE_A_URL SITE_B_URL
+  run --separate-stderr plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.to == "https://b.example.com/blog"' >/dev/null
+}
+
+@test "plan_defaults keeps the path on a mixed pair — one side has a path, the other doesn't (BLOCKER, #73)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://a.example.com/blog"}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://b.example.com"}' > "$b"
+  unset SITE_A_URL SITE_B_URL
+  run --separate-stderr plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.from == "https://a.example.com/blog"' >/dev/null
+  echo "$output" | jq -e '.options.search_replace.to == "https://b.example.com"' >/dev/null
+}
+
+@test "_plan_normalize_remap_url strips exactly one trailing slash after a real path, without collapsing the path away (bonus fix, #73 — the second-transformation trap)" {
+  run _plan_normalize_remap_url "test" "https://a.example.com/blog/"
+  [ "$status" -eq 0 ]
+  [ "$output" = "https://a.example.com/blog" ]
+}
+
+@test "_plan_normalize_remap_url still strips a trailing slash with no path at all" {
+  run _plan_normalize_remap_url "test" "https://a.example.com/"
+  [ "$status" -eq 0 ]
+  [ "$output" = "https://a.example.com" ]
+}
+
+@test "_plan_normalize_remap_url leaves a pathless URL with no trailing slash untouched" {
+  run _plan_normalize_remap_url "test" "https://a.example.com"
+  [ "$status" -eq 0 ]
+  [ "$output" = "https://a.example.com" ]
+}
+
 @test "plan_defaults still treats scan's own "unknown" placeholder as passable, not as a malformed URL to reject (BLOCKER-1, #73 — that is manifest_validate's job, not this normalizer's)" {
   _plan_defaults_setup_modules
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
