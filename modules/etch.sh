@@ -104,11 +104,23 @@ EOF
 # post-type list) are NOT the same thing and still abort: those say the SCAN
 # cannot be reasoned from at all, not that one value is odd.
 #
-# STILL UNVERIFIED, and worth saying plainly: nobody has yet read a real
-# `etch_cpts` row off a live Etch install that uses the feature. The shapes
-# below are plausible, not confirmed. The definitive answer is one query on
-# a real site, and until someone runs it this function is defensive by
-# necessity rather than by design.
+# CONFIRMED (issue #16 fix-pack): a live Etch 1.6.6 install with a real,
+# in-use custom post type was queried directly (`wp option get etch_cpts
+# --format=json`). The row is the THIRD shape above — a map keyed by
+# post-type name, each value a full registration-args object whose own
+# `slug` field echoes the key:
+#
+#   {"fotos":{"name":"fotos","slug":"fotos","labels":{...},"public":true,...}}
+#
+# — which also settles where Etch reads it: `Etch\Services\ContentTypeService
+# ::register_post_types()` (hooked on `init`, priority 5) calls
+# `get_option('etch_cpts', [])` and `register_post_type($id, $args)` for
+# every entry on EVERY request, including the one `wp import` itself
+# bootstraps. That is the mechanism this file's `etch_post_type_defining_
+# option_keys` below relies on: writing `etch_cpts` to B before `wp import`
+# runs is sufficient for B to register the type in time, no mu-plugin
+# involvement needed. The other two shapes remain plausible-but-unconfirmed
+# defensive handling for a site this wasn't checked against.
 #
 # A declared name the scanned site does not actually register is DROPPED,
 # with a warning — never offered. CLAUDE.md's first rule in its original
@@ -257,6 +269,39 @@ etchtheme_license_*
 etch_db_version
 etch_migrations
 etch_svg_version
+EOF
+}
+
+# Issue #16, second half: migrating `etch_cpts` (etch_option_keys above)
+# only wins if it lands on B before the WXR import runs. `etch_cpts` is
+# what Etch reads on every `init` to register the post types it declares
+# (see etch_post_types_dynamic's own "CONFIRMED" comment above for the
+# live-site trace) — a static <mod>_post_types list can name the type, and
+# etch_option_keys can carry its definition, but `graft` used to migrate
+# ALL options (this one included) only in graft_migrate_options, which
+# runs AFTER the WXR import. B's WordPress boot never saw the definition
+# in time, `wp import` treated the type as unknown, and
+# wordpress-importer silently skipped every post of it — caught loud only
+# because issue #53's completeness gate now exists to catch it; before
+# that, `verify` reported PASS with the content simply missing.
+#
+# graft_migrate_post_type_defining_options (lib/graft.sh) calls this
+# function for every module in the manifest and pre-migrates exactly the
+# option keys it names — the SAME guarded per-key logic
+# graft_migrate_options itself uses (domain remap, the #73 usability gate,
+# the "A has no such key, don't blank B" guard), never a shortcut around
+# any of it. graft_migrate_options still migrates this key again, later,
+# as always; writing the identical value twice is a harmless no-op.
+#
+# Every name returned here MUST also appear in etch_option_keys above —
+# this narrows an existing claim, the same relationship
+# etch_option_keys_exclude has to it, and does not establish one of its
+# own. No _dynamic counterpart: unlike the CPT names themselves, WHICH
+# option defines them is fixed knowledge about the plugin, not something
+# that depends on any particular site's scan.
+etch_post_type_defining_option_keys() {
+  cat <<'EOF'
+etch_cpts
 EOF
 }
 

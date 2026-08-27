@@ -247,6 +247,38 @@ EOF
   [[ "$output" == *"etch_db_version"* ]] || false
 }
 
+# --- etch_post_type_defining_option_keys (issue #16, second half): the
+# registered-but-empty-post-type defect was an ORDERING bug, not a
+# selection bug — etch_post_types_dynamic (above) already claimed 'fotos'
+# correctly. graft.sh's graft_migrate_post_type_defining_options
+# (lib/graft.sh) calls this to know WHICH of etch's own option keys must
+# reach B before the WXR import runs.
+@test "etch_post_type_defining_option_keys names etch_cpts" {
+  run etch_post_type_defining_option_keys
+  [ "$output" = "etch_cpts" ]
+}
+
+# Every name this function returns is a narrowing of an existing claim
+# (same relationship etch_option_keys_exclude has), never a claim of its
+# own — a name it returns that etch_option_keys does not also list would
+# be pre-migrated by graft_migrate_post_type_defining_options but then
+# never appear in plan's selection at all, since only etch_option_keys
+# (and etch_option_keys_dynamic, which etch.sh does not define) ever
+# reaches the manifest in the first place.
+@test "every name etch_post_type_defining_option_keys returns is also claimed by etch_option_keys" {
+  local declared_keys option_keys name found
+  declared_keys=$(etch_post_type_defining_option_keys)
+  option_keys=$(etch_option_keys)
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    found=0
+    while IFS= read -r ok; do
+      [ "$ok" = "$name" ] && found=1
+    done <<< "$option_keys"
+    [ "$found" -eq 1 ] || { echo "'${name}' is not in etch_option_keys"; false; }
+  done <<< "$declared_keys"
+}
+
 # --- etch_stack_candidates: the one addition beyond the design doc's §3.3
 # code block, flagged in the PR as a judgment call (see modules/etch.sh's
 # own comment on this function for the full reasoning).

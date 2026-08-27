@@ -496,6 +496,7 @@ Copy [`modules/_template.sh`](../modules/_template.sh) to `modules/<your-plugin>
 | `<mod>_tables` | | Plugin-owned SQL table suffixes (without the live `$table_prefix`), one per line. |
 | `<mod>_tables_dynamic <scan_json>` | | Same, but computed from the scan. |
 | `<mod>_option_keys_exclude` | no | Glob patterns removed from the option keys this module claims (e.g. license keys, DB version markers). Applied to both the static and the dynamic lists. Note it filters *names your module returned*; sitegraft never expands a pattern into keys, so a broad claim has to be enumerated from the scan by `_option_keys_dynamic` — see below. |
+| `<mod>_post_type_defining_option_keys` | no | Names, among this module's own option keys, that make the plugin register a post type dynamically when read (e.g. Etch's `etch_cpts`). `graft` migrates these BEFORE the WXR import instead of after — see below. |
 | `<mod>_post_import <state_dir> <id_map_tsv> <wp_cmd_b>` | no | Hook run after WXR import + generic remaps, for module-specific fixups (e.g. remapping an internal ID reference in postmeta). |
 | `<mod>_stack_candidates` | no | If this plugin also needs to be *present and matching* on B for migrated content to render (like Etch or ACSS), one candidate plugin-folder slug per line, most-preferred/current first. |
 
@@ -558,6 +559,30 @@ different names.
 
 See [`docs/decisions/0007-module-dynamic-selections.md`](decisions/0007-module-dynamic-selections.md)
 for the full contract and the reasoning behind each rule.
+
+### An option that defines a post type
+
+Most plugin options are just settings. Some — Etch's `etch_cpts` is the real
+case this was built for — are read by the plugin at runtime to decide which
+post types to `register_post_type()` in the first place. Migrating that kind
+of option *content* the ordinary way (`_option_keys`, landing in
+`graft_migrate_options`, which runs after the WXR import) still leaves B with
+a registered-but-empty post type: B's WordPress never re-boots between "the
+option arrives" and "the import reads the WXR", so the type stays unknown to
+`wp import` for the entire run, and wordpress-importer silently skips every
+post of it (issue #16 — caught in practice only because the unrelated
+completeness gate from issue #53 exists; without it, `verify` would have
+reported PASS on the partial import).
+
+Name such a key with `<mod>_post_type_defining_option_keys`, and `graft`
+migrates it *before* the WXR import instead — early enough for the plugin to
+register the type on B's very next request. It reuses the identical guarded
+path `graft_migrate_options` itself uses (the #73 domain-remap gate, the "A
+has no such key, don't blank B" skip), so this can never diverge from what
+the later, full options pass does — that pass still migrates the same key
+again afterward, as always; writing an unchanged value twice is a harmless
+no-op. See `modules/etch.sh`'s own `etch_post_type_defining_option_keys` for
+a worked example, verified against a real Etch site's `etch_cpts` row.
 
 **If your `post_import` hook writes to B, wrap every such call in `run_or_echo`**
 (from `lib/core.sh`, already sourced by the time any hook runs) — hooks are called

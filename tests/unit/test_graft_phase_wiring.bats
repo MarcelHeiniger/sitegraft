@@ -538,3 +538,153 @@ MANIFESTEOF
   # never ran, so it must not be marked done.
   [ ! -f "${run_dir}/graft.migrate_options.done" ]
 }
+
+# --- Issue #16: the actual defect was never "which post types get
+# selected" (etch_post_types_dynamic already got that right — see its own
+# header comment) but WHEN the option that defines them reaches B. Before
+# this fix, graft_migrate_options (which carries etch_cpts) ran AFTER
+# graft_import_wxr, so B's WordPress boot never saw the definition before
+# the WXR import needed it, and wordpress-importer treated the type as
+# unknown for the whole import. The fix is this ordering, proven directly
+# here rather than trusted from graft_migrate_post_type_defining_options'
+# own unit tests (tests/unit/test_graft_post_type_defining_options.bats),
+# which cover its internal behavior but not WHERE phase_graft calls it.
+_issue16_stub_everything_but_ordering() {
+  profile_load() {
+    SITE_A_ALIAS=a; SITE_B_ALIAS=b
+    unset SITE_A_SSH_HOST SITE_B_SSH_HOST
+    return 0
+  }
+  modules_discover() { SITEGRAFT_MODULES="etch"; }
+  graft_sync_stack() { :; }
+  graft_check_stack_precondition() { return 0; }
+  graft_media_sync() { :; }
+  graft_deploy_mu_plugin() { :; }
+  graft_migrate_post_type_defining_options() { echo "ORDER: register_post_type_options"; }
+  graft_prune_previous_run() { :; }
+  graft_import_attachments() { :; }
+  graft_ensure_importer() { :; }
+  graft_export_wxr() { :; }
+  graft_integrity_gate() { return 0; }
+  graft_import_wxr() { echo "ORDER: import"; }
+  graft_fetch_id_map() { :; }
+  graft_verify_import_completeness() { return 0; }
+  graft_remove_mu_plugin() { :; }
+  graft_restore_importer_state() { :; }
+  graft_remap_attachment_ids() { :; }
+  graft_remap_featured_images() { :; }
+  graft_search_replace_domain() { :; }
+  graft_migrate_options() { echo "ORDER: migrate_options"; }
+  graft_run_module_post_import() { :; }
+}
+
+@test "phase_graft calls graft_migrate_post_type_defining_options before graft_import_wxr, and before graft_migrate_options (issue #16 — the fix IS this ordering)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  touch "${run_dir}/backup.complete"
+  cat > "${run_dir}/manifest.json" <<'MANIFESTEOF'
+{"migrate":{"etch":{"post_types":["fotos"],"option_keys":["etch_cpts"]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}
+MANIFESTEOF
+
+  _issue16_stub_everything_but_ordering
+
+  # SITEGRAFT_DRY_RUN=1 so the export step's "did graft_export_wxr actually
+  # produce an .xml file" check (unrelated to what this test is about) is
+  # skipped rather than failing against the stubbed no-op graft_export_wxr
+  # above — same reasoning the MAJOR-4 tests above use SITEGRAFT_DRY_RUN=1
+  # for. It has no bearing on the ordering under test: every function this
+  # test cares about (graft_migrate_post_type_defining_options,
+  # graft_import_wxr, graft_migrate_options) is stubbed to unconditionally
+  # echo, dry-run or not.
+  SITEGRAFT_DRY_RUN=1
+  run phase_graft --profile demo --run "$run_dir" --dry-run
+  [ "$status" -eq 0 ]
+
+  local register_line=-1 import_line=-1 migrate_line=-1 i
+  for i in "${!lines[@]}"; do
+    case "${lines[$i]}" in
+      "ORDER: register_post_type_options") register_line=$i ;;
+      "ORDER: import") import_line=$i ;;
+      "ORDER: migrate_options") migrate_line=$i ;;
+    esac
+  done
+  [ "$register_line" -ge 0 ]
+  [ "$import_line" -ge 0 ]
+  [ "$migrate_line" -ge 0 ]
+  [ "$register_line" -lt "$import_line" ]
+  [ "$import_line" -lt "$migrate_line" ]
+}
+
+# --- BLOCKER (issue #16 fix-pack review, Viktor): moving domain_from/
+# domain_to and graft_verify_domain_remap_usable's own `|| return 1` ahead
+# of `SITEGRAFT_GRAFT_RUN_DIR="$run_dir"; trap _graft_exit_trap EXIT` (as
+# the fix-pack's first draft did, to give the new
+# graft_migrate_post_type_defining_options consumer domain_from/domain_to
+# in time) would disarm mu-plugin cleanup on this exact refusal path: a
+# `return 1` before the trap is installed skips the trap entirely, so a
+# mapping mu-plugin already live on B from an earlier, interrupted run
+# stays there UNWATCHED — precisely what issue #54's trap exists to
+# prevent. Reproduced live by the reviewer against that first draft
+# (RESULT=trap-DID-NOT-fire) before the trap was moved back above the
+# domain block. This test is the regression guard: mu_plugin.done present,
+# mu_cleanup.done absent (a genuinely live, unwatched mu-plugin — the exact
+# state issue #54 is about), and a real, reachable domain-guard refusal
+# (issue #73: domain_from real, domain_to the literal 'unknown').
+_issue16_stub_everything_but_trap_and_domain_check() {
+  profile_load() {
+    SITE_A_ALIAS=a; SITE_B_ALIAS=b
+    unset SITE_A_SSH_HOST SITE_B_SSH_HOST SITE_B_WP_PATH
+    return 0
+  }
+  modules_discover() { SITEGRAFT_MODULES=""; }
+  graft_sync_stack() { echo "STUB: graft_sync_stack called -- should NOT happen, the domain guard must abort before this"; }
+  graft_check_stack_precondition() { echo "STUB: graft_check_stack_precondition called -- should NOT happen"; return 0; }
+  graft_media_sync() { echo "STUB: graft_media_sync called -- should NOT happen"; }
+  graft_deploy_mu_plugin() { echo "STUB: graft_deploy_mu_plugin called -- should NOT happen"; }
+  graft_migrate_post_type_defining_options() { echo "STUB: graft_migrate_post_type_defining_options called -- should NOT happen"; }
+  graft_prune_previous_run() { echo "STUB: graft_prune_previous_run called -- should NOT happen"; }
+  graft_import_attachments() { echo "STUB: graft_import_attachments called -- should NOT happen"; }
+  graft_ensure_importer() { echo "STUB: graft_ensure_importer called -- should NOT happen"; }
+  graft_export_wxr() { echo "STUB: graft_export_wxr called -- should NOT happen"; }
+  graft_import_wxr() { echo "STUB: graft_import_wxr called -- should NOT happen"; }
+  graft_search_replace_domain() { echo "STUB: graft_search_replace_domain called -- should NOT happen, the top-level guard must abort before this"; }
+  graft_migrate_options() { echo "STUB: graft_migrate_options called -- should NOT happen, the top-level guard must abort before this"; }
+  graft_run_module_post_import() { echo "STUB: graft_run_module_post_import called -- should NOT happen"; }
+  # The one function under test: a real, interrupted-run mapping mu-plugin
+  # actually gets torn off B when the trap fires.
+  graft_remove_mu_plugin() { echo "CLEANUP: mu-plugin removed from B"; }
+}
+
+@test "phase_graft's domain-remap refusal still runs mu-plugin cleanup — the trap must be armed BEFORE the domain guard can return 1 (issue #16 fix-pack, BLOCKER)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  touch "${run_dir}/backup.complete"
+  # domain_from real, domain_to the literal 'unknown' -- issue #73's own
+  # broken-remap reproduction, guaranteed to make
+  # graft_verify_domain_remap_usable refuse.
+  cat > "${run_dir}/manifest.json" <<'MANIFESTEOF'
+{"migrate":{"core-wp":{"post_types":["page"],"option_keys":["show_on_front"]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"https://a.example.com","to":"unknown"}}}
+MANIFESTEOF
+  # A mapping mu-plugin from an earlier, killed-mid-run pass: deployed,
+  # never cleaned up. This is the ONLY marker set -- every step this test
+  # stubs is stubbed to prove it is NEVER reached, not to let it "complete".
+  graft_mark_step "$run_dir" mu_plugin
+  [ -e "${run_dir}/graft.mu_plugin.done" ]
+  [ ! -e "${run_dir}/graft.mu_cleanup.done" ]
+
+  _issue16_stub_everything_but_trap_and_domain_check
+
+  run phase_graft --profile demo --run "$run_dir"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unknown"* ]] || false
+  # The actual regression assertion: cleanup ran despite the refusal.
+  [[ "$output" == *"CLEANUP: mu-plugin removed from B"* ]] || false
+  # And nothing past the domain guard was ever reached.
+  [[ "$output" != *"-- should NOT happen"* ]] || false
+  # _graft_exit_trap's own documented behavior on this branch: CLEAR the
+  # deploy marker (not mark cleanup done) since the mu-plugin was just
+  # taken off B while the run is incomplete -- see that function's own
+  # comment for why marking it "done" instead would be the wrong lie.
+  [ ! -e "${run_dir}/graft.mu_plugin.done" ]
+  [ ! -e "${run_dir}/graft.mu_cleanup.done" ]
+}

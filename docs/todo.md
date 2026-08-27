@@ -1,7 +1,7 @@
 # Todo — sitegraft
 
 > Current backlog. Prioritized. Reflects the live state after Step 6 (polish).
-> **Last sync: 2026-08-23**
+> **Last sync: 2026-08-27**
 
 ## Next steps (priority)
 
@@ -17,12 +17,19 @@
 
 ## Backlog
 
-- [ ] **Read a real `etch_cpts` row off a live Etch install that uses the
-      feature.** `etch_post_types_dynamic` accepts three plausible shapes and now
-      warns rather than aborts on anything else, but nobody has yet confirmed
-      which shape Etch actually writes. One query on a real site settles it and
-      lets the guesswork come out of that function. Blocks nothing; makes the
-      module honest.
+- [x] **Read a real `etch_cpts` row off a live Etch install that uses the
+      feature.** Done as part of issue #16's fix-pack: queried a live Etch
+      1.6.6 install with a real, in-use custom post type directly (`wp option
+      get etch_cpts --format=json`). The row is the map-keyed-by-name shape
+      `etch_post_types_dynamic` already handled correctly (`{"fotos":
+      {"slug":"fotos", ...}}`) — the OTHER two shapes stay defensive/
+      unconfirmed. The same query traced WHERE Etch reads it
+      (`Etch\Services\ContentTypeService::register_post_types()`, hooked on
+      `init` priority 5), which is what settled issue #16's actual defect:
+      an ORDERING bug (the option reached B too late for that `init` hook to
+      register the type before the WXR import ran), not a selection bug. See
+      `modules/etch.sh`'s `etch_post_types_dynamic` (updated "CONFIRMED"
+      comment) and `etch_post_type_defining_option_keys`.
 - [ ] **Interactive credentials prompt (design doc §5.2, option (b)) — not
       implemented.** `lib/profile.sh` only supports the file-based credentials path
       today; a missing `.creds` file logs a warning and proceeds without

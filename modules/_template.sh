@@ -60,6 +60,35 @@
 # migrating the keys it was there to hold back.
 # my_plugin_option_keys_exclude() { printf 'my_plugin_license_*\n'; }
 
+# Optional: names, among this module's OWN option_keys (static or dynamic),
+# that DEFINE a post type this module's plugin registers dynamically at
+# runtime by reading that option — e.g. Etch's `etch_cpts`
+# (modules/etch.sh). If your plugin's post types are registered the
+# ordinary way (a `register_post_type()` call in the plugin's own PHP,
+# never keyed off a wp_options value), you don't need this function at all.
+#
+# WHY THIS EXISTS: a module can already migrate both the post type's
+# CONTENT (`_post_types`/`_post_types_dynamic`) and its DEFINITION (the
+# option, via `_option_keys`), but `graft_migrate_options` — which carries
+# every option, this one included — runs AFTER the WXR import. If that
+# option is what makes B's WordPress boot register the type in the first
+# place, B's importer sees it as unknown for the entire import and every
+# post of it is skipped, with the type ending up registered and empty
+# (issue #16). Naming the option here migrates it BEFORE the import
+# instead, through the exact same guarded path graft_migrate_options
+# itself uses (domain remap, the "A has no such key" skip) — see
+# graft_migrate_post_type_defining_options (lib/graft.sh) for the
+# mechanism, and modules/etch.sh's own etch_post_type_defining_option_keys
+# for a real, live-site-verified example.
+#
+# Every name returned here MUST also be returned by `_option_keys` (or
+# `_option_keys_dynamic`) — this narrows an existing claim (like
+# `_option_keys_exclude`), it does not establish one of its own. No
+# `_dynamic` counterpart: which option defines a type is fixed knowledge
+# about the plugin's own code, not something that depends on any
+# particular site's scan.
+# my_plugin_post_type_defining_option_keys() { printf 'my_plugin_cpts\n'; }
+
 # Optional: run after WXR import + generic remaps, for module-specific fixups.
 # Called unconditionally, including under `--dry-run` (design doc §3.2) — wrap
 # every write through $wp_cmd_b in lib/core.sh's run_or_echo (already sourced
