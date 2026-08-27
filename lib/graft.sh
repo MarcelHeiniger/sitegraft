@@ -30,12 +30,22 @@
 graft_local_prefix() { _backup_local_exec_prefix "$1"; }
 
 # graft_ssh_host <alias> — SITE_<ALIAS>_SSH_HOST, or empty for a local
-# alias. The single point every file-transfer helper below consults FIRST,
-# before graft_local_prefix, so ssh-remote can never again be a shape a
-# caller has to remember to check for itself (issue #77: three of six
-# graft_push_file call sites never did, and broke the first real migration
-# onto a genuine remote B — see this file's own top-of-file header comment
-# and the PR that added this function for the full story).
+# alias. The single point graft_push_dir/graft_push_file/graft_remove_file
+# below consult FIRST, before graft_local_prefix, so ssh-remote can never
+# again be a shape a caller has to remember to check for itself (issue #77:
+# three of six graft_push_file call sites never did, and broke the first
+# real migration onto a genuine remote B — see this file's own top-of-file
+# header comment and the PR that added this function for the full story).
+#
+# NOT consulted by graft_pull_dir or graft_remove_dir — both still branch
+# only on graft_local_prefix, the exact pre-#77 shape this function exists
+# to retire. Both are safe TODAY only because every one of their call
+# sites already checks SITE_*_SSH_HOST itself before ever calling them
+# (verified while fixing #77) — not because either function guards it
+# internally. A future caller of either that skips that check reintroduces
+# #77 through a door this comment used to claim didn't exist. Left
+# unconverted deliberately (out of scope for this fix-pack — see the PR's
+# own "flagged, not addressed" section), not by oversight.
 #
 # Deliberately does NOT also resolve SITE_<ALIAS>_SSH_KEY — that is issue
 # #75 (a dedicated key only ever reaches wp_remote, lib/inventory.sh), a
@@ -86,9 +96,9 @@ graft_push_dir() {
   if [ -n "$ssh_host" ]; then
     run_or_echo ssh -- "$ssh_host" "mkdir -p $(sq "$dest_dir")"
     if [ "$mode" = "--keep-existing" ]; then
-      run_or_echo rsync -avz --ignore-existing "${host_src_dir%/}/" "${ssh_host}:${dest_dir%/}/"
+      run_or_echo rsync -avz -s --ignore-existing "${host_src_dir%/}/" "${ssh_host}:${dest_dir%/}/"
     else
-      run_or_echo rsync -avz "${host_src_dir%/}/" "${ssh_host}:${dest_dir%/}/"
+      run_or_echo rsync -avz -s "${host_src_dir%/}/" "${ssh_host}:${dest_dir%/}/"
     fi
     return
   fi
@@ -158,7 +168,7 @@ graft_push_file() {
   local ssh_host; ssh_host=$(graft_ssh_host "$alias_lc")
   if [ -n "$ssh_host" ]; then
     run_or_echo ssh -- "$ssh_host" "mkdir -p $(sq "$dest_dir")"
-    run_or_echo rsync -avz "$host_file" "${ssh_host}:${dest_dir}/${dest_name}"
+    run_or_echo rsync -avz -s "$host_file" "${ssh_host}:${dest_dir}/${dest_name}"
     return
   fi
   local prefix; prefix=$(graft_local_prefix "$alias_lc")

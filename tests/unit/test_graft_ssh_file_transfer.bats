@@ -46,7 +46,7 @@ setup() {
   run graft_push_file b "/local/src/lib.php" "/remote/site-b/wp-content" "sitegraft-lib.php"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ssh called with: -- b.example.com mkdir -p '/remote/site-b/wp-content'"* ]] || false
-  [[ "$output" == *"rsync called with: -avz /local/src/lib.php b.example.com:/remote/site-b/wp-content/sitegraft-lib.php"* ]] || false
+  [[ "$output" == *"rsync called with: -avz -s /local/src/lib.php b.example.com:/remote/site-b/wp-content/sitegraft-lib.php"* ]] || false
 }
 
 @test "graft_push_file prefers ssh-remote over a wrapped-local prefix when both SITE_*_SSH_HOST and a container SITE_*_WP_CMD happen to be set" {
@@ -92,7 +92,7 @@ setup() {
   run graft_push_dir b "/local/staging" "/remote/site-b/wp-content/plugins/foo"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ssh called with: -- b.example.com mkdir -p '/remote/site-b/wp-content/plugins/foo'"* ]] || false
-  [[ "$output" == *"rsync called with: -avz /local/staging/ b.example.com:/remote/site-b/wp-content/plugins/foo/"* ]] || false
+  [[ "$output" == *"rsync called with: -avz -s /local/staging/ b.example.com:/remote/site-b/wp-content/plugins/foo/"* ]] || false
 }
 
 @test "graft_push_dir --keep-existing adds --ignore-existing to the ssh-remote rsync, never overwriting a file already on B" {
@@ -101,7 +101,7 @@ setup() {
   rsync() { echo "rsync called with: $*"; }
   run graft_push_dir b "/local/staging" "/remote/site-b/wp-content/uploads" --keep-existing
   [ "$status" -eq 0 ]
-  [[ "$output" == *"rsync called with: -avz --ignore-existing /local/staging/ b.example.com:/remote/site-b/wp-content/uploads/"* ]] || false
+  [[ "$output" == *"rsync called with: -avz -s --ignore-existing /local/staging/ b.example.com:/remote/site-b/wp-content/uploads/"* ]] || false
 }
 
 @test "graft_push_dir still uses the wrapped-local tar-through-the-wrapper path when no SSH_HOST is set but a container wrapper is (regression)" {
@@ -156,7 +156,7 @@ setup() {
   [ "$output" = "/remote/site-b/wp-content/sitegraft-media-import-functions.php" ]
   run cat "$calls"
   [[ "$output" == *"ssh called with: -- b.example.com mkdir -p '/remote/site-b/wp-content'"* ]] || false
-  [[ "$output" == *"rsync called with: -avz"* ]] || false
+  [[ "$output" == *"rsync called with: -avz -s"* ]] || false
   [[ "$output" == *"b.example.com:/remote/site-b/wp-content/sitegraft-media-import-functions.php"* ]] || false
   # never wrote to the orchestrator's own filesystem
   [ ! -e "/remote/site-b" ]
@@ -177,6 +177,7 @@ setup() {
   [ "$output" = "/remote/site-b/wp-content/sitegraft-content-remap-functions.php" ]
   run cat "$calls"
   [[ "$output" == *"ssh called with: -- b.example.com mkdir -p '/remote/site-b/wp-content'"* ]] || false
+  [[ "$output" == *"rsync called with: -avz -s"* ]] || false
   [[ "$output" == *"b.example.com:/remote/site-b/wp-content/sitegraft-content-remap-functions.php"* ]] || false
 }
 
@@ -194,6 +195,7 @@ setup() {
   [ "$output" = "/remote/site-b/wp-content/sitegraft-id-remap-payload.json" ]
   [ ! -e "${run_dir}/.sitegraft-id-remap-payload.json" ]
   run cat "$calls"
+  [[ "$output" == *"rsync called with: -avz -s"* ]] || false
   [[ "$output" == *"b.example.com:/remote/site-b/wp-content/sitegraft-id-remap-payload.json"* ]] || false
 }
 
@@ -211,6 +213,7 @@ setup() {
   run graft_deploy_mu_plugin
   [ "$status" -eq 0 ]
   [[ "$output" == *"ssh called with: -- b.example.com mkdir -p '/remote/site-b/wp-content/mu-plugins'"* ]] || false
+  [[ "$output" == *"rsync called with: -avz -s"* ]] || false
   [[ "$output" == *"b.example.com:/remote/site-b/wp-content/mu-plugins/sitegraft-id-mapper.php"* ]] || false
 }
 
@@ -237,6 +240,24 @@ setup() {
   run graft_media_sync "$BATS_TEST_TMPDIR/run"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ssh called with: -- b.example.com mkdir -p '/remote/site-b/wp-content/uploads'"* ]] || false
-  [[ "$output" == *"rsync called with: -avz --ignore-existing"* ]] || false
+  [[ "$output" == *"rsync called with: -avz -s --ignore-existing"* ]] || false
   [[ "$output" == *"b.example.com:/remote/site-b/wp-content/uploads/"* ]] || false
+}
+
+@test "graft_copy_wp_content_dir (collapsed onto graft_push_dir) still pushes the stack component to B over ssh — MINOR-3, the step that already succeeded live before the media step failed" {
+  SITE_A_WP_PATH="$BATS_TEST_TMPDIR/site-a"
+  unset SITE_A_SSH_HOST SITE_A_WP_CMD
+  mkdir -p "${SITE_A_WP_PATH}/wp-content/plugins/foo"
+  printf 'x' > "${SITE_A_WP_PATH}/wp-content/plugins/foo/foo.php"
+  SITE_B_SSH_HOST="b.example.com"
+  SITE_B_WP_PATH="/remote/site-b"
+  ssh() { echo "ssh called with: $*"; }
+  rsync() {
+    if [[ "$*" == *"${SITE_A_WP_PATH}"* ]]; then command rsync "$@"; else echo "rsync called with: $*"; fi
+  }
+  run graft_copy_wp_content_dir "wp-content/plugins/foo" "$BATS_TEST_TMPDIR/staging"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ssh called with: -- b.example.com mkdir -p '/remote/site-b/wp-content/plugins/foo'"* ]] || false
+  [[ "$output" == *"rsync called with: -avz -s"* ]] || false
+  [[ "$output" == *"b.example.com:/remote/site-b/wp-content/plugins/foo/"* ]] || false
 }
