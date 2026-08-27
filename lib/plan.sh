@@ -359,14 +359,48 @@ _plan_normalize_remap_url() {
   # parameter-expansion suffix removal) instead of the truncating
   # capture group. That keeps the two rules independent: a trailing
   # slash is a formatting artifact (removed), a path is real routing
-  # information (kept). Deliberately `${url%/}`, not a loop or `%%/`: a
-  # value with a path AND a trailing slash
-  # ("https://a.example.com/blog/") must normalize to
-  # "https://a.example.com/blog" (path kept, ONE slash removed), not to
-  # the origin alone — collapsing it further would silently re-hide this
-  # exact defect behind a second transformation.
+  # information (kept).
+  #
+  # NIT (fifth review round): an earlier version of this comment rejected
+  # a loop on the grounds that collapsing further would re-hide the path
+  # defect behind a second transformation. That reasoning was wrong, and
+  # documenting a hazard that does not exist is how the weaker option got
+  # chosen. A trailing-slash loop removes only TRAILING SLASHES — it can
+  # never eat a path segment, because it strips one `/` at a time from
+  # the end and stops the moment the last character is not a slash.
+  # "https://a.example.com/blog/" under a loop is "https://a.example.com/
+  # blog", exactly as required. (`%%/` was moot for the same reason: for
+  # a one-character pattern, `%%` and `%` are identical.)
+  #
+  # `${url%/}` alone strips exactly ONE trailing slash, so a doubled
+  # slash survives as precisely the shape this function exists to remove:
+  # "https://a.example.com//" became "https://a.example.com/", which then
+  # rewrites <a href="https://a.example.com/about"> to
+  # "https://b.example.comabout" — corrupted, and invisible to
+  # verify_domain_absent, which searches for the recorded `from` and no
+  # longer finds it. Not reachable from `wp option get home`, which
+  # cannot produce a doubled slash, but a hand-typed profile value can.
+  # The loop below closes it.
+  #
+  # Surrounding whitespace is refused rather than trimmed: a `from` with
+  # a stray space matches nothing in B's content, so the remap is a
+  # silent no-op that verify then reports green — the same false-green
+  # this issue exists to kill. A leading space was already refused by the
+  # anchored regex; a trailing one was not, because `%/` does not fire
+  # when the last character is a space. Copy-paste into a profile makes
+  # that plausible, so both ends are rejected explicitly and loudly.
+  case "$url" in
+    *[[:space:]]*)
+      log_error "plan: refusing to build a domain remap — ${label} ('${url}') contains whitespace. A remap source carrying a stray space matches nothing in B's content, so the remap would be a silent no-op that verify then reports green (issue #73). Remove the space and try again."
+      return 1
+      ;;
+  esac
   if [[ "$url" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*://[^/?#]+ ]]; then
-    printf '%s' "${url%/}"
+    local normalized="$url"
+    while [ "${normalized%/}" != "$normalized" ]; do
+      normalized="${normalized%/}"
+    done
+    printf '%s' "$normalized"
     return 0
   fi
   log_error "plan: refusing to build a domain remap — ${label} ('${url}') does not parse as an absolute URL with a scheme (e.g. https://example.com). Feeding this straight into graft's raw string search-replace would corrupt every migrated URL it partially matches instead of rewriting it (issue #73, BLOCKER-1). Fix the value — in the profile if this is SITE_A_URL/SITE_B_URL, or by re-running 'sitegraft scan' if it's a scan-recorded home_url — and try again."

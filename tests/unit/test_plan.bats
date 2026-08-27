@@ -500,6 +500,52 @@ EOF
   [ "$output" = "https://a.example.com/blog" ]
 }
 
+# --- NIT, fifth review round: `${url%/}` strips exactly ONE trailing
+# slash, so a DOUBLED slash survives as precisely the shape this function
+# exists to remove -- "https://a.example.com//" came out as
+# "https://a.example.com/", which then rewrites
+# <a href="https://a.example.com/about"> into "https://b.example.comabout":
+# corrupted, and invisible to verify_domain_absent, which searches for the
+# recorded `from` and legitimately no longer finds it. Green run, wrong
+# content -- the exact false-green this issue exists to kill, one notch
+# further out than BLOCKER-1.
+#
+# `wp option get home` cannot produce a doubled trailing slash, so this
+# needs a hand-typed profile value; that is why it is a NIT and not a
+# blocker. Surrounding whitespace is the same class one notch further
+# still: a `from` carrying a stray space matches nothing at all, so the
+# remap silently does nothing and verify reports green. A LEADING space
+# was already refused by the anchored regex; a TRAILING one was not,
+# because `%/` does not fire when the last character is a space.
+#
+# The loop is proven here rather than assumed: reverting it to a single
+# `${url%/}` must redden the doubled-slash cases, and dropping the
+# whitespace guard must redden the whitespace ones.
+
+@test "_plan_normalize_remap_url strips a DOUBLED trailing slash, not just one (NIT, #73)" {
+  run _plan_normalize_remap_url "test" "https://a.example.com//"
+  [ "$status" -eq 0 ]
+  [ "$output" = "https://a.example.com" ]
+}
+
+@test "_plan_normalize_remap_url strips several trailing slashes after a real path, and still keeps the path (NIT, #73)" {
+  run _plan_normalize_remap_url "test" "https://a.example.com/blog//"
+  [ "$status" -eq 0 ]
+  [ "$output" = "https://a.example.com/blog" ]
+}
+
+@test "_plan_normalize_remap_url REFUSES a value with a trailing space, rather than passing a no-op remap through (NIT, #73)" {
+  run --separate-stderr _plan_normalize_remap_url "test" "https://a.example.com/blog/ "
+  [ "$status" -eq 1 ]
+  [[ "$stderr" == *"contains whitespace"* ]] || false
+}
+
+@test "_plan_normalize_remap_url REFUSES a value with a leading space, with the whitespace reason rather than the malformed-URL one (NIT, #73)" {
+  run --separate-stderr _plan_normalize_remap_url "test" " https://a.example.com"
+  [ "$status" -eq 1 ]
+  [[ "$stderr" == *"contains whitespace"* ]] || false
+}
+
 @test "_plan_normalize_remap_url still strips a trailing slash with no path at all" {
   run _plan_normalize_remap_url "test" "https://a.example.com/"
   [ "$status" -eq 0 ]
