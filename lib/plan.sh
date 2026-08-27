@@ -23,9 +23,23 @@
 plan_defaults() {
   local scan_a_json="$1" scan_b_json="$2" profile="${3:-}"
   local manifest
+  # Issue #73: this used to read `.site_url`, a key `scan` never wrote (the
+  # only two places that key existed in the whole codebase were these two
+  # `jq` READS of it) — every manifest froze with search_replace.from/to
+  # both defaulted to the literal string "unknown". `home_url` is the field
+  # inventory_scan_site actually records now, and deliberately `home_url`
+  # rather than `site_url`/siteurl: WordPress builds every internal content
+  # link — the exact text graft_search_replace_domain/graft_migrate_options
+  # rewrite — from home_url(), never from site_url() (see
+  # inventory_scan_site's own header comment for the full reasoning, and
+  # for why `site_url` is recorded separately but not read here). A missing
+  # or unreadable home_url still falls back to the literal "unknown" this
+  # always has — that placeholder is what lets manifest_validate's own
+  # #73 guard (lib/manifest.sh) refuse to freeze rather than produce a
+  # manifest whose domain remap cannot work.
   manifest=$(manifest_new \
-    "$(jq -r '.site_url // "unknown"' "$scan_a_json" 2>/dev/null || echo unknown)" \
-    "$(jq -r '.site_url // "unknown"' "$scan_b_json" 2>/dev/null || echo unknown)" \
+    "$(jq -r '.home_url // "unknown"' "$scan_a_json" 2>/dev/null || echo unknown)" \
+    "$(jq -r '.home_url // "unknown"' "$scan_b_json" 2>/dev/null || echo unknown)" \
     "$profile" "${SITE_A_ALIAS:-a}" "${SITE_B_ALIAS:-b}")
 
   # A module found on A was classified `migrate`, and only a module found

@@ -122,6 +122,48 @@ manifest_validate() {
     bad=true
   fi
 
+  # Issue #73: `plan_defaults` builds `options.search_replace` from each
+  # scan's home_url (lib/plan.sh), defaulting to the literal string
+  # "unknown" when a scan couldn't determine it (a missing/failed
+  # inventory_scan_site query — see that function's own comment). Before
+  # this, that placeholder sailed straight past graft's own
+  # `[ -z "$from" ]` no-op guard (lib/graft.sh's graft_search_replace_domain
+  # — "unknown" is not empty) and ran a REAL search-replace pass that
+  # rewrote the literal text "unknown" to "unknown" everywhere and reported
+  # success, while A's actual domain stayed on every migrated page.
+  # `verify_domain_absent`'s guard was blind to the identical root cause:
+  # searching for "unknown" in B's content, finding none, and reporting the
+  # domain-absence check green.
+  #
+  # Closed here, at the ONE place manifest_freeze gates on — this is the
+  # gate that turns a manifest scan_defaults built (or an operator's own,
+  # since the key is a public part of the schema) into something graft is
+  # allowed to run against. A remap that is empty, "unknown", or a no-op
+  # (from == to) can never rewrite anything, so freezing it would only
+  # defer this exact failure to a later phase that reports it as a pass —
+  # graft_search_replace_domain and verify_domain_absent (lib/graft.sh,
+  # lib/verify.sh) carry the SAME three-value check as a second guard, for
+  # a manifest that reaches them without ever passing through this one (a
+  # SITEGRAFT_MANIFEST_PREFILLED or hand-edited manifest — same "one
+  # enforcement point is elegant and fragile" reasoning as B4 above).
+  #
+  # Gated on `has("from")`, not merely truthiness: a manifest with no
+  # `options.search_replace` key at all (most existing fixtures in this
+  # test file, and the SITEGRAFT_MANIFEST_PREFILLED path, which never calls
+  # manifest_new) never claimed to carry a domain remap in the first place,
+  # so there is nothing here to refuse — same distinction verify.sh's own
+  # domain-absence reporting already draws between "not applicable" and
+  # "unverifiable".
+  if echo "$manifest" | jq -e '.options.search_replace? // {} | has("from")' >/dev/null 2>&1; then
+    local domain_from domain_to
+    domain_from=$(echo "$manifest" | jq -r '.options.search_replace.from // ""')
+    domain_to=$(echo "$manifest" | jq -r '.options.search_replace.to // ""')
+    if [ -z "$domain_from" ] || [ "$domain_from" = "unknown" ] || [ "$domain_from" = "$domain_to" ]; then
+      log_error "manifest invalid: options.search_replace.from is $([ -z "$domain_from" ] && echo "empty" || echo "'${domain_from}'") and options.search_replace.to is $([ -z "$domain_to" ] && echo "empty" || echo "'${domain_to}'") — a domain remap that is empty, the literal placeholder 'unknown', or identical to 'to' can never rewrite anything, so freezing it would only defer this failure to 'graft' or 'verify' reporting a green run that changed nothing (issue #73). This usually means 'scan' could not determine one or both sites' home URL. Re-run 'sitegraft scan' against both A and B and confirm scan-a.json/scan-b.json each carry a real, distinct home_url before re-running 'plan'."
+      bad=true
+    fi
+  fi
+
   [ "$bad" = false ]
 }
 

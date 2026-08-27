@@ -156,3 +156,49 @@ setup() {
   run manifest_freeze "$m"
   [ "$status" -ne 0 ]
 }
+
+# --- issue #73: scan never wrote the key plan_defaults read for the domain
+# remap, so every manifest froze with search_replace.from/to = "unknown"/
+# "unknown" — a non-empty value that slipped straight past
+# graft_search_replace_domain's own `[ -z "$from" ]` no-op guard and ran a
+# real, silently-successful search-replace pass that rewrote nothing.
+# manifest_validate is the one place manifest_freeze gates on, so this is
+# where a manifest carrying a remap that could never work gets refused.
+
+@test "manifest_validate rejects search_replace.from == 'unknown' (#73, the actual defect this issue reproduces)" {
+  local m='{"options":{"search_replace":{"from":"unknown","to":"https://b.example.com"}}}'
+  run manifest_validate "$m"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unknown"* ]] || false
+}
+
+@test "manifest_validate rejects search_replace.from == '' (#73)" {
+  local m='{"options":{"search_replace":{"from":"","to":"https://b.example.com"}}}'
+  run manifest_validate "$m"
+  [ "$status" -ne 0 ]
+}
+
+@test "manifest_validate rejects search_replace.from == to, a real but useless domain remap (#73)" {
+  local m='{"options":{"search_replace":{"from":"https://same.example.com","to":"https://same.example.com"}}}'
+  run manifest_validate "$m"
+  [ "$status" -ne 0 ]
+}
+
+@test "manifest_validate accepts a real, distinct search_replace.from/to (#73)" {
+  local m='{"options":{"search_replace":{"from":"https://a.example.com","to":"https://b.example.com"}}}'
+  run manifest_validate "$m"
+  [ "$status" -eq 0 ]
+}
+
+@test "manifest_validate does not look at search_replace at all when the manifest never claims one (SITEGRAFT_MANIFEST_PREFILLED's own '\"options\":{}' shape, #73)" {
+  local m='{"migrate":{"core-wp":{"post_types":["page"]}},"protect":{},"options":{}}'
+  run manifest_validate "$m"
+  [ "$status" -eq 0 ]
+}
+
+@test "manifest_freeze refuses to freeze a manifest whose search_replace.from is 'unknown' — the exact shape plan_defaults produced before this fix (#73)" {
+  local m='{"migrate":{},"protect":{},"options":{"search_replace":{"from":"unknown","to":"unknown"}}}'
+  run manifest_freeze "$m"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *'"frozen":true'* ]] || false
+}

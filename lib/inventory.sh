@@ -354,6 +354,52 @@ inventory_scan_site() {
     esac
   fi
 
+  # Issue #73: scan never recorded either of WordPress's two URL options,
+  # so plan_defaults (lib/plan.sh) read a `.site_url` key this function
+  # never wrote, jq's `// "unknown"` silently covered for the missing key,
+  # and every manifest froze with search_replace.from/to = "unknown"/
+  # "unknown" -- a real search-replace pass that swapped the literal text
+  # "unknown" for "unknown" and reported success while rewriting nothing.
+  #
+  # `home` vs `siteurl`, decided here rather than left to whoever reads the
+  # scan file later: WordPress builds every internal content link -- the
+  # post_content/post_excerpt text graft_search_replace_domain rewrites,
+  # and the option VALUES graft_migrate_options rewrites -- from
+  # home_url(), never from site_url(). The two are free to differ (a CDN
+  # front-end, a subdirectory WordPress install, domain-mapped multisite),
+  # and on such a site `siteurl` would name a domain that has zero overlap
+  # with what graft's remap surface actually contains. `home_url` is
+  # therefore what plan_defaults now feeds into manifest_new/
+  # options.search_replace -- the only choice that can ever rewrite
+  # anything. `site_url` is still recorded, under its own unambiguous
+  # name, purely so an operator inspecting a scan file can see whether the
+  # two differ on this site; no code path in this fix-pack consumes it.
+  #
+  # Both go through the exact fail-safe treatment nav_dynamic/nav_count
+  # already established just below: a query failure, OR a result that
+  # isn't even the JSON string `wp option get --format=json` is documented
+  # to produce, is recorded as `null` (unknown), never silently coerced
+  # into a value that LOOKS like a real domain -- the null then reaches
+  # manifest_validate's own #73 guard (lib/manifest.sh) as "unknown" via
+  # plan_defaults' `// "unknown"` default, and freezing is refused rather
+  # than producing a manifest whose remap cannot work.
+  local home_url site_url
+  if ! home_url=$(wp_remote "$alias_lc" option get home --format=json 2>/dev/null); then
+    log_warn "could not read site ${alias_lc}'s home URL -- recording home_url as unknown; 'plan' will refuse to freeze a manifest built from this scan rather than silently pairing it with a domain remap that cannot do anything (issue #73)"
+    home_url='null'
+  fi
+  case "$(printf '%s' "$home_url" | jq 'type' 2>/dev/null)" in
+    '"string"') : ;;
+    *) home_url='null' ;;
+  esac
+  if ! site_url=$(wp_remote "$alias_lc" option get siteurl --format=json 2>/dev/null); then
+    site_url='null'
+  fi
+  case "$(printf '%s' "$site_url" | jq 'type' 2>/dev/null)" in
+    '"string"') : ;;
+    *) site_url='null' ;;
+  esac
+
   # #17 fix-pack: the presence fact, computed the same fail-safe way as
   # nav_dynamic just above (A-only, null on query failure, never silently
   # zero -- see inventory_nav_post_count's own header comment for why zero
@@ -444,6 +490,8 @@ inventory_scan_site() {
     --argjson nav_uses_dynamic_page_list "$nav_dynamic" \
     --argjson nav_post_count "$nav_count" \
     --arg table_prefix "$table_prefix" \
+    --argjson home_url "$home_url" \
+    --argjson site_url "$site_url" \
     '{
       post_types: $post_types[0],
       options: $options[0],
@@ -457,7 +505,9 @@ inventory_scan_site() {
       custom_code_signals: $custom_code_signals[0],
       custom_code_detected: $custom_code_detected,
       nav_uses_dynamic_page_list: $nav_uses_dynamic_page_list,
-      nav_post_count: $nav_post_count
+      nav_post_count: $nav_post_count,
+      home_url: $home_url,
+      site_url: $site_url
     }' \
     > "$out_json"; then
     rm -rf "$payload_dir"

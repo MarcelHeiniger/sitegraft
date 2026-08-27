@@ -564,3 +564,86 @@ _assert_alias() {
   run jq -e '.nav_post_count == null' "$out"
   [ "$status" -eq 0 ]
 }
+
+# --- issue #73: scan never wrote site_url, so every manifest built by
+# plan_defaults froze with search_replace.from/to = "unknown"/"unknown" — a
+# real domain search-replace pass that rewrote nothing and reported success.
+# `home` (not `siteurl`) is what plan_defaults now reads: WordPress builds
+# every internal content link (the text graft_search_replace_domain/
+# graft_migrate_options actually rewrite) from home_url(), never from
+# site_url() — the two differ on a site behind a CDN, in a subdirectory
+# install, or under domain mapping, and only `home` overlaps with graft's
+# own rewrite surface. `site_url` (siteurl) is recorded too, purely so an
+# operator inspecting a scan file can see whether the two differ on this
+# site — nothing in this fix-pack consumes it.
+@test "inventory_scan_site records home_url and site_url from wp option get home/siteurl" {
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$*" in
+      "post-type list --format=json") echo '[]' ;;
+      "option list --unserialize --format=json") echo '[]' ;;
+      "db tables --format=list --all-tables-with-prefix") echo 'wp_options' ;;
+      "plugin list --format=json") echo '[]' ;;
+      "theme list --status=active --format=json") echo '[{"name":"t"}]' ;;
+      "menu list --format=json") echo '[]' ;;
+      "option get home --format=json") echo '"https://a.example.com"' ;;
+      "option get siteurl --format=json") echo '"https://a.example.com/wp"' ;;
+      *) echo '[]' ;;
+    esac
+  }
+  local out="$BATS_TEST_TMPDIR/scan-a.json"
+  inventory_scan_site a "$out"
+  run jq -e '.home_url == "https://a.example.com"' "$out"
+  [ "$status" -eq 0 ]
+  run jq -e '.site_url == "https://a.example.com/wp"' "$out"
+  [ "$status" -eq 0 ]
+}
+
+@test "inventory_scan_site records home_url as null (unknown, never a fabricated value) when the home query fails" {
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$*" in
+      "post-type list --format=json") echo '[]' ;;
+      "option list --unserialize --format=json") echo '[]' ;;
+      "db tables --format=list --all-tables-with-prefix") echo 'wp_options' ;;
+      "plugin list --format=json") echo '[]' ;;
+      "theme list --status=active --format=json") echo '[{"name":"t"}]' ;;
+      "menu list --format=json") echo '[]' ;;
+      "option get home --format=json") return 1 ;;
+      "option get siteurl --format=json") echo '"https://a.example.com/wp"' ;;
+      *) echo '[]' ;;
+    esac
+  }
+  local out="$BATS_TEST_TMPDIR/scan-a.json"
+  run --separate-stderr inventory_scan_site a "$out"
+  [ "$status" -eq 0 ]
+  # `has("home_url")` (not just `.home_url == null`, which a jq missing-key
+  # read would satisfy for free even if this key were never written at
+  # all) — the field must be genuinely RECORDED as unknown, not merely
+  # absent, so a manifest built from this scan has something for
+  # plan_defaults' own `// "unknown"` default and manifest_validate's #73
+  # guard to actually see.
+  run jq -e 'has("home_url") and .home_url == null' "$out"
+  [ "$status" -eq 0 ]
+}
+
+@test "inventory_scan_site records home_url as null when wp-cli returns something that is not a JSON string" {
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$*" in
+      "post-type list --format=json") echo '[]' ;;
+      "option list --unserialize --format=json") echo '[]' ;;
+      "db tables --format=list --all-tables-with-prefix") echo 'wp_options' ;;
+      "plugin list --format=json") echo '[]' ;;
+      "theme list --status=active --format=json") echo '[{"name":"t"}]' ;;
+      "menu list --format=json") echo '[]' ;;
+      "option get home --format=json") echo 'not valid json at all' ;;
+      "option get siteurl --format=json") echo '"https://a.example.com/wp"' ;;
+      *) echo '[]' ;;
+    esac
+  }
+  local out="$BATS_TEST_TMPDIR/scan-a.json"
+  inventory_scan_site a "$out"
+  run jq -e 'has("home_url") and .home_url == null' "$out"
+  [ "$status" -eq 0 ]
+}

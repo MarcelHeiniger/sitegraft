@@ -196,6 +196,43 @@ EOF
   echo "$output" | jq -e '.protect == {}' >/dev/null
 }
 
+# --- issue #73: the domain search-replace never ran, because plan_defaults
+# read `.site_url`, a key `scan` never wrote — every real scan produced
+# search_replace.from/to = "unknown"/"unknown", and graft_search_replace_domain
+# only short-circuited on an EMPTY from, so it ran a real, silently-successful
+# no-op pass replacing "unknown" with "unknown". Reproduced here on the exact
+# real scan-a.json key set the issue names (no fabricated `site_url` key).
+@test "plan_defaults derives options.search_replace.from/to from each scan's home_url, not a fabricated site_url key (#73)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  # site_url deliberately differs from home_url on both sides (the real
+  # WordPress case this whole distinction is about, per
+  # inventory_scan_site's own comment) — if plan_defaults ever regressed
+  # back to reading .site_url, this test would derive the WRONG from/to
+  # pair instead of merely deriving a coincidentally-identical one.
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://a.example.com","site_url":"https://cdn-a.example.com"}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://b.example.com","site_url":"https://cdn-b.example.com"}' > "$b"
+  run plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.from == "https://a.example.com"' >/dev/null
+  echo "$output" | jq -e '.options.search_replace.to == "https://b.example.com"' >/dev/null
+}
+
+@test "plan_defaults falls back to the 'unknown' placeholder when a scan carries no home_url at all — a real scan-a.json's actual key set, per issue #73 (nothing named site_url or home_url)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  # The exact key set issue #73 quotes from a real scan-a.json, deliberately
+  # WITHOUT home_url or site_url — this is what every scan looked like
+  # before this fix-pack, and the manifest it produces must still say so
+  # honestly (as "unknown"), never silently invent a URL.
+  echo '{"active_theme":{},"classic_menu_names":[],"classic_menus_detected":false,"classic_menus_unknown":false,"custom_code_detected":false,"custom_code_signals":{},"nav_post_count":null,"nav_uses_dynamic_page_list":null,"options":[],"plugins":[],"post_types":[],"table_prefix":"wp_","tables":[]}' > "$a"
+  echo '{"active_theme":{},"classic_menu_names":[],"classic_menus_detected":false,"classic_menus_unknown":false,"custom_code_detected":false,"custom_code_signals":{},"nav_post_count":null,"nav_uses_dynamic_page_list":null,"options":[],"plugins":[],"post_types":[],"table_prefix":"wp_","tables":[]}' > "$b"
+  run plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.from == "unknown"' >/dev/null
+  echo "$output" | jq -e '.options.search_replace.to == "unknown"' >/dev/null
+}
+
 # --- plan_defaults: dynamic selections and option-key exclusions (issues
 # #13/#15/#16, docs/decisions/0007-module-dynamic-selections.md). Asserted
 # through plan_defaults rather than through module_selection alone, because

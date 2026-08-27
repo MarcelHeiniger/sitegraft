@@ -1962,6 +1962,27 @@ graft_search_replace_domain() {
     return 0
   fi
 
+  # Issue #73, second guard: manifest_validate (lib/manifest.sh) is meant
+  # to refuse freezing a manifest whose search_replace.from is "unknown"
+  # (scan's own placeholder for "could not determine this site's home
+  # URL") or equal to `to` (a domain remap that replaces something with
+  # itself) — both non-empty, so both slip straight past the `[ -z "$from"
+  # ]` no-op guard just above, and both are exactly the shape that made
+  # this function run a real search-replace pass which rewrote nothing and
+  # reported success. This is the belt to that braces: a
+  # SITEGRAFT_MANIFEST_PREFILLED or hand-edited manifest reaches graft
+  # without ever passing through manifest_freeze (same "one enforcement
+  # point is elegant and fragile" reasoning graft_migrate_options' own
+  # comment gives for the identical malformed-name belt-and-braces).
+  # Fails LOUD (log_error + return 1) rather than the silent-success this
+  # issue is entirely about — a caller that ignored this return value
+  # would be exactly the bug being fixed, so it must not be possible to
+  # "succeed" here on an unusable value.
+  if [ "$from" = "unknown" ] || [ "$from" = "$to" ]; then
+    log_error "graft: refusing the domain search-replace — from ('${from}') is the literal placeholder 'unknown', or identical to to ('${to}'). Either way this remap could never rewrite anything, and running it anyway would report success while A's domain stays on every migrated page (issue #73). Rebuild the manifest with 'sitegraft plan' against a fresh 'sitegraft scan' of both sites."
+    return 1
+  fi
+
   local post_ids_json payload_json remote_path lib_path
   post_ids_json=$(graft_migrated_post_ids_json "$id_map_tsv")
   payload_json=$(jq -n --arg from "$from" --arg to "$to" --argjson post_ids "$post_ids_json" \

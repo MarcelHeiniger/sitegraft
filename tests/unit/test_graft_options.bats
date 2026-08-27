@@ -81,6 +81,37 @@ setup() {
   [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }
 
+# --- issue #73: "unknown" and from==to are NOT the same as an empty from —
+# both are non-empty, both used to slip past the guard above, and both used
+# to run a REAL search-replace pass (rewriting "unknown" to "unknown", or a
+# domain to itself) that changed nothing on B while reporting success.
+# manifest_validate (lib/manifest.sh) is meant to catch both before a
+# manifest is ever frozen; this is the second guard, for a manifest that
+# reaches graft without passing through that gate.
+
+@test "graft_search_replace_domain refuses (fails loud, never a silent no-op success) when from is the literal placeholder 'unknown' (#73)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_payload() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
+  run graft_search_replace_domain "unknown" "unknown" "$tsv" "$run_dir"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+  [[ "$output" == *"unknown"* ]] || false
+}
+
+@test "graft_search_replace_domain refuses (fails loud) when from equals to — a real domain that could never rewrite anything (#73)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_payload() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
+  run graft_search_replace_domain "https://same.example.com" "https://same.example.com" "$tsv" "$run_dir"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
 @test "graft_search_replace_domain's payload carries from/to and every migrated post id, never a table name" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   local tsv="$BATS_TEST_TMPDIR/id-map.tsv"

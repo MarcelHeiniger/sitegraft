@@ -272,6 +272,27 @@ verify_domain_absent() {
   local run_dir="$1" id_map_tsv="$2" manifest="$3" domain="$4"
   [ -n "$domain" ] || return 0
 
+  # Issue #73, second guard: the same "unknown" placeholder / from==to
+  # shape that made graft_search_replace_domain (lib/graft.sh) run a real,
+  # silently-successful no-op search-replace also blinds THIS check —
+  # searching B's content for the literal string "unknown" (or for a
+  # domain identical to `to`) reliably finds nothing, so a manifest that
+  # could never have had a working domain remap would otherwise report
+  # "the domain is absent" as a genuine, verified finding. manifest_validate
+  # is meant to refuse freezing such a manifest in the first place; this is
+  # the belt for one that reaches verify without passing through that gate
+  # (SITEGRAFT_MANIFEST_PREFILLED, or hand-edited after freezing).
+  #
+  # `to` comes from THIS manifest (not a second parameter) — verify already
+  # has it, and every other verify_domain_absent call site already passes
+  # the manifest, so no signature change is needed to close this.
+  local domain_to
+  domain_to=$(echo "$manifest" | jq -r '.options.search_replace.to // ""')
+  if [ "$domain" = "unknown" ] || { [ -n "$domain_to" ] && [ "$domain" = "$domain_to" ]; }; then
+    log_error "domain-absence check refused: from ('${domain}') is the literal placeholder 'unknown', or identical to to ('${domain_to}'). Either way this manifest could never have had a working domain remap, so 'the domain is absent from B' cannot be a genuine finding here — it would just mean nothing usable was ever searched for (issue #73, same guard as graft_search_replace_domain's). Rebuild the manifest with 'sitegraft plan' against a fresh 'sitegraft scan' of both sites."
+    return 1
+  fi
+
   local post_ids_json option_keys_json payload_json remote_path lib_path
   post_ids_json='[]'
   [ -s "$id_map_tsv" ] && post_ids_json=$(graft_migrated_post_ids_json "$id_map_tsv")

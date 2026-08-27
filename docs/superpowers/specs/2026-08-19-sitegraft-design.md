@@ -586,6 +586,19 @@ Validation rules (`lib/manifest.sh :: manifest_validate`):
 - `frozen` must be `true` for `graft` to accept the manifest.
 - No post_type/table/option-key may appear in both `migrate` and `protect`
   (conflict → `plan` refuses to freeze).
+- No post_type/table/option-key name may carry a comma or whitespace —
+  `graft`'s comma-joined post-type CSV and its option-key loop cannot
+  address such a name unambiguously (conflict → `plan` refuses to freeze).
+- If present, `options.search_replace.from` must be non-empty, must not be
+  the literal placeholder `"unknown"` (`scan`'s own recorded value when it
+  could not determine a site's `home_url`, §6.1), and must not equal
+  `options.search_replace.to` — a remap in any of those three shapes can
+  never rewrite anything, so freezing it would defer that failure to
+  `graft`/`verify` reporting a run that changed nothing as a pass (issue
+  #73). `graft_search_replace_domain` and `verify_domain_absent`
+  (`lib/graft.sh`/`lib/verify.sh`) carry the identical check as a second
+  guard, for a manifest that reaches them without passing through this one
+  (`SITEGRAFT_MANIFEST_PREFILLED`, or hand-edited after freezing).
 - `checksums_protected_pre_graft` and `content_checksums_pre_graft` are both
   computed and written by the `backup` phase (not by `plan`), and consumed
   by `verify`.
@@ -693,6 +706,22 @@ wp --path="$WP_PATH" menu list --format=json             # classic nav menus, se
 ```
 Writes `scan-a.json` and `scan-b.json` to the state directory. Strictly read-only —
 no writes to A or B. Freely re-runnable.
+
+**Domain remap source (issue #73):** `scan` also records each site's own
+`home` and `siteurl` WordPress options, as `"home_url"`/`"site_url"` in the
+scan file (`wp option get home --format=json` / `... siteurl ...`), each
+falling back to `null` — never a fabricated value — when the query fails or
+the result isn't the JSON string wp-cli is documented to produce. `plan`
+(§6.2) reads `home_url`, not `site_url`, to build
+`options.search_replace.{from,to}`: WordPress builds every internal content
+link — the exact text `graft`'s domain remap rewrites (§9.4) — from
+`home_url()`, never from `site_url()`, and the two are free to differ (a
+CDN front-end, a subdirectory install, domain-mapped multisite). `site_url`
+is recorded purely for an operator inspecting a scan file; no code path
+reads it. This schema addition was missing from every earlier revision of
+this document — `plan_defaults` read a `.site_url` key `scan` never wrote
+at all, so every manifest froze with a domain remap that could never do
+anything (see `manifest_validate`'s own guard against this, §4).
 
 The Etch-specific check Marcel asked for (§0, point 11): `scan` checks whether
 **A's** navigation is a dynamic `wp:page-list` block (no hardcoded IDs) by

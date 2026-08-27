@@ -375,6 +375,46 @@ setup() {
   [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }
 
+# --- issue #73: "unknown" and domain==to are NOT the same as an empty
+# domain — both are non-empty, so both used to pass straight through the
+# `[ -n "$domain" ]` guard above and into a real wp eval search for a
+# string that (by construction) is never going to be found in B's content,
+# reporting the domain-absence check GREEN on a manifest whose remap could
+# never have worked in the first place. This is the exact defect the issue
+# names: "the guard that exists precisely to catch a failed domain remap
+# is blinded by the same root cause".
+
+@test "verify_domain_absent refuses (fails, never a false green) when domain is the literal placeholder 'unknown' (#73)" {
+  # A non-empty scope (a real migrated post + a real option key) on
+  # purpose: an EMPTY scope already returns 2 on its own (the #22/B1 guard
+  # tested above), before ever reaching this one — that would make this
+  # test pass for the wrong reason regardless of whether the #73 guard
+  # exists at all. Proving THIS guard means proving it fires even when
+  # there is real work the check would otherwise have gone on to do.
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_payload() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
+  local manifest='{"migrate":{"core-wp":{"option_keys":["etch_settings"]}},"options":{"search_replace":{"from":"unknown","to":"unknown"}}}'
+  run verify_domain_absent "$run_dir" "$tsv" "$manifest" "unknown"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+  [[ "$output" == *"unknown"* ]] || false
+}
+
+@test "verify_domain_absent refuses (fails) when domain equals the manifest's own search_replace.to (#73)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_payload() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
+  local manifest='{"migrate":{"core-wp":{"option_keys":["etch_settings"]}},"options":{"search_replace":{"from":"https://same.example.com","to":"https://same.example.com"}}}'
+  run verify_domain_absent "$run_dir" "$tsv" "$manifest" "https://same.example.com"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
 @test "verify_domain_absent is a no-op post_ids list (never calls graft_migrated_post_ids_json) when id-map.tsv is empty/missing" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   local tsv="${run_dir}/id-map.tsv" # never created — no posts imported this run
