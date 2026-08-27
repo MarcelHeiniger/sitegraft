@@ -527,7 +527,13 @@ EOF
   # sitegraft's orchestrators routinely run under LC_ALL=C. Asserted
   # under C explicitly, since that is the case the glob had to be
   # widened for -- a UTF-8-only pass would prove nothing about it.
-  run --separate-stderr env LC_ALL=C bash -c '. lib/core.sh; . lib/plan.sh; _plan_normalize_remap_url "test" "https://a.example.com/blog$(printf "\xc2\xa0")"'
+  # LC_ALL as a prefix assignment on `run`, NOT a subshell that re-sources
+  # the libs: setup() has already loaded them, and relative `. lib/...`
+  # inside a subshell resolves against the INVOKING cwd, so the test
+  # passed from the repo root and failed (status 127, source not found)
+  # when the file was run by absolute path. A test that cries wolf about
+  # the very guard it protects is worse than the gap it closed.
+  LC_ALL=C run --separate-stderr _plan_normalize_remap_url "test" "https://a.example.com/blog$(printf '\xc2\xa0')"
   [ "$status" -eq 1 ]
   [[ "$stderr" == *"whitespace"* ]] || false
 }

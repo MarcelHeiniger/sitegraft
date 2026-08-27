@@ -853,8 +853,15 @@ _phase_plan_build() {
     # when a module's `_dynamic` selection function fails, and a plan built
     # from a claim a module could not produce must never reach the freeze
     # step (docs/decisions/0007-module-dynamic-selections.md).
+    # The message below deliberately does NOT name a cause: plan_defaults
+    # has three non-zero exits (a module's dynamic selection, and either
+    # end of the domain remap failing to parse or carrying whitespace,
+    # #73), each of which logs its own specific error immediately before
+    # returning. Naming modules here was accurate while that was the only
+    # cause and became a false claim printed under a true one when the
+    # URL refusals started routing through the same path.
     manifest=$(plan_defaults "${run_dir}/scan-a.json" "${run_dir}/scan-b.json" "$profile") || {
-      log_error "could not build the default selections — no manifest will be frozen from this run. The specific reason is in the error immediately above; plan_defaults refuses for a module whose dynamic selection failed, and also (since #73) for a domain-remap value that does not parse or carries whitespace. Naming only modules here used to be accurate and no longer is."
+      log_error "could not build the default selections — no manifest will be frozen from this run. The specific reason is in the error immediately above; plan_defaults refuses for a module whose dynamic selection failed, and also (since #73) for a domain-remap value that does not parse or carries whitespace."
       return 1
     }
     manifest=$(plan_custom_code_gate "$manifest" "$(cat "${run_dir}/scan-b.json")") || return 1
