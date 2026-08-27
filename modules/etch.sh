@@ -331,7 +331,8 @@ etch_post_import() {
     log_warn "etch post_import: B's etch_settings now carries a non-empty ai_api_key, copied from A along with the rest of the option. If B must not hold A's credential, clear it from Etch's settings on B."
   fi
 
-  # Remap Etch's own component references.
+  # Remap Etch's own component references, AND (issue #84, added below)
+  # dynamic-image mediaId references.
   #
   # Etch templates and components point at each other BY POST ID, in a block
   # attribute of the form:
@@ -342,6 +343,25 @@ etch_post_import() {
   # (lib/php/content-remap-functions.php) only rewrites `"id":<old>` and
   # `wp-image-<old>`, and only for attachments, so a component reference
   # travels to B still holding A's id.
+  #
+  # `wp:etch/dynamic-image` addresses its media the same broken way, one
+  # differently-named attribute over:
+  #
+  #     <!-- wp:etch/dynamic-image {"attributes":{"mediaId":"35199"}} -->
+  #
+  # graft's generic content remap does not catch THIS either, and for the
+  # same root cause: it only ever matches the literal JSON key `"id"`, never
+  # `"mediaId"`. Measured on a real graft (this issue's own description):
+  # 12 distinct mediaId values, 12 of 12 broken, all 12 already present in
+  # id-map.tsv -- the mapping existed, nothing applied it. Its failure mode
+  # is loud rather than silent (DynamicImageBlock::render_block renders
+  # "Image with ID <n> not found" as the actual page content when
+  # wp_get_attachment_metadata() finds nothing), which is precisely why a
+  # human, not `verify`, is what caught it: a byte-for-byte content-equality
+  # check cannot see a value that was supposed to change and did not (see
+  # this issue's own report for the full reasoning) -- lib/verify.sh's
+  # verify_id_references_resolve is issue #84's other half, and exists for
+  # exactly that blind spot.
   #
   # A single dangling reference is not a cosmetic defect: it takes the whole
   # template down. Observed on a real graft — one component out of three
@@ -363,14 +383,38 @@ etch_post_import() {
   # coincidence to rewrite something it shouldn't.
   [ -s "$id_map_tsv" ] || return 0
 
-  local map_json ids_json
+  local map_json ids_json media_map_json
   map_json=$(awk -F'\t' '$3 != "attachment" && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { printf "%s %s\n", $1, $2 }' "$id_map_tsv" \
     | jq -R -s -c 'split("\n") | map(select(length > 0) | split(" ")) | map({(.[0]): (.[1] | tonumber)}) | add // {}')
   ids_json=$(awk -F'\t' '$3 != "attachment" && $2 ~ /^[0-9]+$/ { print $2 }' "$id_map_tsv" \
     | jq -R -s -c 'split("\n") | map(select(length > 0) | tonumber) | unique')
 
+  # Issue #84: `wp:etch/dynamic-image`'s `mediaId` attribute holds an
+  # ATTACHMENT id -- a different id space than "ref" above (component/
+  # template posts), and the OPPOSITE filter of $map_json's for exactly the
+  # same reason graft_remap_attachment_ids (lib/graft.sh) excludes
+  # wp_navigation from ITS scope: an attachment id and a non-attachment
+  # post id are independent sequences that both start at 1 on a fresh
+  # site, so building one combined map from both kinds would let a
+  # coincidental collision rewrite a "ref" as if it were a "mediaId" or
+  # vice versa. Same shape as $map_json (a JSON object keyed by the OLD id,
+  # mapping to the NEW id) -- kept a plain object rather than
+  # graft_remap_attachment_ids' own {old,new} array-of-objects shape
+  # (built for a different consumer, lib/php/verify-content-remap-cli.php)
+  # so this stays a drop-in sibling of $map_json's own established
+  # convention in this same function, not a second shape to remember.
+  media_map_json=$(awk -F'\t' '$3 == "attachment" && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { printf "%s %s\n", $1, $2 }' "$id_map_tsv" \
+    | jq -R -s -c 'split("\n") | map(select(length > 0) | split(" ")) | map({(.[0]): (.[1] | tonumber)}) | add // {}')
+
   if [ "$(printf '%s' "$map_json" | jq 'length')" = "0" ]; then
-    log_info "etch post_import: no non-attachment id mappings in this run — no component references to remap"
+    # A run whose id-map.tsv has zero non-attachment rows has, by
+    # construction, zero rows in $ids_json too (both are filtered from the
+    # exact same `$3 != "attachment"` rows) -- so there is no migrated
+    # post left for a mediaId reference to even live inside, regardless of
+    # how many attachments this run also mapped. Confirmed by this
+    # function's own "does nothing when the run mapped only attachments"
+    # test.
+    log_info "etch post_import: no non-attachment id mappings in this run — no component or media references to remap"
     return 0
   fi
 
@@ -390,12 +434,73 @@ etch_post_import() {
   # count ("$changed" was computed but never read by anything on the bash
   # side) -- graft_record_module_content_rewrite (lib/graft.sh) is what
   # turns that into the record lib/verify.sh's guard 1 excludes by.
+  # Issue #84: mediaId. "mediaId" is DynamicImageBlock's own attribute --
+  # declared type string in its register_block_type call, and read back
+  # with is_string test, media id, else empty -- so a non-string value is
+  # silently treated as ABSENT, never as a numeric id.
+  #
+  # THREE forms are matched below, and only ONE of them is actually
+  # OBSERVED on the real Etch 1.6.6 site this fix-pack was measured
+  # against -- the other two are deliberately defensive, not encountered:
+  #
+  #   1. quoted-string JSON, mediaId colon quote 35199 quote -- OBSERVED.
+  #      Measured directly against wp_posts: 215 occurrences, 13 distinct
+  #      attachment ids, zero of the other two forms anywhere in
+  #      wp_posts/wp_options/wp_postmeta.
+  #   2. bare-number JSON, mediaId colon 35199 with no quotes -- NOT
+  #      observed. Nothing rules it out for a differently configured
+  #      block or a future Etch version, and matching it costs nothing
+  #      extra once the string form's sentinel technique exists.
+  #   3. HTML-attribute form, mediaId equals quote 35199 quote (no colon)
+  #      -- NOT observed either. Etch's own editor UI can render a block
+  #      this way (fix-pack finding: shown directly in the editor as
+  #      `<etch:img ... mediaId="35199" ... />`), but that is a rendered
+  #      VIEW of the block, not what gets persisted -- confirmed by the
+  #      same measurement above finding zero occurrences of this shape in
+  #      any of the three tables. Matched anyway, defensively: if a
+  #      future Etch version starts persisting this form somewhere this
+  #      tool touches, it will already be covered rather than silently
+  #      missed a second time.
+  #
+  # Same two-full-passes-through-a-sentinel technique as $map above, for
+  # the identical reason -- a mapping that rewrites attachment 16 to 173
+  # immediately followed by one that rewrites 173 to 200 must never
+  # re-match what the first substitution just produced -- and the SAME
+  # sentinel token, @@MEDIA_<old>@@, closes all three forms in one second
+  # pass: pass 1 always leaves the token wrapped in whichever quoting (or
+  # lack of it) the original value had, so a single str_replace of the
+  # bare token in pass 2 resolves every case alike without needing to
+  # know which one it was.
+  #
+  # NOT a "ref" false positive: Etch's editor also embeds a base64 JSON
+  # blob under a `data-etch-context` HTML attribute on some raw-HTML
+  # block content (confirmed present, in a `revision` post, on the real
+  # site) carrying its OWN "ref" key, e.g. decoded:
+  # {"name":"If (Condition)","structureState":"open","ref":"b753cpd"} --
+  # an alphanumeric EDITOR element id (the UI's own bookkeeping for the
+  # structure panel), never a WordPress post id. Quoted, and never purely
+  # digits, so it can never match this file's own `"ref":[0-9]` pattern
+  # (below) or verify_id_references_resolve's identical one
+  # (lib/verify.sh) -- nothing to exclude in code, this is documentation
+  # only, so the next reader does not mistake it for a missed reference.
+  #
+  # NOTE ON WHY THE PHP BELOW STAYS COMMENT-FREE: an inline "//" PHP
+  # comment holding an UNBALANCED parenthesis on its own line (an opening
+  # "(" on one line, its matching ")" only on a later line) breaks this
+  # bash 3.2's own here-doc-inside-command-substitution parser --
+  # execution-proven while writing this fix-pack (a "syntax error near
+  # unexpected token" pointing at the PHP comment line itself, gone the
+  # moment the same explanation moved up here instead). Keeping the
+  # heredoc body itself free of prose comments, exactly as it already was
+  # before this change, sidesteps the whole class of bug rather than
+  # hunting for which single parenthesis broke it.
   local php
   php=$(cat <<PHP
 global \$wpdb;
 \$map = json_decode('${map_json}', true);
+\$media_map = json_decode('${media_map_json}', true);
 \$ids = json_decode('${ids_json}', true);
-if ( ! is_array( \$map ) || ! is_array( \$ids ) ) { return; }
+if ( ! is_array( \$map ) || ! is_array( \$media_map ) || ! is_array( \$ids ) ) { return; }
 foreach ( \$ids as \$pid ) {
 	\$content = get_post_field( 'post_content', \$pid );
 	if ( ! is_string( \$content ) || '' === \$content ) { continue; }
@@ -406,6 +511,14 @@ foreach ( \$ids as \$pid ) {
 	foreach ( \$map as \$old => \$new ) {
 		\$content = str_replace( '"ref":@@' . \$old . '@@', '"ref":' . \$new, \$content );
 	}
+	foreach ( \$media_map as \$old => \$new ) {
+		\$content = preg_replace( '/"mediaId":"' . \$old . '"/', '"mediaId":"@@MEDIA_' . \$old . '@@"', \$content );
+		\$content = preg_replace( '/"mediaId":' . \$old . '(?!\d)/', '"mediaId":@@MEDIA_' . \$old . '@@', \$content );
+		\$content = preg_replace( '/mediaId="' . \$old . '"/', 'mediaId="@@MEDIA_' . \$old . '@@"', \$content );
+	}
+	foreach ( \$media_map as \$old => \$new ) {
+		\$content = str_replace( '@@MEDIA_' . \$old . '@@', \$new, \$content );
+	}
 	if ( \$content !== \$before ) {
 		\$wpdb->update( \$wpdb->posts, array( 'post_content' => \$content ), array( 'ID' => \$pid ) );
 		clean_post_cache( \$pid );
@@ -415,7 +528,7 @@ foreach ( \$ids as \$pid ) {
 PHP
 )
 
-  log_info "etch post_import: remapping Etch component references across $(printf '%s' "$ids_json" | jq 'length') migrated post(s)..."
+  log_info "etch post_import: remapping Etch component and mediaId references across $(printf '%s' "$ids_json" | jq 'length') migrated post(s)..."
   # `&&`/`||`, not a bare assignment -- run_or_echo's own real exit status
   # (the eval call's) must survive as THIS function's return value, the
   # same as it did before this restructuring; without it, the while loop
