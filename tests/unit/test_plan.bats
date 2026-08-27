@@ -147,6 +147,86 @@ setup() {
   [ -z "$output" ]
 }
 
+# --- MAJOR-2(b) (issue #73, second round), MOVED and CORRECTED (third
+# round): plan_warn_scope_gaps used to run this check itself, comparing
+# scan's own home_url against scan's own site_url — before plan_defaults
+# had run, so it could not know whether SITE_A_URL had overridden
+# home_url as the actual remap source. plan_warn_asset_domain_gap now
+# takes the FINISHED manifest and compares its real
+# options.search_replace.from against A's scanned site_url instead.
+
+@test "plan_warn_asset_domain_gap warns when the CHOSEN remap source and A's siteurl are on different origins" {
+  local manifest='{"options":{"search_replace":{"from":"https://a.example.com","to":"https://b.example.com"}}}'
+  local a="$BATS_TEST_TMPDIR/a.json"
+  echo '{"site_url":"https://cdn-a.example.com"}' > "$a"
+  run plan_warn_asset_domain_gap "$manifest" "$a"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"different origins"* ]] || false
+  [[ "$output" == *"https://a.example.com"* ]] || false
+  [[ "$output" == *"https://cdn-a.example.com"* ]] || false
+}
+
+@test "plan_warn_asset_domain_gap says nothing when the chosen source and siteurl share an origin (subdirectory install, same domain different path)" {
+  local manifest='{"options":{"search_replace":{"from":"https://a.example.com/blog","to":"https://b.example.com"}}}'
+  local a="$BATS_TEST_TMPDIR/a.json"
+  echo '{"site_url":"https://a.example.com"}' > "$a"
+  run plan_warn_asset_domain_gap "$manifest" "$a"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "plan_warn_asset_domain_gap says nothing when either side is missing or unknown (that is manifest_validate's #73 guard's job, not this warning's)" {
+  local manifest='{"options":{"search_replace":{"from":"unknown","to":"unknown"}}}'
+  local a="$BATS_TEST_TMPDIR/a.json"
+  echo '{"site_url":"https://cdn-a.example.com"}' > "$a"
+  run plan_warn_asset_domain_gap "$manifest" "$a"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+# --- MAJOR-1 (third review round): the two failure directions the OLD
+# placement (inside plan_warn_scope_gaps, comparing two scanned values
+# before plan_defaults ever ran) provably got wrong on real reproductions.
+
+@test "plan_warn_asset_domain_gap fires when scan's home_url==site_url (old check would stay silent) but SITE_A_URL overrode home_url to a genuinely different domain (MAJOR-1, #73)" {
+  # The exact shape that made the OLD placement silent: A's scanned
+  # home_url and site_url are IDENTICAL (both the proxy's own internal
+  # address) — comparing those two, as the old check did, sees no
+  # divergence at all. But plan_defaults chose SITE_A_URL (the real
+  # public domain) as `from`, and THAT genuinely diverges from site_url.
+  local manifest='{"options":{"search_replace":{"from":"https://a.example.com","to":"https://b.example.com"}}}'
+  local a="$BATS_TEST_TMPDIR/a.json"
+  echo '{"home_url":"https://a.ddev.site:8443","site_url":"https://a.ddev.site:8443"}' > "$a"
+  run plan_warn_asset_domain_gap "$manifest" "$a"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"different origins"* ]] || false
+}
+
+@test "plan_warn_asset_domain_gap names the CHOSEN source in its message, not scan's home_url, when they differ (MAJOR-1, #73)" {
+  # The exact shape that made the OLD message FALSE: it named A's scanned
+  # home_url as "this run's domain remap source" when the manifest's real
+  # chosen `from` (SITE_A_URL) was a completely different value.
+  local manifest='{"options":{"search_replace":{"from":"https://public-a.example.com","to":"https://b.example.com"}}}'
+  local a="$BATS_TEST_TMPDIR/a.json"
+  echo '{"home_url":"https://a.ddev.site:8443","site_url":"https://cdn-a.example.com"}' > "$a"
+  run plan_warn_asset_domain_gap "$manifest" "$a"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"https://public-a.example.com"* ]] || false
+  [[ "$output" != *"https://a.ddev.site:8443"* ]] || false
+}
+
+@test "_plan_url_origin strips path/query/fragment, keeping only scheme://host[:port]" {
+  run _plan_url_origin "https://a.example.com:8443/blog/page?x=1#frag"
+  [ "$status" -eq 0 ]
+  [ "$output" = "https://a.example.com:8443" ]
+}
+
+@test "_plan_url_origin treats a bare host with no scheme as its own origin (never errors, never empties)" {
+  run _plan_url_origin "not-a-url"
+  [ "$status" -eq 0 ]
+  [ "$output" = "not-a-url" ]
+}
+
 # --- plan_defaults: not covered by the plan's own bats spec (called out there
 # as "not a pure function... tested separately") — added here for real
 # coverage of the module-dispatch logic itself, using fabricated modules the
@@ -175,7 +255,7 @@ EOF
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
   echo '{"plugins":[{"name":"etch","version":"2.0"}],"post_types":[],"options":[],"tables":[]}' > "$a"
   echo '{"plugins":[{"name":"fake-booking","version":"1.0"}],"post_types":[{"name":"fake_reservation"}],"options":[],"tables":["fakebooking_reservations"]}' > "$b"
-  run plan_defaults "$a" "$b"
+  run --separate-stderr plan_defaults "$a" "$b"
   [ "$status" -eq 0 ]
   echo "$output" | jq -e '.migrate.etch.post_types == ["etch_cfs","etch_cpts"]' >/dev/null
   echo "$output" | jq -e '.migrate.etch.option_keys == ["etch_settings"]' >/dev/null
@@ -190,10 +270,338 @@ EOF
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
   echo '{"plugins":[],"post_types":[],"options":[],"tables":[]}' > "$a"
   echo '{"plugins":[],"post_types":[],"options":[],"tables":[]}' > "$b"
-  run plan_defaults "$a" "$b"
+  run --separate-stderr plan_defaults "$a" "$b"
   [ "$status" -eq 0 ]
   echo "$output" | jq -e '.migrate == {}' >/dev/null
   echo "$output" | jq -e '.protect == {}' >/dev/null
+}
+
+# --- issue #73: the domain search-replace never ran, because plan_defaults
+# read `.site_url`, a key `scan` never wrote — every real scan produced
+# search_replace.from/to = "unknown"/"unknown", and graft_search_replace_domain
+# only short-circuited on an EMPTY from, so it ran a real, silently-successful
+# no-op pass replacing "unknown" with "unknown". Reproduced here on the exact
+# real scan-a.json key set the issue names (no fabricated `site_url` key).
+@test "plan_defaults derives options.search_replace.from/to from each scan's home_url, not a fabricated site_url key (#73)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  # site_url deliberately differs from home_url on both sides (the real
+  # WordPress case this whole distinction is about, per
+  # inventory_scan_site's own comment) — if plan_defaults ever regressed
+  # back to reading .site_url, this test would derive the WRONG from/to
+  # pair instead of merely deriving a coincidentally-identical one.
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://a.example.com","site_url":"https://cdn-a.example.com"}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://b.example.com","site_url":"https://cdn-b.example.com"}' > "$b"
+  run --separate-stderr plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.from == "https://a.example.com"' >/dev/null
+  echo "$output" | jq -e '.options.search_replace.to == "https://b.example.com"' >/dev/null
+}
+
+@test "plan_defaults falls back to the 'unknown' placeholder when a scan carries no home_url at all — a real scan-a.json's actual key set, per issue #73 (nothing named site_url or home_url)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  # The exact key set issue #73 quotes from a real scan-a.json, deliberately
+  # WITHOUT home_url or site_url — this is what every scan looked like
+  # before this fix-pack, and the manifest it produces must still say so
+  # honestly (as "unknown"), never silently invent a URL.
+  echo '{"active_theme":{},"classic_menu_names":[],"classic_menus_detected":false,"classic_menus_unknown":false,"custom_code_detected":false,"custom_code_signals":{},"nav_post_count":null,"nav_uses_dynamic_page_list":null,"options":[],"plugins":[],"post_types":[],"table_prefix":"wp_","tables":[]}' > "$a"
+  echo '{"active_theme":{},"classic_menu_names":[],"classic_menus_detected":false,"classic_menus_unknown":false,"custom_code_detected":false,"custom_code_signals":{},"nav_post_count":null,"nav_uses_dynamic_page_list":null,"options":[],"plugins":[],"post_types":[],"table_prefix":"wp_","tables":[]}' > "$b"
+  run --separate-stderr plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.from == "unknown"' >/dev/null
+  echo "$output" | jq -e '.options.search_replace.to == "unknown"' >/dev/null
+}
+
+# --- Marcel's own catch, second review round: the profile ALREADY carries
+# SITE_A_URL/SITE_B_URL (design doc §5.1, whitelisted since day one), filled
+# in by hand by an operator who knows the real public domain — and until
+# this fix plan_defaults ignored both, guessing from scan's own `home_url`
+# instead. Reproduced live against a real migration: a site served behind
+# a proxy (DDEV, in the reproducing case) records `home` as the proxy's
+# own internal address — zero occurrences of that address in the site's
+# real content — while the profile's own SITE_A_URL already named the
+# public domain that actually appears there. profile_load exports both as
+# real shell variables before plan_defaults runs (same pattern every other
+# SITE_*_* consumer already relies on), so these tests set them the same
+# way. Domains below are this repo's own placeholders throughout
+# (a.example.com/b.example.com — see e.g. tests/integration/ddev-harness.sh,
+# profiles/example.conf), never real hosts.
+
+@test "plan_defaults prefers the profile's SITE_A_URL/SITE_B_URL over scan's home_url (Marcel's catch, #73)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://a.ddev.site:8443"}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://b.ddev.site:8443"}' > "$b"
+  SITE_A_URL="https://a.example.com"
+  SITE_B_URL="https://b.example.com"
+  run --separate-stderr plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.from == "https://a.example.com"' >/dev/null
+  echo "$output" | jq -e '.options.search_replace.to == "https://b.example.com"' >/dev/null
+  echo "$output" | jq -e '.options.search_replace.from != "https://a.ddev.site:8443"' >/dev/null
+}
+
+@test "plan_defaults falls back to scan's home_url when the profile does not set SITE_A_URL/SITE_B_URL (#73)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://a.example.com"}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://b.example.com"}' > "$b"
+  unset SITE_A_URL SITE_B_URL
+  run --separate-stderr plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.from == "https://a.example.com"' >/dev/null
+  echo "$output" | jq -e '.options.search_replace.to == "https://b.example.com"' >/dev/null
+}
+
+@test "plan_defaults mixes sources independently — SITE_A_URL set, SITE_B_URL not, B still falls back to scan's home_url (#73)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://a.ddev.site"}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://b.example.com"}' > "$b"
+  SITE_A_URL="https://a-public.example.com"
+  unset SITE_B_URL
+  run --separate-stderr plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.from == "https://a-public.example.com"' >/dev/null
+  echo "$output" | jq -e '.options.search_replace.to == "https://b.example.com"' >/dev/null
+}
+
+@test "plan_defaults treats an empty SITE_A_URL exactly like an unset one — still falls back to scan's home_url" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://a.example.com"}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://b.example.com"}' > "$b"
+  SITE_A_URL=""
+  SITE_B_URL=""
+  run --separate-stderr plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.from == "https://a.example.com"' >/dev/null
+}
+
+# --- BLOCKER-1 (third review round): SITE_A_URL/SITE_B_URL are taken
+# verbatim, never validated for form. Before the profile-priority
+# change, `from`/`to` always came from `wp option get home` — WordPress
+# stores it untrailingslashit'd and always with a scheme, so both ends
+# were structurally guaranteed to match in form. A hand-typed profile
+# value breaks that guarantee two concrete ways, reproduced against the
+# real sitegraft_remap_domain (a bare string split()/join(), see
+# tests/unit/test_content_remap_functions.bats for that function's own
+# tests): a trailing slash on one side desyncs the split point from the
+# other, and a missing scheme lets the value match as a bare substring
+# inside a scheme-qualified URL, re-inserting `to`'s scheme INSIDE the
+# original one. Both corrupt every migrated URL instead of rewriting it,
+# and verify_domain_absent finds the corrupted `from` legitimately
+# missing and reports the check green.
+
+@test "plan_defaults strips a trailing slash from SITE_A_URL/SITE_B_URL before it ever reaches the manifest (BLOCKER-1, #73)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[]}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[]}' > "$b"
+  SITE_A_URL="https://a.example.com/"
+  SITE_B_URL="https://b.example.com"
+  run --separate-stderr plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.from == "https://a.example.com"' >/dev/null
+  echo "$output" | jq -e '.options.search_replace.to == "https://b.example.com"' >/dev/null
+}
+
+@test "plan_defaults refuses (fails loud, never a corrupting remap) when SITE_A_URL has no scheme (BLOCKER-1, #73)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[]}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[]}' > "$b"
+  SITE_A_URL="a.example.com"
+  SITE_B_URL="https://b.example.com"
+  run --separate-stderr plan_defaults "$a" "$b"
+  [ "$status" -ne 0 ]
+  [[ "$stderr" == *"a.example.com"* ]] || false
+  [[ "$stderr" == *"scheme"* ]] || false
+}
+
+@test "plan_defaults refuses when SITE_B_URL has no scheme (BLOCKER-1, #73)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[]}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[]}' > "$b"
+  SITE_A_URL="https://a.example.com"
+  SITE_B_URL="b.example.com"
+  run --separate-stderr plan_defaults "$a" "$b"
+  [ "$status" -ne 0 ]
+  [[ "$stderr" == *"b.example.com"* ]] || false
+}
+
+@test "plan_defaults normalizes a half-profile/half-scan pair to the SAME canonical form (BLOCKER-1, #73 — the shape this priority order makes newly possible)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  # A's remap source is the profile (with a trailing slash, the way an
+  # operator is likely to type it — Marcel's own first draft had one);
+  # B's is scan's home_url (already clean, the way wp-cli actually
+  # produces it). Both must land in the manifest in the SAME form.
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[]}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://b.example.com"}' > "$b"
+  SITE_A_URL="https://a.example.com/"
+  unset SITE_B_URL
+  run --separate-stderr plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.from == "https://a.example.com"' >/dev/null
+  echo "$output" | jq -e '.options.search_replace.to == "https://b.example.com"' >/dev/null
+}
+
+# --- BLOCKER, fourth review round: _plan_normalize_remap_url's regex
+# capture stopped at the first `/` — killing a trailing slash, the point,
+# but ALSO discarding a real PATH, which is not. `wp option get home`
+# RETURNS the path on a subdirectory install (design doc §785,
+# lib/inventory.sh's own header comment, test_inventory.bats' own
+# fixtures — "https://a.example.com/wp") — a documented, common,
+# fully-supported site shape. No profile, no operator typo needed: A's
+# scanned home_url alone on a subdirectory install used to be enough to
+# silently corrupt every link on B. None of the earlier BLOCKER-1 tests
+# used a URL with a path — this is that coverage.
+
+@test "plan_defaults keeps A's real path when home_url is a subdirectory install (BLOCKER, #73, no profile involved at all)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://a.example.com/blog"}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://b.example.com"}' > "$b"
+  unset SITE_A_URL SITE_B_URL
+  run --separate-stderr plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.from == "https://a.example.com/blog"' >/dev/null
+}
+
+@test "plan_defaults keeps B's real path when home_url is a subdirectory install (BLOCKER, #73, the other direction)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://a.example.com"}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://b.example.com/blog"}' > "$b"
+  unset SITE_A_URL SITE_B_URL
+  run --separate-stderr plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.to == "https://b.example.com/blog"' >/dev/null
+}
+
+@test "plan_defaults keeps the path on a mixed pair — one side has a path, the other doesn't (BLOCKER, #73)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://a.example.com/blog"}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://b.example.com"}' > "$b"
+  unset SITE_A_URL SITE_B_URL
+  run --separate-stderr plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.from == "https://a.example.com/blog"' >/dev/null
+  echo "$output" | jq -e '.options.search_replace.to == "https://b.example.com"' >/dev/null
+}
+
+@test "_plan_normalize_remap_url strips exactly one trailing slash after a real path, without collapsing the path away (bonus fix, #73 — the second-transformation trap)" {
+  run _plan_normalize_remap_url "test" "https://a.example.com/blog/"
+  [ "$status" -eq 0 ]
+  [ "$output" = "https://a.example.com/blog" ]
+}
+
+# --- NIT, fifth review round: `${url%/}` strips exactly ONE trailing
+# slash, so a DOUBLED slash survives as precisely the shape this function
+# exists to remove -- "https://a.example.com//" came out as
+# "https://a.example.com/", which then rewrites
+# <a href="https://a.example.com/about"> into "https://b.example.comabout":
+# corrupted, and invisible to verify_domain_absent, which searches for the
+# recorded `from` and legitimately no longer finds it. Green run, wrong
+# content -- the exact false-green this issue exists to kill, one notch
+# further out than BLOCKER-1.
+#
+# `wp option get home` cannot produce a doubled trailing slash, so this
+# needs a hand-typed profile value; that is why it is a NIT and not a
+# blocker. Surrounding whitespace is the same class one notch further
+# still: a `from` carrying a stray space matches nothing at all, so the
+# remap silently does nothing and verify reports green. A LEADING space
+# was already refused by the anchored regex; a TRAILING one was not,
+# because `%/` does not fire when the last character is a space.
+#
+# The loop is proven here rather than assumed: reverting it to a single
+# `${url%/}` must redden the doubled-slash cases, and dropping the
+# whitespace guard must redden the whitespace ones.
+
+@test "_plan_normalize_remap_url REFUSES a non-breaking space, in every locale (NIT, #73)" {
+  # U+00A0 is not matched by [[:space:]] outside a UTF-8 locale, and
+  # sitegraft's orchestrators routinely run under LC_ALL=C. Asserted
+  # under C explicitly, since that is the case the glob had to be
+  # widened for -- a UTF-8-only pass would prove nothing about it.
+  # LC_ALL as a prefix assignment on `run`, NOT a subshell that re-sources
+  # the libs: setup() has already loaded them, and relative `. lib/...`
+  # inside a subshell resolves against the INVOKING cwd, so the test
+  # passed from the repo root and failed (status 127, source not found)
+  # when the file was run by absolute path. A test that cries wolf about
+  # the very guard it protects is worse than the gap it closed.
+  LC_ALL=C run --separate-stderr _plan_normalize_remap_url "test" "https://a.example.com/blog$(printf '\xc2\xa0')"
+  [ "$status" -eq 1 ]
+  [[ "$stderr" == *"whitespace"* ]] || false
+}
+
+@test "_plan_normalize_remap_url strips a DOUBLED trailing slash, not just one (NIT, #73)" {
+  run _plan_normalize_remap_url "test" "https://a.example.com//"
+  [ "$status" -eq 0 ]
+  [ "$output" = "https://a.example.com" ]
+}
+
+@test "_plan_normalize_remap_url strips several trailing slashes after a real path, and still keeps the path (NIT, #73)" {
+  run _plan_normalize_remap_url "test" "https://a.example.com/blog//"
+  [ "$status" -eq 0 ]
+  [ "$output" = "https://a.example.com/blog" ]
+}
+
+@test "_plan_normalize_remap_url REFUSES a value with a trailing space, rather than passing a no-op remap through (NIT, #73)" {
+  run --separate-stderr _plan_normalize_remap_url "test" "https://a.example.com/blog/ "
+  [ "$status" -eq 1 ]
+  [[ "$stderr" == *"contains whitespace"* ]] || false
+}
+
+# The stderr assertion below is LOAD-BEARING, not decoration: with the
+# whitespace guard removed, a leading space is still refused by the
+# anchored URL regex, so `[ "$status" -eq 1 ]` passes on the broken code.
+# Only the message distinguishes "refused for whitespace" from "refused
+# as a malformed URL" -- verified by mutation. Do not "tidy" this down to
+# a bare status check; that would make the test vacuous.
+@test "_plan_normalize_remap_url REFUSES a value with a leading space, with the whitespace reason rather than the malformed-URL one (NIT, #73)" {
+  run --separate-stderr _plan_normalize_remap_url "test" " https://a.example.com"
+  [ "$status" -eq 1 ]
+  [[ "$stderr" == *"contains whitespace"* ]] || false
+}
+
+@test "_plan_normalize_remap_url still strips a trailing slash with no path at all" {
+  run _plan_normalize_remap_url "test" "https://a.example.com/"
+  [ "$status" -eq 0 ]
+  [ "$output" = "https://a.example.com" ]
+}
+
+@test "_plan_normalize_remap_url leaves a pathless URL with no trailing slash untouched" {
+  run _plan_normalize_remap_url "test" "https://a.example.com"
+  [ "$status" -eq 0 ]
+  [ "$output" = "https://a.example.com" ]
+}
+
+@test "plan_defaults still treats scan's own "unknown" placeholder as passable, not as a malformed URL to reject (BLOCKER-1, #73 — that is manifest_validate's job, not this normalizer's)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[]}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://b.example.com"}' > "$b"
+  unset SITE_A_URL SITE_B_URL
+  run --separate-stderr plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.from == "unknown"' >/dev/null
+}
+
+@test "plan_defaults logs which source (profile or scan) supplied each end of the remap (NIT-1, #73)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://a.ddev.site"}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[]}' > "$b"
+  SITE_A_URL="https://a.example.com"
+  unset SITE_B_URL
+  run --separate-stderr plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  [[ "$stderr" == *"SITE_A_URL"* ]] || false
+  [[ "$stderr" == *"scan's home_url"* ]] || false
 }
 
 # --- plan_defaults: dynamic selections and option-key exclusions (issues
@@ -230,7 +638,7 @@ demo_detect() { jq -e '.plugins[]? | select(.name == "demo")' "$1" >/dev/null 2>
 demo_option_keys_dynamic() { jq -r '.options[]?.option_name | select(startswith("demo_"))' "$1"; }
 demo_option_keys_exclude() { printf 'demo_license_*\ndemo_*_api_key\n'; }
 EOF
-  run plan_defaults "$BATS_TEST_TMPDIR/a.json" "$BATS_TEST_TMPDIR/b.json"
+  run --separate-stderr plan_defaults "$BATS_TEST_TMPDIR/a.json" "$BATS_TEST_TMPDIR/b.json"
   [ "$status" -eq 0 ]
   echo "$output" | jq -e '.migrate.demo.option_keys == ["demo_settings"]' >/dev/null
 }
@@ -242,7 +650,7 @@ demo_detect() { jq -e '.plugins[]? | select(.name == "demo")' "$1" >/dev/null 2>
 demo_option_keys() { printf 'demo_settings\n'; }
 demo_option_keys_dynamic() { printf 'theme_mods_%s\n' "$(jq -r '.active_theme.stylesheet' "$1")"; }
 EOF
-  run plan_defaults "$BATS_TEST_TMPDIR/a.json" "$BATS_TEST_TMPDIR/b.json"
+  run --separate-stderr plan_defaults "$BATS_TEST_TMPDIR/a.json" "$BATS_TEST_TMPDIR/b.json"
   [ "$status" -eq 0 ]
   # A's theme slug, not B's: a module bound for migrate is resolved against scan A.
   echo "$output" | jq -e '.migrate.demo.option_keys | index("theme_mods_a-child-theme")' >/dev/null
@@ -256,7 +664,7 @@ demo_detect() { jq -e '.plugins[]? | select(.name == "demo")' "$1" >/dev/null 2>
 demo_post_types() { printf 'wp_block\n'; }
 demo_post_types_dynamic() { jq -r '.post_types[]?.name | select(. == "fotos")' "$1"; }
 EOF
-  run plan_defaults "$BATS_TEST_TMPDIR/a.json" "$BATS_TEST_TMPDIR/b.json"
+  run --separate-stderr plan_defaults "$BATS_TEST_TMPDIR/a.json" "$BATS_TEST_TMPDIR/b.json"
   [ "$status" -eq 0 ]
   echo "$output" | jq -e '.migrate.demo.post_types == ["wp_block","fotos"]' >/dev/null
 }
@@ -281,7 +689,7 @@ demo_detect() { jq -e '.post_types[]? | select(.name == "page")' "$1" >/dev/null
 demo_tables() { printf 'demo_data\n'; }
 demo_option_keys_dynamic() { printf 'theme_mods_%s\n' "$(jq -r '.active_theme.stylesheet' "$1")"; }
 EOF
-  run plan_defaults "$BATS_TEST_TMPDIR/a.json" "$BATS_TEST_TMPDIR/b.json"
+  run --separate-stderr plan_defaults "$BATS_TEST_TMPDIR/a.json" "$BATS_TEST_TMPDIR/b.json"
   [ "$status" -eq 0 ]
   echo "$output" | jq -e '.protect.demo.option_keys == ["theme_mods_b-theme"]' >/dev/null
 }
@@ -293,9 +701,9 @@ demo_detect() { jq -e '.plugins[]? | select(.name == "demo")' "$1" >/dev/null 2>
 demo_post_types() { printf 'wp_block\n'; }
 demo_post_types_dynamic() { echo "cannot parse that option" >&2; return 1; }
 EOF
-  run plan_defaults "$BATS_TEST_TMPDIR/a.json" "$BATS_TEST_TMPDIR/b.json"
+  run --separate-stderr plan_defaults "$BATS_TEST_TMPDIR/a.json" "$BATS_TEST_TMPDIR/b.json"
   [ "$status" -ne 0 ]
-  [[ "$output" == *"demo_post_types_dynamic"* ]] || false
+  [[ "$stderr" == *"demo_post_types_dynamic"* ]] || false
 }
 
 # N5 (third review round). `tables` used to be expanded for EVERY
@@ -319,7 +727,7 @@ EOF
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
   echo '{"plugins":[],"post_types":[],"options":[],"tables":[]}' > "$a"
   echo '{"plugins":[],"post_types":[],"options":[],"tables":[]}' > "$b"
-  run plan_defaults "$a" "$b"
+  run --separate-stderr plan_defaults "$a" "$b"
   [ "$status" -eq 0 ]
   echo "$output" | jq -e '.migrate == {} and .protect == {}' >/dev/null
 }
@@ -339,7 +747,7 @@ EOF
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
   echo '{"plugins":[],"post_types":[],"options":[],"tables":[]}' > "$a"
   echo '{"plugins":[{"name":"present"}],"post_types":[],"options":[],"tables":[]}' > "$b"
-  run plan_defaults "$a" "$b"
+  run --separate-stderr plan_defaults "$a" "$b"
   [ "$status" -ne 0 ]
 }
 
@@ -362,7 +770,7 @@ EOF
   # from a clone of B's production site.
   echo '{"plugins":[{"name":"etch"},{"name":"fake-booking"}],"post_types":[],"options":[],"tables":[]}' > "$a"
   echo '{"plugins":[{"name":"fake-booking"}],"post_types":[{"name":"fake_reservation"}],"options":[],"tables":["fakebooking_reservations"]}' > "$b"
-  run plan_defaults "$a" "$b"
+  run --separate-stderr plan_defaults "$a" "$b"
   [ "$status" -eq 0 ]
   echo "$output" | jq -e '.protect.fakebooking.tables == ["fakebooking_reservations"]' >/dev/null
   echo "$output" | jq -e '.migrate.fakebooking == null' >/dev/null
@@ -374,7 +782,7 @@ EOF
   # etch declares no tables and is installed on both, as it is on any real pair.
   echo '{"plugins":[{"name":"etch"}],"post_types":[],"options":[],"tables":[]}' > "$a"
   echo '{"plugins":[{"name":"etch"}],"post_types":[],"options":[],"tables":[]}' > "$b"
-  run plan_defaults "$a" "$b"
+  run --separate-stderr plan_defaults "$a" "$b"
   [ "$status" -eq 0 ]
   echo "$output" | jq -e '.migrate.etch.option_keys == ["etch_settings"]' >/dev/null
   echo "$output" | jq -e '.protect.etch == null' >/dev/null

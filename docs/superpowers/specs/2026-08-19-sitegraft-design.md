@@ -586,6 +586,19 @@ Validation rules (`lib/manifest.sh :: manifest_validate`):
 - `frozen` must be `true` for `graft` to accept the manifest.
 - No post_type/table/option-key may appear in both `migrate` and `protect`
   (conflict → `plan` refuses to freeze).
+- No post_type/table/option-key name may carry a comma or whitespace —
+  `graft`'s comma-joined post-type CSV and its option-key loop cannot
+  address such a name unambiguously (conflict → `plan` refuses to freeze).
+- If present, `options.search_replace.from` must be non-empty, must not be
+  the literal placeholder `"unknown"` (`scan`'s own recorded value when it
+  could not determine a site's `home_url`, §6.1), and must not equal
+  `options.search_replace.to` — a remap in any of those three shapes can
+  never rewrite anything, so freezing it would defer that failure to
+  `graft`/`verify` reporting a run that changed nothing as a pass (issue
+  #73). `graft_search_replace_domain` and `verify_domain_absent`
+  (`lib/graft.sh`/`lib/verify.sh`) carry the identical check as a second
+  guard, for a manifest that reaches them without passing through this one
+  (`SITEGRAFT_MANIFEST_PREFILLED`, or hand-edited after freezing).
 - `checksums_protected_pre_graft` and `content_checksums_pre_graft` are both
   computed and written by the `backup` phase (not by `plan`), and consumed
   by `verify`.
@@ -636,6 +649,52 @@ check.
 An empty `SITE_*_SSH_HOST` means "local site, driven directly through
 `SITE_*_WP_CMD` with no SSH" (the case of a local DDEV site on the orchestrator
 itself).
+
+**`SITE_A_URL`/`SITE_B_URL` and the domain remap (issue #73, third review
+round — Marcel's own catch):** both keys are optional and have been on
+`SITEGRAFT_PROFILE_KEYS` since this section's first draft, but until this
+fix-pack neither reached `plan`'s domain remap — `SITE_A_URL` was read
+NOWHERE in the codebase at all (an operator could fill it in and have it
+silently ignored), and `SITE_B_URL` was read only by `verify`'s HTTP smoke
+check (§6.5). `plan_defaults` (§6.2) now reads them FIRST, ahead of
+`scan`'s own `home_url` (§6.1): if `SITE_A_URL`/`SITE_B_URL` are set in the
+profile, `options.search_replace.{from,to}` is built from them directly;
+`scan`'s `home_url` is consulted only when the profile leaves either one
+unset. The reasoning, not just the mechanics: the operator knows the real
+public domain being migrated to/from — this tool can only ever INFER it,
+from whatever WordPress's own `home` option happens to hold on the day
+`scan` ran. Those two can disagree, and not as a theoretical edge case:
+reproduced live against a real DDEV-fronted site A, where `home` held
+DDEV's own internal `*.ddev.site:8443` address (0 occurrences in A's real
+post_content, measured directly) while the profile's own `SITE_A_URL`
+already named the public domain that actually appeared there (27
+occurrences). A site behind any reverse proxy, SSH tunnel, or local dev
+front-end can carry more than one domain in its own database, and `home`
+is not guaranteed to be the one that matters for a given migration's
+content. `scan`'s `home_url` stays real inventory data worth recording
+regardless (see §6.1's own reasoning for why `home` over `siteurl`), and
+remains the fallback whenever the profile doesn't name a URL for that
+site — just no longer the ONLY source `plan` ever consults.
+
+**Form matters, and is enforced (BLOCKER-1, third review round):**
+`lib/profile.sh` whitelists the KEY `SITE_A_URL`/`SITE_B_URL`, never the
+VALUE — a hand-typed profile opens a guarantee `scan`'s own
+`wp option get home` always held for free (WordPress stores `home`
+untrailingslashit'd and always with a scheme) to two reproduced
+corruption shapes once that value reaches `graft`'s bare
+string-replace (design doc §9.4): a trailing slash on one side desyncs
+the split point from the other side's URLs (`.../about` loses its
+leading slash after the domain), and a missing scheme lets the value
+match as a bare substring inside a scheme-qualified URL, re-inserting
+the replacement's own scheme INSIDE the original one
+(`https://https://...`). Both corrupt every migrated URL instead of
+rewriting it, and both leave the `verify` domain-absence check reporting
+green on a run that just wrote broken URLs everywhere. `plan_defaults`
+(`_plan_normalize_remap_url`, `lib/plan.sh`) normalizes WHICHEVER value
+was chosen — profile or scan, since a half-profile/half-scan pair is the
+shape most likely to mismatch in form — to `scheme://host[:port]` before
+it ever reaches the manifest, and REFUSES (logs and aborts `plan`) on
+anything that does not parse as an absolute URL with a real scheme.
 
 ### 5.2 Credentials — two paths
 
@@ -693,6 +752,56 @@ wp --path="$WP_PATH" menu list --format=json             # classic nav menus, se
 ```
 Writes `scan-a.json` and `scan-b.json` to the state directory. Strictly read-only —
 no writes to A or B. Freely re-runnable.
+
+**Domain remap source (issue #73):** `scan` also records each site's own
+`home` and `siteurl` WordPress options, as `"home_url"`/`"site_url"` in the
+scan file (`wp option get home --format=json` / `... siteurl ...`), each
+falling back to `null` — never a fabricated value — when the query fails or
+the result isn't the JSON string wp-cli is documented to produce. `plan`
+(§6.2) reads `home_url`, not `site_url`, as its FALLBACK source for
+`options.search_replace.{from,to}` — see §5.1 for the third review round's
+correction that this is a fallback, not the primary source: the profile's
+own `SITE_A_URL`/`SITE_B_URL`, when set, are read first and win.
+
+**Corrected (MAJOR-2, second review round):** an earlier revision of this
+paragraph claimed WordPress builds "every internal content link... from
+`home_url()`, never from `site_url()`" — checked against WordPress's own
+source this time, that is false. `home` governs permalinks (the URLs
+WordPress generates for posts/pages/menus). `siteurl` governs everything
+`WP_CONTENT_URL` derives from
+(`wp-includes/default-constants.php`: `WP_CONTENT_URL = get_option
+('siteurl') . '/wp-content'`) — every media/upload URL, every plugin URL,
+every theme asset URL. On a real Etch/ACSS site those are not a minor
+surface: image URLs, block-attribute JSON referencing media, and option
+blobs holding stylesheet/asset paths all carry `siteurl`, not `home`. The
+two options' write surfaces genuinely overlap what `graft`'s domain remap
+(§9.4) rewrites — this is not a clean "home is content, siteurl is
+irrelevant" split.
+
+`home_url` remains the fallback `plan` reads whenever the profile doesn't
+supply `SITE_A_URL`/`SITE_B_URL` (§5.1), on a narrower and now-honest
+justification for `home` over `siteurl` specifically: permalinks are
+graft's largest, always-present rewrite target, and on the common case
+(`home == siteurl`, or a subdirectory install sharing an origin) a single
+domain-prefix remap already covers both surfaces correctly. The gap is
+real only when `home` and `siteurl` diverge at the ORIGIN (scheme+host) on
+A — asset URLs then keep pointing at A's `siteurl` domain after migration,
+unrewritten, and `verify` (§6.5) only ever checks for `home`'s absence, so
+it will not catch this. Known and, as of this fix-pack, surfaced rather
+than silent: `plan_warn_asset_domain_gap` (`lib/plan.sh` — corrected in
+this fix-pack's third review round to compare the manifest's ACTUAL
+chosen remap source against A's scanned `site_url`, not two merely-scanned
+values compared before that source was even chosen) warns when they
+differ at the origin, naming the residual scope gap so an operator can
+review B's migrated content for it — a second-rank signal now that a
+correctly-set `SITE_A_URL` is the first place `plan` looks, not the only
+one. `site_url` is recorded specifically so that warning (and an operator
+inspecting a scan file directly) can see it; no rewrite code path reads
+it. This schema addition was missing from every
+earlier revision of this document — `plan_defaults` read a `.site_url` key
+`scan` never wrote at all, so every manifest froze with a domain remap
+that could never do anything (see `manifest_validate`'s own guard against
+this, §4).
 
 The Etch-specific check Marcel asked for (§0, point 11): `scan` checks whether
 **A's** navigation is a dynamic `wp:page-list` block (no hardcoded IDs) by
