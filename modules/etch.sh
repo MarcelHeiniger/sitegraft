@@ -437,22 +437,52 @@ etch_post_import() {
   # Issue #84: mediaId. "mediaId" is DynamicImageBlock's own attribute --
   # declared type string in its register_block_type call, and read back
   # with is_string test, media id, else empty -- so a non-string value is
-  # silently treated as ABSENT, never as a numeric id. Measured on a real
-  # Etch 1.6.6 site, this PR's own description: every instance found was
-  # the quoted-string form, mediaId colon quote 35199 quote. The
-  # bare-number form, mediaId colon 35199 with no quotes, is handled too,
-  # defensively rather than by assumption -- nothing rules it out for a
-  # differently configured block or a future Etch version, and matching it
-  # costs nothing extra once the string form's sentinel technique is in
-  # place. Same two-full-passes-through-a-sentinel technique as $map
-  # above, for the identical reason -- a mapping that rewrites attachment
-  # 16 to 173 immediately followed by one that rewrites 173 to 200 must
-  # never re-match what the first substitution just produced -- and the
-  # SAME sentinel token, @@MEDIA_<old>@@, closes both forms in one second
-  # pass: pass 1 always leaves the token wrapped in whichever quoting, or
-  # lack of it, the original value had, so a single str_replace of the
-  # bare token in pass 2 resolves the quoted and unquoted cases alike
-  # without needing to know which one it was.
+  # silently treated as ABSENT, never as a numeric id.
+  #
+  # THREE forms are matched below, and only ONE of them is actually
+  # OBSERVED on the real Etch 1.6.6 site this fix-pack was measured
+  # against -- the other two are deliberately defensive, not encountered:
+  #
+  #   1. quoted-string JSON, mediaId colon quote 35199 quote -- OBSERVED.
+  #      Measured directly against wp_posts: 215 occurrences, 13 distinct
+  #      attachment ids, zero of the other two forms anywhere in
+  #      wp_posts/wp_options/wp_postmeta.
+  #   2. bare-number JSON, mediaId colon 35199 with no quotes -- NOT
+  #      observed. Nothing rules it out for a differently configured
+  #      block or a future Etch version, and matching it costs nothing
+  #      extra once the string form's sentinel technique exists.
+  #   3. HTML-attribute form, mediaId equals quote 35199 quote (no colon)
+  #      -- NOT observed either. Etch's own editor UI can render a block
+  #      this way (fix-pack finding: shown directly in the editor as
+  #      `<etch:img ... mediaId="35199" ... />`), but that is a rendered
+  #      VIEW of the block, not what gets persisted -- confirmed by the
+  #      same measurement above finding zero occurrences of this shape in
+  #      any of the three tables. Matched anyway, defensively: if a
+  #      future Etch version starts persisting this form somewhere this
+  #      tool touches, it will already be covered rather than silently
+  #      missed a second time.
+  #
+  # Same two-full-passes-through-a-sentinel technique as $map above, for
+  # the identical reason -- a mapping that rewrites attachment 16 to 173
+  # immediately followed by one that rewrites 173 to 200 must never
+  # re-match what the first substitution just produced -- and the SAME
+  # sentinel token, @@MEDIA_<old>@@, closes all three forms in one second
+  # pass: pass 1 always leaves the token wrapped in whichever quoting (or
+  # lack of it) the original value had, so a single str_replace of the
+  # bare token in pass 2 resolves every case alike without needing to
+  # know which one it was.
+  #
+  # NOT a "ref" false positive: Etch's editor also embeds a base64 JSON
+  # blob under a `data-etch-context` HTML attribute on some raw-HTML
+  # block content (confirmed present, in a `revision` post, on the real
+  # site) carrying its OWN "ref" key, e.g. decoded:
+  # {"name":"If (Condition)","structureState":"open","ref":"b753cpd"} --
+  # an alphanumeric EDITOR element id (the UI's own bookkeeping for the
+  # structure panel), never a WordPress post id. Quoted, and never purely
+  # digits, so it can never match this file's own `"ref":[0-9]` pattern
+  # (below) or verify_id_references_resolve's identical one
+  # (lib/verify.sh) -- nothing to exclude in code, this is documentation
+  # only, so the next reader does not mistake it for a missed reference.
   #
   # NOTE ON WHY THE PHP BELOW STAYS COMMENT-FREE: an inline "//" PHP
   # comment holding an UNBALANCED parenthesis on its own line (an opening
@@ -484,6 +514,7 @@ foreach ( \$ids as \$pid ) {
 	foreach ( \$media_map as \$old => \$new ) {
 		\$content = preg_replace( '/"mediaId":"' . \$old . '"/', '"mediaId":"@@MEDIA_' . \$old . '@@"', \$content );
 		\$content = preg_replace( '/"mediaId":' . \$old . '(?!\d)/', '"mediaId":@@MEDIA_' . \$old . '@@', \$content );
+		\$content = preg_replace( '/mediaId="' . \$old . '"/', 'mediaId="@@MEDIA_' . \$old . '@@"', \$content );
 	}
 	foreach ( \$media_map as \$old => \$new ) {
 		\$content = str_replace( '@@MEDIA_' . \$old . '@@', \$new, \$content );

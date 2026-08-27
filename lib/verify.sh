@@ -531,8 +531,14 @@ verify_nav_present() {
 # navigation) and `parentPageID` (modules/core-wp.sh's
 # _core_wp_remap_nav_page_ids, wp:core/page-list) -- is scanned on B's
 # LIVE, post-graft content for every post THIS run imported, and every
-# value found must resolve to an actual post on B (attachments included --
-# a WordPress post either way).
+# value found must resolve to an actual post on B, of ANY post type
+# (issue #84 fix-pack, below) -- but ONLY that it exists, never that it
+# is the RIGHT KIND of post. A mediaId pointing at a real page instead of
+# an attachment still passes this guard; it asks "does this id resolve to
+# a post on B", not "does it resolve to the post THIS attribute means".
+# That is a real, accepted limit, not an oversight -- see the SCOPE
+# section below for why a kind-aware check is out of reach for a dumb,
+# fixed-key scan like this one.
 #
 # WHY THIS EXISTS, and why verify_migrated_content_matches_source (guard 1,
 # above) cannot substitute for it: that guard proves B's content equals
@@ -556,6 +562,40 @@ verify_nav_present() {
 # which attribute it is; this guard does not care which, it only asks
 # whether the target exists.
 #
+# --post_type=any IS NOT "every post type" -- fix-pack finding, execution-
+# proven against a real Etch site. WordPress's own handling of "any"
+# (WP_Query, and every `wp post list --post_type=any` call built on it)
+# resolves to `get_post_types(['exclude_from_search' => false])`, which
+# on a real Etch/block-theme site excludes wp_block, wp_template,
+# wp_navigation and wp_global_styles -- precisely the post types this
+# guard exists to scan, since those are exactly where a mediaId/ref/
+# parentPageID reference lives. Measured directly: `wp post list
+# --post__in=<a real wp_block id> --post_type=any --post_status=any`
+# returned NOTHING for a genuinely published wp_block. The two wp_remote
+# calls below need OPPOSITE fixes for this, because they ask different
+# questions:
+#
+#   - The CONTENT FETCH (call 1) needs the post types THIS RUN actually
+#     migrated -- known precisely, straight from id-map.tsv's own third
+#     column (the same file that built $scope_csv two lines below it),
+#     never "any" and never the manifest's *selected* types either: what
+#     matters here is what id-map.tsv says actually landed on B, the same
+#     "measure, don't assume" discipline verify_migrated_content_matches_
+#     source's own B1 fix (this file, its own header comment) already
+#     established for the identical mistake one function up.
+#
+#   - The EXISTENCE CHECK (call 2) cannot use ANY fixed post_type list,
+#     precise or not: a reference can point at a post of a DIFFERENT type
+#     than the citing post (a page's mediaId points at an attachment; a
+#     wp_navigation's ref can point at a page) or, in principle, a type
+#     this run never touched at all. `--post_type=any`'s exclude_from_
+#     search filter is the wrong tool for "does this id exist as a post,
+#     full stop" regardless of type -- so this call goes through a `wp
+#     eval` testing `get_post()` per id instead, which is genuinely
+#     type-agnostic (core's own function for "resolve an id to a post
+#     object or null", with no post_type/post_status filtering built in
+#     at all) rather than a second, still-incomplete post_type allowlist.
+#
 # SCOPE, deliberately narrow rather than a blind numeric sweep across
 # every JSON value in the content: only the THREE attribute names this
 # codebase's own module hooks already treat as unambiguous id references.
@@ -573,15 +613,28 @@ verify_nav_present() {
 # verify_migrated_content_matches_source's own header comment gives for
 # not reimplementing each module's remap logic a second time.
 #
+# NOT MATCHED, noted rather than silently missed: a JSON-escaped mediaId
+# (`\"mediaId\":\"35199\"`, the way Etch stores some blobs as double-
+# encoded JSON elsewhere) is not matched by the grep patterns below, the
+# same way etch_post_import's own remap does not write that form either
+# -- not observed on the real site this was measured against (every
+# instance was the plain, singly-encoded form), and the remap side and
+# this guard are at least consistent with each other about it: neither
+# would silently disagree with the other about content it can't see.
+#
 # Reported explicitly rather than silently absorbed into "the family this
 # guard covers" (see this issue's own PR description for the fuller
-# account, including the OTHER unbounded case no fixed-name scan can ever
-# close: an Etch COMPONENT PROP with an operator-chosen name, e.g.
-# `"bild":"35253"` passed as a prop into a component whose own template
-# consumes it as `{props.bild}` inside a `mediaId` attribute one post
-# away — the literal id never appears under the literal key `mediaId` at
-# THAT call site at all, so no fixed-name scan, this one included, can
-# find it there).
+# account, including the "bild"-style case one post away that this guard
+# also cannot see: an Etch COMPONENT PROP with an operator-chosen name,
+# e.g. `"bild":"35253"` passed as a prop into a component whose own
+# template consumes it as `{props.bild}` inside a `mediaId` attribute one
+# post away -- the literal id never appears under the literal key
+# `mediaId` at THAT call site at all, so this dumb, fixed-key scan cannot
+# find it there. Out of scope for this fix -- tracked as a follow-up
+# issue, not left unfindable: the component post IS the source of truth
+# for what a prop name resolves to, so a targeted follow-up can read it
+# and close this deterministically, it just needs a different mechanism
+# than this guard's fixed-key scan).
 #
 # Also deliberately narrow in WHAT'S SCANNED: only posts THIS RUN imported
 # (id-map.tsv's own non-attachment, non-term rows — the SAME scope
@@ -591,8 +644,8 @@ verify_nav_present() {
 # Three-valued like the checks above it in this file: 0 + `ID_REFS:<checked>:0`
 # = every reference found resolves (including the genuine "0 of 0" pass
 # when nothing was migrated, or nothing migrated carried any of the three
-# attributes at all); 1 = HARD FAIL, either a live `wp post list` call
-# itself failed (fail-closed — the same B4 discipline verify_migrated_
+# attributes at all); 1 = HARD FAIL, either a live `wp post list`/`wp eval`
+# call itself failed (fail-closed — the same B4 discipline verify_migrated_
 # content_matches_source's own header comment documents: a read that
 # fails is UNKNOWN, never a silent "nothing found") or a reference was
 # found that does not resolve to any post on B.
@@ -606,8 +659,18 @@ verify_id_references_resolve() {
     | sort -un | paste -sd, -)
   [ -n "$scope_csv" ] || { echo "ID_REFS:0:0"; return 0; }
 
+  # The EXACT post types this run migrated, read straight from id-map.tsv's
+  # own third column -- never "any" (see this function's own header
+  # comment for why that silently drops wp_block/wp_template/wp_navigation)
+  # and never the manifest's declared selection either: id-map.tsv is what
+  # actually landed, which is what this call needs to find it again.
+  # Non-empty whenever $scope_csv is (same source rows, same filters).
+  local scope_types_csv
+  scope_types_csv=$(awk -F'\t' '$3 != "attachment" && $3 !~ /^term:/ && $2 ~ /^[0-9]+$/ { print $3 }' "$id_map_tsv" \
+    | sort -u | paste -sd, -)
+
   local live_json live_rc
-  live_json=$(wp_remote b post list --post__in="$scope_csv" --post_type=any --post_status=any --fields=ID,post_content --format=json 2>/dev/null) && live_rc=0 || live_rc=$?
+  live_json=$(wp_remote b post list --post__in="$scope_csv" --post_type="$scope_types_csv" --post_status=any --fields=ID,post_content --format=json 2>/dev/null) && live_rc=0 || live_rc=$?
   if [ "$live_rc" -ne 0 ]; then
     log_error "could not read B's migrated post content for the id-reference guard (post list failed) — treated as UNKNOWN, never as a silent pass"
     return 1
@@ -637,10 +700,11 @@ verify_id_references_resolve() {
     content=$(echo "$row" | jq -r '.post_content')
     # Same three literal JSON keys etch_post_import/_core_wp_remap_nav_page_ids
     # remap — see this function's own header comment for why "id" itself
-    # is deliberately excluded. Quote-optional on mediaId only (issue #84's
-    # own PR description: measured as the quoted-string form on a real
-    # site; the bare-number form is not ruled out for a future Etch
-    # version, so both are matched here, same as the remap side).
+    # is deliberately excluded, and for the escaped-JSON form neither side
+    # matches. Quote-optional on mediaId only (issue #84's own PR
+    # description: measured as the quoted-string form on a real site; the
+    # bare-number form is not ruled out for a future Etch version, so both
+    # are matched here, same as the remap side).
     printf '%s\n' "$content" | grep -oE '"mediaId":"?[0-9]+"?' | grep -oE '[0-9]+' \
       | while IFS= read -r rid; do printf '%s\t%s\tmediaId\n' "$pid" "$rid" >> "$pairs_file"; done
     printf '%s\n' "$content" | grep -oE '"ref":[0-9]+' | grep -oE '[0-9]+' \
@@ -660,11 +724,33 @@ verify_id_references_resolve() {
     | jq -R -s -c 'split("\n") | map(select(length > 0) | tonumber)')
   checked_total=$(echo "$referenced_json" | jq 'length')
 
-  local referenced_csv existing_ids exist_rc
-  referenced_csv=$(echo "$referenced_json" | jq -r 'join(",")')
-  existing_ids=$(wp_remote b post list --post__in="$referenced_csv" --post_type=any --post_status=any --field=ID 2>/dev/null) && exist_rc=0 || exist_rc=$?
+  # Existence, deliberately type-agnostic (this function's own header
+  # comment explains why --post_type=any cannot serve this call): a `wp
+  # eval` running get_post() per candidate id, on B, entirely server-side
+  # -- core's own "resolve an id to a post object or null" primitive,
+  # which applies no post_type or post_status filtering at all, so it
+  # answers the actual question this check asks ("does this id exist as
+  # ANY post on B") rather than an approximation of it through a post
+  # type list that would need to be kept in step with every type B might
+  # ever hold. Comment-free by construction, same as etch_post_import's
+  # own heredoc (modules/etch.sh) -- see that function's own note on why
+  # an unbalanced parenthesis inside a "//" comment on its own line broke
+  # this bash's heredoc-inside-command-substitution parsing, execution-
+  # proven while building this fix; kept out here rather than re-risked.
+  local existing_ids exist_rc php
+  php=$(cat <<PHP
+\$ids = json_decode('${referenced_json}', true);
+if ( ! is_array( \$ids ) ) { return; }
+foreach ( \$ids as \$id ) {
+	if ( null !== get_post( (int) \$id ) ) {
+		echo \$id . "\n";
+	}
+}
+PHP
+)
+  existing_ids=$(wp_remote b eval "$php" 2>/dev/null) && exist_rc=0 || exist_rc=$?
   if [ "$exist_rc" -ne 0 ]; then
-    log_error "could not confirm which referenced id(s) exist on B for the id-reference guard (post list failed) — treated as UNKNOWN, never as a silent pass"
+    log_error "could not confirm which referenced id(s) exist on B for the id-reference guard (eval failed) — treated as UNKNOWN, never as a silent pass"
     rm -f "$pairs_file"
     return 1
   fi
@@ -1739,7 +1825,27 @@ phase_verify() {
   local id_refs_output="" id_refs_rc=0
   id_refs_output=$(verify_id_references_resolve "$run_dir" "$id_map_tsv" 2>>"$report") || id_refs_rc=$?
   if [ "$id_refs_rc" -ne 0 ]; then
-    echo "- [ ] **HARD FAIL: migrated content references an id that does not resolve to any post on B** — see above" >> "$report"
+    # fix-pack nit: the counts belong on the HARD FAIL line too, not only
+    # on the pass line -- an operator staring at a red report should not
+    # have to go dig the raw log_error line out of stderr to see HOW MANY
+    # references were checked and HOW MANY of them were missing. Only the
+    # "a reference was found missing" failure path carries an ID_REFS
+    # marker at all (verify_id_references_resolve's own header comment:
+    # the live-fetch/existence-check failure paths return before printing
+    # one) -- the generic line below covers those, honestly, rather than
+    # printing counts it does not have.
+    case "$id_refs_output" in
+      *ID_REFS:*)
+        local idrf_summary="${id_refs_output##*ID_REFS:}"
+        local idrf_checked idrf_missing
+        idrf_checked=$(echo "$idrf_summary" | cut -d: -f1)
+        idrf_missing=$(echo "$idrf_summary" | cut -d: -f2)
+        echo "- [ ] **HARD FAIL: migrated content references id(s) that do not resolve to any post on B** (${idrf_checked} checked, ${idrf_missing} missing) — see above" >> "$report"
+        ;;
+      *)
+        echo "- [ ] **HARD FAIL: could not verify migrated content's id references against B (query failed)** — see above" >> "$report"
+        ;;
+    esac
     hard_fail=1
   else
     case "$id_refs_output" in

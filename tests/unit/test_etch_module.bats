@@ -515,6 +515,16 @@ _etch_run_captured_php() {
   [[ "$output" != *'35199'* ]] || false
 }
 
+@test "etch_post_import mediaId remap: HTML-attribute form (mediaId equals quoted 35199) is rewritten too, defensively -- fix-pack: seen in Etch editor UI, never in stored content" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t105\tpage\n35199\t763\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php 105 '<etch:img class="home-intro__featured" mediaId="35199" useSrcSet="true" />'
+  [[ "$output" == *'mediaId="763"'* ]] || false
+  [[ "$output" != *'35199'* ]] || false
+}
+
 @test "etch_post_import mediaId remap: digit-boundary safety -- remapping mediaId 1 never touches mediaId 12" {
   local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
   printf '5\t105\tpage\n1\t999\tattachment\n' > "$tsv"
@@ -568,4 +578,24 @@ _etch_run_captured_php() {
   run _etch_run_captured_php 105 '"ref":42 next to "mediaId":"42"'
   [[ "$output" == *'"ref":9001'* ]] || false
   [[ "$output" == *'"mediaId":"9002"'* ]] || false
+}
+
+@test "etch_post_import mediaId remap: an editor-internal data-etch-context ref (alphanumeric, quoted) is left untouched, not mistaken for a numeric component ref" {
+  # Fix-pack finding, confirmed live: a base64-encoded JSON blob under a
+  # data-etch-context HTML attribute (found in a real revision post) can
+  # carry its OWN "ref" key, e.g. decoded:
+  #   {"name":"If (Condition)","structureState":"open","ref":"b753cpd"}
+  # That "ref" is Etch's OWN editor-element id (the structure panel's
+  # bookkeeping), never a WordPress post id -- and it is always a quoted,
+  # non-digit string, so the digits-only "ref":N pattern this hook
+  # actually matches can never touch it. No code change needed for this;
+  # this test pins the observation so a future reader does not "fix" a
+  # false alarm here.
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t105\tpage\n42\t9001\twp_block\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php 105 ' data-etch-context="eyJyZWYiOiJiNzUzY3BkIn0=" "ref":42'
+  [[ "$output" == *'"ref":9001'* ]] || false
+  [[ "$output" == *'data-etch-context="eyJyZWYiOiJiNzUzY3BkIn0="'* ]] || false
 }

@@ -665,13 +665,15 @@ setup() {
 #
 # Every known id-bearing block attribute (mediaId, ref, parentPageID) on
 # every post THIS run imported must resolve to an existing post on B. Two
-# wp_remote calls: the first fetches migrated posts' live content (scoped
-# by id-map.tsv's non-attachment, non-term NEW ids), the second confirms
-# which of the ids found in that content actually exist on B. The stubs
-# below dispatch on the presence of "--fields=ID,post_content" (call 1)
-# vs. its absence (call 2, "--field=ID" only) — the same two-call shape
-# verify_migrated_content_matches_source's own live-fetch already uses
-# elsewhere in this file, one call reused for a second, narrower purpose.
+# wp_remote calls, each stubbed on its own distinguishing shape: call 1
+# fetches migrated posts' live content ("--fields=ID,post_content" is
+# present), call 2 confirms which of the ids found in that content
+# actually exist on B via a `wp eval` (the "eval" subcommand, not a
+# second "post list" -- fix-pack finding, see this repo's own header
+# comment on the production function for why "post list --post_type=any"
+# is not "every post type": it resolves to WordPress's own
+# exclude_from_search filter and silently drops wp_block/wp_template/
+# wp_navigation/wp_global_styles, measured directly against a real site).
 
 @test "verify_id_references_resolve is a no-op (no wp_remote call at all) when id-map.tsv does not exist" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
@@ -693,6 +695,45 @@ setup() {
   [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }
 
+@test "verify_id_references_resolve scopes its content fetch with id-map.tsv's own post types, never --post_type=any (fix-pack, flag-aware stub, execution-proven)" {
+  # The real, measured bug: --post_type=any resolves to WordPress's own
+  # exclude_from_search filter, which drops wp_block on a real Etch site
+  # (verified live: `wp post list --post__in=<a real published wp_block>
+  # --post_type=any --post_status=any` returned nothing). This stub
+  # returns the post ONLY when asked for the type id-map.tsv actually
+  # names ("wp_block"), so a regression back to --post_type=any (which
+  # this stub treats as "not wp_block") fails this test rather than
+  # passing it by accident.
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '14468\t37496\twp_block\n' > "$tsv"
+  wp_remote() {
+    shift # alias
+    local requested_type="" a
+    for a in "$@"; do
+      case "$a" in
+        --post_type=*) requested_type="${a#--post_type=}" ;;
+      esac
+    done
+    for a in "$@"; do
+      case "$a" in
+        --fields=ID,post_content)
+          if [ "$requested_type" = "wp_block" ]; then
+            echo '[{"ID":37496,"post_content":"no references here"}]'
+          else
+            echo "UNEXPECTED post_type: ${requested_type}" >&2; return 1
+          fi
+          return 0
+          ;;
+      esac
+    done
+    echo "UNEXPECTED CALL: $*" >&2; return 1
+  }
+  run verify_id_references_resolve "$run_dir" "$tsv"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ID_REFS:0:0"* ]] || false
+}
+
 @test "verify_id_references_resolve passes when every mediaId/ref/parentPageID found on B resolves to a real post" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   local tsv="${run_dir}/id-map.tsv"
@@ -705,7 +746,11 @@ setup() {
           echo '[{"ID":105,"post_content":"<!-- wp:etch/dynamic-image {\"attributes\":{\"mediaId\":\"763\"}} --><!-- wp:etch/component {\"ref\":40000} --><!-- wp:core/page-list {\"parentPageID\":50} -->"}]'
           return 0
           ;;
-        --field=ID)
+        eval)
+          # The real function's get_post()-per-id existence check --
+          # modelled here as "everything asked about exists", the same
+          # level of fidelity the sibling content-match tests use for
+          # their own live-fetch stubs.
           printf '763\n40000\n50\n'
           return 0
           ;;
@@ -730,7 +775,7 @@ setup() {
           echo '[{"ID":105,"post_content":"<!-- wp:etch/dynamic-image {\"attributes\":{\"mediaId\":\"35199\"}} -->"}]'
           return 0
           ;;
-        --field=ID)
+        eval)
           printf '' # B has nothing carrying this id -- the never-remapped case
           return 0
           ;;
@@ -760,7 +805,7 @@ setup() {
           ;;
       esac
     done
-    echo "UNEXPECTED CALL (a second wp_remote call means something was wrongly extracted): $*" >&2; return 1
+    echo "UNEXPECTED CALL (an eval call means something was wrongly extracted): $*" >&2; return 1
   }
   run verify_id_references_resolve "$run_dir" "$tsv"
   [ "$status" -eq 0 ]
@@ -788,7 +833,7 @@ setup() {
           echo '[{"ID":105,"post_content":"<!-- wp:etch/dynamic-image {\"attributes\":{\"mediaId\":\"763\"}} -->"}]'
           return 0
           ;;
-        --field=ID) return 1 ;; # second call itself fails
+        eval) return 1 ;; # second call itself fails
       esac
     done
     return 1
@@ -822,7 +867,6 @@ setup() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"ID_REFS:0:0"* ]] || false
 }
-
 # --- verify_http_smoke --------------------------------------------------------
 
 @test "verify_http_smoke is a no-op (passes) when no URL is configured" {
@@ -2601,7 +2645,7 @@ EOF
           echo '[{"ID":105,"post_content":"<!-- wp:etch/dynamic-image {\"attributes\":{\"mediaId\":\"763\"}} -->"}]'
           return 0
           ;;
-        --field=ID) printf '763\n'; return 0 ;;
+        eval) printf '763\n'; return 0 ;;
       esac
     done
     case "$1" in
@@ -2624,7 +2668,7 @@ EOF
           echo '[{"ID":105,"post_content":"<!-- wp:etch/dynamic-image {\"attributes\":{\"mediaId\":\"35199\"}} -->"}]'
           return 0
           ;;
-        --field=ID) printf ''; return 0 ;; # never remapped -- B has nothing carrying it
+        eval) printf ''; return 0 ;; # never remapped -- B has nothing carrying it
       esac
     done
     case "$1" in
@@ -2636,6 +2680,11 @@ EOF
   [ "$status" -eq 1 ]
   grep -q "Result: HARD FAIL" "${RUN_DIR}/verify-report.md"
   grep "HARD FAIL" "${RUN_DIR}/verify-report.md" | grep -qi "id"
+  # fix-pack: counts must survive onto the HARD FAIL line itself, not just
+  # the pass line -- an operator staring at a red report needs to see
+  # HOW MANY references were checked and HOW MANY were missing without
+  # scrolling up to the raw log_error line.
+  grep "HARD FAIL" "${RUN_DIR}/verify-report.md" | grep -qi "1 checked, 1 missing"
 }
 
 # --- phase_verify + content guards (issue #52, end-to-end) ------------------
