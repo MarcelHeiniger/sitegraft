@@ -382,15 +382,29 @@ _plan_normalize_remap_url() {
   # cannot produce a doubled slash, but a hand-typed profile value can.
   # The loop below closes it.
   #
-  # Surrounding whitespace is refused rather than trimmed: a `from` with
+  # Whitespace ANYWHERE is refused rather than trimmed -- the glob below
+  # is `*[[:space:]]*`, so it also catches an INTERNAL space
+  # ("https://a b.example.com"), which no amount of trimming could fix and
+  # which the URL regex would otherwise accept (`[^/?#]+` matches a
+  # space). Refusing the whole class uniformly is what makes that safe.
+  # A `from` with
   # a stray space matches nothing in B's content, so the remap is a
   # silent no-op that verify then reports green — the same false-green
   # this issue exists to kill. A leading space was already refused by the
   # anchored regex; a trailing one was not, because `%/` does not fire
   # when the last character is a space. Copy-paste into a profile makes
-  # that plausible, so both ends are rejected explicitly and loudly.
+  # that plausible, so every position is rejected explicitly and loudly.
+  #
+  # A NON-BREAKING space (U+00A0) is a routine copy-paste artifact from
+  # rendered pages, and `[[:space:]]` does NOT match it outside a UTF-8
+  # locale -- measured: caught under en_US.UTF-8 and de_CH.UTF-8, MISSED
+  # under C/POSIX and fr_FR.ISO8859-1. sitegraft runs on orchestrators
+  # where LC_ALL=C is the norm (cron, CI, a bare SSH environment), which
+  # is exactly where it would slip through, match nothing in B's content,
+  # and leave a silent no-op remap under a green verify. Matched
+  # explicitly by its UTF-8 bytes so the guard does not depend on locale.
   case "$url" in
-    *[[:space:]]*)
+    *[[:space:]]*|*$'\xc2\xa0'*)
       log_error "plan: refusing to build a domain remap — ${label} ('${url}') contains whitespace. A remap source carrying a stray space matches nothing in B's content, so the remap would be a silent no-op that verify then reports green (issue #73). Remove the space and try again."
       return 1
       ;;
@@ -840,7 +854,7 @@ _phase_plan_build() {
     # from a claim a module could not produce must never reach the freeze
     # step (docs/decisions/0007-module-dynamic-selections.md).
     manifest=$(plan_defaults "${run_dir}/scan-a.json" "${run_dir}/scan-b.json" "$profile") || {
-      log_error "could not build the default selections from the discovered modules — no manifest will be frozen from this run"
+      log_error "could not build the default selections — no manifest will be frozen from this run. The specific reason is in the error immediately above; plan_defaults refuses for a module whose dynamic selection failed, and also (since #73) for a domain-remap value that does not parse or carries whitespace. Naming only modules here used to be accurate and no longer is."
       return 1
     }
     manifest=$(plan_custom_code_gate "$manifest" "$(cat "${run_dir}/scan-b.json")") || return 1

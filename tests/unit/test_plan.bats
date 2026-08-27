@@ -522,6 +522,16 @@ EOF
 # `${url%/}` must redden the doubled-slash cases, and dropping the
 # whitespace guard must redden the whitespace ones.
 
+@test "_plan_normalize_remap_url REFUSES a non-breaking space, in every locale (NIT, #73)" {
+  # U+00A0 is not matched by [[:space:]] outside a UTF-8 locale, and
+  # sitegraft's orchestrators routinely run under LC_ALL=C. Asserted
+  # under C explicitly, since that is the case the glob had to be
+  # widened for -- a UTF-8-only pass would prove nothing about it.
+  run --separate-stderr env LC_ALL=C bash -c '. lib/core.sh; . lib/plan.sh; _plan_normalize_remap_url "test" "https://a.example.com/blog$(printf "\xc2\xa0")"'
+  [ "$status" -eq 1 ]
+  [[ "$stderr" == *"whitespace"* ]] || false
+}
+
 @test "_plan_normalize_remap_url strips a DOUBLED trailing slash, not just one (NIT, #73)" {
   run _plan_normalize_remap_url "test" "https://a.example.com//"
   [ "$status" -eq 0 ]
@@ -540,6 +550,12 @@ EOF
   [[ "$stderr" == *"contains whitespace"* ]] || false
 }
 
+# The stderr assertion below is LOAD-BEARING, not decoration: with the
+# whitespace guard removed, a leading space is still refused by the
+# anchored URL regex, so `[ "$status" -eq 1 ]` passes on the broken code.
+# Only the message distinguishes "refused for whitespace" from "refused
+# as a malformed URL" -- verified by mutation. Do not "tidy" this down to
+# a bare status check; that would make the test vacuous.
 @test "_plan_normalize_remap_url REFUSES a value with a leading space, with the whitespace reason rather than the malformed-URL one (NIT, #73)" {
   run --separate-stderr _plan_normalize_remap_url "test" " https://a.example.com"
   [ "$status" -eq 1 ]
