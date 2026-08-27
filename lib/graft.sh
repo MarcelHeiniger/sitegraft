@@ -29,6 +29,27 @@
 
 graft_local_prefix() { _backup_local_exec_prefix "$1"; }
 
+# graft_ssh_host <alias> — SITE_<ALIAS>_SSH_HOST, or empty for a local
+# alias. The single point every file-transfer helper below consults FIRST,
+# before graft_local_prefix, so ssh-remote can never again be a shape a
+# caller has to remember to check for itself (issue #77: three of six
+# graft_push_file call sites never did, and broke the first real migration
+# onto a genuine remote B — see this file's own top-of-file header comment
+# and the PR that added this function for the full story).
+#
+# Deliberately does NOT also resolve SITE_<ALIAS>_SSH_KEY — that is issue
+# #75 (a dedicated key only ever reaches wp_remote, lib/inventory.sh), a
+# real but separate gap. This is nonetheless the right place for that fix
+# to land later: whatever ssh/rsync invocation it needs to add (-i/
+# IdentityFile) belongs here, once, rather than re-diverging across every
+# caller a second time.
+graft_ssh_host() {
+  local alias_lc="$1"
+  local alias_uc; alias_uc=$(printf '%s' "$alias_lc" | tr '[:lower:]' '[:upper:]')
+  local host_var="SITE_${alias_uc}_SSH_HOST"
+  printf '%s' "${!host_var:-}"
+}
+
 # graft_pull_dir <alias> <src_dir_on_alias> <host_dest_dir> — pull a whole
 # directory FROM <alias> (A or B) TO the orchestrator. Mirrors
 # backup_wp_content's tar-through-the-wrapper technique for a wrapped-local
@@ -61,6 +82,16 @@ graft_pull_dir() {
 # (bsdtar), so this is portable without an extra dependency.
 graft_push_dir() {
   local alias_lc="$1" host_src_dir="$2" dest_dir="$3" mode="${4:-}"
+  local ssh_host; ssh_host=$(graft_ssh_host "$alias_lc")
+  if [ -n "$ssh_host" ]; then
+    run_or_echo ssh -- "$ssh_host" "mkdir -p $(sq "$dest_dir")"
+    if [ "$mode" = "--keep-existing" ]; then
+      run_or_echo rsync -avz --ignore-existing "${host_src_dir%/}/" "${ssh_host}:${dest_dir%/}/"
+    else
+      run_or_echo rsync -avz "${host_src_dir%/}/" "${ssh_host}:${dest_dir%/}/"
+    fi
+    return
+  fi
   local prefix; prefix=$(graft_local_prefix "$alias_lc")
   if [ -n "$prefix" ]; then
     local untar_opts="-x -z -f -"
@@ -119,9 +150,17 @@ graft_push_dir() {
 }
 
 # graft_push_file <alias> <host_file> <dest_dir_on_alias> <dest_name> — push
-# a single file (the mapping mu-plugin is the only caller today).
+# a single file. Every real (non-mocked) caller today pushes onto B: the
+# mapping mu-plugin, the media-import and content-remap PHP libraries, and
+# the id-remap/domain-remap JSON payloads.
 graft_push_file() {
   local alias_lc="$1" host_file="$2" dest_dir="$3" dest_name="$4"
+  local ssh_host; ssh_host=$(graft_ssh_host "$alias_lc")
+  if [ -n "$ssh_host" ]; then
+    run_or_echo ssh -- "$ssh_host" "mkdir -p $(sq "$dest_dir")"
+    run_or_echo rsync -avz "$host_file" "${ssh_host}:${dest_dir}/${dest_name}"
+    return
+  fi
   local prefix; prefix=$(graft_local_prefix "$alias_lc")
   if [ -n "$prefix" ]; then
     run_or_echo bash -c "${prefix} mkdir -p '${dest_dir}' && ${prefix} tee '${dest_dir}/${dest_name}' >/dev/null < '${host_file}'"
@@ -132,9 +171,16 @@ graft_push_file() {
 }
 
 # graft_remove_file <alias> <path_on_alias> — remove a single file on A/B
-# (the mapping mu-plugin's own removal is the only caller today).
+# (the mapping mu-plugin's own removal, and the media-import/content-remap
+# libraries' and id-remap/domain-remap payloads' own cleanup, right after
+# graft_push_file above put them there).
 graft_remove_file() {
   local alias_lc="$1" path="$2"
+  local ssh_host; ssh_host=$(graft_ssh_host "$alias_lc")
+  if [ -n "$ssh_host" ]; then
+    run_or_echo ssh -- "$ssh_host" "rm -f $(sq "$path")"
+    return
+  fi
   local prefix; prefix=$(graft_local_prefix "$alias_lc")
   if [ -n "$prefix" ]; then
     run_or_echo bash -c "${prefix} rm -f '${path}'"
@@ -222,13 +268,9 @@ graft_copy_wp_content_dir() {
     run_or_echo rsync -avz "${SITE_A_WP_PATH}/${rel_dir}/" "${staging}/"
   fi
 
-  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
-    run_or_echo rsync -avz "${staging}/" "${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/${rel_dir}/"
-  elif [ -n "$(graft_local_prefix b)" ]; then
-    graft_push_dir b "$staging" "${SITE_B_WP_PATH}/${rel_dir}"
-  else
-    run_or_echo rsync -avz "${staging}/" "${SITE_B_WP_PATH}/${rel_dir}/"
-  fi
+  # graft_push_dir itself now handles all three shapes (ssh-remote,
+  # wrapped-local, bare-local) — see its own header comment.
+  graft_push_dir b "$staging" "${SITE_B_WP_PATH}/${rel_dir}"
 }
 
 # graft_sync_theme_parent <child_slug> <run_dir> — a child theme cannot be
@@ -389,22 +431,17 @@ graft_media_sync() {
     graft_pull_dir a "${SITE_A_WP_PATH}/wp-content/uploads" "$staging"
   fi
   log_info "pushing media to B (never overwriting existing files)..."
-  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
-    run_or_echo rsync -avz --ignore-existing "${staging}/" "${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/wp-content/uploads/"
-  else
-    graft_push_dir b "$staging" "${SITE_B_WP_PATH}/wp-content/uploads" --keep-existing
-  fi
+  # graft_push_dir itself now handles all three shapes (ssh-remote,
+  # wrapped-local, bare-local) — see its own header comment.
+  graft_push_dir b "$staging" "${SITE_B_WP_PATH}/wp-content/uploads" --keep-existing
 }
 
 graft_deploy_mu_plugin() {
   local mu_dir="${SITE_B_WP_PATH}/wp-content/mu-plugins"
   local src="${SITEGRAFT_ROOT}/mu-plugins/sitegraft-id-mapper.php"
-  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
-    run_or_echo ssh -- "$SITE_B_SSH_HOST" "mkdir -p $(sq "$mu_dir")"
-    run_or_echo rsync -avz "$src" "${SITE_B_SSH_HOST}:${mu_dir}/sitegraft-id-mapper.php"
-  else
-    graft_push_file b "$src" "$mu_dir" "sitegraft-id-mapper.php"
-  fi
+  # graft_push_file itself now handles all three shapes (ssh-remote,
+  # wrapped-local, bare-local) — see its own header comment.
+  graft_push_file b "$src" "$mu_dir" "sitegraft-id-mapper.php"
 }
 
 # Recommended (Marcel's nightshift mandate): callers wrap this in a trap so
@@ -413,11 +450,9 @@ graft_deploy_mu_plugin() {
 # on a failed run would be a silent, ongoing side effect on B.
 graft_remove_mu_plugin() {
   local target="${SITE_B_WP_PATH}/wp-content/mu-plugins/sitegraft-id-mapper.php"
-  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
-    run_or_echo ssh -- "$SITE_B_SSH_HOST" "rm -f $(sq "$target")"
-  else
-    graft_remove_file b "$target"
-  fi
+  # graft_remove_file itself now handles all three shapes (ssh-remote,
+  # wrapped-local, bare-local) — see its own header comment.
+  graft_remove_file b "$target"
 }
 
 # --- Task 4.2: WXR export/import, integrity gate, importer provisioning ---
@@ -1974,11 +2009,9 @@ graft_search_replace_domain() {
 # than a "first run vs. resume" branch.
 graft_reset_id_map_log() {
   local target="${SITE_B_WP_PATH}/wp-content/sitegraft-id-map.log"
-  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
-    run_or_echo ssh -- "$SITE_B_SSH_HOST" "rm -f $(sq "$target")"
-  else
-    graft_remove_file b "$target"
-  fi
+  # graft_remove_file itself now handles all three shapes (ssh-remote,
+  # wrapped-local, bare-local) — see its own header comment.
+  graft_remove_file b "$target"
 }
 
 # design doc §11 "idempotent reimport": before importing, delete any post B already
