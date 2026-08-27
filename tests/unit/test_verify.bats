@@ -661,6 +661,168 @@ setup() {
   [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }
 
+# --- verify_id_references_resolve (issue #84) --------------------------------
+#
+# Every known id-bearing block attribute (mediaId, ref, parentPageID) on
+# every post THIS run imported must resolve to an existing post on B. Two
+# wp_remote calls: the first fetches migrated posts' live content (scoped
+# by id-map.tsv's non-attachment, non-term NEW ids), the second confirms
+# which of the ids found in that content actually exist on B. The stubs
+# below dispatch on the presence of "--fields=ID,post_content" (call 1)
+# vs. its absence (call 2, "--field=ID" only) — the same two-call shape
+# verify_migrated_content_matches_source's own live-fetch already uses
+# elsewhere in this file, one call reused for a second, narrower purpose.
+
+@test "verify_id_references_resolve is a no-op (no wp_remote call at all) when id-map.tsv does not exist" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  run verify_id_references_resolve "$run_dir" "${run_dir}/id-map.tsv"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ID_REFS:0:0"* ]] || false
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
+@test "verify_id_references_resolve is a no-op when id-map.tsv has only attachment rows (nothing migrated for a reference to live inside)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '900\t901\tattachment\n' > "$tsv"
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  run verify_id_references_resolve "$run_dir" "$tsv"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ID_REFS:0:0"* ]] || false
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
+@test "verify_id_references_resolve passes when every mediaId/ref/parentPageID found on B resolves to a real post" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '5\t105\tpage\n' > "$tsv"
+  wp_remote() {
+    shift # alias
+    for a in "$@"; do
+      case "$a" in
+        --fields=ID,post_content)
+          echo '[{"ID":105,"post_content":"<!-- wp:etch/dynamic-image {\"attributes\":{\"mediaId\":\"763\"}} --><!-- wp:etch/component {\"ref\":40000} --><!-- wp:core/page-list {\"parentPageID\":50} -->"}]'
+          return 0
+          ;;
+        --field=ID)
+          printf '763\n40000\n50\n'
+          return 0
+          ;;
+      esac
+    done
+    echo "UNEXPECTED CALL: $*" >&2; return 1
+  }
+  run verify_id_references_resolve "$run_dir" "$tsv"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ID_REFS:3:0"* ]] || false
+}
+
+@test "verify_id_references_resolve fails when a mediaId does not resolve to any post on B (issue #84's own defect, reproduced)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '5\t105\tpage\n' > "$tsv"
+  wp_remote() {
+    shift
+    for a in "$@"; do
+      case "$a" in
+        --fields=ID,post_content)
+          echo '[{"ID":105,"post_content":"<!-- wp:etch/dynamic-image {\"attributes\":{\"mediaId\":\"35199\"}} -->"}]'
+          return 0
+          ;;
+        --field=ID)
+          printf '' # B has nothing carrying this id -- the never-remapped case
+          return 0
+          ;;
+      esac
+    done
+    echo "UNEXPECTED CALL: $*" >&2; return 1
+  }
+  run verify_id_references_resolve "$run_dir" "$tsv"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"ID_REFS:1:1"* ]] || false
+}
+
+@test "verify_id_references_resolve passes with 0 references when migrated content carries none of the three known attributes" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '5\t105\tpage\n' > "$tsv"
+  wp_remote() {
+    shift
+    for a in "$@"; do
+      case "$a" in
+        --fields=ID,post_content)
+          # A heading's "level":1 and similar plain numeric JSON fields must
+          # never be mistaken for an id reference -- only the three known
+          # attribute NAMES are matched, never a bare number.
+          echo '[{"ID":105,"post_content":"<!-- wp:heading {\"level\":1} --><h1>Hi</h1><!-- /wp:heading -->"}]'
+          return 0
+          ;;
+      esac
+    done
+    echo "UNEXPECTED CALL (a second wp_remote call means something was wrongly extracted): $*" >&2; return 1
+  }
+  run verify_id_references_resolve "$run_dir" "$tsv"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ID_REFS:0:0"* ]] || false
+}
+
+@test "verify_id_references_resolve treats a failed live-content fetch as UNKNOWN, never as a silent pass" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '5\t105\tpage\n' > "$tsv"
+  wp_remote() { return 1; } # B unreachable / query error
+  run verify_id_references_resolve "$run_dir" "$tsv"
+  [ "$status" -eq 1 ]
+}
+
+@test "verify_id_references_resolve treats a failed existence check as UNKNOWN, never as a silent pass" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '5\t105\tpage\n' > "$tsv"
+  wp_remote() {
+    shift
+    for a in "$@"; do
+      case "$a" in
+        --fields=ID,post_content)
+          echo '[{"ID":105,"post_content":"<!-- wp:etch/dynamic-image {\"attributes\":{\"mediaId\":\"763\"}} -->"}]'
+          return 0
+          ;;
+        --field=ID) return 1 ;; # second call itself fails
+      esac
+    done
+    return 1
+  }
+  run verify_id_references_resolve "$run_dir" "$tsv"
+  [ "$status" -eq 1 ]
+}
+
+@test "verify_id_references_resolve excludes attachment and term: rows from scope, same as the content-equality guard" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '5\t105\tpage\n900\t901\tattachment\n3\t14\tterm:category\n' > "$tsv"
+  wp_remote() {
+    shift
+    for a in "$@"; do
+      case "$a" in
+        --fields=ID,post_content)
+          # If 901 or 14 leaked into scope, they would appear in the
+          # --post__in list the real function builds -- asserted on
+          # indirectly here by simply not stubbing that behavior differently;
+          # the direct, load-bearing assertion is that this stub is only
+          # ever asked about 105.
+          echo '[{"ID":105,"post_content":"no references here"}]'
+          return 0
+          ;;
+      esac
+    done
+    echo "UNEXPECTED CALL: $*" >&2; return 1
+  }
+  run verify_id_references_resolve "$run_dir" "$tsv"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ID_REFS:0:0"* ]] || false
+}
+
 # --- verify_http_smoke --------------------------------------------------------
 
 @test "verify_http_smoke is a no-op (passes) when no URL is configured" {
@@ -1029,6 +1191,17 @@ EOF
 @test "phase_verify writes a report and exits 0 when every check passes" {
   setup_phase_verify_fixture
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;;                 # db export (nothing protected to hash)
@@ -1067,6 +1240,17 @@ EOF
 @test "phase_verify --dry-run still runs the real checks and passes on a correct graft (MAJOR-A: dry-run must never fake a HARD FAIL)" {
   setup_phase_verify_fixture
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     if is_dry_run; then
       echo "[dry-run] wp_remote ${alias_lc} $*"
@@ -1095,6 +1279,17 @@ EOF
 @test "phase_verify also honors SITEGRAFT_DRY_RUN=1 as an env var the same way --dry-run does (MAJOR-A, env-var path)" {
   setup_phase_verify_fixture
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     if is_dry_run; then
       echo "[dry-run] wp_remote ${alias_lc} $*"
@@ -1143,6 +1338,17 @@ EOF
 }
 EOF
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       eval) echo "wp_" ;; # inventory_table_prefix
@@ -1171,6 +1377,17 @@ EOF
 }
 EOF
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       eval) echo "wp_" ;;
@@ -1195,6 +1412,17 @@ EOF
   graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   graft_remove_file() { :; }
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       eval) echo "HIT:post:105" ;;
@@ -1217,6 +1445,17 @@ EOF
   graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   graft_remove_file() { :; }
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       eval) echo "OK" ;;
@@ -1237,6 +1476,17 @@ EOF
 @test "phase_verify hard-fails when the orphan post_parent check itself errors (fail closed, not open)" {
   setup_phase_verify_fixture
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       eval) echo "" ;;
@@ -1255,6 +1505,17 @@ EOF
 @test "phase_verify reports found orphans as a warning, not a hard fail" {
   setup_phase_verify_fixture
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       eval) echo "" ;;
@@ -1284,6 +1545,17 @@ EOF
 }
 EOF
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;;
@@ -1326,6 +1598,17 @@ EOF
 }
 EOF
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       eval) echo "wp_" ;;
@@ -1345,6 +1628,17 @@ EOF
 @test "phase_verify's domain line explicitly marks the check not applicable when no domain is configured (not indistinguishable from a real pass)" {
   setup_phase_verify_fixture
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;;
@@ -1389,6 +1683,17 @@ EOF
   # (a run interrupted before migrate_options and then resumed past it).
   rm -f "${RUN_DIR}"/option-*.value
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       eval) echo "wp_" ;;
@@ -1419,6 +1724,17 @@ EOF
   printf '{"a":1}' > "${RUN_DIR}/option-etch_settings.value"
   printf '{"b":2}' > "${RUN_DIR}/option-etch_styles.value"
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;;
@@ -1463,6 +1779,17 @@ EOF
 EOF
   rm -f "${RUN_DIR}"/option-*.value # nothing written this run — interrupted before migrate_options
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;;
@@ -1486,6 +1813,17 @@ EOF
 @test "phase_verify's Result stays PASS with exit status 0 when nothing at all was selected for option migration (0 of 0 is not incomplete)" {
   setup_phase_verify_fixture # shared fixture only selects page_on_front (excluded from the options count) -> 0 of 0
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;;
@@ -1503,6 +1841,17 @@ EOF
 @test "phase_verify's Result stays PASS with exit status 0 when no domain was configured (not applicable is a known fact, not an uncertainty)" {
   setup_phase_verify_fixture
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;;
@@ -1527,6 +1876,17 @@ EOF
   setup_phase_verify_fixture
   rm -f "${RUN_DIR}/option-page_on_front.value" # selected (see fixture manifest) but never written this run
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;;
@@ -1560,6 +1920,17 @@ EOF
 EOF
   rm -f "${RUN_DIR}/option-etch_settings.value" # etch_settings selected but never written -> incomplete
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       eval) echo "wp_" ;;
@@ -1589,6 +1960,17 @@ EOF
   graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   graft_remove_file() { :; }
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       eval) echo "OK" ;;
@@ -1621,6 +2003,17 @@ EOF
   graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
   graft_remove_file() { :; }
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       eval) echo "OK" ;;
@@ -1652,6 +2045,17 @@ EOF
 @test "phase_verify exits 1 with Result: HARD FAIL when page_on_front on B is not the remapped page (issue #12's actual acceptance criterion)" {
   setup_phase_verify_fixture
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;;
@@ -1681,6 +2085,17 @@ EOF
 EOF
   printf '"dark"' > "${RUN_DIR}/option-etch_settings.value" # what graft migrated from A
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;;
@@ -1709,6 +2124,17 @@ EOF
 }
 EOF
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;;
@@ -1734,6 +2160,17 @@ EOF
 @test "phase_verify's page_on_front line says VERIFIED, and names the page, when the remap really was checked against B" {
   setup_phase_verify_fixture
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;;
@@ -1766,6 +2203,17 @@ EOF
 }
 EOF
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;;
@@ -1785,6 +2233,17 @@ EOF
   setup_phase_verify_fixture
   printf '"0"' > "${RUN_DIR}/option-page_on_front.value" # A's own value: A had no front page
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;;
@@ -1808,6 +2267,17 @@ EOF
   setup_phase_verify_fixture
   verify_page_on_front() { return 0; } # a future success path that forgot its marker
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;;
@@ -1830,6 +2300,17 @@ EOF
 @test "phase_verify marks the skipped HTTP smoke check as a ticked not-applicable, never as an unchecked box" {
   setup_phase_verify_fixture
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;;
@@ -1881,6 +2362,17 @@ EOF
 }
 EOF
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;;
@@ -1914,6 +2406,17 @@ EOF
 EOF
   rm -f "${RUN_DIR}"/option-*.value
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;;
@@ -1957,6 +2460,17 @@ EOF
   export SITEGRAFT_ROOT
   command -v php >/dev/null 2>&1 || skip "php CLI not available in this environment"
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;;
@@ -1977,6 +2491,17 @@ EOF
 @test "phase_verify's navigation line says NOT SELECTED, distinctly, when wp_navigation was not part of this run's migrate selection" {
   setup_phase_verify_fixture # fixture migrates post_types ["page"], never wp_navigation
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;;
@@ -2005,6 +2530,17 @@ EOF
   jq '.options.search_replace.from = "https://a.example.com"' "${RUN_DIR}/manifest.json" > "${RUN_DIR}/m.tmp" && mv "${RUN_DIR}/m.tmp" "${RUN_DIR}/manifest.json"
   verify_domain_absent() { return 0; } # a future success path that forgot its DOMAIN_SCOPE marker
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;; option) echo "105" ;; post) return 0 ;; *) echo "" ;;
@@ -2026,6 +2562,17 @@ EOF
   setup_phase_verify_fixture
   verify_nav_present() { return 0; } # a future success path that forgot its marker
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;; option) echo "105" ;; post) return 0 ;; *) echo "" ;;
@@ -2036,6 +2583,59 @@ EOF
   [ "$status" -eq 2 ]
   grep -q "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md"
   grep "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md" | grep -qi "navigation"
+}
+
+# --- phase_verify + verify_id_references_resolve wiring (issue #84) ---------
+# The direct pass/fail logic of verify_id_references_resolve itself is
+# already exercised in full, above ("verify_id_references_resolve" section)
+# — these two tests are only about the WIRING: does phase_verify's report
+# line and overall Result reflect what the check actually found.
+
+@test "phase_verify's id-references line reports a real count and stays a PASS when every reference resolves" {
+  setup_phase_verify_fixture
+  wp_remote() {
+    local alias_lc="$1"; shift
+    for a in "$@"; do
+      case "$a" in
+        --fields=ID,post_content)
+          echo '[{"ID":105,"post_content":"<!-- wp:etch/dynamic-image {\"attributes\":{\"mediaId\":\"763\"}} -->"}]'
+          return 0
+          ;;
+        --field=ID) printf '763\n'; return 0 ;;
+      esac
+    done
+    case "$1" in
+      db) echo "" ;; option) echo "105" ;; post) return 0 ;; *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  grep -qF -- "- [x] id references (mediaId/ref/parentPageID) in migrated content resolve on B (1 checked, 0 missing)" "${RUN_DIR}/verify-report.md"
+}
+
+@test "phase_verify HARD FAILS when migrated content references a mediaId that does not resolve to any post on B (issue #84's own defect)" {
+  setup_phase_verify_fixture
+  wp_remote() {
+    local alias_lc="$1"; shift
+    for a in "$@"; do
+      case "$a" in
+        --fields=ID,post_content)
+          echo '[{"ID":105,"post_content":"<!-- wp:etch/dynamic-image {\"attributes\":{\"mediaId\":\"35199\"}} -->"}]'
+          return 0
+          ;;
+        --field=ID) printf ''; return 0 ;; # never remapped -- B has nothing carrying it
+      esac
+    done
+    case "$1" in
+      db) echo "" ;; option) echo "105" ;; post) return 0 ;; *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 1 ]
+  grep -q "Result: HARD FAIL" "${RUN_DIR}/verify-report.md"
+  grep "HARD FAIL" "${RUN_DIR}/verify-report.md" | grep -qi "id"
 }
 
 # --- phase_verify + content guards (issue #52, end-to-end) ------------------
@@ -2083,6 +2683,17 @@ XML
   }' > "${RUN_DIR}/manifest.json"
 
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1 $2" in
       "post list") echo '[{"ID":16,"post_content":"B old front page","post_excerpt":""}]' ;;
@@ -2156,6 +2767,17 @@ XML
   }' > "${RUN_DIR}/manifest.json"
 
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     local a
     for a in "$@"; do
@@ -2223,6 +2845,17 @@ XML
   }' > "${RUN_DIR}/manifest.json"
 
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1 $2" in
       "post list") echo '[{"ID":105,"post_content":"<p>New design from A</p>","post_excerpt":""}]' ;;
@@ -2241,6 +2874,17 @@ XML
   setup_phase_verify_fixture
   jq '.migrate = {"core-wp": {"post_types": ["page"], "option_keys": []}}' "${RUN_DIR}/manifest.json" > "${RUN_DIR}/manifest.json.tmp" && mv "${RUN_DIR}/manifest.json.tmp" "${RUN_DIR}/manifest.json"
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     case "$1" in
       db) echo "" ;; option) echo "105" ;; post) return 0 ;; *) echo "" ;;
@@ -2301,6 +2945,17 @@ XML
   }' > "${RUN_DIR}/manifest.json"
 
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     if is_dry_run; then
       echo "[dry-run] wp_remote ${alias_lc} $*"
@@ -2348,6 +3003,17 @@ XML
   # that real behavior instead of ignoring the flag the way most other
   # stubs in this file do.
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     local requested_type="post" a
     for a in "$@"; do
@@ -2385,6 +3051,17 @@ XML
   : > "${run_dir}/module-content-rewrites.tsv"
 
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift
     local requested_type="post" a
     for a in "$@"; do
@@ -2444,6 +3121,17 @@ XML
     printf '%s' '[{"post_id":5,"post_type":"page","post_content":"ref-14468","post_excerpt":""},{"post_id":6,"post_type":"page","post_content":"hello","post_excerpt":""}]'
   }
   wp_remote() {
+  # issue #84: phase_verify now also calls verify_id_references_resolve,
+  # which issues a wp_remote post-list call carrying
+  # "--fields=ID,post_content" that no pre-existing stub below anticipates.
+  # Short-circuited to an empty result here, uniformly, BEFORE each
+  # test's own dispatch logic runs: none of these tests are about
+  # mediaId/ref/parentPageID content, so "nothing found, nothing to
+  # verify" is the correct, harmless answer for all of them -- and
+  # confirmed harmless by tests/unit/test_verify.bats' own dedicated
+  # verify_id_references_resolve section, which exercises the real
+  # pass/fail logic directly.
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     # 105 must NEVER be fetched (it is excluded before any live read) --
     # only 106 should appear in the --post__in list.
     local a

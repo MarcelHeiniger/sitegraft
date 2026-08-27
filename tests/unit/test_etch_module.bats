@@ -326,11 +326,17 @@ _etch_capture_eval() {
   grep -q '"14468":15506' "$BATS_TEST_TMPDIR/php.txt"
   grep -q '"14279":15505' "$BATS_TEST_TMPDIR/php.txt"
   # `"ref"` addresses blocks; feeding attachment ids in would only give a
-  # numeric coincidence something to match. Written as an explicit if/return
-  # (SC2314) rather than `! grep -q ... || false` as the test's last
-  # statement — that shape is only load-bearing because nothing follows it;
-  # an assertion appended after it would silently stop being checked.
-  if grep -q '"900"' "$BATS_TEST_TMPDIR/php.txt"; then
+  # numeric coincidence something to match. Checked against the \$map line
+  # SPECIFICALLY (issue #84: the file as a whole now legitimately mentions
+  # "900" too, in the SEPARATE \$media_map line -- checking the whole file,
+  # as this test used to, would fail on that correct new behavior). Written
+  # as an explicit if/return (SC2314) rather than `! grep -q ... || false`
+  # as the test's last statement — that shape is only load-bearing because
+  # nothing follows it; an assertion appended after it would silently stop
+  # being checked.
+  local map_line
+  map_line=$(grep '^\$map = json_decode' "$BATS_TEST_TMPDIR/php.txt")
+  if printf '%s' "$map_line" | grep -q '"900"'; then
     echo "attachment id leaked into the ref map" >&2; return 1
   fi
 }
@@ -405,4 +411,161 @@ _etch_capture_eval() {
   [ "$status" -eq 0 ]
   [ ! -f "${run_dir}/module-content-rewrites.tsv" ]
   [[ "$output" == *"[dry-run]"* ]] || false
+}
+
+# --- etch_post_import: mediaId (issue #84) -----------------------------------
+#
+# wp:etch/dynamic-image addresses its media by ATTACHMENT id, under a
+# differently-named attribute ("mediaId", not "id"), so neither graft's
+# generic content remap (lib/php/content-remap-functions.php, which only
+# ever matches the literal key "id") nor this hook's own pre-existing "ref"
+# remap (a DIFFERENT id space -- component/template posts, never
+# attachments) ever touched it. Measured on a real graft: 12 distinct
+# mediaId values, 12 of 12 broken, all already present in id-map.tsv.
+
+@test "etch_post_import builds its media map from attachment rows only, the OPPOSITE filter of the ref map" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '14468\t15506\twp_block\n900\t901\tattachment\n35199\t763\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  # media_map must carry the attachment rows...
+  grep -q '"900":901' "$BATS_TEST_TMPDIR/php.txt"
+  grep -q '"35199":763' "$BATS_TEST_TMPDIR/php.txt"
+  # ...and media_map must be a SEPARATE variable from map (the ref map),
+  # which must still carry only the non-attachment row.
+  grep -q '\$media_map = json_decode' "$BATS_TEST_TMPDIR/php.txt"
+  grep -q '"14468":15506' "$BATS_TEST_TMPDIR/php.txt"
+}
+
+@test "etch_post_import does nothing (no eval call at all) when the run mapped only attachments (no post to scan)" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '900\t901\tattachment\n' > "$tsv"
+  rm -f "$BATS_TEST_TMPDIR/php.txt"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  # Unchanged behavior from before mediaId existed (see the sibling test
+  # above this section): zero non-attachment rows means zero posts in
+  # scope for EITHER map, attachments included -- there is no migrated
+  # post left for a mediaId reference to even live inside.
+  [ ! -f "$BATS_TEST_TMPDIR/php.txt" ]
+}
+
+# _etch_run_captured_php <post_id> <post_content> — executes the REAL PHP
+# text etch_post_import handed to `wp eval` (captured by _etch_capture_eval
+# above, verbatim, never a second hand-copied version of the substitution
+# logic) against a minimal, purpose-built WordPress stub: get_post_field
+# returns the given canned content for the given id, $wpdb->update records
+# what it was asked to write, clean_post_cache is a no-op. Prints the
+# post_content $wpdb->update was actually called with, or the literal
+# string "NO-WRITE" if $wpdb->update was never called (content unchanged).
+#
+# A dedicated, tiny stub rather than tests/unit/fixtures/wpstub.php: that
+# file's own get_post_field models a "display" context filter prefix
+# ("DISPLAYFILTERED:") that is real WordPress behavior for OTHER fields,
+# but orthogonal to what this test is proving, and reusing it here would
+# make every assertion below account for a prefix that has nothing to do
+# with mediaId's own correctness.
+_etch_run_captured_php() {
+  local post_id="$1" content="$2"
+  # Dynamic values reach PHP as real $argv entries (after --), never
+  # interpolated into the PHP source string itself -- sidesteps the
+  # nested-quoting mess a bash command substitution embedded inside a
+  # single-quoted `php -r` argument would otherwise be.
+  php -r '
+    $post_id = (int) $argv[1];
+    $content = $argv[2];
+    $capture_file = $argv[3];
+    function get_post_field( $field, $id ) {
+      global $post_id, $content;
+      return ( $field === "post_content" && $id === $post_id ) ? $content : "";
+    }
+    function clean_post_cache( $id ) {}
+    class _EtchTestWpdb {
+      public $posts = "wp_posts";
+      public function update( $table, $data, $where ) {
+        echo $data["post_content"];
+        return 1;
+      }
+    }
+    $GLOBALS["wpdb"] = new _EtchTestWpdb();
+    ob_start();
+    eval( file_get_contents( $capture_file ) );
+    $out = ob_get_clean();
+    echo ( $out === "" ) ? "NO-WRITE" : $out;
+  ' -- "$post_id" "$content" "$BATS_TEST_TMPDIR/php.txt"
+}
+
+@test "etch_post_import mediaId remap: quoted-string form is rewritten to the new attachment id, quotes preserved" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t105\tpage\n35199\t763\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php 105 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"35199"}} -->'
+  [[ "$output" == *'"mediaId":"763"'* ]] || false
+  [[ "$output" != *'35199'* ]] || false
+}
+
+@test "etch_post_import mediaId remap: bare-number form is rewritten too, defensively (not yet observed on a real site, but not ruled out)" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t105\tpage\n35199\t763\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php 105 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":35199}} -->'
+  [[ "$output" == *'"mediaId":763'* ]] || false
+  [[ "$output" != *'35199'* ]] || false
+}
+
+@test "etch_post_import mediaId remap: digit-boundary safety -- remapping mediaId 1 never touches mediaId 12" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t105\tpage\n1\t999\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php 105 'keep "mediaId":12 untouched, only remap "mediaId":1 here'
+  [[ "$output" == *'"mediaId":12'* ]] || false
+  [[ "$output" == *'"mediaId":999'* ]] || false
+  [[ "$output" != *'"mediaId":1 '* ]] || false
+}
+
+@test "etch_post_import mediaId remap: chained remap (16 -> 173, 173 -> 200) does not double-substitute" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t105\tpage\n16\t173\tattachment\n173\t200\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php 105 '"mediaId":"16" and "mediaId":"173"'
+  [[ "$output" == *'"mediaId":"173" and "mediaId":"200"'* ]] || false
+}
+
+@test "etch_post_import mediaId remap: leaves a component prop with an operator-chosen name (e.g. \"bild\") untouched -- known, documented gap" {
+  # The dynamic-expression form, mediaId: {props.bild}, never carries a
+  # literal id at THIS call site at all -- the real id lives one post away,
+  # under whatever custom name the component author chose ("bild" on the
+  # real site this issue was measured against). No fixed-key scan can find
+  # it; this test pins that this is a deliberate, known limit, not
+  # something silently and accidentally working. The "ref" in the same
+  # block DOES have a mapping here, so the content genuinely changes --
+  # proving the hook actually ran over this post, rather than the
+  # "nothing changed at all" case a missing mapping would also produce.
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t105\tpage\n37496\t40000\twp_block\n35253\t888\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php 105 '<!-- wp:etch/component {"ref":37496,"attributes":{"bild":"35253"}} -->'
+  [[ "$output" == *'"ref":40000'* ]] || false
+  # "bild" is untouched: the digits 35253 must still be present, unremapped,
+  # because nothing in this hook's known-attribute list is named "bild".
+  [[ "$output" == *'"bild":"35253"'* ]] || false
+}
+
+@test "etch_post_import mediaId remap: leaves \"ref\" untouched and vice versa -- the two id spaces never cross-contaminate" {
+  # A pathological but real-shaped case: the SAME numeric value used as
+  # both an old component-post id (ref) and an old attachment id
+  # (mediaId), remapped to DIFFERENT new ids. If the two maps were ever
+  # merged into one, one of these would corrupt the other.
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t105\tpage\n42\t9001\twp_block\n42\t9002\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php 105 '"ref":42 next to "mediaId":"42"'
+  [[ "$output" == *'"ref":9001'* ]] || false
+  [[ "$output" == *'"mediaId":"9002"'* ]] || false
 }
