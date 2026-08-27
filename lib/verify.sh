@@ -778,6 +778,384 @@ PHP
   echo "ID_REFS:${checked_total}:0"
 }
 
+# verify_component_prop_references_resolve <run_dir> <id_map_tsv> — issue
+# #86, the follow-up verify_id_references_resolve's own header comment
+# already named as unfindable by its fixed-key scan: an Etch component PROP
+# with an OPERATOR-CHOSEN name (e.g. "bild" on the real site this issue
+# reports), carrying an id at a CALL site's own attribute
+# (`wp:etch/component {"ref":R,"attributes":{"bild":"35253"}}`) whose
+# meaning only the REFERENCED COMPONENT's own body knows
+# (`"mediaId":"{props.bild}"`). No fixed-key scan at the call site — not
+# this file's own three-key guard above, not any future one — can ever find
+# an id under a name only the component itself defines. modules/etch.sh's
+# etch_post_import now remaps this at graft time (see that function's own
+# extensive header comment for the full discovery-then-remap mechanism,
+# what it measured on the real reference site, and its documented,
+# depth-1 scope); this is the matching VERIFY side, so a broken reference
+# through this path is provable the same way issue #84's was, not merely
+# fixed on faith.
+#
+# A SEPARATE function rather than folded into verify_id_references_resolve:
+# that guard is a deliberately DUMB, fixed-key scan (its own header
+# comment) — three literal JSON keys, nothing else, precisely so it never
+# has to understand Etch's component/props mechanism at all. This one
+# inherently must: it reads a component's OWN body to learn what one of
+# ITS props means before it can judge anything about a call site. Keeping
+# that knowledge here, rather than growing the other guard's "dumb" claim
+# into something that is not, keeps that guard's own contract honest.
+#
+# ONE `wp eval` call, not two like verify_id_references_resolve above:
+# unlike that guard (which must ask two separate, differently-scoped
+# questions — its own header comment explains why `--post_type=any` can
+# serve neither), everything here — reading migrated components' own
+# bodies, reading migrated posts' live content, and checking existence —
+# is a get_post()/get_post_field() call B's own PHP can make directly,
+# entirely server-side, with no post_type filtering question to get wrong.
+#
+# SCOPE, matching etch_post_import's own discovery exactly (same
+# reasoning, not re-derived here — see that function's header comment):
+# only migrated wp_block posts (id-map.tsv's own third column) are read
+# for discovery; only their DIRECT `"mediaId"/"ref"/"parentPageID":
+# "{props.X}"` usage marks a prop id-bearing — never by the prop's name,
+# never because a call site's value merely looks numeric (exigence #3: a
+# component's own "titre" holding "2024" must never be treated as an id).
+# Only migrated, non-attachment, non-term posts (the SAME scope verify_id_
+# references_resolve and verify_migrated_content_matches_source both use)
+# are scanned for call sites.
+#
+# FIX-PACK (Viktor's review of PR #87) replaced the block-boundary matcher
+# below with the SAME hand-rolled, linear, JSON-string-aware scanner
+# (`sitegraft_json_span`/`sitegraft_find_component_blocks`/`sitegraft_
+# attributes_span`) etch_post_import's own header comment documents in
+# full — duplicated here rather than shared, for the same reason the
+# discovery pattern above already is (this function's own header comment).
+# The read-only consequence of the SAME blockers that mechanism closed on
+# the write side:
+#
+#   - BLOCKER 1: the OLD PCRE-recursive pattern returned `false`
+#     (PREG_BACKTRACK_LIMIT_ERROR) on a single unbalanced brace anywhere in
+#     a citing post's JSON, and this guard treated that exactly like "no
+#     matches" — a damaged block read back as a clean, green
+#     `COMPONENT_PROP_REFS:0:0`, the opposite of what a guard whose whole
+#     point is "prove it, don't assume it" is for. A block that fails to
+#     parse now produces a `MALFORMED:<pid>` line, and the guard HARD
+#     FAILS rather than silently passing over it (see below).
+#   - BLOCKER 3: the OLD version decoded the whole block's JSON to find
+#     `$decoded['attributes'][$propname]`, correctly, but that was never
+#     the actual defect on the write side — reading is inherently safe
+#     against blocker 3's OUT-OF-SCOPE-WRITE risk (nothing here writes
+#     anything), so this guard's own main logic reads `$decoded
+#     ['attributes']` straight off the whole-block decode below and never
+#     calls `sitegraft_attributes_span` at all. That function is still
+#     defined here — DEAD CODE in this file specifically, kept ONLY so the
+#     two files' scanner functions stay byte-identical (review of PR #87
+#     verified this with an md5 diff; a future edit to the block/span
+#     finders that does not also touch this copy would silently drift
+#     without either side's OWN test suite ever exercising the unused
+#     copy's behavior to catch it). Documented here rather than silently
+#     assumed equivalent.
+#   - BLOCKER 2 (chained double-remap) has no read-side equivalent — this
+#     guard never writes, so there is nothing to double-apply.
+#
+# Component composition (a migrated component's own body calling ANOTHER
+# component) is depth 1, the same documented limit as the remap side.
+# UNLIKE the remap side (which warns at graft time and moves on), THIS
+# guard reports it as INCOMPLETE (nit 5, Viktor's review): etch_post_import's
+# own warning is a different phase's log output, gone by the time an
+# operator reads this report, and issue #86's own requirement — "the SAME
+# pass must make verify able to see the case" — held at depth 1 and did
+# NOT hold at depth 2 before this fix (a genuinely dangling id through such
+# a composition read back as a green "0 found to check"). Detected
+# up front, during discovery, before any citing post is even scanned (the
+# same "cannot fully vouch, stop rather than partially reconcile"
+# simplicity verify_page_on_front's own INCOMPLETE case already uses).
+#
+# Three-valued, like verify_page_on_front/verify_migrated_content_matches_
+# source (see their own header comments) — NOT two-valued as the first
+# version of this guard was. 0 + `COMPONENT_PROP_REFS:<checked>:0` = every
+# discovered prop reference resolves (including the "0 checked" pass when
+# no migrated component declares an id-bearing prop, or none of its
+# callers pass a literal digit for one); 1 = HARD FAIL, the live `wp eval`
+# call itself failed, a call site's JSON did not parse (MALFORMED), or a
+# reference was found that does not resolve to any post on B (fail-closed,
+# same B4 discipline as every guard in this file — a read that fails is
+# UNKNOWN, never a silent pass); 2 = INCOMPLETE, component composition was
+# detected and this guard's depth-1 discovery cannot fully vouch for this
+# site's component props. HARD FAIL takes priority over INCOMPLETE when a
+# run could in principle produce evidence for both (checked before it,
+# below) — matching phase_verify's own "HARD FAIL, not INCOMPLETE, when a
+# run has both" precedent (this file's own header comment on that exact
+# rule).
+verify_component_prop_references_resolve() {
+  local run_dir="$1" id_map_tsv="$2"
+
+  [ -s "$id_map_tsv" ] || { echo "COMPONENT_PROP_REFS:0:0"; return 0; }
+
+  # No migrated component at all -- there is no post whose body could ever
+  # declare a prop id-bearing, so there is nothing for a call site to be
+  # judged against. Checked BEFORE issuing any wp_remote call (same
+  # discipline verify_id_references_resolve's own "no-op" cases follow):
+  # this is the common case for every graft that migrated no Etch
+  # component, and it must cost nothing.
+  local component_ids_json
+  component_ids_json=$(awk -F'\t' '$3 == "wp_block" && $2 ~ /^[0-9]+$/ { print $2 }' "$id_map_tsv" \
+    | jq -R -s -c 'split("\n") | map(select(length > 0) | tonumber) | unique')
+  [ "$(printf '%s' "$component_ids_json" | jq 'length')" != "0" ] || { echo "COMPONENT_PROP_REFS:0:0"; return 0; }
+
+  local citing_ids_json
+  citing_ids_json=$(awk -F'\t' '$3 != "attachment" && $3 !~ /^term:/ && $2 ~ /^[0-9]+$/ { print $2 }' "$id_map_tsv" \
+    | jq -R -s -c 'split("\n") | map(select(length > 0) | tonumber) | unique')
+  [ "$(printf '%s' "$citing_ids_json" | jq 'length')" != "0" ] || { echo "COMPONENT_PROP_REFS:0:0"; return 0; }
+
+  # Discovery pattern and call-site block pattern are the SAME two patterns
+  # modules/etch.sh's etch_post_import uses, deliberately duplicated rather
+  # than shared: `verify` does not load modules/*.sh at all (bin/sitegraft's
+  # `verify` case never calls `modules_discover`, unlike `graft`'s), and
+  # this file's own established convention for the fixed-key guard above is
+  # exactly this — independently hardcode the same knowledge on both sides,
+  # heavily cross-referenced, rather than reach into a module's internals
+  # from a phase that structurally never loads them.
+  local php
+  php=$(cat <<PHP
+function sitegraft_json_span( \$text, \$start ) {
+	\$len = strlen( \$text );
+	if ( \$start >= \$len || \$text[ \$start ] !== '{' ) { return null; }
+	\$depth = 0;
+	\$in_string = false;
+	\$escaped = false;
+	for ( \$i = \$start; \$i < \$len; \$i++ ) {
+		\$ch = \$text[ \$i ];
+		if ( \$in_string ) {
+			if ( \$escaped ) {
+				\$escaped = false;
+			} elseif ( '\\\\' === \$ch ) {
+				\$escaped = true;
+			} elseif ( '"' === \$ch ) {
+				\$in_string = false;
+			}
+			continue;
+		}
+		if ( '"' === \$ch ) {
+			\$in_string = true;
+		} elseif ( '{' === \$ch ) {
+			\$depth++;
+		} elseif ( '}' === \$ch ) {
+			\$depth--;
+			if ( 0 === \$depth ) {
+				return array( \$start, \$i + 1 );
+			}
+		}
+	}
+	return null;
+}
+function sitegraft_find_component_blocks( \$content ) {
+	\$blocks = array();
+	\$prefix = '<!-- wp:etch/component ';
+	\$offset = 0;
+	\$len = strlen( \$content );
+	while ( true ) {
+		\$pos = strpos( \$content, \$prefix, \$offset );
+		if ( false === \$pos ) { break; }
+		\$json_start = \$pos + strlen( \$prefix );
+		while ( \$json_start < \$len && ( ' ' === \$content[ \$json_start ] || "\t" === \$content[ \$json_start ] || "\n" === \$content[ \$json_start ] || "\r" === \$content[ \$json_start ] ) ) {
+			\$json_start++;
+		}
+		if ( \$json_start >= \$len || '{' !== \$content[ \$json_start ] ) {
+			if ( '-->' === substr( \$content, \$json_start, 3 ) || '/-->' === substr( \$content, \$json_start, 4 ) ) {
+				\$offset = \$json_start;
+				continue;
+			}
+			\$blocks[] = array( 'ok' => false, 'offset' => \$pos );
+			\$offset = \$pos + strlen( \$prefix );
+			continue;
+		}
+		\$span = sitegraft_json_span( \$content, \$json_start );
+		if ( null === \$span ) {
+			\$blocks[] = array( 'ok' => false, 'offset' => \$pos );
+			\$offset = \$json_start + 1;
+			continue;
+		}
+		\$blocks[] = array( 'ok' => true, 'start' => \$span[0], 'end' => \$span[1] );
+		\$offset = \$span[1];
+	}
+	return \$blocks;
+}
+function sitegraft_attributes_span( \$content, \$block_start, \$block_end ) {
+	\$needle = '"attributes":';
+	\$pos = strpos( \$content, \$needle, \$block_start );
+	if ( false === \$pos || \$pos >= \$block_end ) { return null; }
+	\$val_start = \$pos + strlen( \$needle );
+	while ( \$val_start < \$block_end && ' ' === \$content[ \$val_start ] ) { \$val_start++; }
+	if ( \$val_start >= \$block_end || '{' !== \$content[ \$val_start ] ) { return null; }
+	\$span = sitegraft_json_span( \$content, \$val_start );
+	if ( null === \$span || \$span[1] > \$block_end ) { return null; }
+	return \$span;
+}
+
+\$component_ids = json_decode('${component_ids_json}', true);
+\$citing_ids = json_decode('${citing_ids_json}', true);
+if ( ! is_array( \$component_ids ) || ! is_array( \$citing_ids ) ) { return; }
+\$component_prop_map = array();
+\$nested = array();
+foreach ( \$component_ids as \$cid ) {
+	\$cid = (int) \$cid;
+	\$cbody = get_post_field( 'post_content', \$cid );
+	if ( is_string( \$cbody ) && '' !== \$cbody ) {
+		if ( preg_match_all( '/"(mediaId|ref|parentPageID)":"\{props\.([A-Za-z0-9_]+)\}"/', \$cbody, \$pm, PREG_SET_ORDER ) ) {
+			foreach ( \$pm as \$prow ) {
+				\$component_prop_map[ \$cid ][ \$prow[2] ] = \$prow[1];
+			}
+		}
+		if ( preg_match( '#<!--\s+wp:etch/component\s+#', \$cbody ) ) {
+			\$nested[] = \$cid;
+		}
+	}
+}
+if ( ! empty( \$nested ) ) {
+	foreach ( \$nested as \$ncid ) {
+		echo 'NESTED:' . \$ncid . "\n";
+	}
+	return;
+}
+if ( empty( \$component_prop_map ) ) {
+	echo "NONE\n";
+	return;
+}
+\$pairs = array();
+\$malformed = array();
+foreach ( \$citing_ids as \$pid ) {
+	\$pid = (int) \$pid;
+	\$content = get_post_field( 'post_content', \$pid );
+	if ( ! is_string( \$content ) || '' === \$content ) { continue; }
+	\$blocks = sitegraft_find_component_blocks( \$content );
+	foreach ( \$blocks as \$block ) {
+		if ( empty( \$block['ok'] ) ) {
+			\$malformed[] = \$pid;
+			continue;
+		}
+		\$block_text = substr( \$content, \$block['start'], \$block['end'] - \$block['start'] );
+		\$decoded = json_decode( \$block_text, true );
+		if ( null === \$decoded ) {
+			\$malformed[] = \$pid;
+			continue;
+		}
+		if ( ! is_array( \$decoded ) || ! isset( \$decoded['ref'] ) ) { continue; }
+		\$ref_id = (int) \$decoded['ref'];
+		if ( ! isset( \$component_prop_map[ \$ref_id ] ) ) { continue; }
+		\$call_attrs = ( isset( \$decoded['attributes'] ) && is_array( \$decoded['attributes'] ) ) ? \$decoded['attributes'] : array();
+		foreach ( \$component_prop_map[ \$ref_id ] as \$propname => \$kind ) {
+			if ( ! array_key_exists( \$propname, \$call_attrs ) ) { continue; }
+			\$val = \$call_attrs[ \$propname ];
+			if ( is_int( \$val ) ) {
+				\$pairs[] = \$pid . ':' . ( (string) \$val ) . ':' . \$propname;
+			} elseif ( is_string( \$val ) && preg_match( '/^\d+\z/', \$val ) ) {
+				\$pairs[] = \$pid . ':' . \$val . ':' . \$propname;
+			}
+		}
+	}
+}
+if ( ! empty( \$malformed ) ) {
+	foreach ( array_unique( \$malformed ) as \$mpid ) {
+		echo 'MALFORMED:' . \$mpid . "\n";
+	}
+	return;
+}
+if ( empty( \$pairs ) ) {
+	echo "NONE\n";
+	return;
+}
+\$referenced = array();
+foreach ( \$pairs as \$p ) {
+	\$parts = explode( ':', \$p, 3 );
+	\$referenced[ \$parts[1] ] = true;
+}
+foreach ( array_keys( \$referenced ) as \$rid ) {
+	echo 'CHK:' . \$rid . ':' . ( null !== get_post( (int) \$rid ) ? '1' : '0' ) . "\n";
+}
+foreach ( \$pairs as \$p ) {
+	echo 'PAIR:' . \$p . "\n";
+}
+PHP
+)
+
+  local out rc
+  out=$(wp_remote b eval "$php" 2>/dev/null) && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log_error "could not evaluate migrated content's component-prop id references for the id-reference guard (eval failed) — treated as UNKNOWN, never as a silent pass"
+    return 1
+  fi
+
+  if [ -z "$out" ] || [ "$out" = "NONE" ]; then
+    echo "COMPONENT_PROP_REFS:0:0"
+    return 0
+  fi
+
+  # Fix-pack (Viktor's review of PR #87, blocker 1): a MALFORMED line means
+  # sitegraft_json_span (the PHP above) could not parse at least one
+  # wp:etch/component call site on B as balanced JSON -- the discovery/
+  # scan simply could not be trusted for that post. Checked BEFORE the
+  # NESTED case below, and both BEFORE the normal CHK/PAIR parse: a read
+  # that could not run correctly is UNKNOWN, the same fail-closed
+  # discipline every other guard in this file follows, and takes priority
+  # over the (softer) INCOMPLETE outcome NESTED produces.
+  if printf '%s
+' "$out" | grep -q '^MALFORMED:'; then
+    local malformed_posts
+    malformed_posts=$(printf '%s
+' "$out" | awk -F: '$1=="MALFORMED"{printf "%s ", $2}')
+    log_error "could not parse a wp:etch/component call site as balanced JSON on B, on post(s): ${malformed_posts% } — component-prop id references on those post(s) could not be verified, treated as UNKNOWN, never as a silent pass"
+    return 1
+  fi
+
+  # Fix-pack (Viktor's review, NIT 5): a migrated component whose OWN body
+  # calls ANOTHER component (composition depth > 1) is exactly the gap
+  # etch_post_import's own discovery documents and warns about at graft
+  # time -- but that warning is a DIFFERENT phase's log output, gone by
+  # the time an operator reads THIS report. Without this check, verify
+  # printed a green "(0 found to check)" for a site where an id genuinely
+  # hangs unresolved through that composition -- issue #86's own
+  # requirement ("the SAME pass must make verify able to see the case")
+  # held at depth 1 and silently did not at depth 2. Reported as
+  # INCOMPLETE (2), not a silent pass and not a HARD FAIL: this guard's
+  # OWN machinery is fine, it is TELLING you it cannot fully vouch for
+  # this site's component props, the same distinction phase_verify already
+  # draws for page_on_front/navigation above.
+  if printf '%s
+' "$out" | grep -q '^NESTED:'; then
+    local nested_cids
+    nested_cids=$(printf '%s
+' "$out" | awk -F: '$1=="NESTED"{printf "%s ", $2}')
+    log_error "component(s) ${nested_cids% } call another wp:etch/component in their own body (composition depth > 1) — this guard's discovery only looks one level deep (issue #86's own documented scope limit), so component-prop id references cannot be fully verified on this site"
+    echo "COMPONENT_PROP_REFS:INCOMPLETE"
+    return 2
+  fi
+
+  local checked=0 missing=0 detail="" line rid exists citing_desc
+  while IFS= read -r line; do
+    case "$line" in
+      CHK:*)
+        checked=$((checked + 1))
+        rid="${line#CHK:}"; rid="${rid%%:*}"
+        exists="${line##*:}"
+        if [ "$exists" = "0" ]; then
+          missing=$((missing + 1))
+          citing_desc=$(printf '%s
+' "$out" | awk -F: -v id="$rid" '$1=="PAIR" && $3==id {printf "%s(%s) ", $2, $4}')
+          detail="${detail}${rid}[cited by ${citing_desc% }] "
+        fi
+        ;;
+    esac
+  done <<< "$out"
+
+  if [ "$missing" -gt 0 ]; then
+    log_error "migrated content references id(s), through an Etch component prop, that do not resolve to any post on B: ${detail% }"
+    echo "COMPONENT_PROP_REFS:${checked}:${missing}"
+    return 1
+  fi
+
+  echo "COMPONENT_PROP_REFS:${checked}:0"
+}
+
 # _verify_wxr_items_remapped <run_dir> <id_map_tsv> <manifest_json> — issue
 # #52 shared helper behind both content-equality guards below. Parses A's
 # already-exported WXR file(s) (${run_dir}/export/*.xml, written by
@@ -1866,6 +2244,56 @@ phase_verify() {
         incomplete_names="${incomplete_names}id-references "
         ;;
     esac
+  fi
+
+  # --- the SAME id-reference question, one level deeper: an Etch component
+  # PROP with an operator-chosen name (issue #86 — the case
+  # verify_id_references_resolve's own header comment already named as
+  # unfindable by its fixed-key scan; see verify_component_prop_references_
+  # resolve's own header comment for the full mechanism, and its own NIT-5
+  # fix-pack note for why this is now THREE-valued, not two, matching
+  # verify_page_on_front's own rc==0/rc==2/else shape immediately above in
+  # this file rather than the two-valued shape the id-references block
+  # just above uses. ---------------------------------------------------------
+  local cprop_output="" cprop_rc=0
+  cprop_output=$(verify_component_prop_references_resolve "$run_dir" "$id_map_tsv" 2>>"$report") || cprop_rc=$?
+  if [ "$cprop_rc" -eq 0 ]; then
+    case "$cprop_output" in
+      *COMPONENT_PROP_REFS:*)
+        local cpr_summary="${cprop_output##*COMPONENT_PROP_REFS:}"
+        local cpr_checked cpr_missing
+        cpr_checked=$(echo "$cpr_summary" | cut -d: -f1)
+        cpr_missing=$(echo "$cpr_summary" | cut -d: -f2)
+        if [ "$cpr_checked" -eq 0 ]; then
+          echo "- [x] component-prop id references (issue #86) in migrated content resolve on B (0 found to check)" >> "$report"
+        else
+          echo "- [x] component-prop id references (issue #86) in migrated content resolve on B (${cpr_checked} checked, ${cpr_missing} missing)" >> "$report"
+        fi
+        ;;
+      *)
+        echo "- [ ] component-prop id references resolve on B: **UNVERIFIED — the check reported success without saying which of its outcomes applied** (a success path added without its marker — see lib/verify.sh's verify_component_prop_references_resolve)" >> "$report"
+        incomplete=$((incomplete + 1))
+        incomplete_names="${incomplete_names}component-prop-id-references "
+        ;;
+    esac
+  elif [ "$cprop_rc" -eq 2 ]; then
+    echo "- [ ] component-prop id references: **UNVERIFIED — component composition (a migrated component calling another) was detected, one level deeper than this guard's discovery looks (issue #86's own documented scope limit)** — see above" >> "$report"
+    incomplete=$((incomplete + 1))
+    incomplete_names="${incomplete_names}component-prop-id-references "
+  else
+    case "$cprop_output" in
+      *COMPONENT_PROP_REFS:*)
+        local cprf_summary="${cprop_output##*COMPONENT_PROP_REFS:}"
+        local cprf_checked cprf_missing
+        cprf_checked=$(echo "$cprf_summary" | cut -d: -f1)
+        cprf_missing=$(echo "$cprf_summary" | cut -d: -f2)
+        echo "- [ ] **HARD FAIL: migrated content references id(s), through an Etch component prop, that do not resolve to any post on B** (${cprf_checked} checked, ${cprf_missing} missing) — see above" >> "$report"
+        ;;
+      *)
+        echo "- [ ] **HARD FAIL: could not verify migrated content's component-prop id references against B (query failed, or a call site's JSON did not parse)** — see above" >> "$report"
+        ;;
+    esac
+    hard_fail=1
   fi
 
   # --- migrated content matches A's, after the same remaps graft applies —
