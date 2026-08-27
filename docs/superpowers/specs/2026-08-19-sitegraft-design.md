@@ -676,6 +676,26 @@ regardless (see §6.1's own reasoning for why `home` over `siteurl`), and
 remains the fallback whenever the profile doesn't name a URL for that
 site — just no longer the ONLY source `plan` ever consults.
 
+**Form matters, and is enforced (BLOCKER-1, third review round):**
+`lib/profile.sh` whitelists the KEY `SITE_A_URL`/`SITE_B_URL`, never the
+VALUE — a hand-typed profile opens a guarantee `scan`'s own
+`wp option get home` always held for free (WordPress stores `home`
+untrailingslashit'd and always with a scheme) to two reproduced
+corruption shapes once that value reaches `graft`'s bare
+string-replace (design doc §9.4): a trailing slash on one side desyncs
+the split point from the other side's URLs (`.../about` loses its
+leading slash after the domain), and a missing scheme lets the value
+match as a bare substring inside a scheme-qualified URL, re-inserting
+the replacement's own scheme INSIDE the original one
+(`https://https://...`). Both corrupt every migrated URL instead of
+rewriting it, and both leave the `verify` domain-absence check reporting
+green on a run that just wrote broken URLs everywhere. `plan_defaults`
+(`_plan_normalize_remap_url`, `lib/plan.sh`) normalizes WHICHEVER value
+was chosen — profile or scan, since a half-profile/half-scan pair is the
+shape most likely to mismatch in form — to `scheme://host[:port]` before
+it ever reaches the manifest, and REFUSES (logs and aborts `plan`) on
+anything that does not parse as an absolute URL with a real scheme.
+
 ### 5.2 Credentials — two paths
 
 **(a) File** at `~/.config/sitegraft/<profile>.creds` (chmod 600, gitignored, never
@@ -768,13 +788,16 @@ real only when `home` and `siteurl` diverge at the ORIGIN (scheme+host) on
 A — asset URLs then keep pointing at A's `siteurl` domain after migration,
 unrewritten, and `verify` (§6.5) only ever checks for `home`'s absence, so
 it will not catch this. Known and, as of this fix-pack, surfaced rather
-than silent: `plan_warn_scope_gaps` (`lib/plan.sh`) warns when A's
-`home_url`/`site_url` origins differ, naming the residual scope gap so an
-operator can review B's migrated content for it — a second-rank signal
-now that a correctly-set `SITE_A_URL` is the first place `plan` looks, not
-the only one. `site_url` is recorded specifically so that warning (and an
-operator inspecting a scan file directly) can see it; no rewrite code
-path reads it. This schema addition was missing from every
+than silent: `plan_warn_asset_domain_gap` (`lib/plan.sh` — corrected in
+this fix-pack's third review round to compare the manifest's ACTUAL
+chosen remap source against A's scanned `site_url`, not two merely-scanned
+values compared before that source was even chosen) warns when they
+differ at the origin, naming the residual scope gap so an operator can
+review B's migrated content for it — a second-rank signal now that a
+correctly-set `SITE_A_URL` is the first place `plan` looks, not the only
+one. `site_url` is recorded specifically so that warning (and an operator
+inspecting a scan file directly) can see it; no rewrite code path reads
+it. This schema addition was missing from every
 earlier revision of this document — `plan_defaults` read a `.site_url` key
 `scan` never wrote at all, so every manifest froze with a domain remap
 that could never do anything (see `manifest_validate`'s own guard against

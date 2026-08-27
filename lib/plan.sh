@@ -70,11 +70,41 @@ plan_defaults() {
   # (inventory_scan_site's own header comment; plan_warn_scope_gaps,
   # below) — reduced to a second-rank signal now that a correct
   # profile-supplied URL is the FIRST place this looks, not the only one.
-  local site_a_domain site_b_domain
-  site_a_domain="${SITE_A_URL:-}"
-  [ -n "$site_a_domain" ] || site_a_domain=$(jq -r '.home_url // "unknown"' "$scan_a_json" 2>/dev/null || echo unknown)
-  site_b_domain="${SITE_B_URL:-}"
-  [ -n "$site_b_domain" ] || site_b_domain=$(jq -r '.home_url // "unknown"' "$scan_b_json" 2>/dev/null || echo unknown)
+  local site_a_domain site_b_domain site_a_source site_b_source
+  if [ -n "${SITE_A_URL:-}" ]; then
+    site_a_domain="$SITE_A_URL"; site_a_source="the profile's SITE_A_URL"
+  else
+    site_a_domain=$(jq -r '.home_url // "unknown"' "$scan_a_json" 2>/dev/null || echo unknown)
+    site_a_source="scan's home_url"
+  fi
+  if [ -n "${SITE_B_URL:-}" ]; then
+    site_b_domain="$SITE_B_URL"; site_b_source="the profile's SITE_B_URL"
+  else
+    site_b_domain=$(jq -r '.home_url // "unknown"' "$scan_b_json" 2>/dev/null || echo unknown)
+    site_b_source="scan's home_url"
+  fi
+  # NIT-1 (third review round): the override was totally silent — nothing
+  # said which source (profile vs scan) supplied either end, even though
+  # the whole justification for reading SITE_A_URL/SITE_B_URL at all is a
+  # count this tool itself never runs. `log_warn`, not `log_info`: this
+  # function's STDOUT is the manifest JSON itself, captured by every
+  # caller via `manifest=$(plan_defaults ...)` — `log_info` (lib/core.sh)
+  # writes to stdout and would corrupt that capture; every logging
+  # primitive safe to use inside this function writes to stderr.
+  log_warn "plan: A's domain remap source is ${site_a_source} ('${site_a_domain}')"
+  log_warn "plan: B's domain remap source is ${site_b_source} ('${site_b_domain}')"
+
+  # BLOCKER-1 (third review round): SITE_A_URL/SITE_B_URL are taken
+  # verbatim above — lib/profile.sh whitelists the KEY, never validates
+  # the VALUE. See _plan_normalize_remap_url's own header comment for the
+  # full reasoning (two reproduced corruption shapes: a trailing slash on
+  # one side only, or a missing scheme on one side only) and why this
+  # normalization has to run on WHICHEVER value was just chosen — profile
+  # or scan — not only on the profile path: a half-profile/half-scan pair
+  # is exactly the shape most likely to mismatch in form, and it is the
+  # shape this priority order makes newly possible.
+  site_a_domain=$(_plan_normalize_remap_url "A's domain (${site_a_source})" "$site_a_domain") || return 1
+  site_b_domain=$(_plan_normalize_remap_url "B's domain (${site_b_source})" "$site_b_domain") || return 1
   manifest=$(manifest_new \
     "$site_a_domain" \
     "$site_b_domain" \
@@ -204,39 +234,116 @@ plan_warn_scope_gaps() {
   if jq -e '.classic_menus_detected == true' "$scan_a_json" >/dev/null 2>&1; then
     log_warn "A has classic nav menu(s) with items ($(jq -r '.classic_menu_names | join(", ")' "$scan_a_json")) — sitegraft v1 does not migrate classic menu assignments (design doc §13). Migrate them by hand or write a module."
   fi
+}
 
-  # MAJOR-2(b) (issue #73, second review round): the domain remap
-  # (options.search_replace, built below from A's home_url) only ever
-  # targets `home` — see inventory_scan_site's own comment for why that
-  # scope limit is real: `siteurl` governs every media/plugin/theme asset
-  # URL (WP_CONTENT_URL derives from it), and on a real Etch/ACSS build
-  # those URLs DO appear in migrated post_content and option values. When
-  # A's `home_url` and `site_url` are on different ORIGINS (scheme+host —
-  # a differing PATH, e.g. a subdirectory install, still shares one origin
-  # and one remap covers both), asset URLs under A's `site_url` origin
-  # will NOT be rewritten by this run and will keep pointing at A after
-  # migration — `verify` (verify_domain_absent) only ever checks for
-  # `home_url`'s absence, so it will not catch this either. Named here,
-  # once, at the one place `plan` already surfaces a scan-derived scope gap
-  # (the classic-menu warning just above), rather than left for an
-  # operator to discover by finding A's asset domain still live on B.
-  #
-  # Guarded on BOTH being present, non-"unknown" strings — an `home_url`/
-  # `site_url` that scan could not determine is a DIFFERENT, harder
-  # failure manifest_validate's own #73 guard already refuses to freeze
-  # over; this warning is only about two REAL, resolvable values that
-  # happen to disagree, not about a missing one.
-  local a_home a_site
-  a_home=$(jq -r '.home_url // ""' "$scan_a_json" 2>/dev/null)
+# plan_warn_asset_domain_gap <manifest_json> <scan_a_json> — issue #73,
+# MAJOR-2(b), MOVED and CORRECTED in the third review round. This used to
+# live inside plan_warn_scope_gaps, called BEFORE plan_defaults ever ran,
+# comparing scan's own recorded home_url against scan's own site_url —
+# which structurally cannot know what plan_defaults actually chose,
+# because at that point it hadn't run yet. Once SITE_A_URL/SITE_B_URL
+# could win over scan's home_url (this same fix-pack), that produced two
+# provably wrong outcomes on the exact scenario this warning exists for:
+#   - SILENT when it should have fired: home_url == site_url == the
+#     proxy's internal address (both equal, so the old check saw no
+#     divergence) while SITE_A_URL names the real public domain — the
+#     actual chosen `from` and A's site_url DO diverge, asset URLs won't
+#     be rewritten, and the operator hears nothing.
+#   - WRONG when it did fire: it named A's scanned home_url in the
+#     message ("this run's domain remap only ever rewrites A's HOME
+#     domain (https://a.ddev.site:8443)") when the run's ACTUAL remap
+#     source was the profile's public SITE_A_URL the whole time — a
+#     warning asserting something false about the very run it describes,
+#     in a codebase whose first convention is that a check must never
+#     claim what it hasn't earned.
+#
+# Fixed by moving the comparison to run on the CHOSEN `from`
+# (`.options.search_replace.from` in the already-built manifest — read
+# from `plan`'s own output, not re-derived, so this can never diverge
+# from what plan_defaults/the prefilled manifest actually decided) versus
+# A's SCANNED site_url — the one half of the old comparison that was
+# always correct, since site_url is never itself a remap candidate.
+# Called from _phase_plan_build AFTER `manifest` is finalized (both the
+# plan_defaults path and the SITEGRAFT_MANIFEST_PREFILLED path — a
+# hand-written manifest can have exactly the same gap), not from
+# plan_warn_scope_gaps' own early call, which runs before that value
+# exists.
+#
+# Guarded on both being present, non-"unknown"/non-empty strings — a
+# `from` or `site_url` scan/plan could not determine is a DIFFERENT,
+# harder failure the #73 guards elsewhere already handle; this warning is
+# only about two REAL, resolvable values that happen to disagree.
+plan_warn_asset_domain_gap() {
+  local manifest="$1" scan_a_json="$2"
+  local chosen_from a_site
+  chosen_from=$(echo "$manifest" | jq -r '.options.search_replace.from // ""')
   a_site=$(jq -r '.site_url // ""' "$scan_a_json" 2>/dev/null)
-  if [ -n "$a_home" ] && [ -n "$a_site" ] && [ "$a_home" != "unknown" ] && [ "$a_site" != "unknown" ]; then
-    local a_home_origin a_site_origin
-    a_home_origin=$(_plan_url_origin "$a_home")
+  if [ -n "$chosen_from" ] && [ -n "$a_site" ] && [ "$chosen_from" != "unknown" ] && [ "$a_site" != "unknown" ]; then
+    local chosen_from_origin a_site_origin
+    chosen_from_origin=$(_plan_url_origin "$chosen_from")
     a_site_origin=$(_plan_url_origin "$a_site")
-    if [ "$a_home_origin" != "$a_site_origin" ]; then
-      log_warn "A's home ('${a_home}') and siteurl ('${a_site}') are on different origins — this run's domain remap (design doc §9.4) only ever rewrites A's HOME domain (${a_home_origin}); any asset URL built from A's siteurl (media/plugin/theme URLs under ${a_site_origin} — WP_CONTENT_URL and everything derived from it) will NOT be rewritten and will keep pointing at A after migration. Known, documented scope limit (issue #73, MAJOR-2) — review B's migrated content for lingering ${a_site_origin} references after graft, or write a module/manual pass to cover it."
+    if [ "$chosen_from_origin" != "$a_site_origin" ]; then
+      log_warn "this run's domain remap source ('${chosen_from}') and A's own recorded siteurl ('${a_site}') are on different origins — the remap (design doc §9.4) only ever rewrites ${chosen_from_origin}; any asset URL built from A's siteurl (media/plugin/theme URLs under ${a_site_origin} — WP_CONTENT_URL and everything derived from it) will NOT be rewritten and will keep pointing at ${a_site_origin} after migration. Known, documented scope limit (issue #73, MAJOR-2) — review B's migrated content for lingering ${a_site_origin} references after graft, or write a module/manual pass to cover it."
     fi
   fi
+}
+
+# _plan_normalize_remap_url <label> <url> — issue #73, BLOCKER-1 (third
+# review round): SITE_A_URL/SITE_B_URL are taken verbatim by
+# plan_defaults above (lib/profile.sh whitelists the KEY, never validates
+# the VALUE), and the resulting from/to pair feeds straight into
+# `sitegraft_remap_domain` (lib/php/content-remap-functions.php), a bare
+# string split()/join() — never a URL-aware rewrite. Before this fix-pack
+# `from`/`to` always came from `wp option get home`, which WordPress
+# stores untrailingslashit'd and always with a scheme — both ends were
+# structurally guaranteed to match in form. A hand-typed profile value
+# opens that guarantee to two corruption shapes, both reproduced live
+# against the real function:
+#   - a trailing slash on one side, none on the other: from=
+#     "https://a.example.com/" to="https://b.example.com" turns
+#     ".../about" into "https://b.example.comabout" (the slash that used
+#     to separate them was part of `from`'s own match, so it vanishes
+#     with it) — same for every asset URL, e.g. an <img src> loses the
+#     slash before "wp-content/uploads/...".
+#   - a missing scheme on one side: from="a.example.com" (bare host)
+#     matches as a SUBSTRING inside "https://a.example.com/about" (the
+#     scheme just isn't part of the match), so the replacement re-inserts
+#     `to`'s own scheme INSIDE the original one: "https://" + "https://
+#     b.example.com" + "/about" = "https://https://b.example.com/about".
+# Both shapes leave the recorded `from` string structurally ABSENT from
+# the corrupted output — verify_domain_absent's own content search finds
+# nothing and reports the domain-absence check GREEN on a run that just
+# wrote broken URLs into every migrated page. None of the three existing
+# #73 guards (manifest_validate, graft_domain_remap_unusable_reason,
+# graft_verify_domain_remap_usable) catch this either: they check
+# presence/placeholder/equality, never FORM, and a malformed-but-present,
+# non-"unknown", from-not-equal-to-to string satisfies all three.
+#
+# Normalizes to origin form (scheme://host[:port] — never a trailing
+# slash, since the capturing group stops at the first `/`) using the SAME
+# regex `_plan_url_origin` (below) already uses, but with the OPPOSITE
+# failure contract: `_plan_url_origin` always succeeds (it backs a
+# warning, which must never itself abort a run over a value it merely
+# couldn't parse); this function REFUSES — logs and returns 1 — on
+# anything that doesn't parse as an absolute URL with a real scheme,
+# because feeding an unparseable value into a raw str_replace is exactly
+# the defect being closed here. Empty string and the literal placeholder
+# "unknown" pass through UNCHANGED rather than being rejected: those are
+# sentinel values manifest_validate's own #73 guard is already the
+# designated place to refuse freezing over — this function's job is
+# catching a value that LOOKS usable (non-empty, not "unknown") but isn't
+# actually well-formed, the class none of the other guards can see.
+_plan_normalize_remap_url() {
+  local label="$1" url="$2"
+  case "$url" in
+    ''|unknown) printf '%s' "$url"; return 0 ;;
+  esac
+  if [[ "$url" =~ ^([a-zA-Z][a-zA-Z0-9+.-]*://[^/?#]+) ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  log_error "plan: refusing to build a domain remap — ${label} ('${url}') does not parse as an absolute URL with a scheme (e.g. https://example.com). Feeding this straight into graft's raw string search-replace would corrupt every migrated URL it partially matches instead of rewriting it (issue #73, BLOCKER-1). Fix the value — in the profile if this is SITE_A_URL/SITE_B_URL, or by re-running 'sitegraft scan' if it's a scan-recorded home_url — and try again."
+  return 1
 }
 
 # _plan_url_origin <url> — scheme://host[:port], stripping any path/query/
@@ -692,6 +799,14 @@ _phase_plan_build() {
     manifest=$(plan_resolve_stack "$manifest" "${run_dir}/scan-a.json" "${run_dir}/scan-b.json") || return 1
     manifest=$(plan_select_interactive "$manifest") || return 1
   fi
+
+  # MAJOR-2(b) fix (issue #73, third review round): must run HERE, after
+  # `manifest` is finalized on BOTH branches above — see
+  # plan_warn_asset_domain_gap's own header comment for why the earlier
+  # placement (inside plan_warn_scope_gaps, called before this point ever
+  # existed) was structurally unable to know the chosen remap source, and
+  # produced both a false silence and a false claim as a result.
+  plan_warn_asset_domain_gap "$manifest" "${run_dir}/scan-a.json"
 
   # design doc §3.6: default-deny — computed once, here, after the manifest
   # (whether built interactively above or supplied prefilled) has reached its

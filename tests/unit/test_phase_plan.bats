@@ -30,6 +30,26 @@ EOF
   echo '{"post_types":[],"plugins":[],"classic_menus_detected":false,"active_theme":{}}' > "${RUN_DIR}/scan-a.json"
 }
 
+# MINOR-3 (third review round, named not blocking) + MAJOR-1's own
+# wiring: the DDEV harness only ever drives `plan` through
+# SITEGRAFT_MANIFEST_PREFILLED, which never calls plan_defaults — so this
+# is the one place proving plan_warn_asset_domain_gap is actually WIRED
+# into phase_plan (not just correct in isolation, tested in
+# test_plan.bats), and that a hand-written/prefilled manifest gets the
+# same warning a plan_defaults-built one would.
+@test "phase_plan warns when the prefilled manifest's chosen domain and A's scanned siteurl diverge (MAJOR-1 wiring, #73)" {
+  echo '{"post_types":[],"plugins":[],"classic_menus_detected":false,"active_theme":{},"site_url":"https://cdn-a.example.com"}' > "${RUN_DIR}/scan-a.json"
+  echo '{"post_types":[],"plugins":[],"classic_menus_detected":false,"custom_code_detected":false,"active_theme":{}}' > "${RUN_DIR}/scan-b.json"
+  cat > "${RUN_DIR}/prefilled.json" <<'EOF'
+{"migrate":{},"protect":{},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"https://a.example.com","to":"https://b.example.com"}}}
+EOF
+  SITEGRAFT_MANIFEST_PREFILLED="${RUN_DIR}/prefilled.json" run phase_plan --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"different origins"* ]] || false
+  [[ "$output" == *"https://a.example.com"* ]] || false
+  [[ "$output" == *"https://cdn-a.example.com"* ]] || false
+}
+
 @test "phase_plan freezes a prefilled manifest and computes _unclaimed against scan-b" {
   echo '{"post_types":[{"name":"page"},{"name":"mystery_cpt"}],"plugins":[],"classic_menus_detected":false,"custom_code_detected":false,"active_theme":{}}' > "${RUN_DIR}/scan-b.json"
   cat > "${RUN_DIR}/prefilled.json" <<'EOF'

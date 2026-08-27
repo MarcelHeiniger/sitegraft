@@ -142,6 +142,27 @@ SITEGRAFT_STATE_DIR="${HOME}/.sitegraft/runs"
 SITEGRAFT_CREDS_FILE="${HOME}/.config/sitegraft/my-migration.creds"
 ```
 
+**`SITE_A_URL`/`SITE_B_URL` are not just labels — they drive the domain
+search-replace over every migrated page and option on B.** `plan` builds
+`options.search_replace.{from,to}` from these two values FIRST, ahead of
+whatever `scan` recorded as each site's own `home` option — the profile
+wins whenever it's set (issue #73). Set them to each site's real, public
+domain, not an internal address: a site reached through a reverse proxy,
+an SSH tunnel, or a local dev front-end (DDEV, e.g.) can have its own
+`home` WordPress option answer with an internal URL that never appears
+anywhere in the site's real content, and `scan` has no way to tell —
+`SITE_A_URL`/`SITE_B_URL` are the fix for exactly that.
+
+**Their exact form matters.** Both must be an absolute URL with a scheme
+(`https://example.com`, never a bare `example.com`) and no trailing slash
+(`https://example.com`, never `https://example.com/`) — `plan` normalizes
+and refuses a malformed value before it ever reaches a manifest, but a
+well-formed value in the wrong shape (a trailing slash on one side only,
+say) desyncs the two ends of the remap and corrupts URLs in migrated
+content instead of rewriting them correctly. Leave either one unset and
+`plan` falls back to `scan`'s own recorded `home_url` for that site — the
+best available guess, not a guarantee.
+
 If either site needs a specific SSH private key (rather than whatever your
 ssh-agent/default identity already provides), create the credentials file
 referenced above — **never commit this file**, and it must be `chmod 600` or
