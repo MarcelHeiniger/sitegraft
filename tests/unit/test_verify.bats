@@ -245,7 +245,7 @@ setup() {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   local tsv="${run_dir}/id-map.tsv"
   printf '10\t42\tattachment\n5\t105\tpage\n' > "$tsv"
-  local manifest='{"migrate":{"etch":{"option_keys":["etch_settings"]}}}'
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_settings"]}},"options":{"search_replace":{"to":"https://b.example.com"}}}'
   local captured="$BATS_TEST_TMPDIR/captured.json"
   graft_push_remap_payload() { printf '%s' "$2" > "$captured"; echo "/fake/remote/path.json"; }
   graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
@@ -260,7 +260,7 @@ setup() {
 @test "verify_domain_absent passes (OK) when wp eval reports the domain absent from every scoped surface" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   local tsv="${run_dir}/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
-  local manifest='{"migrate":{"core-wp":{"option_keys":[]}}}'
+  local manifest='{"migrate":{"core-wp":{"option_keys":[]}},"options":{"search_replace":{"to":"https://b.example.com"}}}'
   graft_push_remap_payload() { echo "/fake/remote/path.json"; }
   graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   graft_remove_file() { :; }
@@ -272,7 +272,7 @@ setup() {
 @test "verify_domain_absent fails when wp eval reports a hit, and names it" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   local tsv="${run_dir}/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
-  local manifest='{"migrate":{"core-wp":{"option_keys":[]}}}'
+  local manifest='{"migrate":{"core-wp":{"option_keys":[]}},"options":{"search_replace":{"to":"https://b.example.com"}}}'
   graft_push_remap_payload() { echo "/fake/remote/path.json"; }
   graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   graft_remove_file() { :; }
@@ -285,7 +285,7 @@ setup() {
 @test "verify_domain_absent's wp eval requires the shared content-remap library and calls sitegraft_domain_present for both surfaces" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   local tsv="${run_dir}/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
-  local manifest='{"migrate":{"core-wp":{"option_keys":["etch_settings"]}}}'
+  local manifest='{"migrate":{"core-wp":{"option_keys":["etch_settings"]}},"options":{"search_replace":{"to":"https://b.example.com"}}}'
   graft_push_remap_payload() { echo "/fake/remote/path.json"; }
   graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   graft_remove_file() { :; }
@@ -354,7 +354,7 @@ setup() {
 @test "verify_domain_absent always removes both the pushed payload file and the pushed lib file, pass or fail" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   local tsv="${run_dir}/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
-  local manifest='{"migrate":{"core-wp":{"option_keys":[]}}}'
+  local manifest='{"migrate":{"core-wp":{"option_keys":[]}},"options":{"search_replace":{"to":"https://b.example.com"}}}'
   local removed="$BATS_TEST_TMPDIR/removed-marker"
   graft_push_remap_payload() { echo "/fake/remote/path.json"; }
   graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
@@ -415,13 +415,66 @@ setup() {
   [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }
 
+# --- BLOCKER-1 (second review round): `domain` (from) is real, and the
+# manifest's own `to` is independently broken — A's scan succeeded, B's
+# failed. Before this fix, only `domain == "unknown"` and `domain ==
+# domain_to` were checked, so this exact case (a real `domain`, a broken
+# `domain_to` that is NOT equal to `domain`) sailed through: verify would
+# search B's content for A's real domain, correctly find it ABSENT
+# (because graft just corrupted it into the broken `to` value instead),
+# and report the domain-absence check GREEN on a run that actively
+# destroyed A's URLs.
+@test "verify_domain_absent refuses when domain (from) is real but the manifest's own to is broken (BLOCKER-1, #73)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_payload() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
+  local manifest='{"migrate":{"core-wp":{"option_keys":["etch_settings"]}},"options":{"search_replace":{"from":"https://a.example.com","to":"unknown"}}}'
+  run verify_domain_absent "$run_dir" "$tsv" "$manifest" "https://a.example.com"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+  [[ "$output" == *"to is"*"unknown"* ]] || false
+}
+
+@test "verify_domain_absent refuses when domain (from) is real but the manifest's own to is empty (BLOCKER-1, #73)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_payload() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
+  local manifest='{"migrate":{"core-wp":{"option_keys":["etch_settings"]}},"options":{"search_replace":{"from":"https://a.example.com","to":""}}}'
+  run verify_domain_absent "$run_dir" "$tsv" "$manifest" "https://a.example.com"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+  [[ "$output" == *"to is empty"* ]] || false
+}
+
+# Nat feedback (live DDEV run): same escape-hatch requirement as
+# manifest_validate's/graft_search_replace_domain's own refusal messages --
+# a proxied/tunneled site's scan records its own internal address, and
+# re-scanning alone will not fix that.
+@test "verify_domain_absent's refusal names the hand-edit escape hatch, not just 're-scan' (Nat feedback, #73)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_payload() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
+  local manifest='{"migrate":{"core-wp":{"option_keys":["etch_settings"]}},"options":{"search_replace":{"from":"unknown","to":"https://b.example.com"}}}'
+  run verify_domain_absent "$run_dir" "$tsv" "$manifest" "unknown"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"SITE_A_URL"* ]] || false
+  [[ "$output" == *"hand-edit"* ]] || false
+  [[ "$output" == *"ddev.site"* ]] || false
+}
+
 @test "verify_domain_absent is a no-op post_ids list (never calls graft_migrated_post_ids_json) when id-map.tsv is empty/missing" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   local tsv="${run_dir}/id-map.tsv" # never created — no posts imported this run
   # An option key IS selected on purpose: this test is about the post_ids
   # half of the scope being empty, not about the whole scope being empty
   # (that case is its own test below, and is NOT a pass).
-  local manifest='{"migrate":{"core-wp":{"option_keys":["etch_settings"]}}}'
+  local manifest='{"migrate":{"core-wp":{"option_keys":["etch_settings"]}},"options":{"search_replace":{"to":"https://b.example.com"}}}'
   local captured="$BATS_TEST_TMPDIR/captured.json"
   graft_push_remap_payload() { printf '%s' "$2" > "$captured"; echo "/fake/remote/path.json"; }
   graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
@@ -446,7 +499,7 @@ setup() {
 @test "verify_domain_absent returns 2 (INCOMPLETE, never a pass) when nothing at all is in scope — 0 migrated posts AND 0 migrated options" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   local tsv="${run_dir}/id-map.tsv" # never created — the mu-plugin didn't run
-  local manifest='{"migrate":{"core-wp":{"option_keys":[]}}}'
+  local manifest='{"migrate":{"core-wp":{"option_keys":[]}},"options":{"search_replace":{"to":"https://b.example.com"}}}'
   graft_push_remap_payload() { echo "SHOULD NOT BE CALLED"; }
   graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
   graft_remove_file() { :; }
@@ -464,7 +517,7 @@ setup() {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   local tsv="${run_dir}/id-map.tsv"
   printf '10\t42\tattachment\n5\t105\tpage\n' > "$tsv"
-  local manifest='{"migrate":{"etch":{"option_keys":["etch_settings"]}}}'
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_settings"]}},"options":{"search_replace":{"to":"https://b.example.com"}}}'
   graft_push_remap_payload() { echo "/fake/remote/path.json"; }
   graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   graft_remove_file() { :; }
@@ -1159,7 +1212,7 @@ EOF
 
 @test "phase_verify's domain check PASSES when verify_domain_absent confirms absence" {
   setup_phase_verify_fixture
-  jq '.options.search_replace.from = "https://a.example.com"' "${RUN_DIR}/manifest.json" > "${RUN_DIR}/manifest.json.tmp" && mv "${RUN_DIR}/manifest.json.tmp" "${RUN_DIR}/manifest.json"
+  jq '.options.search_replace.from = "https://a.example.com" | .options.search_replace.to = "https://b.example.com"' "${RUN_DIR}/manifest.json" > "${RUN_DIR}/manifest.json.tmp" && mv "${RUN_DIR}/manifest.json.tmp" "${RUN_DIR}/manifest.json"
   graft_push_remap_payload() { echo "/fake/remote/path.json"; }
   graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   graft_remove_file() { :; }
@@ -1531,7 +1584,7 @@ EOF
 # documents at its own `|| front_rc=$?`.
 @test "phase_verify's domain line names how many posts and options were actually scanned" {
   setup_phase_verify_fixture
-  jq '.options.search_replace.from = "https://a.example.com"' "${RUN_DIR}/manifest.json" > "${RUN_DIR}/m.tmp" && mv "${RUN_DIR}/m.tmp" "${RUN_DIR}/manifest.json"
+  jq '.options.search_replace.from = "https://a.example.com" | .options.search_replace.to = "https://b.example.com"' "${RUN_DIR}/manifest.json" > "${RUN_DIR}/m.tmp" && mv "${RUN_DIR}/m.tmp" "${RUN_DIR}/manifest.json"
   graft_push_remap_payload() { echo "/fake/remote/path.json"; }
   graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
   graft_remove_file() { :; }

@@ -26,20 +26,58 @@ plan_defaults() {
   # Issue #73: this used to read `.site_url`, a key `scan` never wrote (the
   # only two places that key existed in the whole codebase were these two
   # `jq` READS of it) — every manifest froze with search_replace.from/to
-  # both defaulted to the literal string "unknown". `home_url` is the field
-  # inventory_scan_site actually records now, and deliberately `home_url`
-  # rather than `site_url`/siteurl: WordPress builds every internal content
-  # link — the exact text graft_search_replace_domain/graft_migrate_options
-  # rewrite — from home_url(), never from site_url() (see
-  # inventory_scan_site's own header comment for the full reasoning, and
-  # for why `site_url` is recorded separately but not read here). A missing
-  # or unreadable home_url still falls back to the literal "unknown" this
-  # always has — that placeholder is what lets manifest_validate's own
-  # #73 guard (lib/manifest.sh) refuse to freeze rather than produce a
-  # manifest whose domain remap cannot work.
+  # both defaulted to the literal string "unknown".
+  #
+  # Priority order (Marcel's own catch, verified live against a real
+  # profile and a real scan on the same run): `SITE_A_URL`/`SITE_B_URL`
+  # from the profile — if the operator set them — WIN over `scan`'s own
+  # `home_url`, not the other way around. Both keys have been on
+  # SITEGRAFT_PROFILE_KEYS (lib/profile.sh) since design doc §5.1, both
+  # are optional, and until this fix SITE_A_URL was read NOWHERE in the
+  # codebase (dead configuration an operator could fill in and have
+  # silently ignored) while SITE_B_URL was read only by verify's HTTP
+  # smoke check — neither ever reached the domain remap this issue is
+  # about. profile_load has already exported both as real (not merely
+  # local) shell variables by the time phase_plan calls this (same
+  # pattern every other SITE_*_* consumer in this codebase already relies
+  # on, e.g. wp_remote in lib/inventory.sh), so reading them here needs no
+  # new plumbing.
+  #
+  # The reasoning FOR this order, not just the mechanics: the operator
+  # knows which public domain they are actually migrating to/from — this
+  # tool can only ever INFER it, from whatever WordPress happens to have
+  # recorded in its own `home` option. Those two can disagree, and not as
+  # an edge case: reproduced live on a real DDEV-fronted site A, where
+  # `home` held DDEV's own internal `*.ddev.site:8443` address (what `wp
+  # option get home` actually returns behind that proxy) while the site's
+  # real content — 27 occurrences, measured directly against the
+  # database — carried the PUBLIC domain the profile's own SITE_A_URL
+  # already named. A site behind any proxy, SSH tunnel, or local dev
+  # front-end can carry more than one domain in its own database, and
+  # `home` is not guaranteed to be the one that matters for THIS
+  # migration's content. An operator-supplied SITE_A_URL/SITE_B_URL is
+  # exact, by construction; scan's `home_url` is a best-effort inference
+  # that can be wrong in exactly this reproducible way.
+  #
+  # `home_url` is NOT removed as a result — it stays scan's own recorded
+  # fact (real inventory data worth having regardless of whether plan
+  # ends up using it) and remains the FALLBACK here whenever the profile
+  # doesn't name a URL for that site: still the best available guess, and
+  # still what lets manifest_validate's own #73 guard (lib/manifest.sh)
+  # refuse to freeze when even that guess is missing/unusable, and still
+  # subject to the choice between `home`/`siteurl` this fix-pack argued
+  # for and now surfaces as a warning when they diverge on A
+  # (inventory_scan_site's own header comment; plan_warn_scope_gaps,
+  # below) — reduced to a second-rank signal now that a correct
+  # profile-supplied URL is the FIRST place this looks, not the only one.
+  local site_a_domain site_b_domain
+  site_a_domain="${SITE_A_URL:-}"
+  [ -n "$site_a_domain" ] || site_a_domain=$(jq -r '.home_url // "unknown"' "$scan_a_json" 2>/dev/null || echo unknown)
+  site_b_domain="${SITE_B_URL:-}"
+  [ -n "$site_b_domain" ] || site_b_domain=$(jq -r '.home_url // "unknown"' "$scan_b_json" 2>/dev/null || echo unknown)
   manifest=$(manifest_new \
-    "$(jq -r '.home_url // "unknown"' "$scan_a_json" 2>/dev/null || echo unknown)" \
-    "$(jq -r '.home_url // "unknown"' "$scan_b_json" 2>/dev/null || echo unknown)" \
+    "$site_a_domain" \
+    "$site_b_domain" \
     "$profile" "${SITE_A_ALIAS:-a}" "${SITE_B_ALIAS:-b}")
 
   # A module found on A was classified `migrate`, and only a module found
@@ -165,6 +203,60 @@ plan_warn_scope_gaps() {
   local scan_a_json="$1" scan_b_json="$2"
   if jq -e '.classic_menus_detected == true' "$scan_a_json" >/dev/null 2>&1; then
     log_warn "A has classic nav menu(s) with items ($(jq -r '.classic_menu_names | join(", ")' "$scan_a_json")) — sitegraft v1 does not migrate classic menu assignments (design doc §13). Migrate them by hand or write a module."
+  fi
+
+  # MAJOR-2(b) (issue #73, second review round): the domain remap
+  # (options.search_replace, built below from A's home_url) only ever
+  # targets `home` — see inventory_scan_site's own comment for why that
+  # scope limit is real: `siteurl` governs every media/plugin/theme asset
+  # URL (WP_CONTENT_URL derives from it), and on a real Etch/ACSS build
+  # those URLs DO appear in migrated post_content and option values. When
+  # A's `home_url` and `site_url` are on different ORIGINS (scheme+host —
+  # a differing PATH, e.g. a subdirectory install, still shares one origin
+  # and one remap covers both), asset URLs under A's `site_url` origin
+  # will NOT be rewritten by this run and will keep pointing at A after
+  # migration — `verify` (verify_domain_absent) only ever checks for
+  # `home_url`'s absence, so it will not catch this either. Named here,
+  # once, at the one place `plan` already surfaces a scan-derived scope gap
+  # (the classic-menu warning just above), rather than left for an
+  # operator to discover by finding A's asset domain still live on B.
+  #
+  # Guarded on BOTH being present, non-"unknown" strings — an `home_url`/
+  # `site_url` that scan could not determine is a DIFFERENT, harder
+  # failure manifest_validate's own #73 guard already refuses to freeze
+  # over; this warning is only about two REAL, resolvable values that
+  # happen to disagree, not about a missing one.
+  local a_home a_site
+  a_home=$(jq -r '.home_url // ""' "$scan_a_json" 2>/dev/null)
+  a_site=$(jq -r '.site_url // ""' "$scan_a_json" 2>/dev/null)
+  if [ -n "$a_home" ] && [ -n "$a_site" ] && [ "$a_home" != "unknown" ] && [ "$a_site" != "unknown" ]; then
+    local a_home_origin a_site_origin
+    a_home_origin=$(_plan_url_origin "$a_home")
+    a_site_origin=$(_plan_url_origin "$a_site")
+    if [ "$a_home_origin" != "$a_site_origin" ]; then
+      log_warn "A's home ('${a_home}') and siteurl ('${a_site}') are on different origins — this run's domain remap (design doc §9.4) only ever rewrites A's HOME domain (${a_home_origin}); any asset URL built from A's siteurl (media/plugin/theme URLs under ${a_site_origin} — WP_CONTENT_URL and everything derived from it) will NOT be rewritten and will keep pointing at A after migration. Known, documented scope limit (issue #73, MAJOR-2) — review B's migrated content for lingering ${a_site_origin} references after graft, or write a module/manual pass to cover it."
+    fi
+  fi
+}
+
+# _plan_url_origin <url> — scheme://host[:port], stripping any path/query/
+# fragment. Used only by plan_warn_scope_gaps' home/siteurl divergence
+# check just above: comparing full URL strings would flag a subdirectory
+# install (same origin, different path — one domain-prefix remap already
+# covers both) as a false divergence; comparing origins does not.
+# `[[ =~ ]]`/`BASH_REMATCH` is an existing convention in this codebase
+# (lib/profile.sh's own profile-line parser), and portable to the bash 3.2
+# floor (docs/decisions/0003-bash-compatibility.md) unlike associative
+# arrays or other newer bashisms. Falls back to the raw input unchanged if
+# it doesn't look like an absolute URL at all — never errors, since a
+# malformed value here should read as "origins differ" (safe direction:
+# warn) rather than silently skip the check.
+_plan_url_origin() {
+  local url="$1"
+  if [[ "$url" =~ ^([a-zA-Z][a-zA-Z0-9+.-]*://[^/?#]+) ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  else
+    printf '%s' "$url"
   fi
 }
 

@@ -361,19 +361,39 @@ inventory_scan_site() {
   # "unknown" -- a real search-replace pass that swapped the literal text
   # "unknown" for "unknown" and reported success while rewriting nothing.
   #
-  # `home` vs `siteurl`, decided here rather than left to whoever reads the
-  # scan file later: WordPress builds every internal content link -- the
-  # post_content/post_excerpt text graft_search_replace_domain rewrites,
-  # and the option VALUES graft_migrate_options rewrites -- from
-  # home_url(), never from site_url(). The two are free to differ (a CDN
-  # front-end, a subdirectory WordPress install, domain-mapped multisite),
-  # and on such a site `siteurl` would name a domain that has zero overlap
-  # with what graft's remap surface actually contains. `home_url` is
-  # therefore what plan_defaults now feeds into manifest_new/
-  # options.search_replace -- the only choice that can ever rewrite
-  # anything. `site_url` is still recorded, under its own unambiguous
-  # name, purely so an operator inspecting a scan file can see whether the
-  # two differ on this site; no code path in this fix-pack consumes it.
+  # `home` vs `siteurl`, decided here rather than left to whoever reads
+  # the scan file later -- and corrected in this fix-pack's second review
+  # round (MAJOR-2) after the FIRST version of this comment overclaimed
+  # the split ("WordPress builds every internal content link ... never
+  # from site_url()"), checked in the WordPress source rather than from
+  # memory this time:
+  #   - `home` governs PERMALINKS -- the URLs WordPress generates for
+  #     posts/pages/menus, which is what fills post_content's internal
+  #     links.
+  #   - `siteurl` governs everything WP_CONTENT_URL derives from
+  #     (wp-includes/default-constants.php: `WP_CONTENT_URL =
+  #     get_option('siteurl') . '/wp-content'`) -- every media/upload URL
+  #     (`_wp_upload_dir()`), every plugin URL (`WP_PLUGIN_URL`), every
+  #     theme asset URL. On an Etch/ACSS build those are NOT a minor
+  #     surface -- image URLs, block-attribute JSON referencing media, and
+  #     option blobs holding stylesheet/asset paths all carry `siteurl`,
+  #     not `home`.
+  #   So the two options' write surfaces genuinely OVERLAP the content
+  #   graft_search_replace_domain/graft_migrate_options rewrite; this is
+  #   not a clean "home is content, siteurl is irrelevant" split.
+  #
+  # `home_url` is still the field plan_defaults reads as the SOLE remap
+  # source (unchanged decision, now honestly justified): permalinks are
+  # graft's single largest, always-present rewrite target, and on the
+  # common case -- `home == siteurl`, or a subdirectory install where
+  # they share an origin -- a single domain-prefix remap already covers
+  # both surfaces correctly. The gap is real only when the two diverge at
+  # the ORIGIN (scheme+host), which is knowable at scan time and is now
+  # surfaced as a `plan` warning (plan_warn_scope_gaps, lib/plan.sh) when
+  # it happens on A -- see that function's own comment. `site_url` is
+  # still recorded, under its own unambiguous name, specifically so that
+  # warning (and an operator inspecting a scan file) can see it; no
+  # rewrite code path consumes it directly.
   #
   # Both go through the exact fail-safe treatment nav_dynamic/nav_count
   # already established just below: a query failure, OR a result that
@@ -393,6 +413,16 @@ inventory_scan_site() {
     *) home_url='null' ;;
   esac
   if ! site_url=$(wp_remote "$alias_lc" option get siteurl --format=json 2>/dev/null); then
+    # NIT-1 (second review round): this used to fall back to 'null'
+    # silently, unlike home_url's own log_warn just above -- an operator
+    # staring at `"site_url": null` in a scan file had no way to tell
+    # whether that meant "the query failed" or "nothing to record" (it
+    # never means the latter; the field always attempts a real read).
+    # site_url is not itself consumed by any remap code path (see this
+    # function's own header comment), but plan_warn_scope_gaps DOES now
+    # read it (MAJOR-2b) to warn when it diverges from home_url -- a
+    # silently-null site_url would make that warning silently skip too.
+    log_warn "could not read site ${alias_lc}'s siteurl option -- recording site_url as unknown"
     site_url='null'
   fi
   case "$(printf '%s' "$site_url" | jq 'type' 2>/dev/null)" in

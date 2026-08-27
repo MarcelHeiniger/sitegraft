@@ -147,6 +147,53 @@ setup() {
   [ -z "$output" ]
 }
 
+# --- MAJOR-2(b) (issue #73, second review round): the domain remap only
+# ever targets A's home_url; siteurl governs media/plugin/theme asset URLs
+# (WP_CONTENT_URL) that real Etch/ACSS content does carry. When the two
+# diverge at the origin on A, asset URLs are never rewritten and stay
+# silent unless plan says so.
+
+@test "plan_warn_scope_gaps warns when A's home and siteurl are on different origins" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"classic_menus_detected":false,"home_url":"https://a.example.com","site_url":"https://cdn-a.example.com"}' > "$a"
+  echo '{"classic_menus_detected":false}' > "$b"
+  run plan_warn_scope_gaps "$a" "$b"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"different origins"* ]] || false
+  [[ "$output" == *"https://a.example.com"* ]] || false
+  [[ "$output" == *"https://cdn-a.example.com"* ]] || false
+}
+
+@test "plan_warn_scope_gaps says nothing when A's home and siteurl share an origin (subdirectory install, same domain different path)" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"classic_menus_detected":false,"home_url":"https://a.example.com/blog","site_url":"https://a.example.com"}' > "$a"
+  echo '{"classic_menus_detected":false}' > "$b"
+  run plan_warn_scope_gaps "$a" "$b"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "plan_warn_scope_gaps says nothing about home/siteurl divergence when either is missing or unknown (that is manifest_validate's #73 guard's job, not this warning's)" {
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"classic_menus_detected":false,"home_url":"unknown","site_url":"https://cdn-a.example.com"}' > "$a"
+  echo '{"classic_menus_detected":false}' > "$b"
+  run plan_warn_scope_gaps "$a" "$b"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "_plan_url_origin strips path/query/fragment, keeping only scheme://host[:port]" {
+  run _plan_url_origin "https://a.example.com:8443/blog/page?x=1#frag"
+  [ "$status" -eq 0 ]
+  [ "$output" = "https://a.example.com:8443" ]
+}
+
+@test "_plan_url_origin treats a bare host with no scheme as its own origin (never errors, never empties)" {
+  run _plan_url_origin "not-a-url"
+  [ "$status" -eq 0 ]
+  [ "$output" = "not-a-url" ]
+}
+
 # --- plan_defaults: not covered by the plan's own bats spec (called out there
 # as "not a pure function... tested separately") — added here for real
 # coverage of the module-dispatch logic itself, using fabricated modules the
@@ -231,6 +278,72 @@ EOF
   [ "$status" -eq 0 ]
   echo "$output" | jq -e '.options.search_replace.from == "unknown"' >/dev/null
   echo "$output" | jq -e '.options.search_replace.to == "unknown"' >/dev/null
+}
+
+# --- Marcel's own catch, second review round: the profile ALREADY carries
+# SITE_A_URL/SITE_B_URL (design doc §5.1, whitelisted since day one), filled
+# in by hand by an operator who knows the real public domain — and until
+# this fix plan_defaults ignored both, guessing from scan's own `home_url`
+# instead. Reproduced live against a real migration: a site served behind
+# a proxy (DDEV, in the reproducing case) records `home` as the proxy's
+# own internal address — zero occurrences of that address in the site's
+# real content — while the profile's own SITE_A_URL already named the
+# public domain that actually appears there. profile_load exports both as
+# real shell variables before plan_defaults runs (same pattern every other
+# SITE_*_* consumer already relies on), so these tests set them the same
+# way. Domains below are this repo's own placeholders throughout
+# (a.example.com/b.example.com — see e.g. tests/integration/ddev-harness.sh,
+# profiles/example.conf), never real hosts.
+
+@test "plan_defaults prefers the profile's SITE_A_URL/SITE_B_URL over scan's home_url (Marcel's catch, #73)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://a.ddev.site:8443"}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://b.ddev.site:8443"}' > "$b"
+  SITE_A_URL="https://a.example.com"
+  SITE_B_URL="https://b.example.com"
+  run plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.from == "https://a.example.com"' >/dev/null
+  echo "$output" | jq -e '.options.search_replace.to == "https://b.example.com"' >/dev/null
+  echo "$output" | jq -e '.options.search_replace.from != "https://a.ddev.site:8443"' >/dev/null
+}
+
+@test "plan_defaults falls back to scan's home_url when the profile does not set SITE_A_URL/SITE_B_URL (#73)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://a.example.com"}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://b.example.com"}' > "$b"
+  unset SITE_A_URL SITE_B_URL
+  run plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.from == "https://a.example.com"' >/dev/null
+  echo "$output" | jq -e '.options.search_replace.to == "https://b.example.com"' >/dev/null
+}
+
+@test "plan_defaults mixes sources independently — SITE_A_URL set, SITE_B_URL not, B still falls back to scan's home_url (#73)" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://a.ddev.site"}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://b.example.com"}' > "$b"
+  SITE_A_URL="https://a-public.example.com"
+  unset SITE_B_URL
+  run plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.from == "https://a-public.example.com"' >/dev/null
+  echo "$output" | jq -e '.options.search_replace.to == "https://b.example.com"' >/dev/null
+}
+
+@test "plan_defaults treats an empty SITE_A_URL exactly like an unset one — still falls back to scan's home_url" {
+  _plan_defaults_setup_modules
+  local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://a.example.com"}' > "$a"
+  echo '{"plugins":[],"post_types":[],"options":[],"tables":[],"home_url":"https://b.example.com"}' > "$b"
+  SITE_A_URL=""
+  SITE_B_URL=""
+  run plan_defaults "$a" "$b"
+  [ "$status" -eq 0 ]
+  echo "$output" | jq -e '.options.search_replace.from == "https://a.example.com"' >/dev/null
 }
 
 # --- plan_defaults: dynamic selections and option-key exclusions (issues

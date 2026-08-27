@@ -272,24 +272,36 @@ verify_domain_absent() {
   local run_dir="$1" id_map_tsv="$2" manifest="$3" domain="$4"
   [ -n "$domain" ] || return 0
 
-  # Issue #73, second guard: the same "unknown" placeholder / from==to
+  # Issue #73, second guard: the same "unknown" placeholder / broken-`to`
   # shape that made graft_search_replace_domain (lib/graft.sh) run a real,
-  # silently-successful no-op search-replace also blinds THIS check —
-  # searching B's content for the literal string "unknown" (or for a
-  # domain identical to `to`) reliably finds nothing, so a manifest that
-  # could never have had a working domain remap would otherwise report
-  # "the domain is absent" as a genuine, verified finding. manifest_validate
-  # is meant to refuse freezing such a manifest in the first place; this is
+  # silently-successful no-op (or actively corrupting) search-replace also
+  # blinds THIS check — searching B's content for a string that was never
+  # usable to begin with reliably finds nothing, so a manifest that could
+  # never have had a working domain remap would otherwise report "the
+  # domain is absent" as a genuine, verified finding. manifest_validate is
+  # meant to refuse freezing such a manifest in the first place; this is
   # the belt for one that reaches verify without passing through that gate
   # (SITEGRAFT_MANIFEST_PREFILLED, or hand-edited after freezing).
   #
-  # `to` comes from THIS manifest (not a second parameter) — verify already
-  # has it, and every other verify_domain_absent call site already passes
-  # the manifest, so no signature change is needed to close this.
-  local domain_to
+  # graft_domain_remap_unusable_reason (lib/graft.sh — `verify` loads this
+  # file too, see bin/sitegraft's `require_lib graft 4`) is the SAME check
+  # graft_search_replace_domain and graft_migrate_options use, so "usable"
+  # cannot drift between what graft was willing to run and what verify is
+  # willing to trust the result of (BLOCKER-1, second review round: an
+  # earlier version of this guard only ever compared `domain` against
+  # "unknown"/`to`, never checked whether `to` ITSELF was empty or
+  # "unknown" — exactly the shape a B-side scan failure produces, and the
+  # one case this whole check exists to catch: A's home_url resolved fine,
+  # B's didn't, graft wrote B's own broken placeholder into every migrated
+  # page, and a check that only looked at `domain` never noticed). `to`
+  # comes from THIS manifest (not a second parameter) — verify already has
+  # it, and every other verify_domain_absent call site already passes the
+  # manifest, so no signature change was needed to close this.
+  local domain_to unusable_reason
   domain_to=$(echo "$manifest" | jq -r '.options.search_replace.to // ""')
-  if [ "$domain" = "unknown" ] || { [ -n "$domain_to" ] && [ "$domain" = "$domain_to" ]; }; then
-    log_error "domain-absence check refused: from ('${domain}') is the literal placeholder 'unknown', or identical to to ('${domain_to}'). Either way this manifest could never have had a working domain remap, so 'the domain is absent from B' cannot be a genuine finding here — it would just mean nothing usable was ever searched for (issue #73, same guard as graft_search_replace_domain's). Rebuild the manifest with 'sitegraft plan' against a fresh 'sitegraft scan' of both sites."
+  unusable_reason=$(graft_domain_remap_unusable_reason "$domain" "$domain_to")
+  if [ -n "$unusable_reason" ]; then
+    log_error "domain-absence check refused: ${unusable_reason}. This manifest could never have had a working domain remap, so 'the domain is absent from B' cannot be a genuine finding here — it would just mean nothing usable was ever searched for (issue #73, same guard as graft_search_replace_domain's). Rebuild the manifest: set SITE_A_URL/SITE_B_URL in the profile to each site's real public domain and re-run 'sitegraft plan' -- plan_defaults reads those in PREFERENCE to scan's own home_url guess, which a proxied/tunneled/local-dev site (DDEV's own *.ddev.site, an SSH tunnel, a reverse proxy) can get wrong in a way no re-scan fixes. Failing that: re-run 'sitegraft scan' if a value is genuinely missing, or hand-edit scan-a.json/scan-b.json's home_url yourself if scan ran cleanly but simply recorded the wrong domain."
     return 1
   fi
 

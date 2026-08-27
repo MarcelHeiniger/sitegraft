@@ -1852,6 +1852,24 @@ graft_safety_step_done() {
 # safety property this function already had for everything else.
 graft_migrate_options() {
   local run_dir="$1" manifest="$2" domain_from="${3:-}" domain_to="${4:-}"
+
+  # Issue #73, belt-and-braces (MAJOR-1, second review round): this
+  # function had NO guard of its own before this fix-pack — it received
+  # the same domain_from/domain_to pair as graft_search_replace_domain,
+  # unchecked. phase_graft (below) now runs
+  # graft_domain_remap_unusable_reason unconditionally before either
+  # consumer, which is the real fix (see phase_graft's own comment); this
+  # is the second line of defense for any future direct call to this
+  # function that skips phase_graft.
+  if [ -n "$domain_from" ]; then
+    local options_unusable_reason
+    options_unusable_reason=$(graft_domain_remap_unusable_reason "$domain_from" "$domain_to")
+    if [ -n "$options_unusable_reason" ]; then
+      log_error "graft: refusing to migrate options — ${options_unusable_reason}. Pushing a migrated option's value through this remap anyway would write a broken domain string into B's LIVE options and report success (issue #73). Rebuild the manifest: set SITE_A_URL/SITE_B_URL in the profile to each site's real public domain and re-run 'sitegraft plan' -- plan_defaults reads those in PREFERENCE to scan's own home_url guess, which a proxied/tunneled/local-dev site (DDEV's own *.ddev.site, an SSH tunnel, a reverse proxy) can get wrong in a way no re-scan fixes. Failing that: re-run 'sitegraft scan' if a value is genuinely missing, or hand-edit scan-a.json/scan-b.json's home_url yourself if scan ran cleanly but simply recorded the wrong domain."
+      return 1
+    fi
+  fi
+
   local keys key
   keys=$(echo "$manifest" | jq -r '[.migrate[].option_keys[]?] | unique[]')
   # A read loop over fd 3, not `for key in $(...)`. The old form relied on
@@ -1956,30 +1974,111 @@ graft_migrate_options() {
 # and more narrowly by graft_migrate_options — which already only ever
 # touches the manifest's explicitly-listed option_keys, never a table scan
 # — see that function's own domain-rewrite step.
+# graft_domain_remap_unusable_reason <from> <to> — issue #73's BLOCKER-1
+# fix (second review round): the SHARED definition of "this domain remap
+# can never do anything", used by phase_graft's own top-level gate (see
+# that function's own comment for why it needed one), by
+# graft_search_replace_domain's belt-and-braces check just below, by
+# graft_migrate_options' identical belt-and-braces check, and by
+# verify_domain_absent (lib/verify.sh — `verify` loads this file too, see
+# bin/sitegraft's `require_lib graft 4` under both the `graft` and
+# `verify` cases). One definition, four call sites, so "unusable" cannot
+# drift between them the way it drifted the first time: the original #73
+# defect was two independently-blind guards (graft's own `-z` check,
+# verify's own domain search) that each happened to miss the same
+# "unknown" value for different reasons.
+#
+# Deliberately does NOT treat an empty `from` as unusable — every caller
+# already special-cases "no domain configured for this migration" as
+# legitimate with its own guard BEFORE ever reaching this function
+# (graft_search_replace_domain's `[ -z "$from" ]`, graft_migrate_options'
+# `[ -n "$domain_from" ]`, verify_domain_absent's `[ -n "$domain" ] ||
+# return 0`, phase_graft's own `[ -n "$domain_from" ]` below) — this
+# function is only ever consulted once a caller has decided `from` is
+# meant to be a real value. `to` is checked unconditionally once that
+# point is reached, because BLOCKER-1's actual reproduction is exactly a
+# REAL, non-empty `from` paired with a broken `to` (A's scan succeeded,
+# B's failed) — nothing upstream of this function guards `to` on its own,
+# and the first version of this fix-pack didn't either.
+graft_domain_remap_unusable_reason() {
+  local from="$1" to="$2"
+  if [ "$from" = "unknown" ]; then
+    echo "from is the literal placeholder 'unknown' (scan could not determine A's home URL)"
+  elif [ -z "$to" ]; then
+    echo "to is empty (scan could not determine B's home URL)"
+  elif [ "$to" = "unknown" ]; then
+    echo "to is the literal placeholder 'unknown' (scan could not determine B's home URL)"
+  elif [ "$from" = "$to" ]; then
+    echo "from equals to ('${from}') — A and B's own recorded home URLs are identical, so this remap would replace the domain with itself"
+  fi
+}
+
+# graft_verify_domain_remap_usable <domain_from> <domain_to> — MAJOR-1
+# (issue #73, second review round): phase_graft's own top-level gate,
+# pulled out into a named, independently-testable function rather than an
+# inline `if` in phase_graft's body, but still called unconditionally from
+# there (see phase_graft's own call site) — never from inside a
+# `graft_step_done ... || { ... }` block, which is exactly what let the
+# original in-function guards get skipped.
+#
+# The defect this closes: graft_search_replace_domain's own belt-and-
+# braces check (below) sits INSIDE phase_graft's `graft_step_done
+# "$run_dir" remap_domain || { ... }` gate — a run_dir carrying a
+# `graft.remap_domain.done` marker from an EARLIER release (before that
+# guard existed) skips the whole block, guard included, on resume, and
+# never re-evaluates it. graft_migrate_options runs immediately after
+# with the identical domain_from/domain_to and, before this fix, carried
+# no guard of its own at all. Reproduced live against a real rc10 run
+# directory: with only the in-function guards, graft_search_replace_domain's
+# check never ran (its marker pre-dated this fix), and graft_migrate_options
+# pushed A's literal domain string straight into B's live options,
+# unrewritten, reporting success.
+#
+# Calling this ONCE, unconditionally, before either consumer, is what
+# actually closes it — markers only ever skip the individual STEPS in
+# phase_graft, never a plain function call in its body. The in-function
+# checks inside graft_search_replace_domain/graft_migrate_options stay as
+# belt-and-braces for any future direct call to either that doesn't go
+# through phase_graft.
+#
+# Returns 0 (usable, or nothing to check) when domain_from is itself
+# empty — "no domain configured for this migration" is the existing,
+# legitimate no-op case every consumer already special-cases on its own
+# (graft_search_replace_domain's `[ -z "$from" ]`, graft_migrate_options'
+# `[ -n "$domain_from" ]`). Logs and returns 1 otherwise.
+graft_verify_domain_remap_usable() {
+  local domain_from="$1" domain_to="$2"
+  [ -n "$domain_from" ] || return 0
+  local reason
+  reason=$(graft_domain_remap_unusable_reason "$domain_from" "$domain_to")
+  if [ -n "$reason" ]; then
+    log_error "graft: refusing to run at all — this manifest's domain remap is unusable (${reason}). Both the content search-replace and the migrated-options rewrite would otherwise write a broken domain string into B's live content/options and report success (issue #73). Rebuild the manifest: set SITE_A_URL/SITE_B_URL in the profile to each site's real public domain and re-run 'sitegraft plan' -- plan_defaults reads those in PREFERENCE to scan's own home_url guess, which a proxied/tunneled/local-dev site (DDEV's own *.ddev.site, an SSH tunnel, a reverse proxy) can get wrong in a way no re-scan fixes. Failing that: re-run 'sitegraft scan' if a value is genuinely missing, or hand-edit scan-a.json/scan-b.json's home_url yourself if scan ran cleanly but simply recorded the wrong domain."
+    return 1
+  fi
+  return 0
+}
+
 graft_search_replace_domain() {
   local from="$1" to="$2" id_map_tsv="$3" run_dir="$4"
   if [ -z "$from" ] || [ ! -s "$id_map_tsv" ]; then
     return 0
   fi
 
-  # Issue #73, second guard: manifest_validate (lib/manifest.sh) is meant
-  # to refuse freezing a manifest whose search_replace.from is "unknown"
-  # (scan's own placeholder for "could not determine this site's home
-  # URL") or equal to `to` (a domain remap that replaces something with
-  # itself) — both non-empty, so both slip straight past the `[ -z "$from"
-  # ]` no-op guard just above, and both are exactly the shape that made
-  # this function run a real search-replace pass which rewrote nothing and
-  # reported success. This is the belt to that braces: a
-  # SITEGRAFT_MANIFEST_PREFILLED or hand-edited manifest reaches graft
-  # without ever passing through manifest_freeze (same "one enforcement
-  # point is elegant and fragile" reasoning graft_migrate_options' own
-  # comment gives for the identical malformed-name belt-and-braces).
-  # Fails LOUD (log_error + return 1) rather than the silent-success this
-  # issue is entirely about — a caller that ignored this return value
-  # would be exactly the bug being fixed, so it must not be possible to
-  # "succeed" here on an unusable value.
-  if [ "$from" = "unknown" ] || [ "$from" = "$to" ]; then
-    log_error "graft: refusing the domain search-replace — from ('${from}') is the literal placeholder 'unknown', or identical to to ('${to}'). Either way this remap could never rewrite anything, and running it anyway would report success while A's domain stays on every migrated page (issue #73). Rebuild the manifest with 'sitegraft plan' against a fresh 'sitegraft scan' of both sites."
+  # Issue #73, belt-and-braces: phase_graft (below) now runs the SAME
+  # graft_domain_remap_unusable_reason check unconditionally, before this
+  # function is ever called — see phase_graft's own comment for why that
+  # became necessary (MAJOR-1, second review round: a resume marker from
+  # an older release could skip a check that lived only inside this
+  # function). Kept here too, for any future direct call to this function
+  # that doesn't go through phase_graft. Fails LOUD (log_error + return 1)
+  # rather than the silent-success this issue is entirely about — a
+  # caller that ignored this return value would be exactly the bug being
+  # fixed, so it must not be possible to "succeed" here on an unusable
+  # value.
+  local unusable_reason
+  unusable_reason=$(graft_domain_remap_unusable_reason "$from" "$to")
+  if [ -n "$unusable_reason" ]; then
+    log_error "graft: refusing the domain search-replace — ${unusable_reason}. This remap could never rewrite anything, and running it anyway would report success while some domain string stays wrong on every migrated page (issue #73). Rebuild the manifest: set SITE_A_URL/SITE_B_URL in the profile to each site's real public domain and re-run 'sitegraft plan' -- plan_defaults reads those in PREFERENCE to scan's own home_url guess, which a proxied/tunneled/local-dev site (DDEV's own *.ddev.site, an SSH tunnel, a reverse proxy) can get wrong in a way no re-scan fixes. Failing that: re-run 'sitegraft scan' if a value is genuinely missing, or hand-edit scan-a.json/scan-b.json's home_url yourself if scan ran cleanly but simply recorded the wrong domain."
     return 1
   fi
 
@@ -2588,6 +2687,13 @@ phase_graft() {
   # value in this codebase.
   [ "$domain_from" = "null" ] && domain_from=""
   [ "$domain_to" = "null" ] && domain_to=""
+
+  # MAJOR-1 (issue #73, second review round) — see
+  # graft_verify_domain_remap_usable's own header comment (just above its
+  # definition) for the full reasoning. Called unconditionally, before
+  # either consumer, so no resume marker can ever skip it.
+  graft_verify_domain_remap_usable "$domain_from" "$domain_to" || return 1
+
   graft_step_done "$run_dir" remap_domain  || {
     graft_search_replace_domain "$domain_from" "$domain_to" "${run_dir}/id-map.tsv" "$run_dir"
     graft_mark_step "$run_dir" remap_domain

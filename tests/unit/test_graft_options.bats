@@ -112,6 +112,80 @@ setup() {
   [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }
 
+# --- BLOCKER-1 (second review round): `from` real, `to` broken — A's scan
+# succeeded, B's failed. Neither "from is empty" nor "from is unknown" nor
+# "from equals to" catches this: `from` is a genuine domain and `to` is
+# independently broken. Before this fix, this ran a REAL search-replace
+# pass that rewrote A's domain to the literal text "unknown" (or to an
+# empty string) across every migrated page — corrupting content instead of
+# leaving it untouched, and still reporting success.
+
+@test "graft_search_replace_domain refuses when from is real but to is empty (BLOCKER-1, #73)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_payload() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
+  run graft_search_replace_domain "https://a.example.com" "" "$tsv" "$run_dir"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+  [[ "$output" == *"to is empty"* ]] || false
+}
+
+@test "graft_search_replace_domain refuses when from is real but to is 'unknown' (BLOCKER-1, #73 — the actual reproduction: A's scan succeeded, B's failed)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_payload() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
+  run graft_search_replace_domain "https://a.example.com" "unknown" "$tsv" "$run_dir"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+  [[ "$output" == *"unknown"* ]] || false
+}
+
+@test "graft_migrate_options refuses when domain_from is real but domain_to is 'unknown' — no in-function guard existed at all before this fix (MAJOR-1/BLOCKER-1, #73)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local manifest='{"migrate":{"core-wp":{"option_keys":["etch_settings"]}}}'
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  run graft_migrate_options "$run_dir" "$manifest" "https://a.example.com" "unknown"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+  [[ "$output" == *"unknown"* ]] || false
+}
+
+@test "graft_migrate_options is unaffected (no guard fires) when domain_from is empty — no domain configured is still a legitimate no-op (#73)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local manifest='{"migrate":{"core-wp":{"option_keys":["show_on_front"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  wp_remote() { local alias_lc="$1"; if [ "$alias_lc" = "a" ]; then echo '"page"'; fi; }
+  run graft_migrate_options "$run_dir" "$manifest"
+  [ "$status" -eq 0 ]
+}
+
+# --- MAJOR-1 (second review round): the in-function guards above are not
+# enough by themselves — graft_verify_domain_remap_usable is what
+# phase_graft now calls UNCONDITIONALLY, before either consumer, so no
+# resume marker can skip it (see lib/graft.sh's own comment on that
+# function for the full reproduction). Tested directly here since it's now
+# its own named function.
+
+@test "graft_verify_domain_remap_usable passes (no-op) when domain_from is empty" {
+  run graft_verify_domain_remap_usable "" "unknown"
+  [ "$status" -eq 0 ]
+}
+
+@test "graft_verify_domain_remap_usable refuses when from is real but to is broken (MAJOR-1/BLOCKER-1, #73)" {
+  run graft_verify_domain_remap_usable "https://a.example.com" "unknown"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unknown"* ]] || false
+}
+
+@test "graft_verify_domain_remap_usable passes when both from and to are real and distinct" {
+  run graft_verify_domain_remap_usable "https://a.example.com" "https://b.example.com"
+  [ "$status" -eq 0 ]
+}
+
 @test "graft_search_replace_domain's payload carries from/to and every migrated post id, never a table name" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
@@ -349,4 +423,22 @@ setup() {
   [ "$status" -eq 0 ]
   [[ "$output" != *"option update"* ]] || false
   [ -z "$(ls -A "$run_dir")" ]
+}
+
+# Nat feedback (live DDEV run): the message a refused domain remap prints
+# must tell the operator HOW to fix it, not just that it's broken -- a
+# proxied/tunneled site (DDEV, an SSH tunnel, a reverse proxy) has scan
+# record its OWN internal address, not the public domain visitors use, and
+# re-scanning just records the same wrong value again.
+@test "graft_search_replace_domain's refusal names the hand-edit escape hatch, not just 're-scan' (Nat feedback, #73)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"; printf '5\t105\tpage\n' > "$tsv"
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_payload() { echo "SHOULD NOT BE CALLED"; }
+  graft_push_remap_lib() { echo "SHOULD NOT BE CALLED"; }
+  run graft_search_replace_domain "unknown" "https://b.example.com" "$tsv" "$run_dir"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"SITE_A_URL"* ]] || false
+  [[ "$output" == *"hand-edit"* ]] || false
+  [[ "$output" == *"ddev.site"* ]] || false
 }

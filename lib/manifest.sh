@@ -155,11 +155,51 @@ manifest_validate() {
   # domain-absence reporting already draws between "not applicable" and
   # "unverifiable".
   if echo "$manifest" | jq -e '.options.search_replace? // {} | has("from")' >/dev/null 2>&1; then
-    local domain_from domain_to
+    local domain_from domain_to bad_reason="" bad_advice=""
     domain_from=$(echo "$manifest" | jq -r '.options.search_replace.from // ""')
     domain_to=$(echo "$manifest" | jq -r '.options.search_replace.to // ""')
-    if [ -z "$domain_from" ] || [ "$domain_from" = "unknown" ] || [ "$domain_from" = "$domain_to" ]; then
-      log_error "manifest invalid: options.search_replace.from is $([ -z "$domain_from" ] && echo "empty" || echo "'${domain_from}'") and options.search_replace.to is $([ -z "$domain_to" ] && echo "empty" || echo "'${domain_to}'") — a domain remap that is empty, the literal placeholder 'unknown', or identical to 'to' can never rewrite anything, so freezing it would only defer this failure to 'graft' or 'verify' reporting a green run that changed nothing (issue #73). This usually means 'scan' could not determine one or both sites' home URL. Re-run 'sitegraft scan' against both A and B and confirm scan-a.json/scan-b.json each carry a real, distinct home_url before re-running 'plan'."
+    # Symmetric on `to` as well as `from` (BLOCKER-1, second review round):
+    # an earlier version of this check only ever looked at `from`, so a
+    # manifest with a perfectly real, non-empty `from` and a broken `to`
+    # (A's scan succeeded, B's failed — plan_defaults defaults EACH side
+    # independently to "unknown") sailed straight through. That is not a
+    # smaller version of the same bug: graft_search_replace_domain and
+    # graft_migrate_options would have run for real, using B's broken
+    # placeholder as the REPLACEMENT text, and written it into B's own
+    # live content/options — worse than the original #73 no-op, which at
+    # least left content untouched.
+    #
+    # Advice differs by cause, deliberately (MINOR-2, second review
+    # round, then rewritten again after Marcel's own catch): "re-run scan"
+    # is the right fix for empty/"unknown" IF scan genuinely could not
+    # reach the site — but the PRIMARY fix, ahead of that, is now the
+    # profile's own SITE_A_URL/SITE_B_URL (plan_defaults, lib/plan.sh,
+    # reads them in preference to scan's home_url guess): the operator
+    # knows the real public domain; scan can only ever infer it from
+    # whatever WordPress's `home` option happens to hold, which a site
+    # behind a proxy/tunnel/local dev front-end can get wrong in a way no
+    # amount of re-scanning fixes (reproduced live: DDEV's own internal
+    # *.ddev.site address in `home`, the real public domain in the
+    # profile's own SITE_A_URL the whole time). "from == to" gets its own,
+    # different advice: re-scanning OR re-setting the same profile URL
+    # twice would just report the identical pair again — that case is
+    # real, resolved home URLs that are genuinely identical (e.g. an
+    # intra-domain graft: a local clone of B forced onto B's own domain
+    # for testing), a deliberate migration shape this tool does not
+    # support a no-op remap for today, named honestly rather than sent
+    # chasing advice that cannot change the answer.
+    if [ -z "$domain_from" ] || [ "$domain_from" = "unknown" ]; then
+      bad_reason="from is $([ -z "$domain_from" ] && echo "empty" || echo "the literal placeholder 'unknown'")"
+      bad_advice="Set SITE_A_URL in this profile (profiles/<name>.conf) to A's real public domain and re-run 'sitegraft plan' — plan_defaults reads it in PREFERENCE to scan's own home_url guess, so this is the direct fix whenever that guess is wrong or missing (a site behind a reverse proxy, an SSH tunnel, or a local dev URL like DDEV's own *.ddev.site can have 'wp option get home' answer with its OWN internal address, not the public domain visitors actually use — no amount of re-scanning fixes that). If you'd rather not touch the profile: re-run 'sitegraft scan' if it genuinely could not reach A, or hand-edit scan-a.json's home_url yourself if scan ran cleanly but simply recorded the wrong domain."
+    elif [ -z "$domain_to" ] || [ "$domain_to" = "unknown" ]; then
+      bad_reason="to is $([ -z "$domain_to" ] && echo "empty" || echo "the literal placeholder 'unknown'")"
+      bad_advice="Set SITE_B_URL in this profile (profiles/<name>.conf) to B's real public domain and re-run 'sitegraft plan' — same reasoning as SITE_A_URL's case above (plan_defaults reads it in preference to scan's home_url guess). Same fallback escape hatches too: re-run 'sitegraft scan' if it genuinely could not reach B, or hand-edit scan-b.json's home_url yourself if scan ran cleanly but recorded the wrong domain."
+    elif [ "$domain_from" = "$domain_to" ]; then
+      bad_reason="from equals to ('${domain_from}')"
+      bad_advice="Neither re-scanning nor re-setting SITE_A_URL/SITE_B_URL to the same value again will change this — A and B's own resolved home URLs are genuinely identical (e.g. B is a local clone of A, or an intra-domain test graft; check the profile if SITE_A_URL/SITE_B_URL are both set — that is the actual source of the conflict when they are). This tool has no supported way to freeze a domain remap that would replace a domain with itself via 'sitegraft plan'; if no domain rewrite is actually needed for this run, that has to be a deliberate, hand-edited manifest built OUTSIDE 'plan' (which never goes through this freeze gate) — see graft_search_replace_domain's own empty-from no-op path in lib/graft.sh."
+    fi
+    if [ -n "$bad_reason" ]; then
+      log_error "manifest invalid: options.search_replace's domain remap is unusable — ${bad_reason}. A remap in this shape can never rewrite anything correctly, so freezing it would defer this failure to 'graft' (which would run a real rewrite using the broken value, corrupting B's content/options) or to 'verify' reporting a run that changed nothing — or worse, corrupted something — as a pass (issue #73). ${bad_advice}"
       bad=true
     fi
   fi

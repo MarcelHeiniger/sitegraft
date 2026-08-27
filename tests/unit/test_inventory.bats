@@ -617,6 +617,17 @@ _assert_alias() {
   local out="$BATS_TEST_TMPDIR/scan-a.json"
   run --separate-stderr inventory_scan_site a "$out"
   [ "$status" -eq 0 ]
+  # MINOR-1 (second review round): a mutation that deletes JUST the
+  # `if ! home_url=...; then log_warn ...; home_url='null'; fi` failure
+  # branch, keeping only the `case ... jq 'type'` fallback below it,
+  # leaves the OUTPUT JSON identical (an empty `wp_remote` failure also
+  # fails the `jq 'type'` check, so home_url still ends up 'null' either
+  # way) — this test used to assert only the JSON and stayed green
+  # through that mutation, proving nothing about the failure branch its
+  # own name claims to cover. `$stderr` (populated by `--separate-stderr`
+  # above, never previously asserted) is what actually distinguishes them:
+  # only the named branch logs WHY home_url is null.
+  [[ "$stderr" == *"could not read site a's home URL"* ]] || false
   # `has("home_url")` (not just `.home_url == null`, which a jq missing-key
   # read would satisfy for free even if this key were never written at
   # all) — the field must be genuinely RECORDED as unknown, not merely
@@ -645,5 +656,34 @@ _assert_alias() {
   local out="$BATS_TEST_TMPDIR/scan-a.json"
   inventory_scan_site a "$out"
   run jq -e 'has("home_url") and .home_url == null' "$out"
+  [ "$status" -eq 0 ]
+}
+
+# NIT-1 (second review round): site_url's own failure path used to fall
+# back to null silently, unlike home_url's log_warn -- an operator staring
+# at "site_url": null in a scan file had no way to tell why. site_url is
+# also now read by plan_warn_scope_gaps (MAJOR-2b) to warn on home/siteurl
+# divergence, so a silently-null value would make that warning silently
+# skip too.
+@test "inventory_scan_site logs a warning (not silence) when the siteurl query fails" {
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$*" in
+      "post-type list --format=json") echo '[]' ;;
+      "option list --unserialize --format=json") echo '[]' ;;
+      "db tables --format=list --all-tables-with-prefix") echo 'wp_options' ;;
+      "plugin list --format=json") echo '[]' ;;
+      "theme list --status=active --format=json") echo '[{"name":"t"}]' ;;
+      "menu list --format=json") echo '[]' ;;
+      "option get home --format=json") echo '"https://a.example.com"' ;;
+      "option get siteurl --format=json") return 1 ;;
+      *) echo '[]' ;;
+    esac
+  }
+  local out="$BATS_TEST_TMPDIR/scan-a.json"
+  run --separate-stderr inventory_scan_site a "$out"
+  [ "$status" -eq 0 ]
+  [[ "$stderr" == *"could not read site a's siteurl option"* ]] || false
+  run jq -e 'has("site_url") and .site_url == null' "$out"
   [ "$status" -eq 0 ]
 }

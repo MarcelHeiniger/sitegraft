@@ -202,3 +202,64 @@ setup() {
   [ "$status" -ne 0 ]
   [[ "$output" != *'"frozen":true'* ]] || false
 }
+
+# --- BLOCKER-1 (second review round): the checks above only ever tested
+# `from`. plan_defaults fills `to` with the exact same `// "unknown"`
+# default, independently of `from` — so A's scan can succeed (a real
+# `from`) while B's fails (a broken `to`), and the original #73 checks let
+# it straight through: `from` is real, not "unknown", and not equal to a
+# `to` that is itself broken. That is NOT a smaller version of the
+# original bug — graft would run a REAL rewrite using B's broken `to` as
+# the replacement text, corrupting every migrated page/option, and
+# reporting success.
+
+@test "manifest_validate rejects search_replace.to == '' when from is real (BLOCKER-1, #73)" {
+  local m='{"options":{"search_replace":{"from":"https://a.example.com","to":""}}}'
+  run manifest_validate "$m"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"to is empty"* ]] || false
+}
+
+@test "manifest_validate rejects search_replace.to == 'unknown' when from is real (BLOCKER-1, #73)" {
+  local m='{"options":{"search_replace":{"from":"https://a.example.com","to":"unknown"}}}'
+  run manifest_validate "$m"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"to is"*"unknown"* ]] || false
+}
+
+@test "manifest_freeze refuses to freeze when from is real but to is broken — A's scan succeeded, B's didn't (BLOCKER-1, #73)" {
+  local m='{"migrate":{},"protect":{},"options":{"search_replace":{"from":"https://a.example.com","to":"unknown"}}}'
+  run manifest_freeze "$m"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *'"frozen":true'* ]] || false
+}
+
+# MINOR-2 (second review round): re-scanning cannot fix from==to when both
+# are real, distinct-looking-but-identical home URLs (an intra-domain
+# graft) — the message must say so, not send the operator chasing a
+# rescan that will report the identical pair again.
+@test "manifest_validate's from==to message does not tell the operator to re-scan (MINOR-2, #73)" {
+  local m='{"options":{"search_replace":{"from":"https://same.example.com","to":"https://same.example.com"}}}'
+  run manifest_validate "$m"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"Re-run 'sitegraft scan'"* ]] || false
+  [[ "$output" == *"Neither re-scanning nor re-setting"* ]] || false
+}
+
+# --- feedback from a real scan (Nat, live DDEV run): A's home/siteurl came
+# back as DDEV's own internal *.ddev.site address, not the public domain
+# actually present in A's content -- a WELL-FORMED value this guard cannot
+# itself detect (it's neither empty nor "unknown"). But when the guard DOES
+# fire for a genuinely missing value, its advice must point the operator
+# at the REAL, direct fix -- the profile's own SITE_A_URL/SITE_B_URL
+# (Marcel's own catch, third review round: plan_defaults now reads those
+# in PREFERENCE to scan's home_url guess) -- not just "re-scan", which
+# cannot fix a proxied/tunneled site's wrong `home` value either way.
+@test "manifest_validate's empty/unknown advice names SITE_A_URL as the primary fix, ahead of re-scanning/hand-editing (Marcel's catch, #73)" {
+  local m='{"options":{"search_replace":{"from":"unknown","to":"https://b.example.com"}}}'
+  run manifest_validate "$m"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"SITE_A_URL"* ]] || false
+  [[ "$output" == *"hand-edit"* ]] || false
+  [[ "$output" == *"ddev.site"* ]] || false
+}

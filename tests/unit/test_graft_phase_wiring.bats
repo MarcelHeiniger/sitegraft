@@ -467,3 +467,74 @@ EOF
   [ -f "${run_dir}/graft.import_attachments.done" ]
   [[ "$output" != *"STUB: graft_prune_previous_run"* ]] || false
 }
+
+# --- MAJOR-1 (issue #73, second review round): the reviewer's own live
+# reproduction — a run_dir left over from an rc10 (pre-#73-fix) release
+# already carries graft.remap_domain.done, from a pass where
+# graft_search_replace_domain's in-function guard did not exist yet. On
+# resume, `graft_step_done "$run_dir" remap_domain || { ... }` sees that
+# marker and skips the ENTIRE block — guard included — never
+# re-evaluating it, and graft_migrate_options (which had no guard of its
+# own at all before this fix) runs immediately after with the same broken
+# domain_to. graft_verify_domain_remap_usable is now called UNCONDITIONALLY,
+# before either consumer, specifically so a marker like this one cannot
+# hide the check from ever running again.
+_blocker1_stub_everything_but_domain_check() {
+  profile_load() {
+    SITE_A_ALIAS=a; SITE_B_ALIAS=b
+    unset SITE_A_SSH_HOST SITE_B_SSH_HOST
+    return 0
+  }
+  modules_discover() { SITEGRAFT_MODULES=""; }
+  graft_sync_stack() { :; }
+  graft_check_stack_precondition() { return 0; }
+  graft_media_sync() { :; }
+  graft_deploy_mu_plugin() { :; }
+  graft_prune_previous_run() { :; }
+  graft_import_attachments() { :; }
+  graft_ensure_importer() { :; }
+  graft_export_wxr() { :; }
+  graft_integrity_gate() { return 0; }
+  graft_import_wxr() { :; }
+  graft_fetch_id_map() { :; }
+  graft_verify_import_completeness() { return 0; }
+  graft_remove_mu_plugin() { :; }
+  graft_restore_importer_state() { :; }
+  graft_remap_attachment_ids() { :; }
+  graft_remap_featured_images() { :; }
+  graft_search_replace_domain() { echo "STUB: graft_search_replace_domain called -- should NOT happen, the top-level guard must abort before this"; }
+  graft_migrate_options() { echo "STUB: graft_migrate_options called -- should NOT happen, the top-level guard must abort before this"; }
+  graft_run_module_post_import() { echo "STUB: graft_run_module_post_import called -- should NOT happen"; }
+}
+
+@test "phase_graft refuses to run — before graft_migrate_options is ever reached — when resuming a run_dir whose remap_domain marker pre-dates this fix and domain_to is broken (MAJOR-1, #73)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  touch "${run_dir}/backup.complete"
+  # A's scan succeeded (a real, non-empty from); B's scan failed
+  # (plan_defaults' own "unknown" default) — BLOCKER-1's exact
+  # reproduction, on a manifest that (pre-dating manifest_validate's own
+  # #73 guard) was frozen anyway.
+  cat > "${run_dir}/manifest.json" <<'MANIFESTEOF'
+{"migrate":{"core-wp":{"post_types":["page"],"option_keys":["show_on_front"]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"https://a.example.com","to":"unknown"}}}
+MANIFESTEOF
+  # Every step through remap_featured_images already completed on an
+  # earlier, rc10 pass -- INCLUDING remap_domain, whose in-function guard
+  # did not exist yet at the time it ran and "succeeded".
+  local step
+  for step in stack_sync media_sync mu_plugin prune import_attachments importer_setup export import fetch_id_map mu_cleanup importer_cleanup remap_ids remap_featured_images remap_domain; do
+    touch "${run_dir}/graft.${step}.done"
+  done
+
+  _blocker1_stub_everything_but_domain_check
+
+  run phase_graft --profile demo --run "$run_dir"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"STUB: graft_search_replace_domain called"* ]] || false
+  [[ "$output" != *"STUB: graft_migrate_options called"* ]] || false
+  [[ "$output" == *"unknown"* ]] || false
+  # And the pre-existing (now stale) remap_domain marker did not fool the
+  # NEXT step's own marker into being written either -- migrate_options
+  # never ran, so it must not be marked done.
+  [ ! -f "${run_dir}/graft.migrate_options.done" ]
+}

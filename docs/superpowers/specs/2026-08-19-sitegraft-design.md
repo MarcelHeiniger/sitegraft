@@ -650,6 +650,32 @@ An empty `SITE_*_SSH_HOST` means "local site, driven directly through
 `SITE_*_WP_CMD` with no SSH" (the case of a local DDEV site on the orchestrator
 itself).
 
+**`SITE_A_URL`/`SITE_B_URL` and the domain remap (issue #73, third review
+round — Marcel's own catch):** both keys are optional and have been on
+`SITEGRAFT_PROFILE_KEYS` since this section's first draft, but until this
+fix-pack neither reached `plan`'s domain remap — `SITE_A_URL` was read
+NOWHERE in the codebase at all (an operator could fill it in and have it
+silently ignored), and `SITE_B_URL` was read only by `verify`'s HTTP smoke
+check (§6.5). `plan_defaults` (§6.2) now reads them FIRST, ahead of
+`scan`'s own `home_url` (§6.1): if `SITE_A_URL`/`SITE_B_URL` are set in the
+profile, `options.search_replace.{from,to}` is built from them directly;
+`scan`'s `home_url` is consulted only when the profile leaves either one
+unset. The reasoning, not just the mechanics: the operator knows the real
+public domain being migrated to/from — this tool can only ever INFER it,
+from whatever WordPress's own `home` option happens to hold on the day
+`scan` ran. Those two can disagree, and not as a theoretical edge case:
+reproduced live against a real DDEV-fronted site A, where `home` held
+DDEV's own internal `*.ddev.site:8443` address (0 occurrences in A's real
+post_content, measured directly) while the profile's own `SITE_A_URL`
+already named the public domain that actually appeared there (27
+occurrences). A site behind any reverse proxy, SSH tunnel, or local dev
+front-end can carry more than one domain in its own database, and `home`
+is not guaranteed to be the one that matters for a given migration's
+content. `scan`'s `home_url` stays real inventory data worth recording
+regardless (see §6.1's own reasoning for why `home` over `siteurl`), and
+remains the fallback whenever the profile doesn't name a URL for that
+site — just no longer the ONLY source `plan` ever consults.
+
 ### 5.2 Credentials — two paths
 
 **(a) File** at `~/.config/sitegraft/<profile>.creds` (chmod 600, gitignored, never
@@ -712,16 +738,47 @@ no writes to A or B. Freely re-runnable.
 scan file (`wp option get home --format=json` / `... siteurl ...`), each
 falling back to `null` — never a fabricated value — when the query fails or
 the result isn't the JSON string wp-cli is documented to produce. `plan`
-(§6.2) reads `home_url`, not `site_url`, to build
-`options.search_replace.{from,to}`: WordPress builds every internal content
-link — the exact text `graft`'s domain remap rewrites (§9.4) — from
-`home_url()`, never from `site_url()`, and the two are free to differ (a
-CDN front-end, a subdirectory install, domain-mapped multisite). `site_url`
-is recorded purely for an operator inspecting a scan file; no code path
-reads it. This schema addition was missing from every earlier revision of
-this document — `plan_defaults` read a `.site_url` key `scan` never wrote
-at all, so every manifest froze with a domain remap that could never do
-anything (see `manifest_validate`'s own guard against this, §4).
+(§6.2) reads `home_url`, not `site_url`, as its FALLBACK source for
+`options.search_replace.{from,to}` — see §5.1 for the third review round's
+correction that this is a fallback, not the primary source: the profile's
+own `SITE_A_URL`/`SITE_B_URL`, when set, are read first and win.
+
+**Corrected (MAJOR-2, second review round):** an earlier revision of this
+paragraph claimed WordPress builds "every internal content link... from
+`home_url()`, never from `site_url()`" — checked against WordPress's own
+source this time, that is false. `home` governs permalinks (the URLs
+WordPress generates for posts/pages/menus). `siteurl` governs everything
+`WP_CONTENT_URL` derives from
+(`wp-includes/default-constants.php`: `WP_CONTENT_URL = get_option
+('siteurl') . '/wp-content'`) — every media/upload URL, every plugin URL,
+every theme asset URL. On a real Etch/ACSS site those are not a minor
+surface: image URLs, block-attribute JSON referencing media, and option
+blobs holding stylesheet/asset paths all carry `siteurl`, not `home`. The
+two options' write surfaces genuinely overlap what `graft`'s domain remap
+(§9.4) rewrites — this is not a clean "home is content, siteurl is
+irrelevant" split.
+
+`home_url` remains the fallback `plan` reads whenever the profile doesn't
+supply `SITE_A_URL`/`SITE_B_URL` (§5.1), on a narrower and now-honest
+justification for `home` over `siteurl` specifically: permalinks are
+graft's largest, always-present rewrite target, and on the common case
+(`home == siteurl`, or a subdirectory install sharing an origin) a single
+domain-prefix remap already covers both surfaces correctly. The gap is
+real only when `home` and `siteurl` diverge at the ORIGIN (scheme+host) on
+A — asset URLs then keep pointing at A's `siteurl` domain after migration,
+unrewritten, and `verify` (§6.5) only ever checks for `home`'s absence, so
+it will not catch this. Known and, as of this fix-pack, surfaced rather
+than silent: `plan_warn_scope_gaps` (`lib/plan.sh`) warns when A's
+`home_url`/`site_url` origins differ, naming the residual scope gap so an
+operator can review B's migrated content for it — a second-rank signal
+now that a correctly-set `SITE_A_URL` is the first place `plan` looks, not
+the only one. `site_url` is recorded specifically so that warning (and an
+operator inspecting a scan file directly) can see it; no rewrite code
+path reads it. This schema addition was missing from every
+earlier revision of this document — `plan_defaults` read a `.site_url` key
+`scan` never wrote at all, so every manifest froze with a domain remap
+that could never do anything (see `manifest_validate`'s own guard against
+this, §4).
 
 The Etch-specific check Marcel asked for (§0, point 11): `scan` checks whether
 **A's** navigation is a dynamic `wp:page-list` block (no hardcoded IDs) by

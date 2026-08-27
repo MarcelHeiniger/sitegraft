@@ -385,6 +385,62 @@ assert_jq '.nav_post_count > 0' "${RUN_DIR}/scan-a.json" \
 assert_jq '.nav_post_count == null' "${RUN_DIR}/scan-b.json" \
   "site B's scan does not report nav_post_count == null — inventory_nav_post_count is A-only by design (lib/inventory.sh) and should never run against B"
 
+# home_url/site_url (issue #73, second review round — point 7 of that
+# review): this fix-pack's own unit tests (tests/unit/test_inventory.bats)
+# all stub wp_remote, so none of them proves inventory_scan_site's `wp
+# option get home`/`siteurl` calls actually WORK against a real WordPress
+# install — they prove the fail-safe/parsing logic around a canned answer,
+# never that the real wp-cli invocation is spelled correctly, or that
+# --format=json's real output shape (a quoted JSON string) is what gets
+# fetched. This is the one place in the whole test suite that can catch a
+# typo'd option name or flag reaching real wp-cli and silently coming back
+# empty/garbled — the same reasoning nav_post_count's own live comparison
+# just above already established for a different field, and the SAME
+# independent-second-measurement discipline: `wp option get` is a
+# genuinely different wp-cli code path from the `option list` scan already
+# exercises elsewhere in this file, not a restatement of it.
+#
+# Checked on BOTH sites: A because it's what plan_defaults actually reads
+# into options.search_replace (this issue's whole subject), B because a
+# regression there would silently degrade the `to` half of that same pair
+# (BLOCKER-1's own reproduction) without ever showing up in an A-only
+# check.
+echo "==> asserting scan-a.json/scan-b.json's home_url/site_url against a live wp-cli read on each site (issue #73)"
+LIVE_HOME_A=$(ddev exec --raw -p "$PROJECT_A" -- wp option get home)
+LIVE_SITEURL_A=$(ddev exec --raw -p "$PROJECT_A" -- wp option get siteurl)
+SCANNED_HOME_A=$(jq -r '.home_url' "${RUN_DIR}/scan-a.json")
+SCANNED_SITEURL_A=$(jq -r '.site_url' "${RUN_DIR}/scan-a.json")
+if [ "$SCANNED_HOME_A" != "$LIVE_HOME_A" ]; then
+  echo "FAIL: scan-a.json's home_url (${SCANNED_HOME_A}) does not match a direct wp-cli read of site A's real 'home' option (${LIVE_HOME_A})" >&2
+  exit 1
+fi
+if [ "$SCANNED_SITEURL_A" != "$LIVE_SITEURL_A" ]; then
+  echo "FAIL: scan-a.json's site_url (${SCANNED_SITEURL_A}) does not match a direct wp-cli read of site A's real 'siteurl' option (${LIVE_SITEURL_A})" >&2
+  exit 1
+fi
+LIVE_HOME_B=$(ddev exec --raw -p "$PROJECT_B" -- wp option get home)
+LIVE_SITEURL_B=$(ddev exec --raw -p "$PROJECT_B" -- wp option get siteurl)
+SCANNED_HOME_B=$(jq -r '.home_url' "${RUN_DIR}/scan-b.json")
+SCANNED_SITEURL_B=$(jq -r '.site_url' "${RUN_DIR}/scan-b.json")
+if [ "$SCANNED_HOME_B" != "$LIVE_HOME_B" ]; then
+  echo "FAIL: scan-b.json's home_url (${SCANNED_HOME_B}) does not match a direct wp-cli read of site B's real 'home' option (${LIVE_HOME_B})" >&2
+  exit 1
+fi
+if [ "$SCANNED_SITEURL_B" != "$LIVE_SITEURL_B" ]; then
+  echo "FAIL: scan-b.json's site_url (${SCANNED_SITEURL_B}) does not match a direct wp-cli read of site B's real 'siteurl' option (${LIVE_SITEURL_B})" >&2
+  exit 1
+fi
+# A's home and siteurl must themselves be non-empty, real values -- a
+# silent 'null'/'unknown' here would mean scan's own fail-safe path
+# quietly fired against a real, healthy WordPress install (a genuine
+# regression, not the "query legitimately failed" case that path exists
+# for), and every assertion above would still pass by comparing two
+# equally-broken sides.
+assert_jq '.home_url | type == "string" and length > 0' "${RUN_DIR}/scan-a.json" \
+  "site A's scan recorded a non-string or empty home_url against a real, healthy WordPress install — inventory_scan_site's fail-safe path should never fire here"
+assert_jq '.site_url | type == "string" and length > 0' "${RUN_DIR}/scan-a.json" \
+  "site A's scan recorded a non-string or empty site_url against a real, healthy WordPress install — inventory_scan_site's fail-safe path should never fire here"
+
 # Issue #17, closing the gap Nat's review found: proving core-wp's own
 # automatic CLAIM works — not merely that the id-remap mechanics work once
 # something else has already selected wp_navigation. The graft run's
