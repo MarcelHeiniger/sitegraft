@@ -935,7 +935,14 @@ _sg_load_keep_sets() {
 # archive holds as a directory (archive-dirs.sorted). A symlink elsewhere in
 # wp-content that this backup never touches is inert — there is no archive
 # entry by that name for tar to extract through it — and refusing over it
-# would be alarming and wrong, not safe.
+# would be alarming and wrong, not safe. Restricting to DIRECTORIES
+# specifically is that same narrowness, not a gap in it: verified (review,
+# second pass) that busybox tar extracting a plain FILE archive member onto
+# an existing symlink of that name replaces it rather than following it, the
+# same safe behavior every extractor above shows for a directory entry with
+# a real directory already there — the write-through is specific to a
+# directory path COMPONENT being a portal during the deeper recursive write,
+# which only a directory-shaped archive entry can trigger.
 #
 # Byte comparison, not normalized: like every other listing this script
 # compares (see _sg_assert_backup_landed's own comment on NFC/NFD), archive-
@@ -944,7 +951,16 @@ _sg_load_keep_sets() {
 # normalization than the archive's own bytes will not be matched here, and
 # the restore proceeds as if it were not a symlink at all — the same known
 # gap this file already documents at length for the prune half, not
-# something this guard attempts to normalize away.
+# something this guard attempts to normalize away; a case-folding alias
+# (`Uploads` vs `uploads`, only reachable on a case-insensitive filesystem —
+# not the Linux containers this branch actually targets) is the same family
+# of gap, left equally undetected.
+#
+# TOCTOU: this runs at preflight, the extraction runs later — a symlink put
+# in place in between is not re-checked, which is outside this tool's
+# realistic threat model (an operator running a second, adversarial process
+# against B during a restore) but is worth stating plainly rather than
+# implying atomicity this script does not have.
 _sg_assert_no_symlink_targets() {
   local abs rel
   if ! _sg_list_live_symlinks > "$SG_TMP/live-symlinks.raw"; then
@@ -965,7 +981,7 @@ _sg_assert_no_symlink_targets() {
   LC_ALL=C comm -12 "$SG_TMP/archive-dirs.sorted" "$SG_TMP/live-symlinks.sorted" > "$SG_TMP/symlink-collision.txt"
   [ -s "$SG_TMP/symlink-collision.txt" ] || return 0
   {
-    echo "refusing to restore: B's wp-content (${B_WP_CONTENT_ROOT}) has the following path(s) as a SYMLINK where this backup's archive holds a real directory. Extracting on top of a symlinked directory can write files outside the directory this restore is scoped to (a symlinked wp-content/uploads pointing at a separate volume, an NFS mount, or a CDN-synced directory is a common real-world shape of exactly this). sitegraft does not support restoring onto a symlinked wp-content entry — nothing was written. Replace the symlink with a real directory (moving its target's contents back under wp-content first, if that is where they actually live) and re-run, or restore this backup somewhere else and reconcile the files by hand."
+    echo "refusing to restore: B's wp-content (${B_WP_CONTENT_ROOT}) has the following path(s) as a SYMLINK where this backup's archive holds a real directory. Extracting on top of a symlinked directory can write files outside the directory this restore is scoped to (a symlinked wp-content/uploads pointing at a separate volume, an NFS mount, or a CDN-synced directory is a common real-world shape of exactly this). sitegraft does not support restoring onto a symlinked wp-content entry in this situation — nothing was written. Replace the symlink with a real directory (moving its target's contents back under wp-content first, if that is where they actually live) and re-run, or restore this backup somewhere else and reconcile the files by hand."
     while IFS= read -r rel; do
       [ -n "$rel" ] || continue
       printf '  %s\n' "${B_WP_CONTENT_ROOT}/${rel#./}"
