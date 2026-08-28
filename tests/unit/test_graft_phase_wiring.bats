@@ -254,11 +254,20 @@ _major4_stub_everything_but_the_marker_block() {
   graft_media_sync() { :; }
   graft_deploy_mu_plugin() { :; }
   graft_prune_previous_run() { echo "STUB: graft_prune_previous_run $*"; }
-  graft_import_attachments() { echo "STUB: graft_import_attachments called -- should not happen"; }
+  # issue #36 fix-pack, second review round: graft_import_attachments and
+  # graft_import_wxr ("import") are two of the four steps prune_will_rerun
+  # now ALSO forces regardless of dry-run (see phase_graft's own comment on
+  # that flag) -- their own message text no longer says "should not
+  # happen" unconditionally, since whether that's true now depends on
+  # which of the two MAJOR-4 tests below is asking. graft_export_wxr's
+  # marker is NOT one of the four the prune-safety rm -f invalidates, so
+  # it keeps the "should not happen" wording -- that one stays true in
+  # BOTH tests.
+  graft_import_attachments() { echo "STUB: graft_import_attachments called"; }
   graft_ensure_importer() { :; }
   graft_export_wxr() { echo "STUB: graft_export_wxr called -- should not happen"; }
   graft_integrity_gate() { return 0; }
-  graft_import_wxr() { echo "STUB: graft_import_wxr called -- should not happen"; }
+  graft_import_wxr() { echo "STUB: graft_import_wxr called"; }
   graft_fetch_id_map() { :; }
   graft_remove_mu_plugin() { :; }
   graft_restore_importer_state() { :; }
@@ -304,9 +313,20 @@ EOF
   # Sanity: the block really was entered (not vacuously skipped) --
   # graft_prune_previous_run's own stub only prints if actually called.
   [[ "$output" == *"STUB: graft_prune_previous_run"* ]] || false
-  # And nothing downstream of the (correctly still-marked-done)
-  # import_attachments/import steps re-ran for real.
-  [[ "$output" != *"should not happen"* ]] || false
+  # issue #36 fix-pack, second review round: import_attachments/import DO
+  # show themselves running now -- this is the CORRECT, intended behavior
+  # (prune_will_rerun forces their preview even though their on-disk
+  # marker still reads "done"), not a regression of this test's own
+  # original MAJOR-4 point. That point survives unchanged above: the
+  # marker FILES are untouched. What changed is that a dry-run preview
+  # now tells the truth about what the matching real run does to these
+  # two steps, instead of silently omitting them (issue #36 fix-pack's
+  # own BLOCKER-2/NIT). graft_export_wxr is the one step here whose
+  # marker this prune-rm -f never invalidates, so it alone must still
+  # never run.
+  [[ "$output" == *"STUB: graft_import_attachments called"* ]] || false
+  [[ "$output" == *"STUB: graft_import_wxr called"* ]] || false
+  [[ "$output" != *"STUB: graft_export_wxr called"* ]] || false
 }
 
 @test "phase_graft's prune-safety marker-clearing DOES clear real markers once dry-run is off (MAJOR-4: a real interrupted-graft resume must not be skipped)" {
@@ -338,14 +358,14 @@ EOF
   # via graft_mark_step -- so both files are back on disk by the time
   # phase_graft returns, exactly as they should be. The real acceptance
   # criterion is that the STEPS THEMSELVES actually ran again, which the
-  # "should not happen" stubs from _major4_stub_everything_but_the_marker_
-  # block (still installed, un-overridden) prove directly: they only print
-  # if genuinely invoked. Under the MAJOR-4 bug (guard inverted or
-  # removed so `rm -f` never fires under dry-run OR, the mutation that
-  # actually matters here, a guard that ALSO wrongly suppresses it under a
-  # real run), these markers would stay "done" from the earlier pass,
-  # import_attachments/import would be skipped, and neither stub would ever
-  # print -- this assertion goes red exactly then.
+  # stubs from _major4_stub_everything_but_the_marker_block (still
+  # installed, un-overridden) prove directly: they only print if genuinely
+  # invoked. Under the MAJOR-4 bug (guard inverted or removed so `rm -f`
+  # never fires under dry-run OR, the mutation that actually matters here,
+  # a guard that ALSO wrongly suppresses it under a real run), these
+  # markers would stay "done" from the earlier pass, import_attachments/
+  # import would be skipped, and neither stub would ever print -- this
+  # assertion goes red exactly then.
   [[ "$output" == *"STUB: graft_import_attachments called"* ]] || false
   [[ "$output" == *"STUB: graft_import_wxr called"* ]] || false
   [ -f "${run_dir}/graft.import_attachments.done" ]
@@ -722,8 +742,14 @@ _issue36_stub_everything_but_ordering() {
   graft_ensure_importer() { :; }
   graft_export_wxr() { :; }
   graft_integrity_gate() { return 0; }
-  graft_import_wxr() { :; }
-  graft_fetch_id_map() { :; }
+  # import/fetch_id_map echo too (second review round, issue #36 fix-pack):
+  # the SAME `rm -f` that invalidates media_sync.done also invalidates
+  # import_attachments.done, import.done and fetch_id_map.done -- these
+  # two are the other markers that pattern covers. Existing callers of
+  # this stub don't assert on their absence, only on prune/media_sync/
+  # import_attachments' relative order, so echoing here is additive.
+  graft_import_wxr() { echo "ORDER: import"; }
+  graft_fetch_id_map() { echo "ORDER: fetch_id_map"; }
   graft_verify_import_completeness() { return 0; }
   graft_remove_mu_plugin() { :; }
   graft_restore_importer_state() { :; }
@@ -812,4 +838,66 @@ MANIFESTEOF
   # step -- reruns).
   [ "$media_sync_line" -ge 0 ]
   [ "$prune_line" -lt "$media_sync_line" ]
+}
+
+@test "phase_graft's dry-run preview and a real run agree on ALL FOUR markers the prune rm -f invalidates -- media_sync, import_attachments, import, fetch_id_map (issue #36 fix-pack, second review round)" {
+  local manifest_json='{"migrate":{"core-wp":{"post_types":["page","attachment"],"option_keys":[]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}'
+
+  # Every marker EXCEPT fetch_id_map pre-marked done, on BOTH run_dirs --
+  # simulating a prior pass that completed everything through `import` but
+  # was interrupted before fetch_id_map. fetch_id_map missing is what
+  # makes graft_safety_step_done's own gate read prune as "not really
+  # done" (fetch_id_map is one of its consumers) and enter the rerun
+  # block -- the SAME block whose `rm -f` invalidates media_sync.done,
+  # import_attachments.done, import.done and fetch_id_map.done together.
+  local step
+
+  # --- dry-run pass ---
+  local run_dir_dry="$BATS_TEST_TMPDIR/run-dry"
+  mkdir -p "$run_dir_dry"
+  touch "${run_dir_dry}/backup.complete"
+  printf '%s' "$manifest_json" > "${run_dir_dry}/manifest.json"
+  for step in stack_sync mu_plugin prune media_sync import_attachments importer_setup export import; do
+    touch "${run_dir_dry}/graft.${step}.done"
+  done
+
+  _issue36_stub_everything_but_ordering
+
+  SITEGRAFT_DRY_RUN=1
+  run phase_graft --profile demo --run "$run_dir_dry" --dry-run
+  [ "$status" -eq 0 ]
+  local dry_output="$output"
+
+  # --- real pass, identical setup, fresh run_dir ---
+  local run_dir_real="$BATS_TEST_TMPDIR/run-real"
+  mkdir -p "$run_dir_real"
+  touch "${run_dir_real}/backup.complete"
+  printf '%s' "$manifest_json" > "${run_dir_real}/manifest.json"
+  for step in stack_sync mu_plugin prune media_sync import_attachments importer_setup export import; do
+    touch "${run_dir_real}/graft.${step}.done"
+  done
+
+  unset SITEGRAFT_DRY_RUN
+  run phase_graft --profile demo --run "$run_dir_real"
+  [ "$status" -eq 0 ]
+  local real_output="$output"
+
+  # The acceptance criterion: the SAME four markers this `rm -f` invalidates
+  # rerun under BOTH modes, not a subset under one and all four under the
+  # other. Before this fix-pack's second review round, only media_sync had
+  # the prune_will_rerun treatment: the dry-run preview showed
+  # prune+media_sync+fetch_id_map (the last one only because it was left
+  # genuinely un-marked here, to force entry into the rerun block, not
+  # because its own gate was fixed yet) while OMITTING import_attachments
+  # and import entirely -- an operator reading that preview would not be
+  # told two of the four steps the real run is about to redo. Mutation-
+  # tested for this fix-pack: reverting import_attachments'/import's own
+  # gates back to a bare `graft_step_done` (leaving only media_sync's
+  # fixed) reproduces exactly that asymmetry and fails this loop at
+  # import_attachments on the dry-run side.
+  local name
+  for name in prune media_sync import_attachments import fetch_id_map; do
+    [[ "$dry_output" == *"ORDER: ${name}"* ]] || false
+    [[ "$real_output" == *"ORDER: ${name}"* ]] || false
+  done
 }

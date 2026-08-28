@@ -2764,12 +2764,20 @@ phase_graft() {
     # staying set. Logged, not swallowed: losing the ability to clear a
     # resumability marker is itself worth telling the operator about.
     #
-    # This `rm -f` itself STAYS guarded by `is_dry_run` (unlike
-    # media_sync's own gate below, which now no longer trusts its on-disk
-    # marker once prune_will_rerun is set): the marker file is real state
-    # that must not be mutated for real during a preview, exactly like
-    # every other marker-clearing site in this function. prune_will_rerun
-    # is what lets the preview stay accurate WITHOUT that mutation.
+    # This `rm -f` itself STAYS guarded by `is_dry_run` (unlike the four
+    # step gates below it — media_sync, import_attachments, import,
+    # fetch_id_map — which now no longer trust their own on-disk marker
+    # once prune_will_rerun is set): the marker FILES are real state that
+    # must not be mutated for real during a preview, exactly like every
+    # other marker-clearing site in this function. prune_will_rerun is
+    # what lets the preview stay accurate without mutating any of those
+    # four marker files. It does not make the preview a no-op on disk in
+    # general — graft_media_sync's own `mkdir -p "$staging"` (and
+    # graft_pull_dir's own, inside it) are not gated by run_or_echo and so
+    # still create `${run_dir}/media-staging` under --dry-run once this
+    # forces the step to run; harmless, and the same pre-existing class as
+    # every other real-but-benign directory `mkdir -p` this codebase's
+    # dry-run steps already leave behind, not something this flag adds.
     if ! is_dry_run; then
       rm -f "${run_dir}/graft.media_sync.done" "${run_dir}/graft.import_attachments.done" "${run_dir}/graft.import.done" "${run_dir}/graft.fetch_id_map.done" \
         || log_warn "could not clear one or more resumability markers under ${run_dir} before prune — a later resume may not rerun the steps prune is about to invalidate"
@@ -2803,7 +2811,23 @@ phase_graft() {
   # expensive of its two proposed fixes, arriving here through the resume
   # path rather than every single run.
   { [ -z "$prune_will_rerun" ] && graft_step_done "$run_dir" media_sync; } || { graft_media_sync "$run_dir"; graft_mark_step "$run_dir" media_sync; }
-  graft_step_done "$run_dir" import_attachments || { graft_import_attachments "$run_dir"; graft_mark_step "$run_dir" import_attachments; }
+  # NIT (issue #36 fix-pack, second review round): the SAME `rm -f` above
+  # clears FOUR markers, not just media_sync.done — import_attachments.done,
+  # import.done and fetch_id_map.done too (all three pre-date this fix-pack;
+  # see graft_safety_step_done's own header for why THOSE three are cleared
+  # here in the first place). Only media_sync's own gate got the
+  # prune_will_rerun treatment in the first pass of this fix-pack, which
+  # left a dry-run preview honest about ONE of the four markers this same
+  # `rm -f` invalidates and silently wrong about the other three — an
+  # asymmetry with no reason behind it, worse than the uniform (if
+  # incomplete) gap that existed before media_sync was added to the list.
+  # A dry-run preview exists to say what a real run will do; it says so
+  # correctly for all four of this `rm -f`'s markers now, or none of them —
+  # not one arbitrarily singled out. Same mechanism, same reasoning as
+  # media_sync's own gate: prune_will_rerun forces the step whenever prune
+  # is about to (re)run, dry-run or not, ignoring the on-disk marker in
+  # that case only.
+  { [ -z "$prune_will_rerun" ] && graft_step_done "$run_dir" import_attachments; } || { graft_import_attachments "$run_dir"; graft_mark_step "$run_dir" import_attachments; }
   graft_step_done "$run_dir" importer_setup || { graft_ensure_importer "$run_dir"; graft_mark_step "$run_dir" importer_setup; }
   graft_step_done "$run_dir" export        || {
     graft_export_wxr "$wxr_post_types_csv" "$run_dir"
@@ -2818,8 +2842,8 @@ phase_graft() {
     fi
     graft_mark_step "$run_dir" export
   }
-  graft_step_done "$run_dir" import        || { graft_import_wxr "$run_dir"; graft_mark_step "$run_dir" import; }
-  graft_step_done "$run_dir" fetch_id_map  || { graft_fetch_id_map "$run_dir"; graft_mark_step "$run_dir" fetch_id_map; }
+  { [ -z "$prune_will_rerun" ] && graft_step_done "$run_dir" import; } || { graft_import_wxr "$run_dir"; graft_mark_step "$run_dir" import; }
+  { [ -z "$prune_will_rerun" ] && graft_step_done "$run_dir" fetch_id_map; } || { graft_fetch_id_map "$run_dir"; graft_mark_step "$run_dir" fetch_id_map; }
   # Issue #53: unconditional, no marker of its own. This is a correctness
   # gate, not an expensive side-effecting step — it only reads the WXR files
   # and id-map.tsv this run already staged/fetched, both still sitting in
