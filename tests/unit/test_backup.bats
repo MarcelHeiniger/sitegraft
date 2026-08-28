@@ -591,51 +591,57 @@ _manifest_fixture() {
 # rsync builds its OWN remote command line out of the `host:path` destination
 # and hands that to ssh, on the far end, after this script has already run —
 # a construction step sq() (this file's local-quoting helper) never reaches.
-# `--protect-args` is what closes it: with that flag, the destination travels
-# over rsync's own protocol instead of a remote shell command line, so a
-# SITE_B_WP_PATH holding a space or a shell metacharacter is never handed to
-# anything that would re-interpret it. See backup_generate_restore_script's
-# own comment on the `rsync ... host:path` line for what was actually
-# measured (GNU rsync escapes by default even without the flag; macOS's own
-# openrsync does not escape at all and does not implement the flag either).
+# See backup_generate_restore_script's own comment on the `rsync ...
+# host:path` line for the full history: `--protect-args` was the FIRST
+# version of this fix and was reverted after review measured it live against
+# a real openrsync SERVER — it makes the transfer fail outright (refused by
+# restricted shells too, per `man rsync`, which is exactly what a hardened
+# backup account's forced command often is). The fix that shipped instead
+# depends on nothing but the LOCAL rsync's own default arg-escaping (GNU
+# rsync >= 3.2.4), which needs nothing from B's rsync at all — the actual
+# rsync invocation below is therefore IDENTICAL, flag for flag, to the
+# bare-local branch's; only the generated script's runtime PREFLIGHT CHECK
+# differs by branch (see the NEEDS_RSYNC_ARG_ESCAPING tests below).
 
-@test "the generated ssh-remote restore.sh's wp-content rsync uses --protect-args (issue #44)" {
+@test "the generated ssh-remote restore.sh's wp-content rsync command is unchanged (issue #44 fix lives in a preflight check, not the rsync invocation)" {
   SITE_B_SSH_HOST="user@host-b.example.com"
   SITE_B_WP_PATH="/var/www/site-b"
   SITE_B_WP_CMD="wp"
-  local run_dir="$BATS_TEST_TMPDIR/run-ssh-protectargs"
+  local run_dir="$BATS_TEST_TMPDIR/run-ssh-rsync-shape"
   mkdir -p "$run_dir"
   backup_generate_restore_script "$run_dir"
-  run grep -c -- 'rsync -avz --protect-args --delete' "${run_dir}/restore.sh"
+  run grep -c -- "if ! { ssh .* && rsync -avz --delete " "${run_dir}/restore.sh"
   [ "$output" = "1" ]
+  # No --protect-args, no -s, anywhere on that command line.
+  run grep -E "if ! \{ ssh .*rsync" "${run_dir}/restore.sh"
+  [[ "$output" != *"--protect-args"* ]] || false
+  [[ "$output" != *" -s "* ]] || false
 }
 
-@test "the generated bare-local and wrapped-local restore.sh do NOT gain --protect-args (only the ssh-remote destination goes through a second shell)" {
-  SITE_B_SSH_HOST=""
+@test "the generated ssh-remote restore.sh alone sets NEEDS_RSYNC_ARG_ESCAPING=1 (only its wp-content step goes through a second shell)" {
+  SITE_B_SSH_HOST="user@host-b.example.com"
   SITE_B_WP_PATH="/var/www/site-b"
   SITE_B_WP_CMD="wp"
-  local run_dir="$BATS_TEST_TMPDIR/run-bare-protectargs"
+  local run_dir="$BATS_TEST_TMPDIR/run-ssh-needsflag"
   mkdir -p "$run_dir"
   backup_generate_restore_script "$run_dir"
-  # The runtime preflight-check CODE (issue #44) is written into every
-  # restore.sh, guarded by NEEDS_RSYNC_PROTECT_ARGS — so "--protect-args"
-  # appears in the file regardless of branch. What must NOT happen is the
-  # actual wp-content restore COMMAND carrying the flag on a branch whose
-  # rsync never talks to a remote shell at all.
-  run grep -c "if ! { rsync .*--protect-args" "${run_dir}/restore.sh"
-  [ "$output" = "0" ]
-  run grep -c 'NEEDS_RSYNC_PROTECT_ARGS=0' "${run_dir}/restore.sh"
+  # Anchored to the actual assignment line -- the check's own comment,
+  # right below it, also says "NEEDS_RSYNC_ARG_ESCAPING=1" in prose.
+  run grep -c '^NEEDS_RSYNC_ARG_ESCAPING=1$' "${run_dir}/restore.sh"
+  [ "$output" = "1" ]
+
+  SITE_B_SSH_HOST=""
+  local run_dir2="$BATS_TEST_TMPDIR/run-bare-needsflag"
+  mkdir -p "$run_dir2"
+  backup_generate_restore_script "$run_dir2"
+  run grep -c '^NEEDS_RSYNC_ARG_ESCAPING=0$' "${run_dir2}/restore.sh"
   [ "$output" = "1" ]
 
   SITE_B_WP_CMD="env -- wp"
-  local run_dir2="$BATS_TEST_TMPDIR/run-wrapped-protectargs"
-  mkdir -p "$run_dir2"
-  backup_generate_restore_script "$run_dir2"
-  # wrapped-local's wp-content step is tar-through-the-wrapper, not rsync at
-  # all — the flag must not appear on that command line.
-  run grep -c "if ! { .*tar .*--protect-args" "${run_dir2}/restore.sh"
-  [ "$output" = "0" ]
-  run grep -c 'NEEDS_RSYNC_PROTECT_ARGS=0' "${run_dir2}/restore.sh"
+  local run_dir3="$BATS_TEST_TMPDIR/run-wrapped-needsflag"
+  mkdir -p "$run_dir3"
+  backup_generate_restore_script "$run_dir3"
+  run grep -c '^NEEDS_RSYNC_ARG_ESCAPING=0$' "${run_dir3}/restore.sh"
   [ "$output" = "1" ]
 }
 
@@ -698,8 +704,8 @@ _extract_if_body() {
   local chain; chain=$(_extract_if_body "${run_dir}/restore.sh" '^if ! { ssh')
   [ -n "$chain" ]
   # Isolate the ssh/mkdir half from the ` && rsync ...` half that follows it
-  # — only the ssh half is under test here (the rsync half is issue #44's
-  # OTHER fix, covered by its own tests above).
+  # — only the ssh half is under test here (the rsync half is protected by a
+  # different mechanism entirely — see the preflight-check tests below).
   local mkdir_part="${chain%% && rsync*}"
   [[ "$mkdir_part" == ssh* ]] || false
   eval "$mkdir_part" || true
@@ -725,47 +731,86 @@ _extract_if_body() {
   [ ! -e "$sentinel" ]
 }
 
-# --- issue #44: the rsync-version assumption --protect-args introduces ---
-# GNU rsync has had --protect-args since 3.0.0 (2008) -- not a live concern
-# for the rsync docs/usage.md's own install step asks for (Homebrew on
-# macOS, apt on Debian/Ubuntu). What IS a real, measured gap: macOS also
-# ships its own /usr/bin/rsync (openrsync, a different codebase from GNU
-# rsync, the ONLY rsync on macOS 15+) which has never implemented this flag
-# and exits immediately on it. The runtime check below turns that gap into
-# one clear, actionable line instead of a bare "unrecognized option" partway
-# through a restore.
+# --- issue #44: the local-rsync capability preflight check ---
+# GNU rsync has escaped a remote destination by DEFAULT since 3.2.4 (April
+# 2022) — not since 3.0.0, which only added `--protect-args` as something an
+# operator had to opt INTO. `--old-args` is the probe used below: it is the
+# explicit opt-OUT of that default, so a rsync that recognizes it is, by
+# construction, one that escapes by default when the flag is absent (which
+# is exactly how the real restore command runs). Confirmed live against
+# macOS's own /usr/bin/rsync (openrsync, a different codebase, the only
+# rsync macOS 15+ ships): it recognizes neither `--old-args` nor default
+# escaping, and performs no escaping at all.
+#
+# A fixture with a REAL-shaped backup (valid gzip past the size floor, a
+# non-empty wp-content dir) is required for these — the check runs AFTER
+# restore.sh's own integrity check and, since the --dry-run fix below, also
+# after the --dry-run early exit, so a fixture that fails integrity first
+# would never reach it and every assertion here would pass for the wrong
+# reason (the same trap the mkdir/db-import tests above already document).
+_ssh_remote_real_backup_fixture() {
+  local run_dir="$1"
+  mkdir -p "${run_dir}/backup/b-wp-content"
+  touch "${run_dir}/backup/b-wp-content/index.php"
+  # Past the 200-byte floor after compression -- repetitive content
+  # compresses too well to clear it, so this needs real entropy.
+  head -c 2000 /dev/urandom | base64 | gzip > "${run_dir}/backup/b-db.sql.gz"
+}
 
-@test "the generated ssh-remote restore.sh refuses up front, with a clear reason, when the local rsync does not support --protect-args (issue #44)" {
+_rsync_stub_rejecting_old_args() {
   mkdir -p "$BATS_TEST_TMPDIR/bin"
   # Stands in for openrsync: rejects the flag exactly like the real one does
   # (confirmed live against macOS's own /usr/bin/rsync).
   cat > "$BATS_TEST_TMPDIR/bin/rsync" <<'EOS'
 #!/usr/bin/env bash
 case " $* " in
-  *" --protect-args "*) echo "rsync: unrecognized option \`--protect-args'" >&2; exit 1 ;;
+  *" --old-args "*) echo "rsync: unrecognized option \`--old-args'" >&2; exit 1 ;;
 esac
 exit 0
 EOS
   chmod +x "$BATS_TEST_TMPDIR/bin/rsync"
   PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+}
+
+@test "the generated ssh-remote restore.sh refuses, with a clear reason, when the local rsync does not default-escape (issue #44)" {
+  _rsync_stub_rejecting_old_args
 
   SITE_B_SSH_HOST="user@host-b.example.com"
   SITE_B_WP_PATH="/var/www/site-b"
   SITE_B_WP_CMD="wp"
-  local run_dir="$BATS_TEST_TMPDIR/run-ssh-no-protectargs"
-  mkdir -p "${run_dir}/backup"
+  local run_dir="$BATS_TEST_TMPDIR/run-ssh-no-escaping"
+  _ssh_remote_real_backup_fixture "$run_dir"
+  backup_generate_restore_script "$run_dir"
+
+  run "${run_dir}/restore.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"openrsync"* ]] || false
+  [[ "$output" == *"3.2.4"* ]] || false
+  [[ "$output" == *"Nothing was restored"* ]] || false
+  # It must NOT claim --protect-args is the requirement -- that flag was
+  # reverted; the requirement now is default escaping.
+  [[ "$output" != *"--protect-args"* ]] || false
+}
+
+@test "the generated ssh-remote restore.sh --dry-run does NOT refuse on a local rsync that lacks default-escaping (issue #44 NIT: preview must survive this check)" {
+  _rsync_stub_rejecting_old_args
+
+  SITE_B_SSH_HOST="user@host-b.example.com"
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="wp"
+  local run_dir="$BATS_TEST_TMPDIR/run-ssh-dryrun-noescaping"
+  _ssh_remote_real_backup_fixture "$run_dir"
   backup_generate_restore_script "$run_dir"
 
   run "${run_dir}/restore.sh" --dry-run
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"protect-args"* ]] || false
-  [[ "$output" == *"openrsync"* ]] || false
-  [[ "$output" == *"Nothing was restored"* ]] || false
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"[dry-run]"* ]] || false
+  [[ "$output" != *"openrsync"* ]] || false
 }
 
-@test "the generated ssh-remote restore.sh does NOT refuse when the local rsync supports --protect-args (issue #44, prove the check can pass too)" {
+@test "the generated ssh-remote restore.sh does NOT refuse when the local rsync default-escapes (issue #44, prove the check can pass too)" {
   mkdir -p "$BATS_TEST_TMPDIR/bin"
-  # Stands in for a real GNU rsync: accepts the flag.
+  # Stands in for a real GNU rsync >= 3.2.4: accepts --old-args.
   cat > "$BATS_TEST_TMPDIR/bin/rsync" <<'EOS'
 #!/usr/bin/env bash
 exit 0
@@ -776,24 +821,44 @@ EOS
   SITE_B_SSH_HOST="user@host-b.example.com"
   SITE_B_WP_PATH="/var/www/site-b"
   SITE_B_WP_CMD="wp"
-  local run_dir="$BATS_TEST_TMPDIR/run-ssh-yes-protectargs"
-  mkdir -p "${run_dir}/backup"
+  local run_dir="$BATS_TEST_TMPDIR/run-ssh-yes-escaping"
+  _ssh_remote_real_backup_fixture "$run_dir"
   backup_generate_restore_script "$run_dir"
 
   run "${run_dir}/restore.sh" --dry-run
-  # The stub rsync always exits 0, so the --protect-args probe passes and the
-  # script proceeds past it — straight into the real integrity check, which
-  # fails on this fixture's non-backup (no db dump, no wp-content dir). That
-  # failure is expected and is NOT what this test is about: what matters is
-  # that it is THIS failure, not the --protect-args refusal.
-  [[ "$output" != *"protect-args"* ]] || false
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"openrsync"* ]] || false
 }
 
-@test "the generated bare-local and wrapped-local restore.sh never probe rsync --protect-args (they don't need it)" {
+@test "the generated ssh-remote restore.sh gives a DISTINCT message when rsync is not installed at all, vs. installed-but-incapable (issue #44)" {
+  mkdir -p "$BATS_TEST_TMPDIR/bin-norsync"
+  # An otherwise-normal PATH with no `rsync` binary anywhere on it.
+  for cmd in bash gzip gunzip wc cat grep sort comm mktemp xargs find tr sh mkdir rm ssh cmp awk sed ls printf; do
+    p=$(command -v "$cmd" 2>/dev/null) || continue
+    ln -sf "$p" "$BATS_TEST_TMPDIR/bin-norsync/$cmd"
+  done
+
+  SITE_B_SSH_HOST="user@host-b.example.com"
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="wp"
+  local run_dir="$BATS_TEST_TMPDIR/run-ssh-norsync"
+  _ssh_remote_real_backup_fixture "$run_dir"
+  backup_generate_restore_script "$run_dir"
+
+  PATH="$BATS_TEST_TMPDIR/bin-norsync" run "${run_dir}/restore.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not found on PATH"* ]] || false
+  # Must not claim it looked at a version/capability it never got to check.
+  [[ "$output" != *"does not do that"* ]] || false
+}
+
+@test "the generated bare-local and wrapped-local restore.sh never probe rsync's arg-escaping (they don't need it)" {
   mkdir -p "$BATS_TEST_TMPDIR/bin"
   local log="${BATS_TEST_TMPDIR}/rsync-calls.log"
-  printf '#!/usr/bin/env bash\necho "rsync was invoked: $*" >> %s\nexit 0\n' "$(sq "$log")" \
-    > "$BATS_TEST_TMPDIR/bin/rsync"
+  printf '#!/usr/bin/env bash
+echo "rsync was invoked: $*" >> %s
+exit 0
+' "$(sq "$log")"     > "$BATS_TEST_TMPDIR/bin/rsync"
   chmod +x "$BATS_TEST_TMPDIR/bin/rsync"
   PATH="$BATS_TEST_TMPDIR/bin:$PATH"
 
@@ -804,7 +869,7 @@ EOS
   mkdir -p "${run_dir}/backup"
   backup_generate_restore_script "$run_dir"
   run "${run_dir}/restore.sh" --dry-run
-  [ ! -e "$log" ] || ! grep -q -- '--protect-args --version' "$log"
+  [ ! -e "$log" ] || ! grep -q -- '--old-args --version' "$log"
 }
 
 # --- the acceptance criterion of issue #14 ---
@@ -1463,6 +1528,17 @@ exec "$@"'
   [ "$status" -ne 0 ]
   [[ "$output" == *"docs/decisions/0009-restore-unicode-normalization-refusal.md"* ]] || false
   [ -f "${BATS_TEST_DIRNAME}/../../docs/decisions/0009-restore-unicode-normalization-refusal.md" ]
+}
+
+@test "the normalization refusal names the escape hatch for a normalization-INSENSITIVE target (issue #45 review: the stated remedy must not loop forever on APFS)" {
+  local shim; shim=$(_nfd_find_shim)
+  B_ROOT_EXTRA_NFC=1
+  ARCHIVE_FORCE_NFC=1
+  _wrapped_fixture "$shim"
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no-op"* ]] || false
+  [[ "$output" == *"apply it by hand outside sitegraft"* ]] || false
 }
 
 @test "an accented filename that round-trips unchanged is never mistaken for an addition" {

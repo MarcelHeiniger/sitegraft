@@ -52,7 +52,11 @@ support.
    B under its current spelling and rename it to match the byte sequence the
    backup prints, then re-run. It also still allows for the rarer case (the
    extraction genuinely did not land a file) and says how to tell the two
-   apart.
+   apart, and names the one case where the remedy itself cannot work: a
+   normalization-INSENSITIVE target filesystem (macOS's own APFS, by
+   default) where the rename is a true no-op — there, the message says to
+   apply the backup by hand outside sitegraft instead of re-running into the
+   same refusal indefinitely.
 3. **The backup does NOT record which normalization it was taken under**,
    and restore.sh does NOT gain a normalizing pass. Both were considered and
    rejected for this fix (see Alternatives).
@@ -70,11 +74,15 @@ support.
 - **Normalize automatically** (rewrite one side to match the other before
   comparing). Rejected on principle, not convenience: `restore.sh`
   deliberately depends on nothing but `ssh`, `rsync`, `tar`, `gzip`, `find`,
-  `sort`, `comm`, `mktemp`, `xargs` (its own header comment says so, and
-  `backup_generate_restore_script`'s doc comment repeats it) — a genuine
-  Unicode normalization table (`iconv -f UTF-8-MAC`, `uconv`, Python's
-  `unicodedata`) is not guaranteed to exist on whatever machine ends up
-  running a restore, sometimes years after the backup was taken. A silent,
+  `sort`, `comm`, `cmp`, `mktemp`, `wc`, `xargs` (its own header comment
+  names most of these — `ssh`/`rsync`/`tar`/`gzip`/`wc`, plus, on a
+  wrapped-local target, `find`/`sort`/`comm`/`mktemp`/`xargs` — `cmp` is used
+  by `_sg_apply_prune` and is not separately called out there; listed here
+  in full for accuracy, without effect on the argument, since none of them
+  normalize either way) — a genuine Unicode normalization table
+  (`iconv -f UTF-8-MAC`, `uconv`, Python's `unicodedata`) is not guaranteed
+  to exist on whatever machine ends up running a restore, sometimes years
+  after the backup was taken. A silent,
   best-effort normalize-and-hope is also just a slower way to arrive at the
   same wrong-file-deleted risk this refusal exists to prevent, if the guess
   is wrong.

@@ -502,9 +502,13 @@ backup_generate_restore_script() {
   # script's ssh/tar/rsync-local invocations run through, but it cannot reach
   # that second command line: rsync constructs it itself, on the far end,
   # after this script has already exited. Baked into restore.sh as
-  # NEEDS_RSYNC_PROTECT_ARGS so the one runtime check below (added with the
-  # fix) only ever runs for the branch that actually needs it.
-  local needs_rsync_protect_args=0
+  # NEEDS_RSYNC_ARG_ESCAPING so the one runtime check below (added with the
+  # fix) only ever runs for the branch that actually needs it. See the
+  # `rsync -avz --delete <src> host:path` line just below for what this
+  # requires and why (and ADR 0010 for why it is NOT `--protect-args`, which
+  # was the first version of this fix and was reverted — a real remote
+  # incompatibility, found in review, not a hypothetical).
+  local needs_rsync_arg_escaping=0
   # Defined for every branch so the generated script has one uniform shape;
   # only the manifest branch ever calls them.
   prune_helpers="_sg_list_live() { echo 'internal error: this restore.sh does not use a wp-content manifest' >&2; return 1; }
@@ -539,25 +543,46 @@ _sg_delete_from_stdin() { echo 'internal error: this restore.sh does not use a w
     # after this script has already run. Whether that second command line
     # protects special characters in the destination path is entirely
     # rsync's own behavior, not this script's — measured to differ by
-    # implementation: modern GNU rsync (>= 3.0.0) escapes it by default even
-    # without any flag, but macOS's own bundled `/usr/bin/rsync` is a
-    # different codebase (OpenBSD's openrsync, not GNU rsync) that performs
-    # NO escaping at all — confirmed live, `rsync -avz --delete src
-    # 'host:/tmp/x $(touch PWNED)y/'` over openrsync runs the embedded
-    # command on the far end. `--protect-args` (`-s`) closes this the robust
-    # way for any rsync that has it: the destination path is sent over
-    # rsync's own protocol instead of a shell command line, so the remote
-    # shell never sees it as text to interpret at all — but `-s`/
-    # `--protect-args` is a GNU-rsync-only flag: openrsync doesn't recognize
-    # it and exits immediately with "unrecognized option" (confirmed live).
-    # That is a strictly better failure than before (a loud refusal instead
-    # of a silent remote-shell expansion), and the runtime check baked in
-    # below (issue #44) turns that into an explicit, actionable message
-    # instead of a bare rsync usage dump. docs/usage.md's own install step
-    # already asks for a real (GNU/homebrew) rsync on macOS — this is the
-    # first place that requirement is actually load-bearing.
-    needs_rsync_protect_args=1
-    restore_wp_content_cmd="ssh $(sq "$SITE_B_SSH_HOST") $(sq "mkdir -p $(sq "${SITE_B_WP_PATH}/wp-content")") && rsync -avz --protect-args --delete $(sq "${run_dir}/backup/b-wp-content/") $(sq "${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/wp-content/")"
+    # implementation and, within GNU rsync itself, by VERSION:
+    #
+    #   - GNU rsync >= 3.2.4 (April 2022) backslash-escapes the destination
+    #     for the remote shell BY DEFAULT, no flag required — confirmed live
+    #     (a loopback ssh stand-in, `$(touch PWNED)` embedded in the
+    #     destination: inert). `--old-args` reverts to the old, unescaped
+    #     behavior on purpose (an explicit opt-OUT), and running WITH it
+    #     reproduces the injection — confirmed live too.
+    #   - GNU rsync 3.0.0-3.2.3 does NOT escape by default. `--protect-args`/
+    #     `-s` exists on those versions and would close the gap for them —
+    #     see ADR 0010 for why this fix does not use it anyway.
+    #   - macOS's own bundled `/usr/bin/rsync` is not GNU rsync at all — it's
+    #     OpenBSD's `openrsync` (the only rsync macOS 15+ ships). It performs
+    #     NO escaping, ever, and has no `--protect-args`/`-s`/`--old-args`.
+    #
+    # `--protect-args` was the FIRST version of this fix and was reverted:
+    # measured live (a real GNU 3.4.4 client against a real openrsync
+    # SERVER, both invoked for real, not simulated), plain `rsync -avz
+    # --delete` (no flag) against that openrsync server SUCCEEDS — GNU's own
+    # default escaping is a purely client-side, wire-protocol-transparent
+    # behavior that needs nothing from the remote. `--protect-args` against
+    # that same openrsync server FAILS: the client sends `--server -s...`,
+    # openrsync's own arg parser on the far end rejects `-s` outright, and
+    # the transfer dies with "connection unexpectedly closed" (code 12) —
+    # `man rsync` documents `-s` as "refused by restricted shells" for
+    # exactly this reason (rrsync and other forced-command SSH setups are a
+    # standard hardening for backup accounts, i.e. squarely a real B). So
+    # `--protect-args` would have fixed the local-openrsync case at the cost
+    # of BREAKING every ssh-remote restore whose B enforces one — a strictly
+    # worse trade for a class of target this project cannot assume away.
+    #
+    # The fix actually shipped: no change to the rsync invocation itself
+    # (still plain `-avz --delete`, purely dependent on the LOCAL rsync's
+    # own default escaping); the runtime check below (issue #44) instead
+    # verifies the LOCAL rsync actually has that default (`--old-args`
+    # support is the proxy — see the check's own comment) before running it,
+    # and refuses with an explicit message rather than proceeding unsafely
+    # if it does not. Nothing is required of B's rsync at all.
+    needs_rsync_arg_escaping=1
+    restore_wp_content_cmd="ssh $(sq "$SITE_B_SSH_HOST") $(sq "mkdir -p $(sq "${SITE_B_WP_PATH}/wp-content")") && rsync -avz --delete $(sq "${run_dir}/backup/b-wp-content/") $(sq "${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/wp-content/")"
     restore_db_cmd="gunzip -c $(sq "${run_dir}/backup/b-db.sql.gz") | ssh $(sq "$SITE_B_SSH_HOST") $(sq "${SITE_B_WP_CMD} --path=$(sq "${SITE_B_WP_PATH}") db import -")"
     restore_semantics="exact-state, via rsync --delete — wp-content is mirrored back to exactly what this backup contains, and any file added to it since is removed"
   else
@@ -690,7 +715,7 @@ WP_CONTENT_MANIFEST=${q_manifest}
 B_WP_CONTENT_ROOT=${q_root}
 PRUNE_MODE=${q_prune_mode}
 RESTORE_SEMANTICS=${q_semantics}
-NEEDS_RSYNC_PROTECT_ARGS=${needs_rsync_protect_args}
+NEEDS_RSYNC_ARG_ESCAPING=${needs_rsync_arg_escaping}
 
 ${prune_helpers}
 EOF
@@ -722,22 +747,40 @@ trap _sg_cleanup EXIT
 # that lets the restore carry on. Keep the `exit`.
 _sg_die() { echo "$1" >&2; exit 1; }
 
-# issue #44: only the ssh-remote branch sets NEEDS_RSYNC_PROTECT_ARGS=1 (see
+# issue #44: only the ssh-remote branch sets NEEDS_RSYNC_ARG_ESCAPING=1 (see
 # backup_generate_restore_script's comment on the `rsync ... host:path` line
-# for why that branch, alone, needs this). `--protect-args` is what keeps
-# B's SSH shell from interpreting SITE_B_WP_PATH — GNU rsync (Homebrew on
-# macOS, apt on Debian/Ubuntu, per this project's own docs/usage.md install
-# step) has supported it since 3.0.0 (2008), long enough not to be a version
-# concern for any rsync actually installed that way. What IS a real, measured
-# gap: macOS also ships its OWN `/usr/bin/rsync` — openrsync, an entirely
-# different codebase from GNU rsync, first as an option and the only rsync
-# on macOS 15+ — which has never implemented this flag and exits on it
-# immediately. Checked here, before touching B, so that gap surfaces as one
-# clear sentence instead of a bare "unrecognized option" the wp-content step
-# would otherwise fail on midway through the restore.
-if [ "$NEEDS_RSYNC_PROTECT_ARGS" -eq 1 ] && ! rsync --protect-args --version >/dev/null 2>&1; then
-  _sg_die "refusing to restore: this restore's wp-content step relies on 'rsync --protect-args' so B's SSH shell never gets a chance to interpret the destination path — and the rsync resolved on PATH here does not support that option. This is most often macOS's own /usr/bin/rsync (openrsync, a different implementation from GNU rsync, with no --protect-args at all): put a GNU rsync >= 3.0.0 first on PATH (e.g. 'brew install rsync' on macOS; already the default via apt on Debian/Ubuntu) and re-run. Nothing was restored."
-fi
+# for the full reasoning, including why this checks for DEFAULT escaping
+# rather than requiring `--protect-args` — that flag was tried first and
+# reverted: measured live against a real openrsync SERVER, it makes rsync
+# refuse a connection that plain, unflagged rsync completes successfully).
+#
+# `--old-args` is the probe, not `--version` or a parsed version string:
+# `--old-args` is the explicit opt-OUT of default arg-escaping, so a rsync
+# that recognizes it is, by construction, one whose DEFAULT (the flag's
+# absence, which is what the actual restore command below runs with) is to
+# escape. Confirmed live: GNU rsync recognizes `--old-args` from the same
+# release that introduced default escaping (3.2.4) onward; openrsync (macOS's
+# own /usr/bin/rsync, a different codebase, the only rsync macOS 15+ ships)
+# recognizes neither `--old-args` nor default escaping and performs no
+# escaping at all.
+#
+# Defined as a function, not run inline here, so the caller (below, after
+# the --dry-run early exit) can place the call where it belongs: right
+# before the command it gates, not before the argument-parsing / dry-run
+# logic above it. An earlier version of this check ran unconditionally at
+# this point in the script and made --dry-run refuse too, on a target whose
+# rsync lacks this — losing the one thing --dry-run exists for (a safe
+# preview) to a check the preview path never actually needs, since it never
+# calls rsync at all.
+_sg_check_rsync_arg_escaping() {
+  [ "$NEEDS_RSYNC_ARG_ESCAPING" -eq 1 ] || return 0
+  if ! command -v rsync >/dev/null 2>&1; then
+    _sg_die "refusing to restore: rsync is required for this restore and was not found on PATH. Install a GNU-rsync-compatible build (e.g. 'brew install rsync' on macOS; already the default via apt on Debian/Ubuntu) and re-run. Nothing was restored."
+  fi
+  if ! rsync --old-args --version >/dev/null 2>&1; then
+    _sg_die "refusing to restore: this restore's wp-content step depends on the LOCAL rsync escaping B's path by default (so B's SSH shell never gets a chance to interpret it), and the rsync resolved on PATH here does not do that. This is most often macOS's own /usr/bin/rsync (openrsync, a different implementation from GNU rsync, which never escapes anything): put a GNU rsync >= 3.2.4 first on PATH (e.g. 'brew install rsync' on macOS; already the default via apt on Debian/Ubuntu) and re-run. Nothing was restored. (This is a requirement on the LOCAL rsync only — nothing is required of B's.)"
+  fi
+}
 
 SG_NL='
 '
@@ -1129,8 +1172,8 @@ _sg_assert_backup_landed() {
     # itself) — it is that the backup and the target disagree on Unicode
     # normalization for these paths: B has each of these files already,
     # spelled with a different, equally legal, sequence of bytes.
-    echo "This most often means the backup and the target disagree on Unicode normalization for ${n} path(s): an accented filename has two legal UTF-8 encodings (NFC, one code point; NFD, a letter plus a combining mark), and B is showing one of them while this backup used the other. This script compares bytes, not characters, and refuses rather than guess which of two byte-different names is 'the same file' and delete the one it does not recognise."
-    echo "To move forward by hand: for each path listed above, find the file B already has under that name (same folder, same visible characters, different bytes underneath) and rename it on B's filesystem to match the byte sequence printed above exactly — for example, copy the path above as the destination of an 'mv'. (If a path above genuinely does not exist anywhere on B — not even under a different spelling — the extraction itself did not land it; investigate that instead.) Then re-run this script. Why this restore does not attempt that renaming itself, and when that would be worth revisiting, is written down in docs/decisions/0009-restore-unicode-normalization-refusal.md."
+    echo "Either the extraction did not fully land, or — more likely, since a failed extraction would already have failed loudly at the tar/rsync step itself — the backup and the target disagree on Unicode normalization for ${n} path(s): an accented filename has two legal UTF-8 encodings (NFC, one code point; NFD, a letter plus a combining mark), and B may be showing one of them while this backup used the other. This script compares bytes, not characters, and refuses rather than guess which of two byte-different names is 'the same file' and delete the one it does not recognise."
+    echo "To move forward by hand: for each path listed above, find the file B already has under that name (same folder, same visible characters, different bytes underneath) and rename it on B's filesystem to match the byte sequence printed above exactly — for example, copy the path above as the destination of an 'mv'. If that rename appears to do nothing (some filesystems, including macOS's own APFS by default, treat both byte forms as the same path — the rename is then a true no-op, not a mistake), this backup cannot be restored automatically on this filesystem pairing; apply it by hand outside sitegraft instead. (If a path above genuinely does not exist anywhere on B — not even under a different spelling — the extraction itself did not land it; investigate that instead.) Then re-run this script. Why this restore does not attempt that renaming itself, and when that would be worth revisiting, is written down in docs/decisions/0009-restore-unicode-normalization-refusal.md."
   } >&2
   exit 1
 }
@@ -1211,6 +1254,12 @@ if [ "\$DRY_RUN" -eq 1 ]; then
   echo "[dry-run] nothing was written to B."
   exit 0
 fi
+
+# issue #44: checked here, not earlier — this is the local rsync capability
+# this restore is actually about to depend on, and --dry-run (above) never
+# reaches this line at all, so a preview stays available even against a
+# target this specific check would otherwise refuse.
+_sg_check_rsync_arg_escaping
 
 echo "Restoring B wp-content from \${WP_CONTENT_DIR}/ ..."
 # Bug found live (not present in the plan's original pseudocode): the
