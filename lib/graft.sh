@@ -430,20 +430,37 @@ graft_media_push_cmd() {
 # (SITE_*_WP_PATH is a container-internal path — see the helpers block
 # above). Routes through graft_pull_dir/graft_push_dir instead, which fall
 # back to the exact same plain rsync for a genuinely bare-local site.
+# Every step below guards its own exit status with `|| return $?` rather
+# than relying on `set -e`. That is not belt-and-braces, it is required:
+# phase_graft's call site puts this function on the LHS of a `||` (so it can
+# print an operator message about B's state on failure), and bash disables
+# -e for the whole of a function invoked there, INCLUDING its body. Without
+# these guards a mid-body failure -- the pull from A dying on a network drop
+# or a full disk (rsync exit 23) -- fell through to the push, which happily
+# shipped an EMPTY staging tree to B, returned 0, and let phase_graft mark
+# the step done and carry on importing against a B whose media never
+# arrived. Measured: rc 23 before that call-site change, rc 0 after, message
+# never reached. That is issue #36's own failure mode re-entering by another
+# door, and "never report success that was not earned" broken by the very
+# commit meant to improve this failure path. Caught in review of PR #90.
+#
+# `return $?` normalizes nothing on purpose except through phase_graft's own
+# 1/2 contract at the call site; rsync's 23 propagating as a non-zero is
+# what matters here.
 graft_media_sync() {
   local run_dir="$1"
   local staging="${run_dir}/media-staging"
-  mkdir -p "$staging"
+  mkdir -p "$staging" || return $?
   log_info "pulling A's media to the orchestrator..."
   if [ -n "${SITE_A_SSH_HOST:-}" ]; then
-    run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${SITE_A_WP_PATH}/wp-content/uploads/" "${staging}/"
+    run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${SITE_A_WP_PATH}/wp-content/uploads/" "${staging}/" || return $?
   else
-    graft_pull_dir a "${SITE_A_WP_PATH}/wp-content/uploads" "$staging"
+    graft_pull_dir a "${SITE_A_WP_PATH}/wp-content/uploads" "$staging" || return $?
   fi
   log_info "pushing media to B (never overwriting existing files)..."
   # graft_push_dir itself now handles all three shapes (ssh-remote,
   # wrapped-local, bare-local) — see its own header comment.
-  graft_push_dir b "$staging" "${SITE_B_WP_PATH}/wp-content/uploads" --keep-existing
+  graft_push_dir b "$staging" "${SITE_B_WP_PATH}/wp-content/uploads" --keep-existing || return $?
 }
 
 graft_deploy_mu_plugin() {

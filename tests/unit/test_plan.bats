@@ -1,3 +1,5 @@
+bats_require_minimum_version 1.5.0
+
 # tests/unit/test_plan.bats
 setup() {
   load '../../lib/core.sh'

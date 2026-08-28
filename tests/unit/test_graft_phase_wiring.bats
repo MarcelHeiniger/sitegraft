@@ -1,3 +1,5 @@
+bats_require_minimum_version 1.5.0
+
 # tests/unit/test_graft_phase_wiring.bats — the marker-file resumability
 # mechanism every graft sub-step uses (design doc §6.4: "an interrupted
 # graft resumes at the sub-step after the last marker, never from scratch").
@@ -364,7 +366,8 @@ EOF
 
   # These three are NOT what catches a broken is_dry_run guard on that
   # `rm -f` -- the pre-existing `[ -f "${run_dir}/graft.*.done" ]` pair
-  # further down does, and bats stops there first. Measured: removing the
+  # ABOVE (lines 332-333) does, and bats stops there first. Measured:
+  # removing the
   # is_dry_run guard reddens that pair, and these three are never even
   # evaluated. Nor is the reason stated in an earlier draft of this
   # comment true here: under --dry-run graft_mark_step returns early
@@ -405,7 +408,18 @@ EOF
   # The failure this message exists for: rsync dies (disk full on B, network
   # drop) on a RE-graft, i.e. after prune has already deleted the previous
   # run's attachments and their files.
-  graft_media_sync() { echo "STUB: graft_media_sync called"; return 1; }
+  # Fails MID-BODY, not on its last command. That distinction is the whole
+  # point: a last-command failure propagates even without graft_media_sync's
+  # own `|| return $?` guards, so a stub shaped that way would leave them
+  # unpinned. The real hazard is the pull from A dying (rsync exit 23) and
+  # execution carrying on to push an empty staging tree to B -- which
+  # returned 0, marked the step done, and imported against a stripped B.
+  graft_media_sync() {
+    echo "STUB: graft_media_sync called"
+    false || return $?
+    echo "STUB: graft_media_sync PUSHED ANYWAY"
+    return 0
+  }
 
   unset SITEGRAFT_DRY_RUN
   run --separate-stderr phase_graft --profile demo --run "$run_dir"
@@ -414,6 +428,7 @@ EOF
   [ "$status" -ne 0 ]
   [ ! -f "${run_dir}/graft.media_sync.done" ]
   # The step after it must not have run on a B whose media are gone.
+  [[ "$output" != *"STUB: graft_media_sync PUSHED ANYWAY"* ]] || false
   [[ "$output" != *"STUB: graft_import_attachments called"* ]] || false
 
   # The message itself: a bare rsync error leaves the operator unable to
