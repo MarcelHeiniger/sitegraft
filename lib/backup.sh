@@ -495,6 +495,16 @@ backup_generate_restore_script() {
   # moment they run it, not only in the `backup` log they may never have seen.
   local restore_semantics prune_mode="rsync-delete" prune_helpers
   local b_wp_content_root="${SITE_B_WP_PATH:-}/wp-content"
+  # issue #44: only the ssh-remote branch's wp-content step hands a
+  # `host:path` destination to rsync, which is the one case where rsync — not
+  # this script — builds a second, remote command line out of SITE_B_WP_PATH.
+  # sq() (this function's own header comment) protects every path THIS
+  # script's ssh/tar/rsync-local invocations run through, but it cannot reach
+  # that second command line: rsync constructs it itself, on the far end,
+  # after this script has already exited. Baked into restore.sh as
+  # NEEDS_RSYNC_PROTECT_ARGS so the one runtime check below (added with the
+  # fix) only ever runs for the branch that actually needs it.
+  local needs_rsync_protect_args=0
   # Defined for every branch so the generated script has one uniform shape;
   # only the manifest branch ever calls them.
   prune_helpers="_sg_list_live() { echo 'internal error: this restore.sh does not use a wp-content manifest' >&2; return 1; }
@@ -513,8 +523,41 @@ _sg_delete_from_stdin() { echo 'internal error: this restore.sh does not use a w
     # Two shells parse the remote half: restore.sh's own, then the far end's.
     # Hence sq() applied twice to the remote path — the inner call quotes it
     # for the remote shell, the outer one quotes that whole command string for
-    # the local one.
-    restore_wp_content_cmd="ssh $(sq "$SITE_B_SSH_HOST") $(sq "mkdir -p $(sq "${SITE_B_WP_PATH}/wp-content")") && rsync -avz --delete $(sq "${run_dir}/backup/b-wp-content/") $(sq "${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/wp-content/")"
+    # the local one. That covers both `ssh` invocations below (mkdir, and
+    # `wp db import` piped over ssh): each bakes ONE command string that THIS
+    # script hands, as a single argument, to a remote shell it explicitly
+    # asked for — sq() quoting that string for the remote shell is exactly
+    # the right and sufficient protection, verified live (a SITE_B_WP_PATH of
+    # "/var/www/$(touch pwned)html" round-trips as inert text through both).
+    #
+    # `rsync -avz --delete <src> host:path`, below, is a different shape: the
+    # text after `host:` is never an argument on a command line THIS script
+    # controls. rsync reads it, then builds ITS OWN remote command line (to
+    # invoke `rsync --server` on the far end) and hands THAT to ssh — a
+    # second, independent command-construction step this function's sq()
+    # calls never reach, because it happens inside rsync, on the far end,
+    # after this script has already run. Whether that second command line
+    # protects special characters in the destination path is entirely
+    # rsync's own behavior, not this script's — measured to differ by
+    # implementation: modern GNU rsync (>= 3.0.0) escapes it by default even
+    # without any flag, but macOS's own bundled `/usr/bin/rsync` is a
+    # different codebase (OpenBSD's openrsync, not GNU rsync) that performs
+    # NO escaping at all — confirmed live, `rsync -avz --delete src
+    # 'host:/tmp/x $(touch PWNED)y/'` over openrsync runs the embedded
+    # command on the far end. `--protect-args` (`-s`) closes this the robust
+    # way for any rsync that has it: the destination path is sent over
+    # rsync's own protocol instead of a shell command line, so the remote
+    # shell never sees it as text to interpret at all — but `-s`/
+    # `--protect-args` is a GNU-rsync-only flag: openrsync doesn't recognize
+    # it and exits immediately with "unrecognized option" (confirmed live).
+    # That is a strictly better failure than before (a loud refusal instead
+    # of a silent remote-shell expansion), and the runtime check baked in
+    # below (issue #44) turns that into an explicit, actionable message
+    # instead of a bare rsync usage dump. docs/usage.md's own install step
+    # already asks for a real (GNU/homebrew) rsync on macOS — this is the
+    # first place that requirement is actually load-bearing.
+    needs_rsync_protect_args=1
+    restore_wp_content_cmd="ssh $(sq "$SITE_B_SSH_HOST") $(sq "mkdir -p $(sq "${SITE_B_WP_PATH}/wp-content")") && rsync -avz --protect-args --delete $(sq "${run_dir}/backup/b-wp-content/") $(sq "${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/wp-content/")"
     restore_db_cmd="gunzip -c $(sq "${run_dir}/backup/b-db.sql.gz") | ssh $(sq "$SITE_B_SSH_HOST") $(sq "${SITE_B_WP_CMD} --path=$(sq "${SITE_B_WP_PATH}") db import -")"
     restore_semantics="exact-state, via rsync --delete — wp-content is mirrored back to exactly what this backup contains, and any file added to it since is removed"
   else
@@ -647,6 +690,7 @@ WP_CONTENT_MANIFEST=${q_manifest}
 B_WP_CONTENT_ROOT=${q_root}
 PRUNE_MODE=${q_prune_mode}
 RESTORE_SEMANTICS=${q_semantics}
+NEEDS_RSYNC_PROTECT_ARGS=${needs_rsync_protect_args}
 
 ${prune_helpers}
 EOF
@@ -677,6 +721,23 @@ trap _sg_cleanup EXIT
 # `if` condition — where a `return 1` would be silently downgraded to a warning
 # that lets the restore carry on. Keep the `exit`.
 _sg_die() { echo "$1" >&2; exit 1; }
+
+# issue #44: only the ssh-remote branch sets NEEDS_RSYNC_PROTECT_ARGS=1 (see
+# backup_generate_restore_script's comment on the `rsync ... host:path` line
+# for why that branch, alone, needs this). `--protect-args` is what keeps
+# B's SSH shell from interpreting SITE_B_WP_PATH — GNU rsync (Homebrew on
+# macOS, apt on Debian/Ubuntu, per this project's own docs/usage.md install
+# step) has supported it since 3.0.0 (2008), long enough not to be a version
+# concern for any rsync actually installed that way. What IS a real, measured
+# gap: macOS also ships its OWN `/usr/bin/rsync` — openrsync, an entirely
+# different codebase from GNU rsync, first as an option and the only rsync
+# on macOS 15+ — which has never implemented this flag and exits on it
+# immediately. Checked here, before touching B, so that gap surfaces as one
+# clear sentence instead of a bare "unrecognized option" the wp-content step
+# would otherwise fail on midway through the restore.
+if [ "$NEEDS_RSYNC_PROTECT_ARGS" -eq 1 ] && ! rsync --protect-args --version >/dev/null 2>&1; then
+  _sg_die "refusing to restore: this restore's wp-content step relies on 'rsync --protect-args' so B's SSH shell never gets a chance to interpret the destination path — and the rsync resolved on PATH here does not support that option. This is most often macOS's own /usr/bin/rsync (openrsync, a different implementation from GNU rsync, with no --protect-args at all): put a GNU rsync >= 3.0.0 first on PATH (e.g. 'brew install rsync' on macOS; already the default via apt on Debian/Ubuntu) and re-run. Nothing was restored."
+fi
 
 SG_NL='
 '
@@ -1061,7 +1122,15 @@ _sg_assert_backup_landed() {
       if [ "$shown" -gt 20 ]; then echo "  ... and $((n - 20)) more"; break; fi
       printf '  %s\n' "${B_WP_CONTENT_ROOT}/${rel#./}"
     done < "$SG_TMP/missing.txt"
-    echo "Either the extraction did not fully land, or these names exist on B in a different Unicode normalization: an accented filename has two legal UTF-8 encodings (NFC, one code point; NFD, a letter plus a combining mark), and a name held in one form does not match the same name reported in the other. This script compares bytes and cannot normalize them without a Unicode table it is not allowed to depend on, so it refuses rather than delete a file it failed to recognise. Check the paths above by hand, then re-run."
+    # issue #45: naming the paths (above) is not the same as telling the
+    # operator what to do about it. The most likely cause, by far, is not a
+    # failed extraction (a genuinely un-landed file is rare and this script
+    # would already have failed loudly earlier, at the tar/rsync step
+    # itself) — it is that the backup and the target disagree on Unicode
+    # normalization for these paths: B has each of these files already,
+    # spelled with a different, equally legal, sequence of bytes.
+    echo "This most often means the backup and the target disagree on Unicode normalization for ${n} path(s): an accented filename has two legal UTF-8 encodings (NFC, one code point; NFD, a letter plus a combining mark), and B is showing one of them while this backup used the other. This script compares bytes, not characters, and refuses rather than guess which of two byte-different names is 'the same file' and delete the one it does not recognise."
+    echo "To move forward by hand: for each path listed above, find the file B already has under that name (same folder, same visible characters, different bytes underneath) and rename it on B's filesystem to match the byte sequence printed above exactly — for example, copy the path above as the destination of an 'mv'. (If a path above genuinely does not exist anywhere on B — not even under a different spelling — the extraction itself did not land it; investigate that instead.) Then re-run this script. Why this restore does not attempt that renaming itself, and when that would be worth revisiting, is written down in docs/decisions/0009-restore-unicode-normalization-refusal.md."
   } >&2
   exit 1
 }
@@ -1079,7 +1148,7 @@ _sg_apply_prune() {
   # wp-content, or the extraction left both normalization forms of a name
   # behind instead of renaming one into the other.
   if ! cmp -s "$SG_TMP/to-preview.txt" "$SG_TMP/to-remove.txt"; then
-    _sg_die "refusing to remove anything from B: the set of paths to remove is not the one reported above. Either something else is writing to B's wp-content, or extracting this backup left a filename present under two different Unicode normalizations. Nothing was removed, and the database has NOT been touched."
+    _sg_die "refusing to remove anything from B: the set of paths to remove is not the one reported above. Either something else is writing to B's wp-content, or extracting this backup left a filename present under two different Unicode normalizations (compare the listing above to B's actual files by hand — a name repeated with different bytes underneath is the tell; see docs/decisions/0009-restore-unicode-normalization-refusal.md for the remedy). Nothing was removed, and the database has NOT been touched."
   fi
   [ "$SG_PRUNE_COUNT" -gt 0 ] || return 0
   echo "Removing ${SG_PRUNE_COUNT} path(s) added to wp-content since this backup ..."

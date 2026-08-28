@@ -580,8 +580,231 @@ _manifest_fixture() {
   backup_generate_restore_script "$run_dir"
   run grep -c 'RESTORE_SEMANTICS=' "${run_dir}/restore.sh"
   [ "$output" = "1" ]
-  run grep -c 'rsync -avz --delete' "${run_dir}/restore.sh"
+  # The wp-content restore command itself, not RESTORE_SEMANTICS (which also
+  # mentions "rsync --delete" in its own descriptive text).
+  run grep -c "if ! { ssh .* && rsync .*--delete" "${run_dir}/restore.sh"
   [ "$output" = "1" ]
+}
+
+# --- issue #44: the ssh-remote rsync destination is a SECOND shell's problem
+# ---
+# rsync builds its OWN remote command line out of the `host:path` destination
+# and hands that to ssh, on the far end, after this script has already run —
+# a construction step sq() (this file's local-quoting helper) never reaches.
+# `--protect-args` is what closes it: with that flag, the destination travels
+# over rsync's own protocol instead of a remote shell command line, so a
+# SITE_B_WP_PATH holding a space or a shell metacharacter is never handed to
+# anything that would re-interpret it. See backup_generate_restore_script's
+# own comment on the `rsync ... host:path` line for what was actually
+# measured (GNU rsync escapes by default even without the flag; macOS's own
+# openrsync does not escape at all and does not implement the flag either).
+
+@test "the generated ssh-remote restore.sh's wp-content rsync uses --protect-args (issue #44)" {
+  SITE_B_SSH_HOST="user@host-b.example.com"
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="wp"
+  local run_dir="$BATS_TEST_TMPDIR/run-ssh-protectargs"
+  mkdir -p "$run_dir"
+  backup_generate_restore_script "$run_dir"
+  run grep -c -- 'rsync -avz --protect-args --delete' "${run_dir}/restore.sh"
+  [ "$output" = "1" ]
+}
+
+@test "the generated bare-local and wrapped-local restore.sh do NOT gain --protect-args (only the ssh-remote destination goes through a second shell)" {
+  SITE_B_SSH_HOST=""
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="wp"
+  local run_dir="$BATS_TEST_TMPDIR/run-bare-protectargs"
+  mkdir -p "$run_dir"
+  backup_generate_restore_script "$run_dir"
+  # The runtime preflight-check CODE (issue #44) is written into every
+  # restore.sh, guarded by NEEDS_RSYNC_PROTECT_ARGS — so "--protect-args"
+  # appears in the file regardless of branch. What must NOT happen is the
+  # actual wp-content restore COMMAND carrying the flag on a branch whose
+  # rsync never talks to a remote shell at all.
+  run grep -c "if ! { rsync .*--protect-args" "${run_dir}/restore.sh"
+  [ "$output" = "0" ]
+  run grep -c 'NEEDS_RSYNC_PROTECT_ARGS=0' "${run_dir}/restore.sh"
+  [ "$output" = "1" ]
+
+  SITE_B_WP_CMD="env -- wp"
+  local run_dir2="$BATS_TEST_TMPDIR/run-wrapped-protectargs"
+  mkdir -p "$run_dir2"
+  backup_generate_restore_script "$run_dir2"
+  # wrapped-local's wp-content step is tar-through-the-wrapper, not rsync at
+  # all — the flag must not appear on that command line.
+  run grep -c "if ! { .*tar .*--protect-args" "${run_dir2}/restore.sh"
+  [ "$output" = "0" ]
+  run grep -c 'NEEDS_RSYNC_PROTECT_ARGS=0' "${run_dir2}/restore.sh"
+  [ "$output" = "1" ]
+}
+
+# Behavioral, not just textual: a fake `ssh` that reproduces real ssh's own
+# documented behavior (join every argument after the host with a single
+# space, hand the result to the remote user's shell) proves the two `ssh`
+# invocations on this branch (mkdir, and the piped db import) are already
+# safe — sq() applied twice (see backup_generate_restore_script's header
+# comment) quotes the path for THAT shell, not just the local one. This is
+# the "measure it, don't assume it" check issue #44 asks for on the ssh
+# invocations specifically, mutation-provable: point SITE_B_WP_PATH at a
+# command substitution, and prove it is never executed.
+_ssh_remote_loopback_shim() {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/ssh" <<'EOS'
+#!/usr/bin/env bash
+# Real ssh's own behavior for a command given as multiple argv words: join
+# them with a single space and execute the result through the remote user's
+# shell. This does the identical join and runs it through a LOCAL shell
+# instead of a network hop -- enough to prove whether a value baked into the
+# joined string is treated as data or as syntax, without a real remote host.
+shift # drop the host argument; this stand-in never actually connects
+exec sh -c "$*"
+EOS
+  chmod +x "$BATS_TEST_TMPDIR/bin/ssh"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+}
+
+# _extract_if_body <file> <pattern> — pulls just the command chain out of a
+# generated "if ! { <chain>; }; then" line, stripping the `if`/`then`
+# scaffolding around it. Evaluating the WHOLE line (scaffolding included) is
+# not valid on its own -- it is half of a compound statement with no
+# matching `fi` -- so `eval` on it fails to PARSE and never runs any of the
+# embedded commands at all. That failure looks identical to "the injection
+# didn't fire," which is exactly backwards: it hides the very thing these
+# tests exist to catch instead of proving it closed. (Found by mutation-
+# testing these tests themselves: neutering the inner sq() call on
+# SITE_B_WP_PATH — the exact regression issue #44 asks to guard against —
+# did not turn the naive version of this test red.)
+_extract_if_body() {
+  local file="$1" pattern="$2" line
+  line=$(grep "$pattern" "$file")
+  line="${line#if ! { }"
+  # The suffix pattern must be quoted: unquoted, its own literal "}" closes
+  # the "${line%...}" expansion early and the rest leaks through as text —
+  # found the same way as the bug above, by mutation-testing this helper.
+  line="${line%"; }; then"}"
+  printf '%s' "$line"
+}
+
+@test "the generated ssh-remote restore.sh's mkdir command is data, not syntax, for a SITE_B_WP_PATH holding a command substitution (issue #44)" {
+  _ssh_remote_loopback_shim
+  local sentinel="$BATS_TEST_TMPDIR/INJECTED_MKDIR"
+  SITE_B_SSH_HOST="fakehost"
+  SITE_B_WP_PATH="/var/www/\$(touch ${sentinel})html"
+  SITE_B_WP_CMD="wp"
+  local run_dir="$BATS_TEST_TMPDIR/run-ssh-mkdir-inject"
+  mkdir -p "${run_dir}/backup"
+  backup_generate_restore_script "$run_dir"
+  local chain; chain=$(_extract_if_body "${run_dir}/restore.sh" '^if ! { ssh')
+  [ -n "$chain" ]
+  # Isolate the ssh/mkdir half from the ` && rsync ...` half that follows it
+  # — only the ssh half is under test here (the rsync half is issue #44's
+  # OTHER fix, covered by its own tests above).
+  local mkdir_part="${chain%% && rsync*}"
+  [[ "$mkdir_part" == ssh* ]] || false
+  eval "$mkdir_part" || true
+  [ ! -e "$sentinel" ]
+}
+
+@test "the generated ssh-remote restore.sh's db-import command is data, not syntax, for a SITE_B_WP_PATH holding a command substitution (issue #44)" {
+  _ssh_remote_loopback_shim
+  local sentinel="$BATS_TEST_TMPDIR/INJECTED_DBIMPORT"
+  SITE_B_SSH_HOST="fakehost"
+  SITE_B_WP_PATH="/var/www/\$(touch ${sentinel})html"
+  SITE_B_WP_CMD="wp"
+  local run_dir="$BATS_TEST_TMPDIR/run-ssh-dbimport-inject"
+  mkdir -p "${run_dir}/backup"
+  echo fake-dump > "${run_dir}/backup/b-db.sql.gz"
+  backup_generate_restore_script "$run_dir"
+  local chain; chain=$(_extract_if_body "${run_dir}/restore.sh" '^if ! { gunzip')
+  [ -n "$chain" ]
+  [[ "$chain" == gunzip* ]] || false
+  # `wp` is unresolvable through the loopback shim -- that is fine, the only
+  # thing under test is whether the substitution ran on the way to failing.
+  eval "$chain" || true
+  [ ! -e "$sentinel" ]
+}
+
+# --- issue #44: the rsync-version assumption --protect-args introduces ---
+# GNU rsync has had --protect-args since 3.0.0 (2008) -- not a live concern
+# for the rsync docs/usage.md's own install step asks for (Homebrew on
+# macOS, apt on Debian/Ubuntu). What IS a real, measured gap: macOS also
+# ships its own /usr/bin/rsync (openrsync, a different codebase from GNU
+# rsync, the ONLY rsync on macOS 15+) which has never implemented this flag
+# and exits immediately on it. The runtime check below turns that gap into
+# one clear, actionable line instead of a bare "unrecognized option" partway
+# through a restore.
+
+@test "the generated ssh-remote restore.sh refuses up front, with a clear reason, when the local rsync does not support --protect-args (issue #44)" {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  # Stands in for openrsync: rejects the flag exactly like the real one does
+  # (confirmed live against macOS's own /usr/bin/rsync).
+  cat > "$BATS_TEST_TMPDIR/bin/rsync" <<'EOS'
+#!/usr/bin/env bash
+case " $* " in
+  *" --protect-args "*) echo "rsync: unrecognized option \`--protect-args'" >&2; exit 1 ;;
+esac
+exit 0
+EOS
+  chmod +x "$BATS_TEST_TMPDIR/bin/rsync"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+
+  SITE_B_SSH_HOST="user@host-b.example.com"
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="wp"
+  local run_dir="$BATS_TEST_TMPDIR/run-ssh-no-protectargs"
+  mkdir -p "${run_dir}/backup"
+  backup_generate_restore_script "$run_dir"
+
+  run "${run_dir}/restore.sh" --dry-run
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"protect-args"* ]] || false
+  [[ "$output" == *"openrsync"* ]] || false
+  [[ "$output" == *"Nothing was restored"* ]] || false
+}
+
+@test "the generated ssh-remote restore.sh does NOT refuse when the local rsync supports --protect-args (issue #44, prove the check can pass too)" {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  # Stands in for a real GNU rsync: accepts the flag.
+  cat > "$BATS_TEST_TMPDIR/bin/rsync" <<'EOS'
+#!/usr/bin/env bash
+exit 0
+EOS
+  chmod +x "$BATS_TEST_TMPDIR/bin/rsync"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+
+  SITE_B_SSH_HOST="user@host-b.example.com"
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="wp"
+  local run_dir="$BATS_TEST_TMPDIR/run-ssh-yes-protectargs"
+  mkdir -p "${run_dir}/backup"
+  backup_generate_restore_script "$run_dir"
+
+  run "${run_dir}/restore.sh" --dry-run
+  # The stub rsync always exits 0, so the --protect-args probe passes and the
+  # script proceeds past it — straight into the real integrity check, which
+  # fails on this fixture's non-backup (no db dump, no wp-content dir). That
+  # failure is expected and is NOT what this test is about: what matters is
+  # that it is THIS failure, not the --protect-args refusal.
+  [[ "$output" != *"protect-args"* ]] || false
+}
+
+@test "the generated bare-local and wrapped-local restore.sh never probe rsync --protect-args (they don't need it)" {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  local log="${BATS_TEST_TMPDIR}/rsync-calls.log"
+  printf '#!/usr/bin/env bash\necho "rsync was invoked: $*" >> %s\nexit 0\n' "$(sq "$log")" \
+    > "$BATS_TEST_TMPDIR/bin/rsync"
+  chmod +x "$BATS_TEST_TMPDIR/bin/rsync"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+
+  SITE_B_SSH_HOST=""
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="wp"
+  local run_dir="$BATS_TEST_TMPDIR/run-bare-no-probe"
+  mkdir -p "${run_dir}/backup"
+  backup_generate_restore_script "$run_dir"
+  run "${run_dir}/restore.sh" --dry-run
+  [ ! -e "$log" ] || ! grep -q -- '--protect-args --version' "$log"
 }
 
 # --- the acceptance criterion of issue #14 ---
@@ -1202,6 +1425,44 @@ exec "$@"'
   [ -e "${B_ROOT}/wp-content/themes/$(printf 'Caf\xc3\xa9.css')" ]
   [ -f "${B_ROOT}/wp-content/index.php" ]
   [ -f "${B_ROOT}/wp-content/themes/t/style.css" ]
+}
+
+# issue #45: naming the paths is not the same as telling the operator what to
+# do about it. These assert on the two things the issue's acceptance actually
+# asks for, distinct from the test above (which only proves the refusal
+# fires and nothing is deleted): the situation is NAMED in plain terms, and a
+# concrete manual remedy is STATED, not just implied by the word
+# "normalization" appearing somewhere in the output.
+@test "the normalization refusal names the situation in plain terms (issue #45)" {
+  local shim; shim=$(_nfd_find_shim)
+  B_ROOT_EXTRA_NFC=1
+  ARCHIVE_FORCE_NFC=1
+  _wrapped_fixture "$shim"
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"backup and the target disagree on Unicode normalization"* ]] || false
+}
+
+@test "the normalization refusal states a manual remedy, not just the missing paths (issue #45)" {
+  local shim; shim=$(_nfd_find_shim)
+  B_ROOT_EXTRA_NFC=1
+  ARCHIVE_FORCE_NFC=1
+  _wrapped_fixture "$shim"
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"rename"* ]] || false
+  [[ "$output" == *"re-run"* ]] || false
+}
+
+@test "the normalization refusal points at the written decision on why this isn't detected/normalized earlier (issue #45)" {
+  local shim; shim=$(_nfd_find_shim)
+  B_ROOT_EXTRA_NFC=1
+  ARCHIVE_FORCE_NFC=1
+  _wrapped_fixture "$shim"
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"docs/decisions/0009-restore-unicode-normalization-refusal.md"* ]] || false
+  [ -f "${BATS_TEST_DIRNAME}/../../docs/decisions/0009-restore-unicode-normalization-refusal.md" ]
 }
 
 @test "an accented filename that round-trips unchanged is never mistaken for an addition" {
