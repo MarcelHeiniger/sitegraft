@@ -1,19 +1,34 @@
 # Todo — sitegraft
 
-> Current backlog. Prioritized. Reflects the live state after Step 6 (polish).
-> **Last sync: 2026-08-27**
+> Current backlog. Prioritized. Reflects the live state after the first real
+> client migration.
+> **Last sync: 2026-08-28**
 
 ## Next steps (priority)
 
-- [ ] **Pre-`1.0.0` gate:** a real dry run against a staging copy of a genuine A/B
-      pair, closing design doc §0.2's R2/R4 — see `docs/definition-of-done.md`.
-      Not satisfiable by more DDEV-only testing. This is the one thing standing
-      between the current `1.0.0-rc4` tag and a plain `1.0.0` — Marcel's call, on
-      a real pair, not something Step 6 (or any DDEV-only work) can close.
-- [ ] Review/merge the Step 6 PR (dry-run + stack-override audit, EOF durcissement
-      on the plain selection fallback, `docs/usage.md`, LICENSE/README already in
-      place; double-reviewed by Kimi + Viktor, fix-pack applied on the same PR —
-      see `docs/status.md` → "Step 6 fix-pack" — version now `1.0.0-rc2`).
+- [x] **Pre-`1.0.0` gate** — closed 2026-08-28, and by more than it asked: a full
+      real migration on a genuine A/B pair, human-confirmed, not a dry run.
+- [ ] Decide what remains between `1.0.0-rc15` and a plain `1.0.0`.
+- [ ] **#82 — Etch taxonomies.** `etch_taxonomies` is claimed by no module.
+      Same defect as #16 one level up, and **worse**: the completeness gate counts
+      items, so a post whose terms were dropped still lands and the gate passes.
+      Not triggered on the pilot site (the option does not exist there).
+- [ ] **#83 — `wp-content/fonts/` is never synced.** Media sync covers only
+      `wp-content/uploads/`; WordPress 6.5+ writes the Font Library to a sibling
+      directory. The page renders with a fallback font and nothing reports it.
+      Worked around by hand on the pilot.
+- [ ] **#88 — spaced JSON.** Every rewrite pass matches the compact form only; a
+      spaced call site is left untouched, by two independent causes. Pre-existing
+      (#84/#85 miss it identically), never emitted by WordPress's serializer.
+      Contains a cheap sub-task worth doing regardless: the remap decodes each
+      block, so it knows when it *decided* to rewrite — reporting "decided, but the
+      raw text did not change" turns total silence into a named post id.
+- [ ] **#79 — the harness fixture misses the shapes that matter.** It went green
+      on three separate broken builds this session. Needs: an ssh-remote target, a
+      post type outside `get_post_types(['exclude_from_search' => false])`, and
+      blocks carrying id references.
+- [ ] Consider making the HTTP smoke marker configurable per profile — it
+      currently looks for "Home" and false-fails on any non-English site.
 
 ## Backlog
 

@@ -37,36 +37,65 @@ database of its own. Run state is stored on the machine running the tool (the
 
 ## 4. Where the project stands (status)
 
-All 6 implementation-plan steps are done (`main`, PRs #1-#5 plus the Step 6 polish
-pass, still open as PR #6 pending review/merge): scan, plan, backup, graft, verify,
-and restore are fully implemented, unit-tested, and exercised end-to-end by the
-DDEV harness. PR #6 went through a double review (Kimi + Viktor) that found and a
-fix-pack then closed two review-blocking issues (`verify --dry-run` was producing
-false HARD FAILs; `graft --dry-run` was writing real resumability markers, which
-could make a REAL `graft` right after silently skip the whole pipeline) plus several
-smaller findings — `SITEGRAFT_VERSION` is now `1.0.0-rc4`, not a plain `1.0.0` yet,
-because the pre-`1.0.0` DoD gate (a real dry run against a genuine A/B pair, not the
-DDEV harness) is still open and deliberately not closeable by more DDEV-only work.
-No pilot run has happened yet.
+**The pre-`1.0.0` gate is closed.** On 2026-08-27/28 sitegraft performed its first
+real client migration — a live WordPress Etch/ACSS site onto a separate hosted
+target — and Marcel confirmed the result by hand. `SITEGRAFT_VERSION` is
+`1.0.0-rc15`.
+
+It took three runs, and the two failures are the point:
+
+1. **Run 1 stopped itself.** The import-completeness gate (#53) refused a graft in
+   which one item of 48 never landed. Root cause #16: a module's post-type-defining
+   option was migrated *after* the WXR import, so the type was unregistered while
+   the import ran. Without that gate the run would have reported success with
+   content silently missing.
+2. **Run 2 reported PASS and was wrong.** Every check was green; a human looked at
+   the page and saw `Image with ID … not found` where the logo and hero belonged.
+   Etch blocks reference media by id, the attachments got new ids on the target,
+   and nothing rewrote them (#84) — including ids carried through
+   operator-named component props (#86).
+3. **Run 3 passed, verified by code and by human.** 6 pages, 0 broken-image
+   placeholders, 0 references to the source domain, all font assets served.
+
+**The lesson that shaped the fixes**: `verify` was green *because* of the defect.
+Its content check compares the target's content to the source's — an id that
+should have been rewritten and wasn't leaves the two **identical**, therefore
+conformant. Anything requiring a remap is structurally invisible to an equality
+comparison. Each remap now needs its own guard asking a *different* question, and
+two such guards (`verify_id_references_resolve`,
+`verify_component_prop_references_resolve`) were added and proved on the real run.
+
 → Detail: [`docs/status.md`](docs/status.md)
 
 ## 5. What's left to do (todo)
 
-- [ ] **Pre-`1.0.0` gate**: a real dry run against a staging copy of a genuine A/B
-      pair — Marcel's call, on a real pair (see `docs/definition-of-done.md`).
-- [ ] Review/merge the Step 6 polish PR.
-- [ ] Backlog: `modules/acss.sh` (blocked on verifying a real legacy ACSS slug),
-      the §5.2 interactive-credentials prompt, the `motopress`/`classic-menus`
-      modules, the `clean` sub-step of `graft`.
+- [x] **Pre-`1.0.0` gate** — done, and beyond a dry run: a full real migration,
+      human-confirmed.
+- [ ] Decide what still stands between `1.0.0-rc15` and a plain `1.0.0`.
+- [ ] **#82** — Etch taxonomies (`etch_taxonomies`) are never migrated. Same shape
+      as #16 one level up, but **silent**: the completeness gate counts items, and
+      a post whose terms were dropped still lands.
+- [ ] **#83** — `wp-content/fonts/` is never synced, so WordPress 6.5+'s Font
+      Library is lost without a word. Worked around by hand on the pilot.
+- [ ] **#88** — the rewrite passes match only compact JSON; a spaced call site is
+      left untouched. Pre-existing, low likelihood, total invisibility. Includes a
+      cheap guard worth doing on its own: the remap already knows when it *decided*
+      to rewrite, so "decided, but the text did not change" can be reported.
+- [ ] **#79** — the DDEV harness fixture does not cover the shapes where the
+      defects actually live (ssh-remote target, post types outside
+      `exclude_from_search`, blocks carrying id references). It went green on three
+      separate broken builds this session.
+- [ ] Backlog: `modules/acss.sh` legacy slug, §5.2 interactive credentials,
+      `motopress`/`classic-menus` modules, the `clean` sub-step of `graft`.
 → Detail: [`docs/todo.md`](docs/todo.md)
 
 ## 6. Definition of Done
 
-The v1 DoD (all 6 phases implemented, 2 shipped modules working end-to-end on the
-DDEV harness, non-contamination + restore + `--dry-run` + default-deny all verified,
-repo publish-ready) is met. The separate pre-`1.0.0` gate (a real dry run on a
-genuine A/B pair, closing design doc §0.2's R2/R4) is **not** — that's the one item
-left unchecked, deliberately, pending a real run.
+The v1 DoD is met, and the separate pre-`1.0.0` gate (design doc §0.2 R2/R4 — a
+real run on a genuine A/B pair) is now **met as well**, by a full migration rather
+than a dry run. What the pilot exposed is not a gap in that DoD but a gap in the
+*verification model*: see §4. A future DoD should require, for every id remap, a
+guard that does not rest on source/target content equality.
 → Detail: [`docs/definition-of-done.md`](docs/definition-of-done.md)
 
 ## 7. Getting started (dev)
