@@ -253,7 +253,29 @@ _major4_stub_everything_but_the_marker_block() {
   graft_check_stack_precondition() { return 0; }
   graft_media_sync() { :; }
   graft_deploy_mu_plugin() { :; }
-  graft_prune_previous_run() { echo "STUB: graft_prune_previous_run $*"; }
+  graft_prune_previous_run() {
+    echo "STUB: graft_prune_previous_run $*"
+    # issue #36 fix-pack, third review round: this loop is what actually
+    # proves the prune block's own `rm -f` fired for real BEFORE this
+    # stub runs (the rm -f sits ahead of graft_prune_previous_run's own
+    # call site in phase_graft, on purpose) -- not merely that
+    # prune_will_rerun forced these four steps to rerun regardless.
+    # Without it, prune_will_rerun alone made every existing assertion in
+    # BOTH MAJOR-4 tests below pass even with the rm -f itself replaced
+    # by `if false` (measured for this fix-pack: 38/38 green across every
+    # test file in this repo that asserts on these markers, with the
+    # rm -f neutered) -- a marker LEFT ON DISK untouched is not the same
+    # thing as a marker CLEARED then re-written by the step that reran,
+    # and nothing distinguished the two once the flag made the four steps
+    # rerun unconditionally either way. $2 is run_dir -- every real and
+    # stubbed call site already passes it positionally, unchanged by this
+    # addition.
+    local _m
+    for _m in media_sync import_attachments import fetch_id_map; do
+      [ -f "${2}/graft.${_m}.done" ] && echo "MARKER STILL SET AT PRUNE: ${_m}"
+    done
+    return 0
+  }
   # issue #36 fix-pack, second review round: graft_import_attachments and
   # graft_import_wxr ("import") are two of the four steps prune_will_rerun
   # now ALSO forces regardless of dry-run (see phase_graft's own comment on
@@ -324,9 +346,36 @@ EOF
   # own BLOCKER-2/NIT). graft_export_wxr is the one step here whose
   # marker this prune-rm -f never invalidates, so it alone must still
   # never run.
+  #
+  # NOTE (issue #36 fix-pack, third review round): the four assertions
+  # below (the two "STUB: ... called" lines here, plus their mirror pair
+  # in the sibling real-run test) prove prune_will_rerun fired -- they do
+  # NOT, on their own, prove the prune block's own `rm -f` fired, since
+  # prune_will_rerun now forces these steps regardless of the on-disk
+  # marker either way. Measured: replacing that `rm -f` with `if false`
+  # leaves every one of these four assertions (in BOTH tests) green.
+  # `[[ "$output" == *"MARKER STILL SET AT PRUNE"* ]]`, below, is the one
+  # that actually discriminates the `rm -f` -- see
+  # _major4_stub_everything_but_the_marker_block's own comment on
+  # graft_prune_previous_run for why.
   [[ "$output" == *"STUB: graft_import_attachments called"* ]] || false
   [[ "$output" == *"STUB: graft_import_wxr called"* ]] || false
   [[ "$output" != *"STUB: graft_export_wxr called"* ]] || false
+
+  # The actual `rm -f`-under-dry-run acceptance criterion: is_dry_run
+  # guards that `rm -f`, so under THIS test's --dry-run pass it must never
+  # fire for real -- media_sync/import_attachments/import (all three
+  # pre-marked done above) must still be ON DISK at the exact moment
+  # graft_prune_previous_run's stub checks, before prune_will_rerun's
+  # forced rerun of each step gets a chance to re-touch them itself.
+  # fetch_id_map is deliberately absent from this assertion: it was never
+  # marked done in this test's own setup (that absence is what forces
+  # entry into the block at all), so it can never appear in this stub's
+  # "still set" output regardless of the rm -f's own behavior -- asserting
+  # on it here would prove nothing about is_dry_run's guard.
+  [[ "$output" == *"MARKER STILL SET AT PRUNE: media_sync"* ]] || false
+  [[ "$output" == *"MARKER STILL SET AT PRUNE: import_attachments"* ]] || false
+  [[ "$output" == *"MARKER STILL SET AT PRUNE: import"* ]] || false
 }
 
 @test "phase_graft's prune-safety marker-clearing DOES clear real markers once dry-run is off (MAJOR-4: a real interrupted-graft resume must not be skipped)" {
@@ -356,20 +405,44 @@ EOF
   # RERUN (that's the entire point of clearing them) and, succeeding for
   # real under a non-dry-run pass, immediately re-touch their own markers
   # via graft_mark_step -- so both files are back on disk by the time
-  # phase_graft returns, exactly as they should be. The real acceptance
-  # criterion is that the STEPS THEMSELVES actually ran again, which the
-  # stubs from _major4_stub_everything_but_the_marker_block (still
-  # installed, un-overridden) prove directly: they only print if genuinely
-  # invoked. Under the MAJOR-4 bug (guard inverted or removed so `rm -f`
-  # never fires under dry-run OR, the mutation that actually matters here,
-  # a guard that ALSO wrongly suppresses it under a real run), these
-  # markers would stay "done" from the earlier pass, import_attachments/
-  # import would be skipped, and neither stub would ever print -- this
-  # assertion goes red exactly then.
+  # phase_graft returns, exactly as they should be. The stubs from
+  # _major4_stub_everything_but_the_marker_block (still installed,
+  # un-overridden) prove the STEPS THEMSELVES ran again: they only print
+  # if genuinely invoked.
+  #
+  # issue #36 fix-pack, third review round: these two assertions no
+  # longer discriminate the `rm -f`'s own effect the way this comment used
+  # to claim -- prune_will_rerun now forces import_attachments/import to
+  # run regardless of whether the `rm -f` actually cleared their markers,
+  # so replacing that `rm -f` with `if false` leaves both of these green
+  # too (measured for this fix-pack). What they still DO prove is that
+  # phase_graft genuinely entered the prune-rerun block at all (armed
+  # prune_will_rerun) rather than skipping it — a real, if narrower,
+  # regression guard. The assertion below is the one that actually
+  # discriminates the `rm -f`'s own effect.
   [[ "$output" == *"STUB: graft_import_attachments called"* ]] || false
   [[ "$output" == *"STUB: graft_import_wxr called"* ]] || false
   [ -f "${run_dir}/graft.import_attachments.done" ]
   [ -f "${run_dir}/graft.import.done" ]
+
+  # The actual `rm -f`-fired acceptance criterion, and the one this test's
+  # own name promises ("DOES clear real markers"): by the moment
+  # graft_prune_previous_run's stub runs, the `rm -f` immediately above its
+  # call site in phase_graft must already have removed all three markers
+  # this test pre-marked (media_sync/import_attachments/import) for real —
+  # none of them may still be readable as "still set" at that exact point,
+  # regardless of prune_will_rerun re-writing them moments later via each
+  # step's own graft_mark_step. Confirmed for this fix-pack: replacing the
+  # `rm -f` with `if false` makes this assertion fail while every
+  # assertion above it (including the two STUB lines) stays green — this
+  # is the one that actually catches that mutation, and the reason the
+  # `rm -f` is not redundant with prune_will_rerun despite the two
+  # overlapping in what they force to rerun within a single phase_graft
+  # call (see phase_graft's own comment on prune_will_rerun for the
+  # cross-invocation case this `rm -f` alone still protects: a run killed
+  # between the prune block and these four gates, with prune_will_rerun
+  # gone the moment that process exits).
+  [[ "$output" != *"MARKER STILL SET AT PRUNE"* ]] || false
 }
 
 # --- BLOCKER-B (review): MAJOR-3 + BLOCKER-1c together used to form a
