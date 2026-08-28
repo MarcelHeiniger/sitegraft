@@ -1,22 +1,78 @@
 # Status — sitegraft
 
 **STATUS: in progress**  <!-- idea → in progress → live/production → maintenance → archived -->
-**Last updated: 2026-08-26** (PR #61 note appended; body below still reflects the 2026-08-20 Step 6 self-review)
+**Last updated: 2026-08-28** (first real client migration, completed and human-confirmed)
 
 ## Summary
 
-All 6 steps of the implementation plan are done. `main` has scan, plan, backup,
-graft, verify, and restore fully implemented, unit-tested (`bats`), and exercised
-end-to-end by the DDEV integration harness. This Step 6 pass (polish) audited
-`--dry-run`/`--allow-stack-mismatch` consistency across every writing phase, closed
-an EOF-defaults-to-migrate durcissement flagged (non-blocking) back in the Step 2
-review, ran a full design-doc-vs-code self-review, and wrote the public-facing
-usage docs. PR #6 (Step 6) then went through a double review (Kimi + Viktor); a
-fix-pack on the same PR closed 2 blocking findings and several smaller ones (see
-"Step 6 fix-pack" below). `SITEGRAFT_VERSION` is `1.0.0-rc2` — the one thing still
-blocking a plain `1.0.0` tag is the pre-`1.0.0` DoD gate (a real dry run against a
-genuine A/B pair), which is deliberately **not** satisfiable by more DDEV-only
-work; see `docs/definition-of-done.md`.
+`1.0.0-rc15`. The six phases (scan, plan, backup, graft, verify, restore) are
+implemented, unit-tested (926 `bats` assertions), exercised end-to-end by the DDEV
+harness — and, as of 2026-08-27/28, exercised by a **real client migration**, from
+a live WordPress Etch/ACSS source onto a separately hosted target, confirmed by
+hand after the run.
+
+**That does not close the pre-`1.0.0` gate.** The target was *empty*: 2 pages, 0
+attachments, no active plugins. The source side was demanding — 1466 posts, 1438
+attachments, a real Etch/ACSS stack, a real remote target over ssh, two real
+restores — but nothing on the target side pushed back, so the entire protection
+model went untested: default-deny and `protect` had almost nothing to protect, id
+collisions with existing content barely existed, and every stack item resolved to
+`copy` because B had no plugins of its own — the `keep-B` branch has still never
+run on a real pair. The gate needs a target that has *lived*.
+
+The pilot took three attempts, and both failures taught more than the success:
+
+- **Run 1** was stopped by the import-completeness gate: 1 of 48 items never
+  landed. Root cause #16 — a module's post-type-defining option was migrated
+  *after* the WXR import, leaving the type unregistered while the import ran.
+  Measured on the live site rather than guessed: Etch re-registers its types from
+  that option on every request (`init`, priority 5), so writing it before the
+  import is sufficient.
+- **Run 2 reported PASS and was wrong.** A human saw `Image with ID … not found`
+  on the home page. Etch references media by id; the attachments received new ids;
+  nothing rewrote them (#84), including ids passed through operator-named
+  component props (#86).
+- **Run 3** passed: 6 pages, 0 placeholders, 0 source-domain references, 25 images
+  rendering, all font assets served at their exact source sizes.
+
+### The verification lesson
+
+`verify` was green **because** of the defect. Its content check compares the
+target's content to the source's; an id that should have been rewritten and wasn't
+leaves the two byte-identical, therefore conformant — while a correctly rewritten
+id would have made them differ. **Everything requiring a remap is structurally
+invisible to an equality comparison.** The existing remaps escaped this only
+because each had its own dedicated assertion.
+
+Two guards were added and proved on the real run:
+`verify_id_references_resolve` (17 references checked) and
+`verify_component_prop_references_resolve` (3 checked) — both asking whether an id
+*resolves on the target*, a question equality cannot answer.
+
+### Merged this session
+
+`#81` (#16, types before import), `#85` (#84, media ids), `#87` (#86, component
+props). Each went through review rounds that found real defects **created by the
+fix**: a domain guard hoisted above the exit trap (mu-plugin left on the target on
+an abort path), `--post_type=any` silently excluding `wp_block`/`wp_template`, a
+recursive PCRE failing closed-mouthed on one unbalanced brace, a rewrite pass
+bolted on outside the sentinel discipline that could point an image at a
+*different* existing attachment with the guard still green.
+
+### Known gaps, none blocking the pilot site
+
+`#82` (Etch taxonomies never migrated — and silent, since the gate counts items),
+`#83` (`wp-content/fonts/` never synced, WP 6.5+ Font Library lost), `#88` (spaced
+JSON unmatched by the rewrite passes), `#79` (the harness fixture does not cover
+the shapes where these defects live — it went green on three broken builds this
+session).
+
+### Done by hand on the pilot target, outside the tool
+
+Copying `wp-content/fonts/` and rewriting the source host inside
+`etch_global_stylesheets` (#83). Two items left to Marcel's judgement: Etch's AI
+API key was copied to the target along with the rest of its settings, and the HTTP
+smoke check fails on a false positive (it looks for "Home" in a German page).
 
 ## Done
 

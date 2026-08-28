@@ -53,3 +53,4 @@ tests/test_helper/bats-assert/
 *.bak
 *~
 *.swp
+.claude/worktrees/
