@@ -1284,6 +1284,26 @@ _verify_component_prop_run_captured_php() {
   [[ "$stderr" == *"400"* ]] || false
   [[ "$stderr" == *"balanced JSON"* ]] || false
 }
+@test "verify_component_prop_references_resolve: captured PHP execution-proof -- NIT G, a malformed call site is reported even when NO migrated component declares an id-bearing prop (the components may simply not have landed on B)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t400\tpage\n8\t500\twp_block\n' > "$tsv"
+  local capture="$BATS_TEST_TMPDIR/php.txt"
+  wp_remote() { shift; case "$1" in eval) printf '%s' "$2" > "$capture" ;; esac; }
+  verify_component_prop_references_resolve "$run_dir" "$tsv" >/dev/null 2>&1 || true
+  [ -s "$capture" ]
+  # Component 500 comes back EMPTY -- on a real site that is what a
+  # component which never landed on B looks like, so $component_prop_map
+  # ends up empty. Post 400 carries a truncated call site. Before the NIT F
+  # reordering the empty-map short-circuit sat ABOVE the citing loop and
+  # printed a green "0 found to check" over exactly that failure.
+  run _verify_component_prop_run_captured_php "$capture" \
+    400 '<!-- wp:etch/component {"ref":500,"attributes":{"bild":"888" -->' \
+    500 ''
+  [[ "$output" == *"MALFORMED:400"* ]] || false
+  [[ "$output" != *"NONE"* ]] || false
+}
+
 # --- verify_http_smoke --------------------------------------------------------
 
 @test "verify_http_smoke is a no-op (passes) when no URL is configured" {

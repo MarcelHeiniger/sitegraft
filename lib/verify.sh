@@ -1065,6 +1065,17 @@ if ( ! empty( \$nested ) ) {
 	}
 	return;
 }
+// This short-circuit sits BELOW the citing-post loop on purpose (review
+// round 4). An empty \$component_prop_map has two causes, not one: either
+// no migrated component declares an id-bearing prop -- genuinely nothing
+// for this guard to check -- or get_post_field came back empty for the
+// migrated components, i.e. they never landed on B at all, which is a real
+// migration failure. Above the loop this printed a green "0 found to check"
+// over that second case AND swallowed any malformed call site with it.
+// Below the loop, \$malformed is populated first, so a block this guard
+// cannot parse is reported either way. The cost is one get_post_field per
+// citing post on a site whose components declare no id-bearing prop; the
+// sibling guards in this phase already load every migrated post.
 if ( empty( \$component_prop_map ) ) {
 	echo "NONE\n";
 	return;
