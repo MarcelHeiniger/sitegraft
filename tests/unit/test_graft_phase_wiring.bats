@@ -418,8 +418,14 @@ EOF
   # stripped B. It does NOT pin graft_media_sync's own `|| return $?`
   # guards -- it cannot, since the real function is never called here
   # (measured: all four guard mutations leave this file at 0 failures).
-  # Those guards are pinned in tests/unit/test_graft_mediastep.bats, which
-  # runs the real function.
+  # The TWO PULL guards are pinned in tests/unit/test_graft_mediastep.bats,
+  # which runs the real function -- one test per branch, local and remote-A.
+  # The other two are deliberately not, and measured so: removing
+  # graft_push_dir's guard changes nothing because it is the function's LAST
+  # command, so its status propagates without it; and `mkdir -p "$staging"`
+  # is not a realistic failure on a run dir this process just created. Both
+  # mutations leave every test file in the repo at 0 failures, which is the
+  # honest reason, not an oversight.
   graft_media_sync() {
     echo "STUB: graft_media_sync called"
     false || return $?
