@@ -574,15 +574,37 @@ _sg_delete_from_stdin() { echo 'internal error: this restore.sh does not use a w
     # of BREAKING every ssh-remote restore whose B enforces one — a strictly
     # worse trade for a class of target this project cannot assume away.
     #
-    # The fix actually shipped: no change to the rsync invocation itself
-    # (still plain `-avz --delete`, purely dependent on the LOCAL rsync's
-    # own default escaping); the runtime check below (issue #44) instead
-    # verifies the LOCAL rsync actually has that default (`--old-args`
-    # support is the proxy — see the check's own comment) before running it,
-    # and refuses with an explicit message rather than proceeding unsafely
-    # if it does not. Nothing is required of B's rsync at all.
+    # The fix actually shipped, revised once more in review: `--no-old-args`
+    # is now on the invocation itself, not just checked for. The runtime
+    # check below (issue #44) verifies the LOCAL rsync is CAPABLE of default
+    # escaping (`--old-args` support is the proxy) — but capability is not
+    # the same as what actually runs. `man rsync`, under `--old-args`: "You
+    # may also control this setting via the RSYNC_OLD_ARGS environment
+    # variable. If it has the value '1', rsync will default to a
+    # single-option setting" — i.e. an operator (or a wrapper script, or a
+    # profile sourced before this one) can set RSYNC_OLD_ARGS=1 and the
+    # capability check still passes (the binary still RECOGNIZES the flag)
+    # while the UNFLAGGED command below would silently run unescaped.
+    # Confirmed live: with RSYNC_OLD_ARGS=1 exported, `rsync --old-args
+    # --version` exits 0 (probe: pass) and a plain `rsync -avz --delete`
+    # with the same destination lets the embedded command execute (fix:
+    # bypassed) — this is not hypothetical, rsync's own COMPATIBILITY docs
+    # explicitly suggest exporting RSYNC_OLD_ARGS=1 for old scripts.
+    # `--no-old-args` forces escaping regardless of that variable — measured
+    # live, RSYNC_OLD_ARGS=1 exported AND `--no-old-args` on the command:
+    # inert. It stays purely client-side (unlike `--protect-args`/`-s`,
+    # reverted above): against a real openrsync SERVER it produces the
+    # identical escaped wire content the safe default does, and the
+    # transfer succeeds — it does not reopen the restricted-shell
+    # regression that `--protect-args` caused. It requires nothing newer
+    # than 3.2.4, the same floor the capability check already requires (it
+    # is the on/off pair of the same feature `--old-args` toggles). The
+    # runtime check remains: it is still worth refusing loudly, before
+    # touching B, on a rsync that cannot even parse `--no-old-args` (i.e.
+    # does not have the feature at all) rather than letting rsync itself
+    # fail on an unrecognized option mid-restore.
     needs_rsync_arg_escaping=1
-    restore_wp_content_cmd="ssh $(sq "$SITE_B_SSH_HOST") $(sq "mkdir -p $(sq "${SITE_B_WP_PATH}/wp-content")") && rsync -avz --delete $(sq "${run_dir}/backup/b-wp-content/") $(sq "${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/wp-content/")"
+    restore_wp_content_cmd="ssh $(sq "$SITE_B_SSH_HOST") $(sq "mkdir -p $(sq "${SITE_B_WP_PATH}/wp-content")") && rsync -avz --no-old-args --delete $(sq "${run_dir}/backup/b-wp-content/") $(sq "${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/wp-content/")"
     restore_db_cmd="gunzip -c $(sq "${run_dir}/backup/b-db.sql.gz") | ssh $(sq "$SITE_B_SSH_HOST") $(sq "${SITE_B_WP_CMD} --path=$(sq "${SITE_B_WP_PATH}") db import -")"
     restore_semantics="exact-state, via rsync --delete — wp-content is mirrored back to exactly what this backup contains, and any file added to it since is removed"
   else
@@ -755,14 +777,28 @@ _sg_die() { echo "$1" >&2; exit 1; }
 # refuse a connection that plain, unflagged rsync completes successfully).
 #
 # `--old-args` is the probe, not `--version` or a parsed version string:
-# `--old-args` is the explicit opt-OUT of default arg-escaping, so a rsync
-# that recognizes it is, by construction, one whose DEFAULT (the flag's
-# absence, which is what the actual restore command below runs with) is to
-# escape. Confirmed live: GNU rsync recognizes `--old-args` from the same
-# release that introduced default escaping (3.2.4) onward; openrsync (macOS's
-# own /usr/bin/rsync, a different codebase, the only rsync macOS 15+ ships)
-# recognizes neither `--old-args` nor default escaping and performs no
-# escaping at all.
+# it is the explicit opt-OUT of default arg-escaping, so a rsync that
+# recognizes it is one that HAS the default-escaping feature at all —
+# openrsync (macOS's own /usr/bin/rsync, a different codebase, the only
+# rsync macOS 15+ ships) recognizes neither `--old-args` nor default
+# escaping. This is a CAPABILITY check, not a guarantee of what the actual
+# restore command runs with: an earlier version of this comment claimed a
+# rsync recognizing `--old-args` escapes "by construction" when the flag is
+# absent, which review measured false — `RSYNC_OLD_ARGS=1` in the
+# environment (an operator's profile, a wrapper script; rsync's own
+# COMPATIBILITY docs explicitly suggest exporting it for old scripts) makes
+# a fully-capable rsync default to the OLD, unescaped behavior even with the
+# flag absent, while this exact probe still passes (the binary still
+# recognizes `--old-args`). Confirmed live. That is why the restore command
+# below carries `--no-old-args` explicitly, rather than relying on this
+# probe's pass meaning "the plain invocation is safe" — `--no-old-args`
+# FORCES escaping regardless of RSYNC_OLD_ARGS, confirmed live including
+# against a real openrsync SERVER (same escaped wire content as the safe
+# default, transfer succeeds — it does not reopen the restricted-shell
+# regression `--protect-args` caused). This check's job is narrower than it
+# used to be: refuse loudly, before touching B, on a rsync that cannot even
+# parse `--no-old-args` — not vouch for what the flag-less command would
+# have done.
 #
 # Defined as a function, not run inline here, so the caller (below, after
 # the --dry-run early exit) can place the call where it belongs: right
@@ -778,7 +814,7 @@ _sg_check_rsync_arg_escaping() {
     _sg_die "refusing to restore: rsync is required for this restore and was not found on PATH. Install a GNU-rsync-compatible build (e.g. 'brew install rsync' on macOS; already the default via apt on Debian/Ubuntu) and re-run. Nothing was restored."
   fi
   if ! rsync --old-args --version >/dev/null 2>&1; then
-    _sg_die "refusing to restore: this restore's wp-content step depends on the LOCAL rsync escaping B's path by default (so B's SSH shell never gets a chance to interpret it), and the rsync resolved on PATH here does not do that. This is most often macOS's own /usr/bin/rsync (openrsync, a different implementation from GNU rsync, which never escapes anything): put a GNU rsync >= 3.2.4 first on PATH (e.g. 'brew install rsync' on macOS; already the default via apt on Debian/Ubuntu) and re-run. Nothing was restored. (This is a requirement on the LOCAL rsync only — nothing is required of B's.)"
+    _sg_die "refusing to restore: this restore's wp-content step forces rsync to escape B's path (--no-old-args) so B's SSH shell never gets a chance to interpret it, and the rsync resolved on PATH here does not support that option at all. This is most often macOS's own /usr/bin/rsync (openrsync, a different implementation from GNU rsync, which never escapes anything): put a GNU rsync >= 3.2.4 first on PATH (e.g. 'brew install rsync' on macOS; already the default via apt on Debian/Ubuntu) and re-run. Nothing was restored. (This is a requirement on the LOCAL rsync only — nothing is required of B's.)"
   fi
 }
 

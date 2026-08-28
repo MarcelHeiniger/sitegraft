@@ -76,21 +76,55 @@ them regardless), while actively BREAKING every ssh-remote restore whose B
 enforces a restricted shell or runs an rsync that predates the flag's
 protocol variant — a regression this project has no basis for assuming away.
 
+### Measurement 3 — does a CAPABILITY probe guarantee the flag-less command's actual behavior?
+
+No, and this is the second correction this ADR needed (see History). The
+first shipped version of the fix relied purely on `rsync --old-args
+--version` succeeding as proof that the flag-less restore command would
+escape by default. That reasoning is false, and rsync's own docs say so:
+`man rsync`, under `--old-args`, documents `RSYNC_OLD_ARGS` — "You may also
+control this setting via the RSYNC_OLD_ARGS environment variable. If it has
+the value '1', rsync will default to a single-option [i.e. old, unescaped]
+setting" — and rsync's COMPATIBILITY section explicitly *recommends*
+exporting `RSYNC_OLD_ARGS=1` (and `RSYNC_PROTECT_ARGS=0`) for scripts that
+predate this behavior. Confirmed live, GNU rsync 3.4.4:
+
+- `RSYNC_OLD_ARGS=1 rsync --old-args --version` exits 0 — the capability
+  probe PASSES (the binary still recognizes the flag).
+- `RSYNC_OLD_ARGS=1 rsync -avz --delete src 'host:x $(touch PWNED)y/'` (no
+  flag on the command line, exactly what the first shipped fix ran) lets
+  `PWNED` get created on the "remote" side — the actual restore command
+  RUNS UNESCAPED, despite the capability probe having just passed.
+
+So the probe alone told the operator "safe" while the path stayed open —
+worse than having no guard, because the ADR and the generated script's own
+message both asserted a property that did not hold. `RSYNC_OLD_ARGS=1`
+reaching the machine that runs a restore is not exotic: an operator's shell
+profile, a wrapper script inherited from an older backup setup, or rsync's
+own documented advice to script authors are all ordinary ways it gets set.
+
 ## Decision
 
-1. **The rsync invocation is unchanged** — still plain `rsync -avz --delete`,
-   exactly as before this issue. No `--protect-args`, no `-s`.
-2. `restore.sh` instead verifies, at runtime, that the LOCAL rsync
-   default-escapes: the probe is `rsync --old-args --version` (see the
-   `_sg_check_rsync_arg_escaping` function in the generated script) —
-   `--old-args` is the explicit opt-OUT of the 3.2.4+ default, so a rsync
-   that recognizes it is, by construction, one that escapes by default when
-   the flag is absent (exactly how the real restore command runs). If the
-   probe fails, `restore.sh` refuses with an explicit, actionable message —
-   naming `openrsync`, the actual version floor (3.2.4), and the
-   `brew install rsync` remedy — rather than a bare `rsync: unrecognized
-   option` mid-restore, or (worse) a silent, successful-looking restore that
-   never protected the path at all.
+1. **The rsync invocation carries `--no-old-args`** — `rsync -avz
+   --no-old-args --delete`. This is the enforcement, not the probe below:
+   `--no-old-args` FORCES escaping regardless of `RSYNC_OLD_ARGS`, confirmed
+   live (same command, `RSYNC_OLD_ARGS=1` exported, `PWNED` no longer
+   created). It stays purely client-side like the rest of default escaping —
+   confirmed live against a real openrsync SERVER with `RSYNC_OLD_ARGS=1`
+   exported: the wire content is byte-identical to the safe default's, and
+   the transfer succeeds. It does not reopen Measurement 2's regression —
+   a real openrsync-server B run through the same harness with `-s` still
+   dies at code 12; `--no-old-args` does not. Still no `--protect-args`, no
+   `-s`.
+2. `restore.sh` additionally verifies, at runtime, that the LOCAL rsync is
+   even CAPABLE of this: the probe is `rsync --old-args --version` (see the
+   `_sg_check_rsync_arg_escaping` function in the generated script). Given
+   Measurement 3, this probe's job is now narrower and honestly scoped: it
+   catches a rsync that cannot parse `--no-old-args` at all (openrsync, or
+   GNU rsync < 3.2.4) and refuses loudly, before touching B, rather than
+   letting rsync fail on an unrecognized option mid-restore. It is NOT
+   relied on to certify what the actual (now-flagged) command will do —
+   `--no-old-args` on the invocation itself is what does that.
 3. The check runs once, immediately before the wp-content restore step it
    gates — not earlier. It is skipped entirely under `--dry-run`, which
    never invokes rsync and therefore never needs it (an earlier draft ran
@@ -103,12 +137,14 @@ protocol variant — a regression this project has no basis for assuming away.
 4. This is a real, load-bearing version/implementation requirement, and it
    is written down here rather than left implicit: **the ssh-remote restore
    path requires a GNU-rsync-compatible `rsync` >= 3.2.4 resolved first on
-   `PATH`, on the LOCAL (orchestrator) machine, at restore time.** Nothing
-   is required of B's rsync. `docs/usage.md`'s existing `brew install
-   rsync` / `apt install rsync` step already satisfies this for anyone who
-   follows it; what this ADR adds is that the requirement is now enforced
-   for the ssh-remote wp-content step specifically, not merely suggested
-   project-wide.
+   `PATH`, on the LOCAL (orchestrator) machine, at restore time — and that
+   machine's environment must not be relied on alone to keep this safe;
+   `--no-old-args` is what actually enforces it regardless of environment.**
+   Nothing is required of B's rsync. `docs/usage.md`'s existing
+   `brew install rsync` / `apt install rsync` step already satisfies the
+   version floor for anyone who follows it; what this ADR adds is that the
+   requirement is now enforced for the ssh-remote wp-content step
+   specifically, not merely suggested project-wide.
 
 ## Alternatives considered, and rejected
 
@@ -117,6 +153,13 @@ protocol variant — a regression this project has no basis for assuming away.
   it breaks a real, common B configuration (restricted-shell / rrsync-style
   forced-command SSH accounts) that the unmodified `rsync -avz --delete`
   command has always worked against.
+- **A capability probe alone, with no flag on the actual invocation.** This
+  was the SECOND version of this fix, shipped and then also reverted:
+  Measurement 3 above is why — `RSYNC_OLD_ARGS=1` in the environment lets a
+  fully-capable rsync default to unescaped behavior while the probe still
+  passes, so the check certified a property the actual command did not
+  have. `--no-old-args` on the invocation is what turns "this rsync CAN
+  escape" into "this exact command WILL escape."
 - **Do nothing beyond documenting it.** Rejected: the vulnerability this
   closes (issue #44) is exactly the case that hardening a documentation page
   cannot fix — an operator who never reads it is the one still exposed.
@@ -128,8 +171,9 @@ protocol variant — a regression this project has no basis for assuming away.
   this fix anyway: it makes this script responsible for enumerating every
   character a remote `/bin/sh` treats as special, forever, and getting that
   list wrong once is worse than refusing outright — GNU rsync's own default
-  escaping (3.2.4+) already does this correctly and is the dependency this
-  fix chooses to require instead of re-implementing it.
+  escaping (3.2.4+, forced via `--no-old-args`) already does this correctly
+  and is the dependency this fix chooses to require instead of
+  re-implementing it.
 - **Detect the REMOTE rsync's capability too** (SSH to B during the restore
   and probe there as well, so the check could adapt — e.g. still choose
   `--protect-args` when both ends support it). Rejected as unnecessary
@@ -142,14 +186,18 @@ protocol variant — a regression this project has no basis for assuming away.
 - (+) Closes the remote-shell-expansion vulnerability (issue #44) for every
   local rsync >= 3.2.4 (both of this project's own documented install
   paths), with **no new requirement on B's rsync or shell** — a restricted-
-  shell / rrsync B that worked before this fix still works after it.
+  shell / rrsync B that worked before this fix still works after it. This
+  holds regardless of `RSYNC_OLD_ARGS`/`RSYNC_PROTECT_ARGS` in the
+  environment, because `--no-old-args` on the invocation forces it rather
+  than relying on either variable's default state.
 - (+) Where the local rsync cannot meet this (openrsync, or GNU rsync
   < 3.2.4), the failure mode changes from "silently vulnerable" to "loudly
   refuses, names the fix, and does not fire under `--dry-run`" — safer than
   the unpatched behavior for that local rsync, and NOT the strict
   improvement over every alternative this ADR's first draft claimed: it is
-  worse than doing nothing for the one case measurement 2 describes, which
-  is exactly why that alternative (`--protect-args`) was not the one shipped.
+  worse than doing nothing for the one case Measurement 2 describes, which
+  is exactly why that alternative (`--protect-args`) was not the one
+  shipped.
 - (−) A restore run with a local rsync that isn't GNU >= 3.2.4 (openrsync,
   or an old GNU rsync) now refuses outright rather than proceeding
   (unsafely, for openrsync; safely but undetected, for old GNU rsync without
@@ -174,16 +222,29 @@ protocol variant — a regression this project has no basis for assuming away.
 
 ## History
 
-This ADR originally recommended `--protect-args`/`-s`, on the strength of
-Measurement 1 alone (local escaping behavior) without checking what the flag
-requires of the REMOTE `rsync --server` process. Review caught this before
-merge: a live test against a real openrsync server (Measurement 2) showed
-`-s` breaks the connection outright, and `man rsync`'s own "refused by
-restricted shells" note explains why in general. The same review also
-caught that the original text mis-cited default escaping as a 3.0.0 feature
-(that is `--protect-args`'s own introduction date; default escaping is
-3.2.4). Both are corrected above; the decision itself changed from
-"add `--protect-args`" to "require default escaping instead."
+This ADR went through two corrections before landing, both caught in review
+before merge, neither self-discovered:
+
+1. **Originally recommended `--protect-args`/`-s`**, on the strength of
+   Measurement 1 alone (local escaping behavior) without checking what the
+   flag requires of the REMOTE `rsync --server` process. A live test against
+   a real openrsync server (Measurement 2) showed `-s` breaks the connection
+   outright, and `man rsync`'s own "refused by restricted shells" note
+   explains why in general. The same round also caught that the original
+   text mis-cited default escaping as a 3.0.0 feature (that is
+   `--protect-args`'s own introduction date; default escaping is 3.2.4).
+   Decision changed from "add `--protect-args`" to "require default
+   escaping instead."
+2. **The first version of "require default escaping" checked capability
+   only** (`rsync --old-args --version`) and claimed — in this ADR's own
+   prior text — that a rsync passing that probe was, "by construction," one
+   that would escape the actual restore command. Review measured this false
+   (Measurement 3): `RSYNC_OLD_ARGS=1` in the environment defeats exactly
+   that construction, live-reproduced. `man rsync`'s own COMPATIBILITY
+   section recommending that exact variable for old scripts is what makes
+   this a realistic, not hypothetical, environment for a restore to run in.
+   Decision changed again, from "probe implies safety" to "probe catches
+   incapability; `--no-old-args` on the invocation is what enforces it."
 
 ## Reopening condition
 

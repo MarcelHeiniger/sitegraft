@@ -603,19 +603,64 @@ _manifest_fixture() {
 # bare-local branch's; only the generated script's runtime PREFLIGHT CHECK
 # differs by branch (see the NEEDS_RSYNC_ARG_ESCAPING tests below).
 
-@test "the generated ssh-remote restore.sh's wp-content rsync command is unchanged (issue #44 fix lives in a preflight check, not the rsync invocation)" {
+# issue #44, second review round: the capability probe alone (does this
+# rsync KNOW about --old-args?) is not enough -- `RSYNC_OLD_ARGS=1` in the
+# environment (an operator's profile, a wrapper script; rsync's own
+# COMPATIBILITY docs explicitly suggest exporting it for old scripts) makes
+# a fully-capable rsync default to the OLD, unescaped behavior even with no
+# flag on the command line, while the probe still passes (the binary still
+# recognizes --old-args). `--no-old-args` on the actual invocation forces
+# escaping regardless of that variable, closing the gap the probe alone
+# left open.
+@test "the generated ssh-remote restore.sh's wp-content rsync command forces escaping with --no-old-args, not just a --protect-args-shaped flag (issue #44)" {
   SITE_B_SSH_HOST="user@host-b.example.com"
   SITE_B_WP_PATH="/var/www/site-b"
   SITE_B_WP_CMD="wp"
   local run_dir="$BATS_TEST_TMPDIR/run-ssh-rsync-shape"
   mkdir -p "$run_dir"
   backup_generate_restore_script "$run_dir"
-  run grep -c -- "if ! { ssh .* && rsync -avz --delete " "${run_dir}/restore.sh"
+  run grep -c -- "if ! { ssh .* && rsync -avz --no-old-args --delete " "${run_dir}/restore.sh"
   [ "$output" = "1" ]
-  # No --protect-args, no -s, anywhere on that command line.
+  # No --protect-args, no bare -s, anywhere on that command line.
   run grep -E "if ! \{ ssh .*rsync" "${run_dir}/restore.sh"
   [[ "$output" != *"--protect-args"* ]] || false
   [[ "$output" != *" -s "* ]] || false
+}
+
+# A REAL end-to-end exercise, not just a text/shape assertion: a loopback
+# `ssh` that hands its command to a real local shell (real ssh's own
+# documented behavior for a multi-word command), a REAL local `rsync`
+# (whatever GNU rsync this machine has -- the project's own documented
+# dependency), and a target path under $BATS_TEST_TMPDIR that mkdir can
+# actually create -- so the `mkdir && rsync` chain reaches the rsync half
+# instead of failing earlier on an unwritable path like `/var/www` and
+# never invoking rsync at all (a masking bug an earlier draft of this exact
+# test had -- caught only by first confirming the mutant it was meant to
+# catch stayed green).
+@test "the generated ssh-remote restore.sh's --no-old-args forces escaping even when RSYNC_OLD_ARGS=1 is exported (issue #44, closes the capability-probe bypass)" {
+  local sentinel="$BATS_TEST_TMPDIR/INJECTED_ENVBYPASS"
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/ssh" <<'EOS'
+#!/usr/bin/env bash
+host="$1"; shift
+exec sh -c "$*"
+EOS
+  chmod +x "$BATS_TEST_TMPDIR/bin/ssh"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+
+  SITE_B_SSH_HOST="fakehost"
+  SITE_B_WP_PATH="$BATS_TEST_TMPDIR/b-target/\$(touch ${sentinel})html"
+  SITE_B_WP_CMD="wp"
+  local run_dir="$BATS_TEST_TMPDIR/run-ssh-envbypass"
+  _ssh_remote_real_backup_fixture "$run_dir"
+  backup_generate_restore_script "$run_dir"
+
+  RSYNC_OLD_ARGS=1 run "${run_dir}/restore.sh"
+  # The mkdir half of the chain must actually have succeeded (proving rsync
+  # was reached, not short-circuited past by a failed mkdir) ...
+  [ -d "$BATS_TEST_TMPDIR/b-target" ]
+  # ... and the injected command must not have run.
+  [ ! -e "$sentinel" ]
 }
 
 @test "the generated ssh-remote restore.sh alone sets NEEDS_RSYNC_ARG_ESCAPING=1 (only its wp-content step goes through a second shell)" {
@@ -850,26 +895,6 @@ EOS
   [[ "$output" == *"not found on PATH"* ]] || false
   # Must not claim it looked at a version/capability it never got to check.
   [[ "$output" != *"does not do that"* ]] || false
-}
-
-@test "the generated bare-local and wrapped-local restore.sh never probe rsync's arg-escaping (they don't need it)" {
-  mkdir -p "$BATS_TEST_TMPDIR/bin"
-  local log="${BATS_TEST_TMPDIR}/rsync-calls.log"
-  printf '#!/usr/bin/env bash
-echo "rsync was invoked: $*" >> %s
-exit 0
-' "$(sq "$log")"     > "$BATS_TEST_TMPDIR/bin/rsync"
-  chmod +x "$BATS_TEST_TMPDIR/bin/rsync"
-  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
-
-  SITE_B_SSH_HOST=""
-  SITE_B_WP_PATH="/var/www/site-b"
-  SITE_B_WP_CMD="wp"
-  local run_dir="$BATS_TEST_TMPDIR/run-bare-no-probe"
-  mkdir -p "${run_dir}/backup"
-  backup_generate_restore_script "$run_dir"
-  run "${run_dir}/restore.sh" --dry-run
-  [ ! -e "$log" ] || ! grep -q -- '--old-args --version' "$log"
 }
 
 # --- the acceptance criterion of issue #14 ---
