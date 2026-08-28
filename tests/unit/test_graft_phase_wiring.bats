@@ -388,6 +388,43 @@ EOF
   [[ "$output" == *"MARKER STILL SET AT PRUNE: import"* ]] || false
 }
 
+@test "phase_graft tells the operator what state B is in when media_sync fails after prune (issue #36, second-reviewer finding)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  touch "${run_dir}/backup.complete"
+  cat > "${run_dir}/manifest.json" <<'EOF'
+{"migrate":{"core-wp":{"post_types":["page"],"option_keys":[]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}
+EOF
+  local step
+  for step in stack_sync media_sync mu_plugin prune import_attachments importer_setup export import; do
+    touch "${run_dir}/graft.${step}.done"
+  done
+
+  _major4_stub_everything_but_the_marker_block
+  graft_verify_import_completeness() { return 0; }
+  # The failure this message exists for: rsync dies (disk full on B, network
+  # drop) on a RE-graft, i.e. after prune has already deleted the previous
+  # run's attachments and their files.
+  graft_media_sync() { echo "STUB: graft_media_sync called"; return 1; }
+
+  unset SITEGRAFT_DRY_RUN
+  run --separate-stderr phase_graft --profile demo --run "$run_dir"
+
+  # Fail closed, and do not mark a step that did not happen.
+  [ "$status" -ne 0 ]
+  [ ! -f "${run_dir}/graft.media_sync.done" ]
+  # The step after it must not have run on a B whose media are gone.
+  [[ "$output" != *"STUB: graft_import_attachments called"* ]] || false
+
+  # The message itself: a bare rsync error leaves the operator unable to
+  # tell "B lost its media permanently" from "B lost its media until you
+  # rerun". Say which, and say how.
+  [[ "$stderr" == *"deleted by prune"* ]] || false
+  [[ "$stderr" == *"Nothing is lost that a resume cannot restore"* ]] || false
+  [[ "$stderr" == *"${run_dir}"* ]] || false
+  [[ "$stderr" == *"backup"* ]] || false
+}
+
 @test "phase_graft's prune-safety marker-clearing DOES clear real markers once dry-run is off (MAJOR-4: a real interrupted-graft resume must not be skipped)" {
   local run_dir="$BATS_TEST_TMPDIR/run"
   mkdir -p "$run_dir"

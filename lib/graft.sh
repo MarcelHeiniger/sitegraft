@@ -2648,11 +2648,13 @@ phase_graft() {
   # options' own header for the full mechanism and why issue #53's
   # completeness gate is what actually caught this on a real site).
   # Placed right after mu_plugin, ahead of prune/import_attachments, for
-  # the same reason media_sync/mu_plugin already sit here: "prepare B"
-  # steps that have to land before B's content changes, not steps that
-  # themselves depend on run_dir/id-map.tsv state (this one only needs
-  # the manifest, already parsed above, and domain_from/domain_to,
-  # already computed and verified above).
+  # the same reason mu_plugin sits here: "prepare B" steps that have to
+  # land before B's content changes, not steps that themselves depend on
+  # run_dir/id-map.tsv state (this one only needs the manifest, already
+  # parsed above, and domain_from/domain_to, already computed and verified
+  # above). media_sync used to be named here too and no longer is -- issue
+  # #36 moved it BELOW prune, because prune deletes an attachment's file
+  # from disk and so undid the sync on a re-graft.
   graft_step_done "$run_dir" register_post_type_options || {
     graft_migrate_post_type_defining_options "$run_dir" "$manifest" "$domain_from" "$domain_to"
     graft_mark_step "$run_dir" register_post_type_options
@@ -2810,7 +2812,24 @@ phase_graft() {
   # deliberately: it is the exact cost the issue itself named as the more
   # expensive of its two proposed fixes, arriving here through the resume
   # path rather than every single run.
-  { [ -z "$prune_will_rerun" ] && graft_step_done "$run_dir" media_sync; } || { graft_media_sync "$run_dir"; graft_mark_step "$run_dir" media_sync; }
+  # Second reviewer (independent, on PR #90) measured the blast radius this
+  # PR's reorder moved, and it is worth telling the operator about rather
+  # than leaving them to infer it. media_sync now runs AFTER prune, so if it
+  # fails on a re-graft, prune has already deleted the previous run's
+  # attachments AND their files, and A's have not been pushed yet: B is
+  # briefly without either. That window is strictly better than what it
+  # replaces -- the old order lost B's media on the SUCCESS path (issue #36)
+  # -- and it is recoverable: resuming the same run_dir re-enters the prune
+  # block, which clears media_sync's marker again, and the step reruns
+  # (measured end to end by that reviewer: status 0, file restored). But a
+  # bare rsync error says none of that, so say it here.
+  { [ -z "$prune_will_rerun" ] && graft_step_done "$run_dir" media_sync; } || {
+    graft_media_sync "$run_dir" || {
+      log_error "media sync failed. B right now: the previous graft's attachments and their files were already deleted by prune, and A's have not been pushed yet. Nothing is lost that a resume cannot restore -- rerun the same command with --run ${run_dir} and this step will run again. If you would rather go back, the pre-graft backup is in ${run_dir}/backup."
+      return 1
+    }
+    graft_mark_step "$run_dir" media_sync
+  }
   # NIT (issue #36 fix-pack, second review round): the SAME `rm -f` above
   # clears FOUR markers, not just media_sync.done — import_attachments.done,
   # import.done and fetch_id_map.done too (all three pre-date this fix-pack;
