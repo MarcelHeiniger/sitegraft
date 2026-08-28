@@ -7,9 +7,18 @@
 
 `1.0.0-rc15`. The six phases (scan, plan, backup, graft, verify, restore) are
 implemented, unit-tested (926 `bats` assertions), exercised end-to-end by the DDEV
-harness — and, as of 2026-08-27/28, **proven on a real client migration**, from a
-live WordPress Etch/ACSS source onto a separately hosted target, confirmed by hand
-after the run. That closes the pre-`1.0.0` gate, which asked only for a dry run.
+harness — and, as of 2026-08-27/28, exercised by a **real client migration**, from
+a live WordPress Etch/ACSS source onto a separately hosted target, confirmed by
+hand after the run.
+
+**That does not close the pre-`1.0.0` gate.** The target was *empty*: 2 pages, 0
+attachments, no active plugins. The source side was demanding — 1466 posts, 1438
+attachments, a real Etch/ACSS stack, a real remote target over ssh, two real
+restores — but nothing on the target side pushed back, so the entire protection
+model went untested: default-deny and `protect` had almost nothing to protect, id
+collisions with existing content barely existed, and every stack item resolved to
+`copy` because B had no plugins of its own — the `keep-B` branch has still never
+run on a real pair. The gate needs a target that has *lived*.
 
 The pilot took three attempts, and both failures taught more than the success:
 

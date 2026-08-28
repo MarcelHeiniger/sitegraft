@@ -37,8 +37,9 @@ database of its own. Run state is stored on the machine running the tool (the
 
 ## 4. Where the project stands (status)
 
-**The pre-`1.0.0` gate is closed.** On 2026-08-27/28 sitegraft performed its first
-real client migration — a live WordPress Etch/ACSS site onto a separate hosted
+**First real client migration done — but the pre-`1.0.0` gate is NOT closed** (the
+target was empty; see §6). On 2026-08-27/28 sitegraft performed its first real
+client migration — a live WordPress Etch/ACSS site onto a separate hosted
 target — and Marcel confirmed the result by hand. `SITEGRAFT_VERSION` is
 `1.0.0-rc15`.
 
@@ -69,9 +70,13 @@ two such guards (`verify_id_references_resolve`,
 
 ## 5. What's left to do (todo)
 
-- [x] **Pre-`1.0.0` gate** — done, and beyond a dry run: a full real migration,
-      human-confirmed.
-- [ ] Decide what still stands between `1.0.0-rc15` and a plain `1.0.0`.
+- [ ] **Pre-`1.0.0` gate — NOT closed.** The pilot ran onto a *virgin* target: 2
+      pages, 0 attachments, no active plugins. The half the gate exists for was
+      never exercised — see §6.
+- [ ] **Graft onto a target that has lived.** A B with its own accumulated
+      content, media, plugins and users. That is what default-deny, `protect`, id
+      collisions with existing content, and the `keep-B` stack resolution are
+      *for*, and none of them met real resistance on the pilot.
 - [ ] **#82** — Etch taxonomies (`etch_taxonomies`) are never migrated. Same shape
       as #16 one level up, but **silent**: the completeness gate counts items, and
       a post whose terms were dropped still lands.
@@ -91,11 +96,30 @@ two such guards (`verify_id_references_resolve`,
 
 ## 6. Definition of Done
 
-The v1 DoD is met, and the separate pre-`1.0.0` gate (design doc §0.2 R2/R4 — a
-real run on a genuine A/B pair) is now **met as well**, by a full migration rather
-than a dry run. What the pilot exposed is not a gap in that DoD but a gap in the
-*verification model*: see §4. A future DoD should require, for every id remap, a
-guard that does not rest on source/target content equality.
+The v1 DoD is met. The pre-`1.0.0` gate (design doc §0.2 R2/R4 — a real run on a
+genuine A/B pair) is **not**, and marking it closed on the pilot would have been
+wrong: **the target was empty.** 2 pages, 0 attachments, no active plugins. Source
+side, the run was demanding — 1466 posts, 1438 attachments, a real Etch/ACSS stack,
+a real remote target over ssh, two real restores. Target side, it graft onto a
+blank page.
+
+Everything sitegraft's safety model exists for went untested, because nothing
+pushed back:
+
+- **default-deny and `protect`** — B's own 2 pages and 1 post survived, which is
+  the smallest possible evidence. A site with real content to lose was never tried.
+- **id collisions with B's existing content** — the pilot's target had almost no
+  ids of its own to collide with.
+- **the `keep-B` stack resolution** — every plugin and the theme resolved to
+  `copy`, because B had none. That branch has never run on a real pair.
+
+So the gate stands as written, and needs a target that has lived: a site with its
+own history, plugins, media and users. Until then the pilot proves the pipeline
+and the source side, not the protection model.
+
+Separately, what the pilot *did* expose is a gap in the **verification model** (see
+§4): a future DoD should require, for every id remap, a guard that does not rest on
+source/target content equality.
 → Detail: [`docs/definition-of-done.md`](docs/definition-of-done.md)
 
 ## 7. Getting started (dev)

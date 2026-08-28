@@ -6,9 +6,17 @@
 
 ## Next steps (priority)
 
-- [x] **Pre-`1.0.0` gate** — closed 2026-08-28, and by more than it asked: a full
-      real migration on a genuine A/B pair, human-confirmed, not a dry run.
-- [ ] Decide what remains between `1.0.0-rc15` and a plain `1.0.0`.
+- [ ] **Pre-`1.0.0` gate — still open.** The 2026-08-28 pilot was a full real
+      migration, human-confirmed, but onto a **virgin target** (2 pages, 0
+      attachments, no active plugins). It proves the pipeline and the source side;
+      it does not prove the protection model, which is the half the gate exists
+      for. Do not tick this on a graft onto a blank site.
+- [ ] **Graft onto a target that has lived** — a B with its own accumulated
+      content, media, plugins and users. Exercises what the pilot could not:
+      default-deny and `protect` against content that actually matters, id
+      collisions with B's existing posts, and the **`keep-B` stack resolution**,
+      which has never run on a real pair (every item resolved to `copy` on the
+      pilot because B had no plugins).
 - [ ] **#82 — Etch taxonomies.** `etch_taxonomies` is claimed by no module.
       Same defect as #16 one level up, and **worse**: the completeness gate counts
       items, so a post whose terms were dropped still lands and the gate passes.
