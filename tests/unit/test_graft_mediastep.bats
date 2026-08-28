@@ -47,6 +47,69 @@ php_eval_captured() {
   php "$script"
 }
 
+# --- graft_media_sync guards its own exit status (PR #90 review, BLOCKER)
+#
+# phase_graft calls this function on the LHS of a `||` so it can print an
+# operator message about B's state when the sync fails. Bash disables `set
+# -e` for a function invoked there, and that suppression covers the whole
+# function body -- so without an explicit guard on each step, a mid-body
+# failure kept going. Measured before the fix: the pull from A failing
+# (rsync exit 23) fell through to the push, which shipped an EMPTY staging
+# tree to B and returned 0. phase_graft then marked the step done and
+# imported against a B whose media never arrived: a silent success, and
+# issue #36's own failure mode re-entering by another door.
+#
+# This test runs the REAL graft_media_sync (the phase_wiring test that
+# covers the operator message stubs it out entirely, so it cannot pin this).
+#
+# One test, not two: a companion asserting "the push is never reached" was
+# written and then removed as REDUNDANT -- not as a false green, which is
+# what an earlier version of this note wrongly claimed. Measured in review:
+# with the pull's guard removed, the push IS reached in this very shape, so
+# the assertion would have been true-and-discriminating in isolation; but
+# `[ "$rc" -ne 0 ]` above it fails first and bats stops there, so it could
+# never have added an independent signal.
+#
+# The shape matters and is fragile. An explicit `set -euo pipefail` inside a
+# subshell on the LHS of a `||` does NOT re-enable errexit -- the
+# suppression reaches all the way in (measured). Wrapping the call in
+# `out=$( … )` instead DOES change the -e context, and made a draft of that
+# companion pass with the guard removed. Keep the invocation below
+# verbatim.
+@test "graft_media_sync returns non-zero when the pull from A fails, even called on the LHS of a || (set -e is off there)" {
+  local staging_parent="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$staging_parent"
+  SITE_A_WP_PATH="/a"; SITE_B_WP_PATH="/b"
+  unset SITE_A_SSH_HOST
+  graft_pull_dir() { echo "PULL FAILED"; return 23; }
+  graft_push_dir() { echo "PUSHED ANYWAY"; return 0; }
+
+  # Exactly phase_graft's call shape: LHS of a ||, which is what disables -e.
+  local rc=0
+  ( set -euo pipefail; graft_media_sync "$staging_parent" ) || rc=$?
+
+  [ "$rc" -ne 0 ]
+}
+
+@test "graft_media_sync returns non-zero when the ssh pull from A fails (remote-A branch, same LHS-of-|| context)" {
+  # The branch taken whenever A is remote -- the primary production shape.
+  # Its guard is load-bearing and was unpinned when this fix-pack landed:
+  # with it removed, the failed ssh pull fell through to the push, which
+  # shipped an empty staging tree to B and returned 0. Same blocker, one
+  # branch over.
+  local staging_parent="$BATS_TEST_TMPDIR/run-ssh"
+  mkdir -p "$staging_parent"
+  SITE_A_WP_PATH="/a"; SITE_B_WP_PATH="/b"
+  SITE_A_SSH_HOST="host-a"
+  run_or_echo() { echo "SSH PULL FAILED"; return 23; }
+  graft_push_dir() { echo "PUSHED ANYWAY"; return 0; }
+
+  local rc=0
+  ( set -euo pipefail; graft_media_sync "$staging_parent" ) || rc=$?
+
+  [ "$rc" -ne 0 ]
+}
+
 @test "graft_media_pull_cmd routes A's uploads to a local staging dir via ssh when A is remote" {
   run graft_media_pull_cmd "user@host-a.example.com" "/site-a/wp-content/uploads/" "/run/media-staging/"
   [[ "$output" == *"rsync"* ]] || false
