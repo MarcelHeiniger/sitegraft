@@ -408,12 +408,18 @@ EOF
   # The failure this message exists for: rsync dies (disk full on B, network
   # drop) on a RE-graft, i.e. after prune has already deleted the previous
   # run's attachments and their files.
-  # Fails MID-BODY, not on its last command. That distinction is the whole
-  # point: a last-command failure propagates even without graft_media_sync's
-  # own `|| return $?` guards, so a stub shaped that way would leave them
-  # unpinned. The real hazard is the pull from A dying (rsync exit 23) and
+  # Fails MID-BODY, not on its last command, so this stub reproduces the
+  # real hazard's SHAPE: the pull from A dying (rsync exit 23) with
   # execution carrying on to push an empty staging tree to B -- which
   # returned 0, marked the step done, and imported against a stripped B.
+  #
+  # What this test pins is the CALL SITE's handling of a failing
+  # media_sync: the message, the absent marker, and not importing against a
+  # stripped B. It does NOT pin graft_media_sync's own `|| return $?`
+  # guards -- it cannot, since the real function is never called here
+  # (measured: all four guard mutations leave this file at 0 failures).
+  # Those guards are pinned in tests/unit/test_graft_mediastep.bats, which
+  # runs the real function.
   graft_media_sync() {
     echo "STUB: graft_media_sync called"
     false || return $?
