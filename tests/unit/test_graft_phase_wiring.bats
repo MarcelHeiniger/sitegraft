@@ -362,12 +362,22 @@ EOF
   [[ "$output" == *"STUB: graft_import_wxr called"* ]] || false
   [[ "$output" != *"STUB: graft_export_wxr called"* ]] || false
 
-  # The actual `rm -f`-under-dry-run acceptance criterion: is_dry_run
-  # guards that `rm -f`, so under THIS test's --dry-run pass it must never
-  # fire for real -- media_sync/import_attachments/import (all three
-  # pre-marked done above) must still be ON DISK at the exact moment
-  # graft_prune_previous_run's stub checks, before prune_will_rerun's
-  # forced rerun of each step gets a chance to re-touch them itself.
+  # These three are NOT what catches a broken is_dry_run guard on that
+  # `rm -f` -- the pre-existing `[ -f "${run_dir}/graft.*.done" ]` pair
+  # further down does, and bats stops there first. Measured: removing the
+  # is_dry_run guard reddens that pair, and these three are never even
+  # evaluated. Nor is the reason stated in an earlier draft of this
+  # comment true here: under --dry-run graft_mark_step returns early
+  # (lib/graft.sh, `is_dry_run && return 0`), so prune_will_rerun's forced
+  # reruns cannot re-touch a marker mid-pass -- "present at prune time"
+  # and "present at the end" are the same fact in a dry run.
+  #
+  # What they DO earn: they make the real-run test's negative assertion
+  # non-vacuous. Wire this stub to the wrong argument (${9} instead of
+  # ${2}) and it silently reports nothing -- the real-run
+  # `!= *"MARKER STILL SET AT PRUNE"*` would then pass for the wrong
+  # reason, while these positives fail. The two tests cross-check each
+  # other's stub wiring; that is why these belong here.
   # fetch_id_map is deliberately absent from this assertion: it was never
   # marked done in this test's own setup (that absence is what forces
   # entry into the block at all), so it can never appear in this stub's
