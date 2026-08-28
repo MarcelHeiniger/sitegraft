@@ -867,17 +867,35 @@ _sg_load_keep_sets() {
   # _sg_prune_preflight.
   LC_ALL=C sort -u "$SG_TMP/archive.txt" "$SG_TMP/manifest.txt" > "$SG_TMP/accounted.sorted"
 
-  # issue #35: which of the archive's own paths are DIRECTORIES specifically —
-  # a symlink standing in for one of these, on B, is the shape that lets
-  # extraction write outside wp-content (see _sg_assert_no_symlink_targets,
-  # below, and _sg_list_live_symlinks in this script's header). Filtered from
-  # archive.txt (already validated as safe relative paths above) rather than a
-  # second `find -type d`, so this can never disagree with it. WP_CONTENT_DIR
-  # is the pulled-down archive sitting on THIS machine's own filesystem —
-  # never behind a wrapper — so a plain `[ -d ]` is enough, no ${prefix}.
+  # issue #35: which of the archive's own paths are REAL DIRECTORIES
+  # specifically — a symlink standing in for one of these, on B, is the shape
+  # that lets extraction write outside wp-content (see
+  # _sg_assert_no_symlink_targets, below, and _sg_list_live_symlinks in this
+  # script's header). Filtered from archive.txt (already validated as safe
+  # relative paths above) rather than a second `find -type d`, so this can
+  # never disagree with it. WP_CONTENT_DIR is the pulled-down archive sitting
+  # on THIS machine's own filesystem — never behind a wrapper.
+  #
+  # `[ -d ] && [ ! -L ]`, NOT a bare `[ -d ]` — bug found by review. `-d`
+  # follows a symlink to test what it points AT, so a bare `-d` cannot tell
+  # "this archive path is a real directory" apart from "this archive path is
+  # a symlink whose target happens to be a directory". The second case is
+  # exactly the issue's own motivating setup, reproduced on the archive side
+  # of this very check: wp-content/uploads was ALREADY a symlink (to a
+  # separate volume, an NFS mount, a CDN-synced directory) at BACKUP time, so
+  # neither tar creation side dereferenced it — the archive's own "uploads"
+  # is a symlink entry too, not a directory tree. A bare `-d` on that entry
+  # returned true whenever its target genuinely existed as a directory
+  # (measured: it does, on the machine running this generator), so
+  # archive-dirs.sorted wrongly counted "uploads" as a real directory, its
+  # unchanged symlink on B matched it below, and a perfectly legitimate
+  # restore was refused over nothing — the archive holds no files under that
+  # name at all, so there was never anything for extraction to write through
+  # it. `[ ! -L ]` closes that: an archive entry that is itself a symlink is
+  # never treated as a directory this check needs to protect.
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
-    if [ -d "${WP_CONTENT_DIR}/${rel#./}" ]; then
+    if [ -d "${WP_CONTENT_DIR}/${rel#./}" ] && [ ! -L "${WP_CONTENT_DIR}/${rel#./}" ]; then
       printf '%s\n' "$rel"
     fi
   done < "$SG_TMP/archive.txt" > "$SG_TMP/archive-dirs.txt"
@@ -893,25 +911,40 @@ _sg_load_keep_sets() {
 # protective behavior. Same shape as every other check in this script: read
 # both sides, decide, refuse, never guess.
 #
-# Measured, not assumed: this backup's archive is always a plain, ordinary
-# recursive filesystem tree pulled from B (see archive-dirs.sorted, built
-# above, and its own directory-vs-file distinction). Given a real directory
-# entry at the destination path, a modern GNU tar (1.35) and macOS's
-# bsdtar (3.5.3) replace a destination symlink with a real directory rather
-# than follow it — reproduced live, on this exact `tar czf - | tar xzf -`
-# pipeline shape, before this guard existed. The write-through only
-# reproduced, on the same two tars, for an archive built WITHOUT recursion
-# (file entries with no directory entry for their parent) — not this tool's
-# archive shape. This guard exists anyway, because "not reproduced on two
-# tars checked today" is not the same claim as "impossible on whatever tar
-# the target has" — exactly the distinction this script's own doc comment
-# above warns against relying on.
+# This is a real fix, not defensive padding for a case that cannot happen —
+# measured across three extractors, all fed the IDENTICAL ordinary recursive
+# archive (built by either gtar or bsdtar; this tool never builds any other
+# shape) through this exact `tar czf - | tar xzf -` pipeline, against a
+# destination directory symlink:
+#
+#   extractor                        recursive archive (this tool's shape)
+#   GNU tar 1.30 / 1.34 / 1.35       replaces the symlink with a real dir — safe
+#   bsdtar 3.5.3 (macOS)             replaces the symlink with a real dir — safe
+#   busybox tar 1.36 / 1.37 / 1.38   writes straight through the symlink — UNSAFE
+#
+# busybox tar ignores the archive's own directory entry for the symlinked
+# name (it is present — verified — and changes nothing) and follows the
+# symlink anyway. Reachable today: a bare `alpine` or `nginx:alpine` image
+# ships busybox tar; `wordpress:cli` and the `*-fpm-alpine` WordPress/PHP
+# images install GNU tar 1.35 instead, so they are unaffected as of this
+# writing — but which extractor a given target actually has is exactly the
+# thing this script cannot know, which is why that fact is not load-bearing
+# here.
 #
 # The set checked is deliberately narrow: only paths this backup's OWN
 # archive holds as a directory (archive-dirs.sorted). A symlink elsewhere in
 # wp-content that this backup never touches is inert — there is no archive
 # entry by that name for tar to extract through it — and refusing over it
 # would be alarming and wrong, not safe.
+#
+# Byte comparison, not normalized: like every other listing this script
+# compares (see _sg_assert_backup_landed's own comment on NFC/NFD), archive-
+# dirs.sorted and live-symlinks.sorted are compared by raw bytes below. An
+# accented directory name that is a symlink on B in a different Unicode
+# normalization than the archive's own bytes will not be matched here, and
+# the restore proceeds as if it were not a symlink at all — the same known
+# gap this file already documents at length for the prune half, not
+# something this guard attempts to normalize away.
 _sg_assert_no_symlink_targets() {
   local abs rel
   if ! _sg_list_live_symlinks > "$SG_TMP/live-symlinks.raw"; then

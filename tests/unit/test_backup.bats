@@ -393,6 +393,19 @@ _wrapped_fixture() {
     printf 'accented\n' > "${B_ROOT}/wp-content/themes/$(printf 'Caf\xc3\xa9.css')"
   fi
 
+  # Opt-in: wp-content/uploads is ALREADY a symlink to a real, populated
+  # directory BEFORE the backup ever runs -- the issue's own motivating case
+  # (media on a separate volume, an NFS mount, a CDN-synced directory), not a
+  # symlink introduced later by a botched graft. The archive therefore
+  # captures "uploads" as a symlink entry, never as a directory tree (neither
+  # tar creation side dereferences it). Off by default, same reasoning as
+  # B_ROOT_EXTRA_NFC above.
+  if [ -n "${B_ROOT_SYMLINK_AT_BACKUP:-}" ]; then
+    mkdir -p "$BATS_TEST_TMPDIR/media-volume"
+    printf 'media\n' > "$BATS_TEST_TMPDIR/media-volume/photo.jpg"
+    ln -s "$BATS_TEST_TMPDIR/media-volume" "${B_ROOT}/wp-content/uploads"
+  fi
+
   SITE_B_SSH_HOST=""
   SITE_B_WP_PATH="$B_ROOT"
   SITE_B_WP_CMD="${wrapper} wp"
@@ -645,26 +658,31 @@ _manifest_fixture() {
 # the archive on top of it can land files at the symlink's target instead of
 # inside wp-content.
 #
-# Measured (not assumed) before writing this guard: with the exact command
-# shape backup_generate_restore_script bakes (`tar czf - -C src . | tar xzf -
-# -C dst`, both ends creating archives the normal recursive way — never
-# `--no-recursion`), a real target's directory entry for the symlinked name
-# makes both GNU tar 1.35 and macOS's bsdtar 3.5.3 replace the destination
-# symlink with a real directory rather than follow it — this specific
-# scenario, alone, would already come back clean without any new guard on
-# those two tar builds. It stops being clean the moment the archive has no
-# explicit directory entry for that name and only reaches it through a
-# deeper file entry (reproduced live with a --no-recursion, files-only
-# archive: the file landed outside the destination tree, through the
-# symlink, unchanged by either tar). Sitegraft's own archives are always
-# built by a plain recursive `tar c` over a real pulled-down directory tree,
-# so today's local tars do not reproduce the write-through on THIS backup
-# shape — but the generated script runs on a target whose tar flavour and
-# version are unknown (see backup_generate_restore_script's own comment on
-# why no flag can be relied on), so the fix does not lean on that being true
-# elsewhere. It detects the unsafe target state before extracting, the same
-# "read, decide, refuse" shape the manifest checks above already use, rather
-# than trusting whichever tar happens to be on PATH.
+# This is a real vulnerability on this tool's ACTUAL archive shape, measured
+# across three extractors, not a defensive guard against a case that never
+# occurs. Every archive here is built by a plain recursive `tar c` over a real
+# pulled-down directory tree (never `--no-recursion`) — the only shape
+# backup_generate_restore_script ever produces — fed through the exact
+# `tar czf - -C src . | tar xzf - -C dst` pipeline it bakes, against a
+# destination directory symlink:
+#
+#   GNU tar 1.30 / 1.34 / 1.35      replaces the symlink with a real dir — safe
+#   bsdtar 3.5.3 (macOS)            replaces the symlink with a real dir — safe
+#   busybox tar 1.36 / 1.37 / 1.38  writes straight through the symlink — UNSAFE
+#
+# busybox tar ignores the archive's own directory entry for the symlinked
+# name (verified present) and follows the symlink anyway — archives built by
+# EITHER gtar or bsdtar reproduce it the same way once busybox is the one
+# extracting. Reachable today: a bare `alpine` or `nginx:alpine` container
+# ships busybox tar; `wordpress:cli` and the `*-fpm-alpine` WordPress/PHP
+# images install GNU tar 1.35 instead, so they are unaffected as of this
+# writing. Which extractor a given restore target actually has is exactly
+# what the generated script cannot know (see backup_generate_restore_script's
+# own comment on why no flag can be relied on), so the fix does not lean on
+# "safe on the tars I checked" as a property of the target — it detects the
+# unsafe target state before extracting, the same "read, decide, refuse"
+# shape the manifest checks above already use, rather than trusting whichever
+# tar happens to be on PATH.
 @test "the generated wrapped-local restore.sh refuses to extract through a symlinked wp-content entry, naming it" {
   _wrapped_fixture
   rm -rf "${B_ROOT}/wp-content/themes"
@@ -715,6 +733,30 @@ _manifest_fixture() {
 
   run "${RUN_DIR}/restore.sh"
   [ "$status" -eq 0 ]
+  [ "$(cat "${B_ROOT}/wp-content/themes/t/style.css")" = "original" ]
+}
+
+# Bug found by review: `[ -d "${WP_CONTENT_DIR}/${rel#./}" ]` follows
+# symlinks. If wp-content/uploads was ALREADY a symlink at BACKUP time --
+# the issue's own motivating case, media on a separate volume, an NFS mount,
+# or a CDN-synced directory -- the archive holds "uploads" as a symlink
+# entry, not a directory. On the machine that generates and runs this
+# restore.sh (this test, and potentially the real orchestrator if it can
+# resolve the same path), a bare `-d` on that archived symlink can still
+# return true whenever its target happens to exist and be a directory --
+# which it always does here, by construction. That wrongly classifies
+# "uploads" as an archive DIRECTORY, matches it against B's live symlink at
+# the same name, and refuses a restore that was never unsafe: the archive
+# holds no files under "uploads" at all, so there is nothing for extraction
+# to write through it.
+@test "the generated wrapped-local restore.sh does NOT refuse when wp-content/uploads was ALREADY a symlink at backup time (legitimate separate-volume setup)" {
+  B_ROOT_SYMLINK_AT_BACKUP=1 _wrapped_fixture
+  # B is unchanged since the backup: "uploads" is still the very same symlink.
+  [ -L "${B_ROOT}/wp-content/uploads" ]
+
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -eq 0 ]
+  [ -L "${B_ROOT}/wp-content/uploads" ]
   [ "$(cat "${B_ROOT}/wp-content/themes/t/style.css")" = "original" ]
 }
 
@@ -875,7 +917,16 @@ OLD
 
 @test "the generated wrapped-local restore.sh REFUSES when listing B's wp-content comes back empty (could-not-verify is not 'nothing to remove')" {
   local shim
-  shim=$(_wrapper_shim silentfind 'if [ "$1" = "find" ]; then exit 0; fi
+  # Only misbehaves for the PLAIN listing call (_sg_list_live, no -type l) --
+  # the symlink-only listing (_sg_list_live_symlinks, issue #35) is let
+  # through untouched, so this still exercises _sg_scan_prune's own guard
+  # rather than being silently absorbed by the newer, narrower one.
+  shim=$(_wrapper_shim silentfind 'if [ "$1" = "find" ]; then
+  case " $* " in
+    *" -type l "*) exec "$@" ;;
+  esac
+  exit 0
+fi
 exec "$@"')
   _wrapped_fixture "$shim"
   run "${RUN_DIR}/restore.sh"
@@ -885,7 +936,15 @@ exec "$@"')
 
 @test "the generated wrapped-local restore.sh REFUSES when listing B returns a path outside wp-content" {
   local shim
-  shim=$(_wrapper_shim evilfind 'if [ "$1" = "find" ]; then printf "%s\0" /etc/passwd; exit 0; fi
+  # Same discrimination as silentfind above -- let the -type l (symlink)
+  # listing through untouched, only poison the plain listing.
+  shim=$(_wrapper_shim evilfind 'if [ "$1" = "find" ]; then
+  case " $* " in
+    *" -type l "*) exec "$@" ;;
+  esac
+  printf "%s\0" /etc/passwd
+  exit 0
+fi
 exec "$@"')
   _wrapped_fixture "$shim"
   run "${RUN_DIR}/restore.sh"
@@ -915,7 +974,14 @@ exec "$@"')
 
 @test "the generated wrapped-local restore.sh REFUSES when listing B returns a path with a '..' component" {
   local shim
-  shim=$(_wrapper_shim dotdotfind 'if [ "$1" = "find" ]; then printf "%s\0" "$2/../../escape"; exit 0; fi
+  # Same discrimination as silentfind/evilfind above.
+  shim=$(_wrapper_shim dotdotfind 'if [ "$1" = "find" ]; then
+  case " $* " in
+    *" -type l "*) exec "$@" ;;
+  esac
+  printf "%s\0" "$2/../../escape"
+  exit 0
+fi
 exec "$@"')
   _wrapped_fixture "$shim"
   run "${RUN_DIR}/restore.sh"
