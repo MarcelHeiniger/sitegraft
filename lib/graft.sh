@@ -2602,7 +2602,27 @@ phase_graft() {
   graft_step_done "$run_dir" stack_sync || { graft_sync_stack "$run_dir" "$manifest"; graft_mark_step "$run_dir" stack_sync; }
   graft_check_stack_precondition "${run_dir}/scan-a.json" "${run_dir}/scan-b.json" "$manifest" "$allow_mismatch" || return 1
 
-  graft_step_done "$run_dir" media_sync    || { graft_media_sync "$run_dir"; graft_mark_step "$run_dir" media_sync; }
+  # Issue #36: media_sync used to run HERE, before mu_plugin — i.e. before
+  # prune, several steps below. graft_media_sync pushes A's uploads onto B
+  # with rsync --ignore-existing (never overwrite a file already there);
+  # graft_prune_previous_run's `wp post delete --force` on a previously-
+  # migrated attachment deletes that attachment's underlying FILE as a side
+  # effect of deleting the post (verified live — see the issue's own DDEV
+  # reproduction). Run in that order, a SECOND graft against a target that
+  # already carries a first graft's attachments was silently destructive:
+  # media_sync saw every file already present and skipped all of them,
+  # prune then deleted every one of those same files for real, and
+  # import_attachments found nothing left on disk to register — a full
+  # media wipe on the single most ordinary case sitegraft exists for (an
+  # iterative regraft onto the same B). Moved below the prune block instead
+  # (see prune's own comment for why it still runs before import_attachments,
+  # unchanged): prune deletes the stale files first, then media_sync
+  # re-pushes A's uploads onto the now-empty slots --ignore-existing was
+  # skipping, THEN import_attachments finds them again. The cheaper of the
+  # two fixes the issue names (moving the step vs. dropping
+  # --ignore-existing entirely, which would cost a full media re-transfer
+  # on every single run — exactly what #11's batching fix-pack just made
+  # fast for the opposite reason).
   graft_step_done "$run_dir" mu_plugin     || { graft_deploy_mu_plugin; graft_mark_step "$run_dir" mu_plugin; }
   # Issue #16: must run before graft_import_wxr (several steps down) —
   # any later than that and the WXR import runs against a B whose
@@ -2679,6 +2699,23 @@ phase_graft() {
   # below (alongside import_attachments'/import's) means a resume that
   # only got as far as fetch_id_map reruns it too, against a fresh id-map
   # this prune pass just cleaned.
+  #
+  # Issue #36: graft.media_sync.done is now cleared here too, for the SAME
+  # reason as the three markers already listed — prune's own `wp post
+  # delete --force` deletes an attachment's underlying FILE, and
+  # media_sync is the ONLY step that puts those files back. media_sync now
+  # runs AFTER this block (below), so on this run's very first pass
+  # through here its marker is not set yet and this is a no-op — but on a
+  # RESUME whose earlier pass got as far as media_sync (marker set) and
+  # then failed partway through import_attachments, THIS block reruns
+  # (import_attachments is a consumer, above) and deletes the very files
+  # that earlier media_sync run placed, for exactly the same reason it
+  # deletes a partially-imported run's own posts. Without clearing
+  # media_sync's marker here too, the resumed pass below would see it as
+  # "already done", skip re-running it, and import_attachments would fail
+  # to find files this prune pass just removed — the issue #36 bug,
+  # reproduced a second time inside a single interrupted run instead of
+  # across two separate ones.
   graft_safety_step_done "$run_dir" prune import_attachments import fetch_id_map || {
     # `|| true` on the `rm -f` itself, not just the `is_dry_run ||` in
     # front of it (review, MINOR-E): this whole block is the RHS of a
@@ -2691,12 +2728,20 @@ phase_graft() {
     # staying set. Logged, not swallowed: losing the ability to clear a
     # resumability marker is itself worth telling the operator about.
     if ! is_dry_run; then
-      rm -f "${run_dir}/graft.import_attachments.done" "${run_dir}/graft.import.done" "${run_dir}/graft.fetch_id_map.done" \
+      rm -f "${run_dir}/graft.media_sync.done" "${run_dir}/graft.import_attachments.done" "${run_dir}/graft.import.done" "${run_dir}/graft.fetch_id_map.done" \
         || log_warn "could not clear one or more resumability markers under ${run_dir} before prune — a later resume may not rerun the steps prune is about to invalidate"
     fi
     graft_prune_previous_run "$post_types_csv" "$run_dir"
     graft_mark_step "$run_dir" prune
   }
+  # Issue #36: media_sync runs HERE now — after prune, before
+  # import_attachments — not near the top of this function where it used
+  # to sit (see the comment on its old call site, above, for the full
+  # mechanism/reasoning). Prune has just deleted the files it deletes (if
+  # any); this re-pushes A's uploads onto whatever gap that left, so
+  # import_attachments (next) finds every file it expects, whether this is
+  # a first graft or the twentieth onto the same B.
+  graft_step_done "$run_dir" media_sync    || { graft_media_sync "$run_dir"; graft_mark_step "$run_dir" media_sync; }
   graft_step_done "$run_dir" import_attachments || { graft_import_attachments "$run_dir"; graft_mark_step "$run_dir" import_attachments; }
   graft_step_done "$run_dir" importer_setup || { graft_ensure_importer "$run_dir"; graft_mark_step "$run_dir" importer_setup; }
   graft_step_done "$run_dir" export        || {
@@ -2835,8 +2880,15 @@ phase_graft() {
     # read-only run_dir, e.g.) would otherwise abort phase_graft right
     # here, before `log_error` below ever runs, with a bare undiagnosed
     # nonzero exit instead of the message this whole fix exists to show.
+    #
+    # Issue #36: graft.media_sync.done cleared here too, same reasoning as
+    # the matching addition above the prune block — the retry this message
+    # describes reruns prune first (its own comment, above), which deletes
+    # the attachment(s) this run already imported AND their underlying
+    # files; media_sync's marker must not keep claiming "already placed"
+    # against files prune is about to remove out from under it.
     if ! is_dry_run; then
-      rm -f "${run_dir}/graft.import_attachments.done" "${run_dir}/graft.import.done" "${run_dir}/graft.fetch_id_map.done" \
+      rm -f "${run_dir}/graft.media_sync.done" "${run_dir}/graft.import_attachments.done" "${run_dir}/graft.import.done" "${run_dir}/graft.fetch_id_map.done" \
         || log_warn "could not clear one or more resumability markers under ${run_dir} — a retry may not behave as described below"
     fi
     log_error "B right now: a partially migrated set of posts from this run (each still carrying _sitegraft_source_id), plus the attachment(s) this run already imported. The mapping mu-plugin is removed automatically as this process exits; wordpress-importer's own plugin state on B has NOT been restored yet — that only happens once this gate passes. Re-running 'sitegraft graft' against this SAME run directory WILL retry: prune deletes everything this run left on B, then the WXR import runs again from scratch. If the same item(s) get skipped again, this will keep failing the same way — restore B from the pre-graft backup recorded under ${run_dir} instead, or resolve why wordpress-importer considers them pre-existing on B before retrying."

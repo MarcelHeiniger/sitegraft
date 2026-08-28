@@ -458,14 +458,25 @@ EOF
   [[ "$output" == *"partially migrated"* ]] || false
   [[ "$output" == *"WILL retry"* ]] || false
 
-  # MAJOR-2/MAJOR-3: the three markers a retry depends on are cleared...
+  # MAJOR-2/MAJOR-3: the markers a retry depends on are cleared...
   [ ! -f "${run_dir}/graft.import_attachments.done" ]
   [ ! -f "${run_dir}/graft.import.done" ]
   [ ! -f "${run_dir}/graft.fetch_id_map.done" ]
+  # Issue #36: graft.media_sync.done is cleared here too now, alongside the
+  # three above -- prune's own `wp post delete --force` deletes an
+  # attachment's underlying FILE, and a retry from this exact point reruns
+  # prune first (see the reasoning below), which can delete files an
+  # earlier media_sync pass already placed. media_sync must rerun after it
+  # to put them back before import_attachments retries -- see
+  # phase_graft's own comment on this rm -f (lib/graft.sh) for the full
+  # mechanism. This fixture's A never has any attachments (`echo '[]'`), so
+  # media_sync's rerun is a harmless no-op here either way; the marker
+  # itself is still the right thing to assert on, since a future fixture
+  # WITH real attachments depends on exactly this clearing.
+  [ ! -f "${run_dir}/graft.media_sync.done" ]
   # ...but the steps that already ran correctly and don't need to redo
   # their (expensive) work are left alone.
   [ -f "${run_dir}/graft.stack_sync.done" ]
-  [ -f "${run_dir}/graft.media_sync.done" ]
   [ -f "${run_dir}/graft.prune.done" ]
   [ -f "${run_dir}/graft.importer_setup.done" ]
   [ -f "${run_dir}/graft.export.done" ]
@@ -606,4 +617,178 @@ EOF
   [ "$status" -eq 1 ]
   [[ "$output" == *"1 of 2"* ]] || false
   [[ "$output" == *"page#102"* ]] || false
+}
+
+# --- issue #36 acceptance: media_sync used to run before prune -------------
+#
+# graft_media_sync pushes A's uploads onto B with rsync --ignore-existing
+# (never overwrite a file already there). graft_prune_previous_run's own
+# `wp post delete --force` on a previously-migrated attachment deletes that
+# attachment's underlying FILE as a side effect of deleting the post
+# (verified live on a disposable site -- see the GitHub issue's own DDEV
+# reproduction). With media_sync running BEFORE prune, a second graft
+# against a target that already carries a first graft's attachments was
+# silently destructive: media_sync saw the file already present and skipped
+# it, prune then deleted it for real, and import_attachments found nothing
+# left on disk to register. lib/graft.sh now runs prune, then media_sync,
+# then import_attachments (see phase_graft's own comment on graft_media_sync's
+# old and new call sites) -- proven at the wiring level by
+# tests/unit/test_graft_phase_wiring.bats's own issue #36 test. This is the
+# issue's own acceptance criterion instead: grafting TWICE onto the same
+# target leaves B's media intact, covering the SECOND run, not just the
+# first.
+#
+# phase_graft itself is exercised directly (not via bin/sitegraft), same
+# convention as this file's other phase_graft-level tests and
+# tests/unit/test_graft_phase_wiring.bats's MAJOR-4/issue #16 tests -- every
+# step BUT graft_prune_previous_run, graft_media_sync and
+# graft_import_attachments is stubbed out, so what runs for real is exactly
+# the three functions issue #36 is about, driven by phase_graft's own
+# production wiring, against a REAL uploads directory on a REAL filesystem
+# (graft_media_sync's rsync is not mocked). wp_remote is stubbed at the two
+# points that would otherwise need a real WordPress -- A's/B's attachment
+# metadata, and B's post list/delete for pruning -- but the post-delete stub
+# performs the one side effect this whole issue is about: deleting the
+# underlying file, exactly like a live `wp post delete --force` on an
+# attachment does. Everything downstream of "is the file present when
+# import needs it" (rsync placing it, the batch's file_exists-shaped
+# fail-closed report, graft_import_attachments' own accounting/refusal
+# logic) is the real, unmodified code.
+_issue36_stub_everything_but_prune_media_sync_import_attachments() {
+  # profile_load is deliberately NOT stubbed here -- the caller defines its
+  # own right after calling this helper, since it needs to close over
+  # site_a/site_b (declared local in the @test body).
+  modules_discover() { SITEGRAFT_MODULES=""; }
+  graft_sync_stack() { :; }
+  graft_check_stack_precondition() { return 0; }
+  graft_deploy_mu_plugin() { :; }
+  graft_migrate_post_type_defining_options() { :; }
+  graft_ensure_importer() { :; }
+  graft_export_wxr() { :; }
+  graft_integrity_gate() { return 0; }
+  graft_import_wxr() { :; }
+  graft_fetch_id_map() { :; }
+  graft_verify_import_completeness() { return 0; }
+  graft_remove_mu_plugin() { :; }
+  graft_restore_importer_state() { :; }
+  graft_remap_attachment_ids() { :; }
+  graft_remap_featured_images() { :; }
+  graft_search_replace_domain() { :; }
+  graft_migrate_options() { :; }
+  graft_run_module_post_import() { :; }
+  graft_push_remap_payload() { echo "/fake/remote/payload.json"; }
+  graft_push_media_import_lib() { echo "/fake/remote/lib.php"; }
+  graft_remove_file() { :; }
+}
+
+@test "issue #36 acceptance: grafting twice onto the same target leaves B's media intact (covers the SECOND run)" {
+  local site_a="$BATS_TEST_TMPDIR/site-a" site_b="$BATS_TEST_TMPDIR/site-b"
+  mkdir -p "${site_a}/wp-content/uploads" "${site_b}/wp-content/uploads"
+  printf 'fixture bytes, not a real jpg' > "${site_a}/wp-content/uploads/probe.jpg"
+  local probe_on_b="${site_b}/wp-content/uploads/probe.jpg"
+
+  unset SITEGRAFT_DRY_RUN
+
+  # B's own state, independent of any run_dir -- exactly what a real B's
+  # post table would be queryable by _sitegraft_source_id for, across two
+  # entirely separate `sitegraft graft` invocations against it. Starts
+  # empty: B has never seen this attachment yet.
+  local prune_ids_file="$BATS_TEST_TMPDIR/b-attachment-ids"
+  : > "$prune_ids_file"
+
+  _issue36_stub_everything_but_prune_media_sync_import_attachments
+  profile_load() {
+    SITE_A_ALIAS=a; SITE_B_ALIAS=b
+    SITE_A_WP_PATH="$site_a"; SITE_B_WP_PATH="$site_b"
+    unset SITE_A_SSH_HOST SITE_B_SSH_HOST SITE_A_WP_CMD SITE_B_WP_CMD
+    return 0
+  }
+
+  # The one wp-cli surface graft_prune_previous_run/graft_import_attachments
+  # need -- see this test's own header comment above for what each branch
+  # reproduces and why.
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$1" in
+      eval)
+        if [ "$alias_lc" = "a" ]; then
+          echo '[{"old":10,"rel_path":"probe.jpg","title":"Probe"}]'
+        elif [ -f "$probe_on_b" ]; then
+          echo '{"ok":true,"requested":1,"accounted_for":1,"imported":[10],"already_present":[],"no_local_file":[],"failed":[],"map":{"10":100}}'
+        else
+          echo '{"ok":true,"requested":1,"accounted_for":1,"imported":[],"already_present":[],"no_local_file":[],"failed":[{"old":10,"error":"file not found on B"}],"map":{}}'
+        fi
+        ;;
+      post)
+        case "$2" in
+          list) cat "$prune_ids_file" 2>/dev/null || true ;;
+          delete)
+            local id="$3"
+            grep -vxF "$id" "$prune_ids_file" > "${prune_ids_file}.tmp" 2>/dev/null || : > "${prune_ids_file}.tmp"
+            mv "${prune_ids_file}.tmp" "$prune_ids_file"
+            # The load-bearing side effect this whole issue is about: a
+            # real `wp post delete --force` on an attachment deletes the
+            # underlying file too.
+            rm -f "$probe_on_b"
+            echo "post delete ${id} --force"
+            ;;
+        esac
+        ;;
+    esac
+  }
+
+  local manifest='{"migrate":{"core-wp":{"post_types":["attachment"],"option_keys":[]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}'
+
+  # --- first graft: B starts empty, prune has nothing to do, media lands,
+  # attachment imports for the first time. ---
+  local run_dir_1="$BATS_TEST_TMPDIR/run1"
+  mkdir -p "$run_dir_1"
+  touch "${run_dir_1}/backup.complete"
+  printf '%s' "$manifest" > "${run_dir_1}/manifest.json"
+  # export/import (WXR content, unrelated to this test) pre-marked done so
+  # phase_graft's real "did export produce an .xml" check is never reached
+  # -- graft_export_wxr/graft_import_wxr are stubbed no-ops above, and this
+  # test needs a REAL (non-dry-run) pass for prune/media_sync/import_attachments'
+  # own side effects, so --dry-run is not an option here the way the
+  # sibling wiring test uses it.
+  touch "${run_dir_1}/graft.export.done" "${run_dir_1}/graft.import.done"
+
+  run phase_graft --profile demo --run "$run_dir_1"
+  [ "$status" -eq 0 ]
+  [ -f "$probe_on_b" ]
+  [[ "$output" != *"post delete"* ]] || false
+  [[ "$output" == *"1 newly imported"* ]] || false
+  [ -s "${run_dir_1}/id-map.tsv" ]
+
+  # B now "has" this attachment (old id 10 -> new id 100, exactly what pass
+  # 1's own canned batch result reported) -- feed pass 2's prune query from
+  # it, the same way a real B's post table would answer it.
+  printf '100\n' > "$prune_ids_file"
+
+  # --- second graft against the SAME target: the acceptance criterion.
+  # A fresh run_dir (a real iterative regraft is scan -> plan -> backup ->
+  # graft again, not a resume of run_dir_1), but the SAME site_a/site_b --
+  # prune deletes B's post from pass 1 AND its file (reproducing the
+  # issue's exact mechanism); with the fix, media_sync then re-places the
+  # file before import_attachments needs it. ---
+  local run_dir_2="$BATS_TEST_TMPDIR/run2"
+  mkdir -p "$run_dir_2"
+  touch "${run_dir_2}/backup.complete"
+  printf '%s' "$manifest" > "${run_dir_2}/manifest.json"
+  touch "${run_dir_2}/graft.export.done" "${run_dir_2}/graft.import.done"
+
+  run phase_graft --profile demo --run "$run_dir_2"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"post delete 100 --force"* ]] || false
+
+  # The acceptance criterion itself: B still has the file after the SECOND
+  # graft. Under the pre-fix ordering (media_sync before prune), prune's
+  # delete above would be the LAST thing that ever touches this file --
+  # media_sync already ran and skipped it (already existed on disk at that
+  # point), so it would stay gone and this is exactly the assertion that
+  # catches it (reverting lib/graft.sh's reordering and re-running this
+  # test reproduces that failure: pass 2 fails closed instead, with
+  # "failed to import 1 of 1 attachment(s)").
+  [ -f "$probe_on_b" ]
+  [[ "$output" == *"1 newly imported"* ]] || false
 }

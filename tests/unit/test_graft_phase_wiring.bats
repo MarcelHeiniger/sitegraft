@@ -688,3 +688,83 @@ MANIFESTEOF
   [ ! -e "${run_dir}/graft.mu_plugin.done" ]
   [ ! -e "${run_dir}/graft.mu_cleanup.done" ]
 }
+
+# --- Issue #36: graft_media_sync (rsync --ignore-existing, never overwrite
+# a file already on B) used to run near the very top of phase_graft, well
+# before graft_prune_previous_run several steps below. Prune's own
+# `wp post delete --force` on a previously-migrated attachment deletes that
+# attachment's underlying FILE as a side effect (verified live against a
+# disposable site -- see the issue's own DDEV reproduction). In that order,
+# a SECOND graft against a target that already carries a first graft's
+# attachments was silently destructive: media_sync saw every file already
+# present and skipped all of them, prune then deleted every one of those
+# same files for real, and import_attachments found nothing left on disk to
+# register. The fix is this ordering -- prune, THEN media_sync, THEN
+# import_attachments -- proven directly here rather than trusted from
+# graft_media_sync/graft_prune_previous_run's own unit tests (which cover
+# their internal behavior but not WHERE phase_graft calls them), the same
+# way the sibling issue #16 test above proves its own reordering fix at
+# this exact call-site level.
+_issue36_stub_everything_but_ordering() {
+  profile_load() {
+    SITE_A_ALIAS=a; SITE_B_ALIAS=b
+    unset SITE_A_SSH_HOST SITE_B_SSH_HOST
+    return 0
+  }
+  modules_discover() { SITEGRAFT_MODULES=""; }
+  graft_sync_stack() { :; }
+  graft_check_stack_precondition() { return 0; }
+  graft_deploy_mu_plugin() { :; }
+  graft_migrate_post_type_defining_options() { :; }
+  graft_prune_previous_run() { echo "ORDER: prune"; }
+  graft_media_sync() { echo "ORDER: media_sync"; }
+  graft_import_attachments() { echo "ORDER: import_attachments"; }
+  graft_ensure_importer() { :; }
+  graft_export_wxr() { :; }
+  graft_integrity_gate() { return 0; }
+  graft_import_wxr() { :; }
+  graft_fetch_id_map() { :; }
+  graft_verify_import_completeness() { return 0; }
+  graft_remove_mu_plugin() { :; }
+  graft_restore_importer_state() { :; }
+  graft_remap_attachment_ids() { :; }
+  graft_remap_featured_images() { :; }
+  graft_search_replace_domain() { :; }
+  graft_migrate_options() { :; }
+  graft_run_module_post_import() { :; }
+}
+
+@test "phase_graft calls graft_prune_previous_run, then graft_media_sync, then graft_import_attachments, in that order (issue #36 — the fix IS this ordering)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  touch "${run_dir}/backup.complete"
+  cat > "${run_dir}/manifest.json" <<'MANIFESTEOF'
+{"migrate":{"core-wp":{"post_types":["page","attachment"],"option_keys":[]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}
+MANIFESTEOF
+
+  _issue36_stub_everything_but_ordering
+
+  # SITEGRAFT_DRY_RUN=1 for the same reason the issue #16 ordering test
+  # above uses it: the export step's "did graft_export_wxr actually produce
+  # an .xml file" check (unrelated to what this test is about) is skipped
+  # rather than failing against the stubbed no-op graft_export_wxr. It has
+  # no bearing on the ordering under test: every function this test cares
+  # about is stubbed to unconditionally echo, dry-run or not.
+  SITEGRAFT_DRY_RUN=1
+  run phase_graft --profile demo --run "$run_dir" --dry-run
+  [ "$status" -eq 0 ]
+
+  local prune_line=-1 media_sync_line=-1 import_attachments_line=-1 i
+  for i in "${!lines[@]}"; do
+    case "${lines[$i]}" in
+      "ORDER: prune") prune_line=$i ;;
+      "ORDER: media_sync") media_sync_line=$i ;;
+      "ORDER: import_attachments") import_attachments_line=$i ;;
+    esac
+  done
+  [ "$prune_line" -ge 0 ]
+  [ "$media_sync_line" -ge 0 ]
+  [ "$import_attachments_line" -ge 0 ]
+  [ "$prune_line" -lt "$media_sync_line" ]
+  [ "$media_sync_line" -lt "$import_attachments_line" ]
+}
