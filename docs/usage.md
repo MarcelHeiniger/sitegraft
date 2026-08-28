@@ -420,14 +420,22 @@ gets there depends on the target:
 `restore.sh` **refuses to restore at all**, and says why, if any of these hold: the
 manifest is missing, empty, unreadable, or reads back as no entries; the manifest's
 entry count disagrees with the archive's; either listing contains anything that is
-not a plain relative path inside `wp-content`; B's listing comes back empty; or a
-path the archive contains is still not present on B after the extraction. That last
-one is how a filename that exists under two different Unicode normalizations (an
-accented name can be encoded either way, and paths are compared as bytes) is caught
-instead of being mistaken for a file added since the backup: the script names the
-paths and stops. It never quietly falls back to overwriting-without-deleting, and it
-never deletes on a guess. An old run directory taken before manifests existed
-therefore needs a fresh `backup`.
+not a plain relative path inside `wp-content`; B's listing comes back empty; a
+path the archive contains is still not present on B after the extraction; or a
+directory the backup's archive holds (as a real directory — a directory that was
+*already* a symlink when the backup was taken is unaffected) currently exists on B
+as a symlink instead. That second-to-last one is how a filename that exists under
+two different Unicode normalizations (an accented name can be encoded either way,
+and paths are compared as bytes) is caught instead of being mistaken for a file
+added since the backup. The last one exists because extracting the archive on top
+of a symlinked directory could put files outside `wp-content` entirely — sitegraft
+names the link and stops rather than write through it. In every one of these
+cases the script names the paths and stops; it never quietly falls back to
+overwriting-without-deleting, and it never deletes on a guess. An old run
+directory taken before manifests existed therefore needs a fresh `backup`. For the
+symlink case specifically: replace the symlink with a real directory (moving
+whatever it points to back under `wp-content` first, if that is genuinely where it
+belongs) and re-run `restore`, or apply this backup by hand outside sitegraft.
 
 `--dry-run` is a real preview here, not a printed command line: it runs
 `restore.sh --dry-run`, which reads B, lists every path it would remove, and writes
