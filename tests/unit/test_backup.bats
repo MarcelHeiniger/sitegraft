@@ -635,6 +635,89 @@ _manifest_fixture() {
   [ -d "$BATS_TEST_TMPDIR/outside" ]
 }
 
+# --- issue #35: refuse to extract THROUGH a symlinked wp-content entry ------
+# The sibling of the test immediately above, and the other half of the same
+# operation: that test is about the PRUNE side (rm -rf on an added symlink
+# removes the link, never its target — already safe via find's own default
+# -P). This is about the EXTRACT side, which had no equivalent guard: if a
+# path this backup's archive covers (e.g. "themes", standing in for the real
+# report's "uploads") is a symlink on B instead of a real directory, writing
+# the archive on top of it can land files at the symlink's target instead of
+# inside wp-content.
+#
+# Measured (not assumed) before writing this guard: with the exact command
+# shape backup_generate_restore_script bakes (`tar czf - -C src . | tar xzf -
+# -C dst`, both ends creating archives the normal recursive way — never
+# `--no-recursion`), a real target's directory entry for the symlinked name
+# makes both GNU tar 1.35 and macOS's bsdtar 3.5.3 replace the destination
+# symlink with a real directory rather than follow it — this specific
+# scenario, alone, would already come back clean without any new guard on
+# those two tar builds. It stops being clean the moment the archive has no
+# explicit directory entry for that name and only reaches it through a
+# deeper file entry (reproduced live with a --no-recursion, files-only
+# archive: the file landed outside the destination tree, through the
+# symlink, unchanged by either tar). Sitegraft's own archives are always
+# built by a plain recursive `tar c` over a real pulled-down directory tree,
+# so today's local tars do not reproduce the write-through on THIS backup
+# shape — but the generated script runs on a target whose tar flavour and
+# version are unknown (see backup_generate_restore_script's own comment on
+# why no flag can be relied on), so the fix does not lean on that being true
+# elsewhere. It detects the unsafe target state before extracting, the same
+# "read, decide, refuse" shape the manifest checks above already use, rather
+# than trusting whichever tar happens to be on PATH.
+@test "the generated wrapped-local restore.sh refuses to extract through a symlinked wp-content entry, naming it" {
+  _wrapped_fixture
+  rm -rf "${B_ROOT}/wp-content/themes"
+  mkdir -p "$BATS_TEST_TMPDIR/outside-themes"
+  printf 'should never appear\n' > "$BATS_TEST_TMPDIR/outside-themes/leak.txt"
+  ln -s "$BATS_TEST_TMPDIR/outside-themes" "${B_ROOT}/wp-content/themes"
+
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -eq 1 ]
+  # names the link
+  [[ "$output" == *"${B_ROOT}/wp-content/themes"* ]] || false
+  # the symlink itself is untouched -- refused, not "fixed" by deleting it
+  [ -L "${B_ROOT}/wp-content/themes" ]
+  # nothing from the archive landed through it
+  [ ! -e "$BATS_TEST_TMPDIR/outside-themes/style.css" ]
+  [ ! -d "$BATS_TEST_TMPDIR/outside-themes/t" ]
+  [ "$(ls "$BATS_TEST_TMPDIR/outside-themes")" = "leak.txt" ]
+  # nothing else ran either -- refused before the first byte was written
+  [[ "$output" != *"stub wp ran"* ]] || false
+  [ ! -e "${B_ROOT}/wp-content/index.php.sitegraft-tmp" ]
+}
+
+# The check runs during the preflight pass, which also drives --dry-run's
+# preview -- a preview must not stay silent about a restore that would in
+# fact be refused.
+@test "the generated wrapped-local restore.sh --dry-run also refuses (and reports) a symlinked wp-content entry" {
+  _wrapped_fixture
+  rm -rf "${B_ROOT}/wp-content/themes"
+  mkdir -p "$BATS_TEST_TMPDIR/outside-themes-dry"
+  ln -s "$BATS_TEST_TMPDIR/outside-themes-dry" "${B_ROOT}/wp-content/themes"
+
+  run "${RUN_DIR}/restore.sh" --dry-run
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"${B_ROOT}/wp-content/themes"* ]] || false
+  [ -L "${B_ROOT}/wp-content/themes" ]
+  [ -z "$(ls -A "$BATS_TEST_TMPDIR/outside-themes-dry")" ]
+}
+
+# Discrimination, not just detection: a symlink on B that this backup's
+# archive never covers is inert (tar has no entry by that name to extract),
+# and must not block an otherwise-ordinary restore. Without this, the guard
+# above would not be proof it distinguishes the real hazard from an unrelated
+# symlink -- it would just be refusing on sight of any symlink anywhere.
+@test "the generated wrapped-local restore.sh does NOT refuse for a symlink the archive never covers" {
+  _wrapped_fixture
+  mkdir -p "$BATS_TEST_TMPDIR/unrelated-target"
+  ln -s "$BATS_TEST_TMPDIR/unrelated-target" "${B_ROOT}/wp-content/not-in-the-backup"
+
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -eq 0 ]
+  [ "$(cat "${B_ROOT}/wp-content/themes/t/style.css")" = "original" ]
+}
+
 # --- --dry-run on the path that deletes ---
 
 @test "the generated wrapped-local restore.sh --dry-run lists what it would remove and removes NOTHING" {

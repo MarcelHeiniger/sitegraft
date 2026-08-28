@@ -498,6 +498,7 @@ backup_generate_restore_script() {
   # Defined for every branch so the generated script has one uniform shape;
   # only the manifest branch ever calls them.
   prune_helpers="_sg_list_live() { echo 'internal error: this restore.sh does not use a wp-content manifest' >&2; return 1; }
+_sg_list_live_symlinks() { echo 'internal error: this restore.sh does not use a wp-content manifest' >&2; return 1; }
 _sg_delete_from_stdin() { echo 'internal error: this restore.sh does not use a wp-content manifest' >&2; return 1; }"
 
   # Decorative only (see backup_wp_cmd_literal's own comment) — if it can't
@@ -556,7 +557,14 @@ _sg_delete_from_stdin() { echo 'internal error: this restore.sh does not use a w
       # neither be split nor re-expanded by any shell the wrapper puts in
       # between (several do — see _backup_local_exec_prefix's own comment on
       # `--raw`).
+      # issue #35: _sg_list_live_symlinks is the extract-half counterpart of
+      # _sg_list_live above — same wrapper, same `find`'s own default -P (never
+      # follows a symlink it traverses through), restricted to `-type l` so
+      # _sg_assert_no_symlink_targets (below) can check which of THIS backup's
+      # own directory paths currently exist on B as a symlink rather than a
+      # real directory, before the extraction that would write through one.
       prune_helpers="_sg_list_live() { ${prefix} find $(sq "${SITE_B_WP_PATH}/wp-content") -mindepth 1 -print0; }
+_sg_list_live_symlinks() { ${prefix} find $(sq "${SITE_B_WP_PATH}/wp-content") -mindepth 1 -type l -print0; }
 _sg_delete_from_stdin() { ${prefix} xargs -0 rm -rf --; }"
       log_info "B is a wrapped-local site (SITE_B_WP_CMD implies a wrapper, e.g. DDEV) — the generated restore.sh restores wp-content to exactly what this backup contains: it extracts the backup's archive in place and then removes the paths wp-content holds that the archive does not, recomputed after the extraction. It never removes wp-content itself (a container sync can make that fail with 'Device or resource busy'), and it refuses to remove anything at all — rather than silently downgrading to overwrite-only — if this backup's manifest is missing, empty, unreadable, reads back as no entries, disagrees with the archive's entry count, or if any listed path is unsafe or is still missing from B after the extraction."
       # MAJOR bug found by review (Viktor), confirmed live: `${SITE_B_WP_CMD}`
@@ -858,6 +866,79 @@ _sg_load_keep_sets() {
   # Union of the two, used ONLY to keep the pre-extraction preview honest — see
   # _sg_prune_preflight.
   LC_ALL=C sort -u "$SG_TMP/archive.txt" "$SG_TMP/manifest.txt" > "$SG_TMP/accounted.sorted"
+
+  # issue #35: which of the archive's own paths are DIRECTORIES specifically —
+  # a symlink standing in for one of these, on B, is the shape that lets
+  # extraction write outside wp-content (see _sg_assert_no_symlink_targets,
+  # below, and _sg_list_live_symlinks in this script's header). Filtered from
+  # archive.txt (already validated as safe relative paths above) rather than a
+  # second `find -type d`, so this can never disagree with it. WP_CONTENT_DIR
+  # is the pulled-down archive sitting on THIS machine's own filesystem —
+  # never behind a wrapper — so a plain `[ -d ]` is enough, no ${prefix}.
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    if [ -d "${WP_CONTENT_DIR}/${rel#./}" ]; then
+      printf '%s\n' "$rel"
+    fi
+  done < "$SG_TMP/archive.txt" > "$SG_TMP/archive-dirs.txt"
+  LC_ALL=C sort "$SG_TMP/archive-dirs.txt" > "$SG_TMP/archive-dirs.sorted"
+}
+
+# _sg_assert_no_symlink_targets — issue #35. Called from _sg_prune_preflight,
+# strictly BEFORE the extraction that would otherwise write through one.
+#
+# GNU tar has no portable flag to refuse this on extract, and this script runs
+# on the TARGET machine, where neither the tar variant nor its version is
+# known — so this detects rather than leaning on any particular tar's own
+# protective behavior. Same shape as every other check in this script: read
+# both sides, decide, refuse, never guess.
+#
+# Measured, not assumed: this backup's archive is always a plain, ordinary
+# recursive filesystem tree pulled from B (see archive-dirs.sorted, built
+# above, and its own directory-vs-file distinction). Given a real directory
+# entry at the destination path, a modern GNU tar (1.35) and macOS's
+# bsdtar (3.5.3) replace a destination symlink with a real directory rather
+# than follow it — reproduced live, on this exact `tar czf - | tar xzf -`
+# pipeline shape, before this guard existed. The write-through only
+# reproduced, on the same two tars, for an archive built WITHOUT recursion
+# (file entries with no directory entry for their parent) — not this tool's
+# archive shape. This guard exists anyway, because "not reproduced on two
+# tars checked today" is not the same claim as "impossible on whatever tar
+# the target has" — exactly the distinction this script's own doc comment
+# above warns against relying on.
+#
+# The set checked is deliberately narrow: only paths this backup's OWN
+# archive holds as a directory (archive-dirs.sorted). A symlink elsewhere in
+# wp-content that this backup never touches is inert — there is no archive
+# entry by that name for tar to extract through it — and refusing over it
+# would be alarming and wrong, not safe.
+_sg_assert_no_symlink_targets() {
+  local abs rel
+  if ! _sg_list_live_symlinks > "$SG_TMP/live-symlinks.raw"; then
+    _sg_die "refusing to restore: could not check B's current wp-content (${B_WP_CONTENT_ROOT}) for symlinks before extracting this backup's archive on top of it"
+  fi
+  while IFS= read -r -d '' abs; do
+    [ -n "$abs" ] || continue
+    case "$abs" in
+      "${B_WP_CONTENT_ROOT}/"?*) ;;
+      *) _sg_die "refusing to restore: listing B's wp-content for symlinks returned a path outside ${B_WP_CONTENT_ROOT} ([${abs}])" ;;
+    esac
+    rel=".${abs#"${B_WP_CONTENT_ROOT}"}"
+    _sg_check_rel "$rel" || _sg_die "refusing to restore: listing B's wp-content for symlinks returned an unsafe path ([${abs}]) — it is not a plain relative path under wp-content, or it carries a '..' component, or its name contains a newline."
+    printf '%s\n' "$rel"
+  done < "$SG_TMP/live-symlinks.raw" > "$SG_TMP/live-symlinks.txt"
+  [ -s "$SG_TMP/live-symlinks.txt" ] || return 0
+  LC_ALL=C sort "$SG_TMP/live-symlinks.txt" > "$SG_TMP/live-symlinks.sorted"
+  LC_ALL=C comm -12 "$SG_TMP/archive-dirs.sorted" "$SG_TMP/live-symlinks.sorted" > "$SG_TMP/symlink-collision.txt"
+  [ -s "$SG_TMP/symlink-collision.txt" ] || return 0
+  {
+    echo "refusing to restore: B's wp-content (${B_WP_CONTENT_ROOT}) has the following path(s) as a SYMLINK where this backup's archive holds a real directory. Extracting on top of a symlinked directory can write files outside the directory this restore is scoped to (a symlinked wp-content/uploads pointing at a separate volume, an NFS mount, or a CDN-synced directory is a common real-world shape of exactly this). sitegraft does not support restoring onto a symlinked wp-content entry — nothing was written. Replace the symlink with a real directory (moving its target's contents back under wp-content first, if that is where they actually live) and re-run, or restore this backup somewhere else and reconcile the files by hand."
+    while IFS= read -r rel; do
+      [ -n "$rel" ] || continue
+      printf '  %s\n' "${B_WP_CONTENT_ROOT}/${rel#./}"
+    done < "$SG_TMP/symlink-collision.txt"
+  } >&2
+  exit 1
 }
 
 _sg_prune_preflight() {
@@ -868,6 +949,10 @@ _sg_prune_preflight() {
   [ -s "$WP_CONTENT_MANIFEST" ] || _sg_die "refusing to restore: the wp-content manifest ${WP_CONTENT_MANIFEST} is empty. An empty manifest cannot certify that this backup's archive is complete, and an incomplete archive restored as an exact state deletes files that were never additions. The backup is incomplete."
   SG_TMP=$(mktemp -d) || _sg_die "refusing to restore: could not create a temporary directory"
   _sg_load_keep_sets
+  # issue #35: before anything on B is even LISTED for removal, refuse if
+  # extracting this backup's archive would write through a symlink standing
+  # in for one of the archive's own directories.
+  _sg_assert_no_symlink_targets
   _sg_scan_prune
 
   # The preview is deliberately WIDER than the keep-set: a path is only
