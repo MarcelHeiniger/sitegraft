@@ -1,3 +1,5 @@
+bats_require_minimum_version 1.5.0
+
 # tests/unit/test_verify.bats — phase: verify (design doc §6.5, review finding
 # B3). Read-only smoke checks on B after a graft: recomputed protected-data
 # checksums (same normalization as backup — finding A5), migrated-option
@@ -867,6 +869,441 @@ setup() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"ID_REFS:0:0"* ]] || false
 }
+
+# --- verify_component_prop_references_resolve (issue #86) --------------------
+#
+# An Etch component prop with an operator-chosen name (e.g. "bild") carries
+# an id at a CALL site's own attribute
+# (`wp:etch/component {"ref":R,"attributes":{"bild":"35253"}}`) whose
+# meaning only the REFERENCED component's own body knows
+# ("mediaId":"{props.bild}"). verify_id_references_resolve's fixed-key scan
+# above can never find "bild" -- this is the guard that closes it, ONE
+# `wp_remote` call (a single `wp eval`, not two), stubbed on that single
+# distinguishing shape.
+
+@test "verify_component_prop_references_resolve is a no-op (no wp_remote call at all) when id-map.tsv does not exist" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  run verify_component_prop_references_resolve "$run_dir" "${run_dir}/id-map.tsv"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"COMPONENT_PROP_REFS:0:0"* ]] || false
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
+@test "verify_component_prop_references_resolve is a no-op when the run migrated no wp_block at all (no component could ever declare an id-bearing prop)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '5\t105\tpage\n900\t901\tattachment\n' > "$tsv"
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  run verify_component_prop_references_resolve "$run_dir" "$tsv"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"COMPONENT_PROP_REFS:0:0"* ]] || false
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
+@test "verify_component_prop_references_resolve is a no-op when the run migrated wp_block components but nothing else could call them" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  # A wp_block row is present, but attachment/term rows only otherwise --
+  # no post left for a call site to live inside.
+  printf '37496\t40000\twp_block\n900\t901\tattachment\n' > "$tsv"
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  run verify_component_prop_references_resolve "$run_dir" "$tsv"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"COMPONENT_PROP_REFS:0:0"* ]] || false
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
+@test "verify_component_prop_references_resolve passes when a component prop's id, discovered from the component's own body, resolves on B (bild -> mediaId, the shape issue #86 reports)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t105\tpage\n37496\t40000\twp_block\n' > "$tsv"
+  wp_remote() {
+    shift
+    case "$1" in
+      eval) printf 'CHK:888:1\nPAIR:105:888:bild\n' ;;
+      *) echo "UNEXPECTED CALL: $*" >&2; return 1 ;;
+    esac
+  }
+  run verify_component_prop_references_resolve "$run_dir" "$tsv"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"COMPONENT_PROP_REFS:1:0"* ]] || false
+}
+
+@test "verify_component_prop_references_resolve fails when a component prop's id does not resolve to any post on B (issue #86's own defect, reproduced)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t105\tpage\n37496\t40000\twp_block\n' > "$tsv"
+  wp_remote() {
+    shift
+    case "$1" in
+      eval) printf 'CHK:888:0\nPAIR:105:888:bild\n' ;;
+      *) echo "UNEXPECTED CALL: $*" >&2; return 1 ;;
+    esac
+  }
+  run --separate-stderr verify_component_prop_references_resolve "$run_dir" "$tsv"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"COMPONENT_PROP_REFS:1:1"* ]] || false
+  [[ "$stderr" == *"888"* ]] || false
+  [[ "$stderr" == *"105(bild)"* ]] || false
+}
+
+@test "verify_component_prop_references_resolve passes with 0 references when the eval reports NONE (no component declares an id-bearing prop, or no call site supplies a literal digit for one)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t105\tpage\n37496\t40000\twp_block\n' > "$tsv"
+  wp_remote() {
+    shift
+    case "$1" in
+      eval) echo "NONE" ;;
+      *) echo "UNEXPECTED CALL: $*" >&2; return 1 ;;
+    esac
+  }
+  run verify_component_prop_references_resolve "$run_dir" "$tsv"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"COMPONENT_PROP_REFS:0:0"* ]] || false
+}
+
+@test "verify_component_prop_references_resolve treats a failed eval as UNKNOWN, never as a silent pass" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t105\tpage\n37496\t40000\twp_block\n' > "$tsv"
+  wp_remote() { return 1; } # B unreachable / query error
+  run verify_component_prop_references_resolve "$run_dir" "$tsv"
+  [ "$status" -eq 1 ]
+}
+
+@test "verify_component_prop_references_resolve excludes attachment and term: rows from the citing scope, same as the fixed-key guard" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t105\tpage\n37496\t40000\twp_block\n900\t901\tattachment\n3\t14\tterm:category\n' > "$tsv"
+  wp_remote() {
+    shift
+    case "$1" in
+      eval)
+        # Asserted indirectly, same convention as the fixed-key guard's own
+        # equivalent test: the citing_ids passed to `wp eval` are embedded
+        # in the PHP source captured on stdin by run_or_echo-free direct
+        # invocation here, so a leaked 901/14 would show up in the source
+        # text this stub can inspect via $2.
+        if printf '%s' "$2" | grep -q '901\|"14"'; then
+          echo "attachment or term id leaked into citing scope" >&2
+          return 1
+        fi
+        echo "NONE"
+        ;;
+      *) echo "UNEXPECTED CALL: $*" >&2; return 1 ;;
+    esac
+  }
+  run verify_component_prop_references_resolve "$run_dir" "$tsv"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"COMPONENT_PROP_REFS:0:0"* ]] || false
+}
+
+# _verify_component_prop_run_captured_php <capture_var> -- runs the REAL PHP
+# text verify_component_prop_references_resolve hands to `wp eval` (captured
+# verbatim, never a hand-copied re-implementation of the discovery/scan
+# logic) against a minimal WordPress stub. Mirrors modules/etch.sh's own
+# test-harness discipline (tests/unit/test_etch_module.bats'
+# _etch_run_captured_php_multi) for the identical reason: this mechanism
+# must prove it discriminates for real, not merely that its bash half wires
+# up the right ids.
+_verify_component_prop_run_captured_php() {
+  php -r '
+    $capture_file = $argv[1];
+    $store = array();
+    for ( $i = 2; $i < count( $argv ); $i += 2 ) {
+      $store[ (int) $argv[ $i ] ] = $argv[ $i + 1 ];
+    }
+    function get_post_field( $field, $id ) {
+      global $store;
+      return ( $field === "post_content" && array_key_exists( (int) $id, $store ) ) ? $store[ (int) $id ] : "";
+    }
+    function get_post( $id ) {
+      global $store;
+      return array_key_exists( (int) $id, $store ) ? (object) array( "ID" => (int) $id ) : null;
+    }
+    eval( file_get_contents( $capture_file ) );
+  ' -- "$@"
+}
+
+@test "verify_component_prop_references_resolve: captured PHP execution-proof -- discovers bild via mediaId, reports it, and never mentions a non-id-bearing prop on the same call" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t105\tpage\n37496\t40000\twp_block\n' > "$tsv"
+  local capture="$BATS_TEST_TMPDIR/php.txt"
+  wp_remote() { shift; case "$1" in eval) printf '%s' "$2" > "$capture" ;; esac; }
+  verify_component_prop_references_resolve "$run_dir" "$tsv" >/dev/null 2>&1 || true
+  [ -s "$capture" ]
+  # 888 (the attachment "bild" resolves to) is registered with EMPTY
+  # content, same as any real attachment post — get_post_field is never
+  # asked about it (888 is never a citing id), only get_post's existence
+  # check is, which this stub answers from the same $store by key
+  # presence alone, content aside.
+  run _verify_component_prop_run_captured_php "$capture" \
+    105 '<!-- wp:etch/component {"ref":40000,"attributes":{"titre":"9","bild":"888"}} -->' \
+    40000 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.bild}"}} --><!-- wp:etch/text {"content":"{props.titre}"} /-->' \
+    888 ''
+  [[ "$output" == *"CHK:888:1"* ]] || false
+  [[ "$output" == *"PAIR:105:888:bild"* ]] || false
+  [[ "$output" != *":9:"* ]] || false
+  [[ "$output" != *"titre"* ]] || false
+}
+
+@test "verify_component_prop_references_resolve: captured PHP execution-proof -- reports a component prop's id as missing when it does not resolve on B" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t105\tpage\n37496\t40000\twp_block\n' > "$tsv"
+  local capture="$BATS_TEST_TMPDIR/php.txt"
+  wp_remote() { shift; case "$1" in eval) printf '%s' "$2" > "$capture" ;; esac; }
+  verify_component_prop_references_resolve "$run_dir" "$tsv" >/dev/null 2>&1 || true
+  [ -s "$capture" ]
+  run _verify_component_prop_run_captured_php "$capture" \
+    105 '<!-- wp:etch/component {"ref":40000,"attributes":{"bild":"35253"}} -->' \
+    40000 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.bild}"}} -->'
+  [[ "$output" == *"CHK:35253:0"* ]] || false
+  [[ "$output" == *"PAIR:105:35253:bild"* ]] || false
+}
+
+@test "verify_component_prop_references_resolve: captured PHP execution-proof -- a pass-through value ({props.X}) at a call site is never mistaken for a literal id" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t200\tpage\n7\t40000\twp_block\n' > "$tsv"
+  local capture="$BATS_TEST_TMPDIR/php.txt"
+  wp_remote() { shift; case "$1" in eval) printf '%s' "$2" > "$capture" ;; esac; }
+  verify_component_prop_references_resolve "$run_dir" "$tsv" >/dev/null 2>&1 || true
+  [ -s "$capture" ]
+  run _verify_component_prop_run_captured_php "$capture" \
+    200 '<!-- wp:etch/component {"ref":40000,"attributes":{"bild":"{props.outerBild}"}} -->' \
+    40000 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.bild}"}} -->'
+  # "NONE" is the captured PHP's own explicit "nothing to check" marker
+  # (the same one verify_component_prop_references_resolve's bash half
+  # treats as COMPONENT_PROP_REFS:0:0) -- never a CHK/PAIR line, and
+  # never the literal placeholder text either.
+  [ "$output" = "NONE" ]
+  [[ "$output" != *"outerBild"* ]] || false
+}
+
+# --- issue #86 fix-pack (Viktor's review of PR #87): the READ-side
+# consequences of the same three blockers modules/etch.sh's own fix-pack
+# closes on the write side (see that file's header comment for the full
+# mechanism this duplicates), plus NIT 5 (INCOMPLETE on nested
+# composition) and NIT 6 (the digit regex's trailing-newline gap).
+
+@test "verify_component_prop_references_resolve: captured PHP execution-proof -- BLOCKER 1/3, a call site whose JSON only LOOKS unbalanced (a literal brace inside a string) still parses and remaps correctly, scoped to attributes only" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t105\tpage\n7\t40000\twp_block\n' > "$tsv"
+  local capture="$BATS_TEST_TMPDIR/php.txt"
+  wp_remote() { shift; case "$1" in eval) printf '%s' "$2" > "$capture" ;; esac; }
+  verify_component_prop_references_resolve "$run_dir" "$tsv" >/dev/null 2>&1 || true
+  [ -s "$capture" ]
+  run _verify_component_prop_run_captured_php "$capture" \
+    105 '<!-- wp:etch/component {"ref":40000,"attributes":{"t":"start { here","bild":"888"}},"metadata":{"bindings":{"bild":"999999"}}} -->' \
+    40000 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.bild}"}} -->' \
+    888 ''
+  [[ "$output" == *"CHK:888:1"* ]] || false
+  [[ "$output" == *"PAIR:105:888:bild"* ]] || false
+  # the metadata.bindings mirror (999999) was never discovered as a
+  # reference at all -- scoped strictly to the attributes span.
+  [[ "$output" != *"999999"* ]] || false
+}
+
+@test "verify_component_prop_references_resolve: captured PHP execution-proof -- BLOCKER 1, a genuinely malformed call site emits a MALFORMED marker rather than hanging or reading as zero references" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t105\tpage\n7\t40000\twp_block\n' > "$tsv"
+  local capture="$BATS_TEST_TMPDIR/php.txt"
+  wp_remote() { shift; case "$1" in eval) printf '%s' "$2" > "$capture" ;; esac; }
+  verify_component_prop_references_resolve "$run_dir" "$tsv" >/dev/null 2>&1 || true
+  [ -s "$capture" ]
+  run _verify_component_prop_run_captured_php "$capture" \
+    105 '<!-- wp:etch/component {"ref":40000,"attributes":{"bild":"35253" -->' \
+    40000 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.bild}"}} -->'
+  [[ "$output" == *"MALFORMED:105"* ]] || false
+  [[ "$output" != *"NONE"* ]] || false
+}
+
+@test "verify_component_prop_references_resolve: MALFORMED from the eval hard-fails the guard (bash half), never reads as a silent pass" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t105\tpage\n37496\t40000\twp_block\n' > "$tsv"
+  wp_remote() {
+    shift
+    case "$1" in
+      eval) printf 'MALFORMED:105\n' ;;
+      *) echo "UNEXPECTED CALL: $*" >&2; return 1 ;;
+    esac
+  }
+  run --separate-stderr verify_component_prop_references_resolve "$run_dir" "$tsv"
+  [ "$status" -eq 1 ]
+  [[ "$stderr" == *"105"* ]] || false
+  [[ "$stderr" == *"balanced JSON"* ]] || false
+}
+
+@test "verify_component_prop_references_resolve: NIT 5 -- NESTED from the eval reports INCOMPLETE (rc 2), never a silent pass, when component composition is detected" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t105\tpage\n37496\t40000\twp_block\n' > "$tsv"
+  wp_remote() {
+    shift
+    case "$1" in
+      eval) printf 'NESTED:40000\n' ;;
+      *) echo "UNEXPECTED CALL: $*" >&2; return 1 ;;
+    esac
+  }
+  run --separate-stderr verify_component_prop_references_resolve "$run_dir" "$tsv"
+  [ "$status" -eq 2 ]
+  [[ "$stderr" == *"40000"* ]] || false
+  [[ "$stderr" == *"composition"* ]] || false
+}
+
+@test "verify_component_prop_references_resolve: captured PHP execution-proof -- NIT 5, a component whose own body calls another component emits NESTED during discovery, before any citing post is scanned" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t200\tpage\n8\t500\twp_block\n7\t40000\twp_block\n' > "$tsv"
+  local capture="$BATS_TEST_TMPDIR/php.txt"
+  wp_remote() { shift; case "$1" in eval) printf '%s' "$2" > "$capture" ;; esac; }
+  verify_component_prop_references_resolve "$run_dir" "$tsv" >/dev/null 2>&1 || true
+  [ -s "$capture" ]
+  run _verify_component_prop_run_captured_php "$capture" \
+    200 '<!-- wp:etch/component {"ref":500,"attributes":{"outerBild":"77"}} -->' \
+    500 '<!-- wp:etch/component {"ref":40000,"attributes":{"bild":"{props.outerBild}"}} -->' \
+    40000 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.bild}"}} -->'
+  [[ "$output" == *"NESTED:500"* ]] || false
+  [[ "$output" != *"CHK:"* ]] || false
+  [[ "$output" != *"NONE"* ]] || false
+}
+
+@test "verify_component_prop_references_resolve: captured PHP execution-proof -- NIT 6, a bare-digit value with a trailing newline is not read as a plain digit id" {
+  # PCRE's dollar anchor matches before a final newline, not only at the
+  # true end of string -- the old pattern would accept "35253" followed by
+  # a trailing newline as a match, and that newline would then ride along
+  # inside the recorded id, splitting CHK/PAIR onto two lines when echoed
+  # and letting bash's own suffix-based parsing read the id back as
+  # verified-present without ever having checked it. The \z anchor (this
+  # fix) requires the TRUE end of string, so a value carrying a trailing
+  # newline is correctly rejected as "not a plain digit id" -- same as any
+  # other non-numeric string, left untouched.
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t105\tpage\n7\t40000\twp_block\n' > "$tsv"
+  local capture="$BATS_TEST_TMPDIR/php.txt"
+  wp_remote() { shift; case "$1" in eval) printf '%s' "$2" > "$capture" ;; esac; }
+  verify_component_prop_references_resolve "$run_dir" "$tsv" >/dev/null 2>&1 || true
+  [ -s "$capture" ]
+  run _verify_component_prop_run_captured_php "$capture" \
+    105 '<!-- wp:etch/component {"ref":40000,"attributes":{"bild":"35253\n"}} -->' \
+    40000 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.bild}"}} -->'
+  [ "$output" = "NONE" ]
+}
+
+# --- issue #86 SECOND fix-pack (independent review round 2): the block
+# finder's OWN failure modes on the READ side, matching modules/etch.sh's
+# identical fix (the two scanner copies are kept byte-identical -- see
+# this file's own header comment on why they are duplicated at all).
+
+@test "verify_component_prop_references_resolve: captured PHP execution-proof -- SECOND fix-pack BLOCKER A, a span that IS balanced but does not decode as JSON (an unpaired quote) emits MALFORMED, never NONE" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t105\tpage\n7\t40000\twp_block\n' > "$tsv"
+  local capture="$BATS_TEST_TMPDIR/php.txt"
+  wp_remote() { shift; case "$1" in eval) printf '%s' "$2" > "$capture" ;; esac; }
+  verify_component_prop_references_resolve "$run_dir" "$tsv" >/dev/null 2>&1 || true
+  [ -s "$capture" ]
+  run _verify_component_prop_run_captured_php "$capture" \
+    105 '<!-- wp:etch/component {"ref":40000,"attributes":{"t":"a" b" c","bild":"888"}} -->' \
+    40000 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.bild}"}} -->'
+  [[ "$output" == *"MALFORMED:105"* ]] || false
+  [[ "$output" != *"NONE"* ]] || false
+}
+
+@test "verify_component_prop_references_resolve: captured PHP execution-proof -- SECOND fix-pack BLOCKER B, a newline between the block prefix and its JSON is accepted, and a JSON-less component occurrence is not treated as malformed" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t105\tpage\n7\t40000\twp_block\n' > "$tsv"
+  local capture="$BATS_TEST_TMPDIR/php.txt"
+  wp_remote() { shift; case "$1" in eval) printf '%s' "$2" > "$capture" ;; esac; }
+  verify_component_prop_references_resolve "$run_dir" "$tsv" >/dev/null 2>&1 || true
+  [ -s "$capture" ]
+  local page="<!-- wp:etch/component --><!-- wp:etch/component 
+{\"ref\":40000,\"attributes\":{\"bild\":\"888\"}} -->"
+  run _verify_component_prop_run_captured_php "$capture" \
+    105 "$page" \
+    40000 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.bild}"}} -->' \
+    888 ''
+  [[ "$output" != *"MALFORMED"* ]] || false
+  [[ "$output" == *"CHK:888:1"* ]] || false
+  [[ "$output" == *"PAIR:105:888:bild"* ]] || false
+}
+
+# --- issue #86 THIRD fix-pack (independent review, round 3): NIT F -- the
+# MALFORMED-before-NESTED priority the bash half already implemented was
+# unreachable, because the PHP used to return on NESTED before the
+# citing-post loop that builds $malformed ever ran. Citing posts are now
+# always scanned first; NESTED is only echoed (and only after MALFORMED)
+# once that scan is done -- so a site that is BOTH composed AND carrying
+# unparseable content now correctly fails CLOSED instead of settling for
+# the softer INCOMPLETE.
+
+@test "verify_component_prop_references_resolve: captured PHP execution-proof -- NIT F, a site both composed AND carrying a malformed block reports MALFORMED, never NESTED" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t400\tpage\n8\t500\twp_block\n7\t600\twp_block\n' > "$tsv"
+  local capture="$BATS_TEST_TMPDIR/php.txt"
+  wp_remote() { shift; case "$1" in eval) printf '%s' "$2" > "$capture" ;; esac; }
+  verify_component_prop_references_resolve "$run_dir" "$tsv" >/dev/null 2>&1 || true
+  [ -s "$capture" ]
+  # post 400: a truncated (malformed) call site. Component 500's own body
+  # calls component 600 (composition, depth > 1) -- the reviewer's own
+  # exact reproduction shape.
+  run _verify_component_prop_run_captured_php "$capture" \
+    400 '<!-- wp:etch/component {"ref":500,"attributes":{"bild":"888" -->' \
+    500 '<!-- wp:etch/component {"ref":600,"attributes":{}} -->' \
+    600 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.bild}"}} -->'
+  [[ "$output" == *"MALFORMED:400"* ]] || false
+  [[ "$output" != *"NESTED"* ]] || false
+}
+
+@test "verify_component_prop_references_resolve: NIT F -- a MALFORMED marker alongside a NESTED one hard-fails (rc 1), never settles for INCOMPLETE (rc 2)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t400\tpage\n8\t500\twp_block\n' > "$tsv"
+  wp_remote() {
+    shift
+    case "$1" in
+      # A stub standing in for PHP output that includes BOTH markers --
+      # the exact shape the fixed PHP can now actually produce, and the
+      # exact shape the bash half's own priority claim needs to be real.
+      eval) printf 'MALFORMED:400\nNESTED:500\n' ;;
+      *) echo "UNEXPECTED CALL: $*" >&2; return 1 ;;
+    esac
+  }
+  run --separate-stderr verify_component_prop_references_resolve "$run_dir" "$tsv"
+  [ "$status" -eq 1 ]
+  [[ "$stderr" == *"400"* ]] || false
+  [[ "$stderr" == *"balanced JSON"* ]] || false
+}
+@test "verify_component_prop_references_resolve: captured PHP execution-proof -- NIT G, a malformed call site is reported even when NO migrated component declares an id-bearing prop (the components may simply not have landed on B)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t400\tpage\n8\t500\twp_block\n' > "$tsv"
+  local capture="$BATS_TEST_TMPDIR/php.txt"
+  wp_remote() { shift; case "$1" in eval) printf '%s' "$2" > "$capture" ;; esac; }
+  verify_component_prop_references_resolve "$run_dir" "$tsv" >/dev/null 2>&1 || true
+  [ -s "$capture" ]
+  # Component 500 comes back EMPTY -- on a real site that is what a
+  # component which never landed on B looks like, so $component_prop_map
+  # ends up empty. Post 400 carries a truncated call site. Before the NIT F
+  # reordering the empty-map short-circuit sat ABOVE the citing loop and
+  # printed a green "0 found to check" over exactly that failure.
+  run _verify_component_prop_run_captured_php "$capture" \
+    400 '<!-- wp:etch/component {"ref":500,"attributes":{"bild":"888" -->' \
+    500 ''
+  [[ "$output" == *"MALFORMED:400"* ]] || false
+  [[ "$output" != *"NONE"* ]] || false
+}
+
 # --- verify_http_smoke --------------------------------------------------------
 
 @test "verify_http_smoke is a no-op (passes) when no URL is configured" {
@@ -2685,6 +3122,116 @@ EOF
   # HOW MANY references were checked and HOW MANY were missing without
   # scrolling up to the raw log_error line.
   grep "HARD FAIL" "${RUN_DIR}/verify-report.md" | grep -qi "1 checked, 1 missing"
+}
+
+# --- phase_verify + verify_component_prop_references_resolve (issue #86,
+# end-to-end): the actual real-site defect report #86 is about -- a
+# component prop with an operator-chosen name ("bild") carries an id that
+# verify_id_references_resolve's own fixed-key scan cannot see, wired all
+# the way into phase_verify's report and its exit status. Two DIFFERENT
+# `eval` calls happen in this run (verify_id_references_resolve's own
+# "ref":40000 existence check -- "ref" is one of ITS three known keys and
+# the call site genuinely has a literal one -- and this guard's own
+# component-prop eval), distinguished in the stub by inspecting the PHP
+# payload for "component_ids", the marker unique to this guard's own
+# generated source.
+
+@test "phase_verify's component-prop line reports a real count and stays a PASS when the discovered prop's id resolves (issue #86)" {
+  setup_phase_verify_fixture
+  printf '5\t105\tpage\n9\t37468\tpage\n37496\t40000\twp_block\n' > "${RUN_DIR}/id-map.tsv"
+  wp_remote() {
+    local alias_lc="$1"; shift
+    for a in "$@"; do
+      case "$a" in
+        --fields=ID,post_content)
+          echo '[{"ID":37468,"post_content":"<!-- wp:etch/component {\"ref\":40000,\"attributes\":{\"bild\":\"888\"}} --><!-- /wp:etch/component -->"},{"ID":40000,"post_content":"<!-- wp:etch/dynamic-image {\"attributes\":{\"mediaId\":\"{props.bild}\"}} -->"}]'
+          return 0
+          ;;
+        eval)
+          if printf '%s' "$2" | grep -q 'component_ids'; then
+            printf 'CHK:888:1\nPAIR:37468:888:bild\n'
+          else
+            printf '40000\n' # verify_id_references_resolve's own "ref" existence check
+          fi
+          return 0
+          ;;
+      esac
+    done
+    case "$1" in
+      db) echo "" ;; option) echo "105" ;; post) return 0 ;; *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  grep -qF -- "- [x] component-prop id references (issue #86) in migrated content resolve on B (1 checked, 0 missing)" "${RUN_DIR}/verify-report.md"
+}
+
+@test "phase_verify HARD FAILS when a component prop's id (e.g. \"bild\") does not resolve to any post on B (issue #86's own defect, reproduced end-to-end)" {
+  setup_phase_verify_fixture
+  printf '5\t105\tpage\n9\t37468\tpage\n37496\t40000\twp_block\n' > "${RUN_DIR}/id-map.tsv"
+  wp_remote() {
+    local alias_lc="$1"; shift
+    for a in "$@"; do
+      case "$a" in
+        --fields=ID,post_content)
+          echo '[{"ID":37468,"post_content":"<!-- wp:etch/component {\"ref\":40000,\"attributes\":{\"bild\":\"35253\"}} --><!-- /wp:etch/component -->"},{"ID":40000,"post_content":"<!-- wp:etch/dynamic-image {\"attributes\":{\"mediaId\":\"{props.bild}\"}} -->"}]'
+          return 0
+          ;;
+        eval)
+          if printf '%s' "$2" | grep -q 'component_ids'; then
+            printf 'CHK:35253:0\nPAIR:37468:35253:bild\n' # never remapped -- A's raw attachment id, still on B
+          else
+            printf '40000\n'
+          fi
+          return 0
+          ;;
+      esac
+    done
+    case "$1" in
+      db) echo "" ;; option) echo "105" ;; post) return 0 ;; *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 1 ]
+  grep -q "Result: HARD FAIL" "${RUN_DIR}/verify-report.md"
+  grep "HARD FAIL" "${RUN_DIR}/verify-report.md" | grep -qi "component prop"
+  grep "HARD FAIL" "${RUN_DIR}/verify-report.md" | grep -qi "1 checked, 1 missing"
+}
+
+@test "phase_verify's Result is INCOMPLETE, not a silent PASS, when a migrated component's own body calls another component (NIT 5, Viktor's review of PR #87)" {
+  setup_phase_verify_fixture
+  printf '5\t105\tpage\n9\t37468\tpage\n37496\t40000\twp_block\n' > "${RUN_DIR}/id-map.tsv"
+  wp_remote() {
+    local alias_lc="$1"; shift
+    for a in "$@"; do
+      case "$a" in
+        --fields=ID,post_content)
+          echo '[]'
+          return 0
+          ;;
+        eval)
+          if printf '%s' "$2" | grep -q 'component_ids'; then
+            printf 'NESTED:40000\n'
+          else
+            printf ''
+          fi
+          return 0
+          ;;
+      esac
+    done
+    case "$1" in
+      db) echo "" ;; option) echo "105" ;; post) return 0 ;; *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -ne 0 ]
+  grep -q "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md"
+  grep -qi "component composition" "${RUN_DIR}/verify-report.md"
+  # never claimed as a pass -- the exact regression NIT 5 closes.
+  ! grep -qF -- "[x] component-prop id references" "${RUN_DIR}/verify-report.md"
 }
 
 # --- phase_verify + content guards (issue #52, end-to-end) ------------------

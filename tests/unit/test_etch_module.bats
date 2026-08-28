@@ -545,25 +545,30 @@ _etch_run_captured_php() {
   [[ "$output" == *'"mediaId":"173" and "mediaId":"200"'* ]] || false
 }
 
-@test "etch_post_import mediaId remap: leaves a component prop with an operator-chosen name (e.g. \"bild\") untouched -- known, documented gap" {
-  # The dynamic-expression form, mediaId: {props.bild}, never carries a
-  # literal id at THIS call site at all -- the real id lives one post away,
-  # under whatever custom name the component author chose ("bild" on the
-  # real site this issue was measured against). No fixed-key scan can find
-  # it; this test pins that this is a deliberate, known limit, not
-  # something silently and accidentally working. The "ref" in the same
-  # block DOES have a mapping here, so the content genuinely changes --
-  # proving the hook actually ran over this post, rather than the
-  # "nothing changed at all" case a missing mapping would also produce.
+# Issue #86 CLOSES the gap the test above this section used to pin (see git
+# history / PR #85's own description for the "known, documented gap" this
+# replaces). `bild` is a name only the referenced COMPONENT'S OWN body
+# knows the meaning of; this hook now reads that body once (the discovery
+# pass, above the main loop) and remaps the prop AT the call site using the
+# discovered kind. This single test needs TWO posts in the stub (the
+# citing page AND the component it calls), so it uses
+# _etch_run_captured_php_multi below rather than the single-post harness
+# every other test in this file uses.
+@test "etch_post_import mediaId remap: a component prop with an operator-chosen name (e.g. \"bild\") is now discovered and remapped through the component that declares it (#86)" {
   local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
   printf '5\t105\tpage\n37496\t40000\twp_block\n35253\t888\tattachment\n' > "$tsv"
   run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
   [ "$status" -eq 0 ]
-  run _etch_run_captured_php 105 '<!-- wp:etch/component {"ref":37496,"attributes":{"bild":"35253"}} -->'
-  [[ "$output" == *'"ref":40000'* ]] || false
-  # "bild" is untouched: the digits 35253 must still be present, unremapped,
-  # because nothing in this hook's known-attribute list is named "bild".
-  [[ "$output" == *'"bild":"35253"'* ]] || false
+  run _etch_run_captured_php_multi \
+    105 '<!-- wp:etch/component {"ref":37496,"attributes":{"text":"Alpha","bild":"35253"}} -->' \
+    40000 '<!-- wp:etch/dynamic-image {"attributes":{"class":"item-card__image","mediaId":"{props.bild}"}} -->'
+  local write_105
+  write_105=$(printf '%s\n' "$output" | grep '^WRITE:105:')
+  [[ "$write_105" == *'"ref":40000'* ]] || false
+  [[ "$write_105" == *'"bild":"888"'* ]] || false
+  [[ "$write_105" != *'35253'* ]] || false
+  # A non-id-bearing prop on the SAME call ("text") must be left byte-exact.
+  [[ "$write_105" == *'"text":"Alpha"'* ]] || false
 }
 
 @test "etch_post_import mediaId remap: leaves \"ref\" untouched and vice versa -- the two id spaces never cross-contaminate" {
@@ -598,4 +603,335 @@ _etch_run_captured_php() {
   run _etch_run_captured_php 105 ' data-etch-context="eyJyZWYiOiJiNzUzY3BkIn0=" "ref":42'
   [[ "$output" == *'"ref":9001'* ]] || false
   [[ "$output" == *'data-etch-context="eyJyZWYiOiJiNzUzY3BkIn0="'* ]] || false
+}
+
+# --- etch_post_import: component PROPS with an operator-chosen name (#86) ---
+#
+# Follow-up to #84/PR #85: `bild` is a name only the referenced component's
+# OWN body knows the meaning of ("mediaId":"{props.bild}"), so no fixed-key
+# scan at the CALL site (page 37468 on the real reference site,
+# "bild":"35253") can ever find it. The component post is the source of
+# truth for what the prop means; these tests exercise the two-post
+# discovery-then-remap mechanism modules/etch.sh's etch_post_import now
+# implements for it.
+
+# _etch_run_captured_php_multi <id1> <content1> [<id2> <content2> ...] --
+# same discipline as _etch_run_captured_php above (executes the REAL
+# captured PHP, never a hand-copied re-implementation of it), extended to
+# more than one stubbed post: this mechanism reads TWO kinds of post while
+# it runs -- the citing post (whatever calls a component) AND the
+# component's own body (to learn which props are id-bearing) -- and the
+# single-post harness above cannot stand in for both at once. Prints one
+# "WRITE:<id>:<content>" line per post $wpdb->update was actually called
+# for (never for a post left unchanged), plus one "ECHO:<line>" per line
+# etch_post_import's PHP itself echoed (post ids it recorded as rewritten,
+# and any "NESTED_COMPONENT:<id>" marker -- see modules/etch.sh's own
+# comment on why that marker exists).
+_etch_run_captured_php_multi() {
+  php -r '
+    $capture_file = $argv[1];
+    $store = array();
+    for ( $i = 2; $i < count( $argv ); $i += 2 ) {
+      $store[ (int) $argv[ $i ] ] = $argv[ $i + 1 ];
+    }
+    function get_post_field( $field, $id ) {
+      global $store;
+      return ( $field === "post_content" && array_key_exists( (int) $id, $store ) ) ? $store[ (int) $id ] : "";
+    }
+    function clean_post_cache( $id ) {}
+    class _EtchTestWpdbMulti {
+      public $posts = "wp_posts";
+      public $writes = array();
+      public function update( $table, $data, $where ) {
+        $this->writes[ (int) $where["ID"] ] = $data["post_content"];
+        return 1;
+      }
+    }
+    $GLOBALS["wpdb"] = new _EtchTestWpdbMulti();
+    ob_start();
+    eval( file_get_contents( $capture_file ) );
+    $echoed = ob_get_clean();
+    foreach ( explode( "\n", $echoed ) as $line ) {
+      if ( $line !== "" ) { echo "ECHO:" . $line . "\n"; }
+    }
+    foreach ( $GLOBALS["wpdb"]->writes as $wid => $wcontent ) {
+      echo "WRITE:" . $wid . ":" . $wcontent . "\n";
+    }
+  ' -- "$BATS_TEST_TMPDIR/php.txt" "$@"
+}
+
+@test "etch_post_import component-prop remap: three call sites to the SAME component, three DIFFERENT ids, each rewritten to its own new id (page 37468 calling the same component with three different attachment ids) (#86)" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '9\t37468\tpage\n37496\t40000\twp_block\n35253\t888\tattachment\n35255\t889\tattachment\n35254\t890\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  local page='<!-- wp:etch/component {"ref":37496,"attributes":{"text":"Alpha","bild":"35253"}} --><!-- /wp:etch/component --><!-- wp:etch/component {"ref":37496,"attributes":{"text":"Beta","bild":"35255"}} --><!-- /wp:etch/component --><!-- wp:etch/component {"ref":37496,"attributes":{"text":"Gamma","bild":"35254"}} --><!-- /wp:etch/component -->'
+  local component='<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.bild}"}} -->'
+  run _etch_run_captured_php_multi 37468 "$page" 40000 "$component"
+  local write
+  write=$(printf '%s\n' "$output" | grep '^WRITE:37468:')
+  [[ "$write" == *'"bild":"888"'* ]] || false
+  [[ "$write" == *'"bild":"889"'* ]] || false
+  [[ "$write" == *'"bild":"890"'* ]] || false
+  [[ "$write" != *'35253'* ]] || false
+  [[ "$write" != *'35255'* ]] || false
+  [[ "$write" != *'35254'* ]] || false
+  # the "text" prop of every call, not id-bearing, must survive byte-exact
+  [[ "$write" == *'"text":"Alpha"'* ]] || false
+  [[ "$write" == *'"text":"Beta"'* ]] || false
+  [[ "$write" == *'"text":"Gamma"'* ]] || false
+}
+
+@test "etch_post_import component-prop remap: exigence #3 -- a prop the SAME component consumes in a NON-id-bearing attribute is never touched, even when its value COLLIDES with a real old id in the map" {
+  # A component can legitimately have a prop like "titre" holding "2024".
+  # Rewriting it would be a silent corruption. The value chosen here, "9",
+  # is deliberately a REAL old id that a broader (buggy) discovery would
+  # actually find a mapping for (id-map.tsv's own "9\t105\tpage" row) --
+  # a value that could never collide (like "2024") would let a
+  # too-broad "content" is also id-bearing" mutation pass unnoticed,
+  # since the map simply has no entry for it either way. This pins that
+  # the per-component discovery only marks a prop id-bearing when THAT
+  # prop feeds a known id-bearing attribute (mediaId/ref/parentPageID),
+  # never "content" or any other attribute, and never by the prop's name
+  # or its value merely looking numeric.
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '9\t105\tpage\n37496\t40000\twp_block\n35253\t888\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php_multi \
+    105 '<!-- wp:etch/component {"ref":37496,"attributes":{"titre":"9","bild":"35253"}} -->' \
+    40000 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.bild}"}} --><!-- wp:etch/text {"content":"{props.titre}"} /-->'
+  local write
+  write=$(printf '%s\n' "$output" | grep '^WRITE:105:')
+  [[ "$write" == *'"bild":"888"'* ]] || false
+  [[ "$write" == *'"titre":"9"'* ]] || false
+}
+
+@test "etch_post_import component-prop remap: the SAME prop name used by TWO DIFFERENT components for DIFFERENT purposes never cross-contaminates (per-component scoping)" {
+  # Component A's "value" prop is id-bearing (mediaId); component B's
+  # "value" prop is not (feeds a "content" text attribute). A call to B
+  # with a numeric-looking "value" must be left alone even though the SAME
+  # prop name is id-bearing for A -- discovery is scoped per component,
+  # never a global "this prop name always means an id" table.
+  #
+  # Fix-pack (issue #86, blocker 2): the citing page's own "ref" values
+  # below are A's OLD component ids (1, 2), not B's new ones (201, 202) --
+  # this pass now runs against genuinely untouched original content,
+  # BEFORE the fixed-key ref pass remaps "ref" itself, so the fixture must
+  # reflect that ordering the same way a real graft's content would.
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '9\t105\tpage\n1\t201\twp_block\n2\t202\twp_block\n42\t888\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  local page='<!-- wp:etch/component {"ref":1,"attributes":{"value":"42"}} --><!-- /wp:etch/component --><!-- wp:etch/component {"ref":2,"attributes":{"value":"42"}} --><!-- /wp:etch/component -->'
+  local comp_a='<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.value}"}} -->'
+  local comp_b='<!-- wp:etch/text {"content":"{props.value}"} /-->'
+  run _etch_run_captured_php_multi 105 "$page" 201 "$comp_a" 202 "$comp_b"
+  local write
+  write=$(printf '%s\n' "$output" | grep '^WRITE:105:')
+  # ref 1 -> 201 (component A, id-bearing "value") is remapped...
+  [[ "$write" == *'"ref":201,"attributes":{"value":"888"}}'* ]] || false
+  # ...ref 2 -> 202 (component B, non-id-bearing "value") keeps its literal "42".
+  [[ "$write" == *'"ref":202,"attributes":{"value":"42"}}'* ]] || false
+}
+
+@test "etch_post_import component-prop remap: a pass-through value ({props.X}, an unresolved cascade) is left untouched, never mistaken for a literal id" {
+  # A citing post that has not resolved a value yet (this hook's own
+  # depth-1 scope: a post that is ITSELF another component's body, calling
+  # 40000 with "bild":"{props.outerBild}" instead of a literal digit) must
+  # not have that placeholder text treated as if it were a plain string id
+  # -- 40000's own body DOES directly declare "bild" as mediaId-bearing
+  # (discovery fires, unlike the composition test below), so this pins the
+  # VALUE-shape guard specifically, not "nothing was discovered".
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '9\t200\tpage\n7\t40000\twp_block\n77\t999\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php_multi \
+    200 '<!-- wp:etch/component {"ref":40000,"attributes":{"bild":"{props.outerBild}"}} -->' \
+    40000 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.bild}"}} -->'
+  # Nothing to remap at post 200's own call site (the value is not a
+  # literal digit) -- no write for it at all, not a corrupted one.
+  [[ "$output" != *'WRITE:200:'* ]] || false
+}
+
+@test "etch_post_import component-prop remap: a component that itself calls ANOTHER component is warned about by name (composition depth > 1, #86's documented scope limit)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '9\t200\tpage\n8\t50000\twp_block\n7\t40000\twp_block\n' > "$tsv"
+  _etch_capture_eval_nested() {
+    case "$1" in
+      option) echo '{}' ;;
+      eval)
+        printf '%s' "$2" > "$BATS_TEST_TMPDIR/php.txt"
+        # Simulates the real wp-cli eval output for this exact fixture:
+        # component 50000's own body contains a nested wp:etch/component
+        # reference (to 40000), so the discovery pass echoes the marker.
+        echo "NESTED_COMPONENT:50000"
+        ;;
+    esac
+  }
+  run --separate-stderr etch_post_import "$run_dir" "$tsv" "_etch_capture_eval_nested"
+  [ "$status" -eq 0 ]
+  [[ "$stderr" == *"50000"* ]] || false
+  [[ "$stderr" == *"another wp:etch/component"* ]] || false
+  # Never recorded as a content rewrite (it is a WARNING marker, not a post
+  # id) -- graft_record_module_content_rewrite's own digit-only guard would
+  # already refuse it, but this pins that it is INTERCEPTED and surfaced
+  # rather than silently dropped by that guard.
+  [ ! -f "${run_dir}/module-content-rewrites.tsv" ]
+}
+
+@test "etch_post_import component-prop remap: discovery is skipped entirely (no eval crash, existing behavior unchanged) when the run migrated no wp_block at all" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '9\t105\tpage\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  grep -q '\$component_map = json_decode(.{}' "$BATS_TEST_TMPDIR/php.txt"
+}
+
+# --- issue #86 fix-pack (Viktor's review of PR #87): three blockers, one test
+# each, all reproducing the EXACT scenarios the review measured against a
+# real PHP 8.5.7 execution, not a paraphrase of them.
+
+@test "etch_post_import component-prop remap: BLOCKER 1 -- a call site whose JSON does not balance (even inside a string, from the naive-regex era) is warned about, never hangs, and does not prevent a LATER, well-formed call site on the same post from being remapped" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '9\t105\tpage\n1\t500\twp_block\n35253\t900\tattachment\n99999\t901\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  # First block: a STRING value containing a literal, unescaped "{" -- the
+  # OLD PCRE-recursion pattern drove preg_match_all() into catastrophic
+  # backtracking on exactly this shape (PREG_BACKTRACK_LIMIT_ERROR, false
+  # treated as "no matches" both here and in lib/verify.sh). The current
+  # linear, string-aware scanner parses it correctly (it IS balanced JSON,
+  # a brace inside a quoted string is not a structural brace) and remaps
+  # it -- proving the fix does more than merely fail safely on this exact
+  # shape, it fixes it. Second block: genuinely truncated JSON (a hard
+  # negative control the scanner really cannot parse), which must be
+  # flagged loudly rather than silently ignored or hung on.
+  local page='<!-- wp:etch/component {"ref":1,"attributes":{"t":"start { here","bild":"35253"}} --><!-- /wp:etch/component --><!-- wp:etch/component {"ref":1,"attributes":{"bild":"99999" -->'
+  local component='<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.bild}"}} -->'
+  run _etch_run_captured_php_multi 105 "$page" 500 "$component"
+  [ "$status" -eq 0 ]
+  local write_105
+  write_105=$(printf '%s\n' "$output" | grep '^WRITE:105:')
+  # The well-formed first block's "bild" is discovered and remapped...
+  [[ "$write_105" == *'"bild":"900"'* ]] || false
+  [[ "$write_105" != *'35253'* ]] || false
+  # ...the string content containing a literal "{" survives byte-exact...
+  [[ "$write_105" == *'"t":"start { here"'* ]] || false
+  # ...and the truncated second block is named in a warning, not silently
+  # dropped or left to hang the whole hook.
+  [[ "$output" == *'ECHO:MALFORMED_COMPONENT_BLOCK:105'* ]] || false
+}
+
+@test "etch_post_import component-prop remap: BLOCKER 2 -- a prop literally named \"mediaId\" does not get double-remapped through a chained id-map row (35253->900, 900->901)" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '9\t105\tpage\n37496\t500\twp_block\n35253\t900\tattachment\n900\t901\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  # The component's OWN prop happens to be named "mediaId" -- the single
+  # most natural name an author would choose for a prop that feeds a
+  # mediaId attribute, and exactly the name collision the fixed-key
+  # mediaId pass above does not know to avoid.
+  run _etch_run_captured_php_multi \
+    105 '<!-- wp:etch/component {"ref":37496,"attributes":{"mediaId":"35253"}} -->' \
+    500 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.mediaId}"}} -->'
+  local write_105
+  write_105=$(printf '%s\n' "$output" | grep '^WRITE:105:')
+  # Correct: the ONE real hop, 35253 -> 900 -- not chained a second time
+  # into 901 by this pass re-reading its own OWN output as if it were still
+  # an old value.
+  [[ "$write_105" == *'"mediaId":"900"'* ]] || false
+  [[ "$write_105" != *'"mediaId":"901"'* ]] || false
+}
+
+@test "etch_post_import component-prop remap: BLOCKER 3 -- substitution never leaks outside the attributes span (a prop named \"ref\" colliding with the block's own top-level ref; a metadata.bindings mirror of a remapped prop is left untouched)" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '9\t105\tpage\n37496\t500\twp_block\n500\t600\twp_block\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  # The component's own prop is literally named "ref" -- colliding, at the
+  # TEXT level, with the SAME block's own top-level "ref" pointer. Correct
+  # behavior: BOTH occurrences resolve to 37496's real new id (500) via the
+  # fixed-key ref pass's own sentinel-protected chaining, since attributes.
+  # ref is a plain fixed-key occurrence to THAT pass once this hook's own
+  # component-prop pass has finished with it -- never chained a second hop
+  # to 600 (the id-map's OWN unrelated 500->600 row) by a component-prop
+  # substitution that reached outside its own bounded span.
+  run _etch_run_captured_php_multi \
+    105 '<!-- wp:etch/component {"ref":37496,"attributes":{"ref":37496}} -->' \
+    500 '<!-- wp:etch/dynamic-image {"attributes":{"ref":"{props.ref}"}} -->'
+  local write_105
+  write_105=$(printf '%s\n' "$output" | grep '^WRITE:105:')
+  [[ "$write_105" == *'"ref":500,"attributes":{"ref":500}}'* ]] || false
+  [[ "$write_105" != *'600'* ]] || false
+}
+
+@test "etch_post_import component-prop remap: BLOCKER 3b -- a metadata.bindings mirror of a remapped attributes prop (Etch's own editor-binding shape) is left untouched, only the attributes copy is rewritten" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '9\t105\tpage\n37496\t40000\twp_block\n35253\t888\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php_multi \
+    105 '<!-- wp:etch/component {"ref":37496,"attributes":{"bild":"35253"},"metadata":{"bindings":{"bild":"35253"}}} -->' \
+    40000 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.bild}"}} -->'
+  local write_105
+  write_105=$(printf '%s\n' "$output" | grep '^WRITE:105:')
+  [[ "$write_105" == *'"attributes":{"bild":"888"}'* ]] || false
+  # The metadata.bindings MIRROR of the same digits, outside "attributes"
+  # entirely, must survive byte-exact -- only ONE occurrence was ever
+  # discovered as id-bearing (the attributes one), and this hook's
+  # substitution is bounded to that exact span, not "wherever this digit
+  # string happens to appear in the block".
+  [[ "$write_105" == *'"metadata":{"bindings":{"bild":"35253"}}}'* ]] || false
+}
+
+# --- issue #86 SECOND fix-pack (independent review round 2): the block
+# finder's OWN failure modes -- a span it says is "ok" but whose bytes are
+# not actually valid JSON (BLOCKER A), and whitespace/void-block shapes the
+# finder rejected too eagerly (BLOCKER B).
+
+@test "etch_post_import component-prop remap: SECOND fix-pack BLOCKER A -- a call site whose span is BALANCED but whose bytes are not valid JSON (an unpaired quote desyncs string tracking) is warned about, not silently skipped" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '9\t105\tpage\n37496\t40000\twp_block\n35253\t888\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  # sitegraft_json_span correctly finds a balanced { ... } span here (the
+  # unpaired quote does not break brace counting), but json_decode() on
+  # that span fails -- the exact case a bare "continue" used to swallow
+  # with no marker at all, on either side of the guard.
+  run _etch_run_captured_php_multi \
+    105 '<!-- wp:etch/component {"ref":37496,"attributes":{"t":"a" b" c","bild":"35253"}} -->' \
+    40000 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.bild}"}} -->'
+  [[ "$output" == *'ECHO:MALFORMED_COMPONENT_BLOCK:105'* ]] || false
+  local write_105
+  write_105=$(printf '%s\n' "$output" | grep '^WRITE:105:')
+  # the fixed-key ref pass is a SEPARATE, blind mechanism and still applies
+  # (37496 -> 40000) -- what must NOT happen is the component-prop pass
+  # treating this malformed occurrence as resolved: "bild" stays untouched.
+  [[ "$write_105" == *'"ref":40000'* ]] || false
+  [[ "$write_105" == *'"bild":"35253"'* ]] || false
+}
+
+@test "etch_post_import component-prop remap: SECOND fix-pack BLOCKER B -- a newline between the block prefix and its JSON is accepted (the old regex's \\\\s+ equivalent), and a JSON-less component occurrence is not treated as malformed" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '9\t105\tpage\n37496\t40000\twp_block\n35253\t888\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  local page="<!-- wp:etch/component --><!-- wp:etch/component 
+{\"ref\":37496,\"attributes\":{\"bild\":\"35253\"}} -->"
+  local component='<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.bild}"}} -->'
+  run _etch_run_captured_php_multi 105 "$page" 40000 "$component"
+  # neither occurrence is malformed: the JSON-less first one is a legitimate
+  # no-op, and the newline-separated second one parses and remaps normally.
+  # Asserted against the whole $output, not a single grep'd line: WRITE:105
+  # itself spans two physical lines here (the citing content's own embedded
+  # newline survives into the rewritten post), so a "^WRITE:105:" grep would
+  # only capture the FIRST of them and miss the remapped "bild" on the
+  # second -- there is only one WRITE in this fixture, so matching against
+  # the whole output is unambiguous.
+  [[ "$output" != *"MALFORMED_COMPONENT_BLOCK"* ]] || false
+  [[ "$output" == *"WRITE:105:"* ]] || false
+  [[ "$output" == *'"bild":"888"'* ]] || false
 }

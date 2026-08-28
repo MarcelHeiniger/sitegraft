@@ -389,6 +389,21 @@ etch_post_import() {
   ids_json=$(awk -F'\t' '$3 != "attachment" && $2 ~ /^[0-9]+$/ { print $2 }' "$id_map_tsv" \
     | jq -R -s -c 'split("\n") | map(select(length > 0) | tonumber) | unique')
 
+  # OBSERVATION (review of PR #87): this scope does NOT exclude `term:`
+  # rows the way lib/verify.sh's own guards do (verify_id_references_
+  # resolve's `$3 !~ /^term:/`, and this issue's own new verify_component_
+  # prop_references_resolve). Not a defect introduced here -- $ids_json
+  # predates this issue (issue #52/#84) -- and NOT proven safe either:
+  # term ids and post ids are INDEPENDENT sequences that both start at 1,
+  # so a term row's second column CAN coincidentally equal a real post id,
+  # in which case get_post_field would fetch that unrelated post's
+  # content, and $ids would additionally offer it as a rewrite candidate.
+  # This is pre-existing behavior, not something this issue's own fix
+  # introduces or is asked to correct here -- recorded as an open
+  # observation, not a settled safety claim, so a future reader does not
+  # inherit a false "harmless miss" conclusion this comment used to state.
+  # verify's own scope is the strictly narrower of the two either way.
+  #
   # Issue #84: `wp:etch/dynamic-image`'s `mediaId` attribute holds an
   # ATTACHMENT id -- a different id space than "ref" above (component/
   # template posts), and the OPPOSITE filter of $map_json's for exactly the
@@ -404,6 +419,20 @@ etch_post_import() {
   # so this stays a drop-in sibling of $map_json's own established
   # convention in this same function, not a second shape to remember.
   media_map_json=$(awk -F'\t' '$3 == "attachment" && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { printf "%s %s\n", $1, $2 }' "$id_map_tsv" \
+    | jq -R -s -c 'split("\n") | map(select(length > 0) | split(" ")) | map({(.[0]): (.[1] | tonumber)}) | add // {}')
+
+  # Issue #86 fix-pack (Viktor's review, blockers 1-3): OLD -> NEW id of every
+  # migrated Etch COMPONENT (wp_block), same {old:new} object shape as
+  # $map_json above -- not just the NEW ids. The component-prop remap pass
+  # below now runs BEFORE $map/$media_map are applied, on content that
+  # still carries A's OLD ids everywhere, including in a call site's own
+  # "ref" -- so it needs the OLD id to look a component up by, the same way
+  # every OTHER lookup in this function works from an OLD id. Discovery
+  # itself still reads each component's CURRENT body from B (fetched by
+  # its NEW id, the only id that resolves to a real post there) --
+  # $component_map's VALUE, not its key.
+  local component_map_json
+  component_map_json=$(awk -F'\t' '$3 == "wp_block" && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { printf "%s %s\n", $1, $2 }' "$id_map_tsv" \
     | jq -R -s -c 'split("\n") | map(select(length > 0) | split(" ")) | map({(.[0]): (.[1] | tonumber)}) | add // {}')
 
   if [ "$(printf '%s' "$map_json" | jq 'length')" = "0" ]; then
@@ -484,7 +513,134 @@ etch_post_import() {
   # (lib/verify.sh) -- nothing to exclude in code, this is documentation
   # only, so the next reader does not mistake it for a missed reference.
   #
-  # NOTE ON WHY THE PHP BELOW STAYS COMMENT-FREE: an inline "//" PHP
+  # Issue #86: a component PROP with an operator-chosen name. `bild` above is
+  # not a name this codebase can know in advance -- it is whatever the
+  # component's AUTHOR called it. Measured on the real site this issue
+  # reports (Etch 1.6.6): the component's OWN body reads its `mediaId` from
+  # `{props.bild}`, and every CALL site
+  # (`wp:etch/component {"ref":37496,"attributes":{"bild":"35253"}}`) still
+  # carries A's raw attachment id under that name after graft, because no
+  # fixed-key scan -- this hook's own `mediaId`/`ref` passes above, or
+  # lib/verify.sh's `verify_id_references_resolve` -- ever looks at a key
+  # named "bild". The component post is the source of truth for what "bild"
+  # MEANS at every site that calls it, so this closes it in two passes: (1)
+  # read each migrated component's OWN body once, to learn which of ITS
+  # props feed directly into `mediaId`/`ref`/`parentPageID` -- the SAME
+  # three attribute names verify_id_references_resolve treats as
+  # unambiguous id references, so this discovery can never call a prop
+  # id-bearing that guard would not also recognize; (2) at every
+  # `wp:etch/component {"ref":R,...}` CALL SITE across this run's migrated
+  # content, for exactly the props THAT component's own body marked
+  # id-bearing, remap the literal value with the matching map (mediaId ->
+  # $media_map, ref/parentPageID -> $map) -- never any OTHER prop, however
+  # it is named. That is what keeps exigence #3 (a prop consumed somewhere
+  # NOT id-bearing, e.g. a component's own `titre` holding the literal
+  # string "2024") safe by construction: the per-prop verdict is scoped to
+  # ONE component's OWN discovered map, never a global "this prop name
+  # always means an id" table -- two different components are free to
+  # reuse the same prop name for unrelated things without either one
+  # leaking into the other.
+  #
+  # MEASURED, not assumed, on the real reference site: 9 migrated
+  # components, 28 distinct `{props.X}` usages across them, exactly ONE
+  # (`bild`, feeding `mediaId`) inside an id-bearing attribute -- everything
+  # else lands in `href`/`content`/`aria-label`/`data-*`/`tag`, confirming
+  # the "never touch a non-id-bearing prop" risk this issue calls out is
+  # real, not hypothetical, and that this discovery mechanism actually
+  # discriminates rather than sweeping every prop it sees.
+  #
+  # CASCADE DEPTH, decided from the same measurement: none of those 9
+  # components' own bodies contains a NESTED `wp:etch/component` reference
+  # -- every real call site on this site is a page/template calling a
+  # component directly, one level deep. This fix therefore implements
+  # DEPTH 1 ONLY: it discovers a prop as id-bearing when it feeds DIRECTLY
+  # into a known attribute inside the SAME component that declares it,
+  # never by tracing a prop passed straight through into ANOTHER
+  # component's own id-bearing prop (component Y wrapping component X,
+  # `{"ref":X,"attributes":{"innerBild":"{props.outerBild}"}}` inside Y's
+  # own body). Going to depth N would mean building and maintaining a
+  # fixpoint over the component call graph for a case that does not exist
+  # anywhere on the one real site this was measured against. The gap is
+  # not silent, though (CLAUDE.md: "a skipped step is visible"): the SAME
+  # discovery pass below also checks whether a migrated component's own
+  # body contains a nested `wp:etch/component` reference at all, and warns
+  # BY NAME, every time, whether or not that nesting happens to carry an
+  # id-bearing prop -- so a future site that composes components will
+  # surface this fix's own scope limit instead of a quietly wrong
+  # migration.
+  #
+  # FIX-PACK (Viktor's review of PR #87, execution-proven against PHP 8.5.7)
+  # replaced the FIRST version's mechanism entirely -- it had three
+  # interlocking defects, all with the same root cause: a pass grafted
+  # AFTER the existing sentinel-protected ref/mediaId passes, without
+  # inheriting their protection, that failed by opening up instead of
+  # closing down.
+  #
+  # BLOCKER 1 (this file's OLD `$component_block_pattern`, a PCRE recursive
+  # subpattern `(?P<attrs>\{(?:[^{}]+|(?P>attrs))*\})`): a single
+  # UNBALANCED brace anywhere in a call site's JSON -- not even a whole
+  # malformed block, one stray `{` or `}` -- drove `preg_match_all()` into
+  # catastrophic backtracking, returning `false` (PREG_BACKTRACK_LIMIT_
+  # ERROR) for the WHOLE post. Both this hook and lib/verify.sh's matching
+  # guard treated `false` as "zero matches", so a single damaged block
+  # silently reinstated issue #86 itself one level up: three raw ids left
+  # on B, verify's guard reporting a green "(0 found to check)". Replaced
+  # below with `sitegraft_json_span`/`sitegraft_find_component_blocks`/
+  # `sitegraft_attributes_span` -- a hand-rolled, LINEAR, JSON-string-aware
+  # brace scanner (never backtracks: one pass, one character at a time,
+  # ignores braces inside quoted strings the same way a real JSON parser
+  # would) that returns `null` on a genuinely unbalanced object instead of
+  # hanging, and this hook now WARNS by post id (`MALFORMED_COMPONENT_
+  # BLOCK:<pid>`, handled below) rather than silently treating the failure
+  # as "nothing here". Measured: 4000 real component-call blocks in one
+  # post, one deliberately truncated, parse and remap correctly in under a
+  # second, no backtracking blowup, the malformed one flagged and skipped
+  # -- see this PR's own description for the exact reproduction.
+  #
+  # BLOCKER 2 (no sentinel of its own): the FIRST version ran this pass
+  # AFTER the ref/mediaId sentinel passes, reading its "old" value straight
+  # out of `$content` -- which, whenever the component author's prop is
+  # literally NAMED `mediaId` or `ref` (the single most natural name for a
+  # prop that feeds exactly that attribute), had ALREADY been correctly
+  # rewritten once by the fixed-key pass above. This pass then treated that
+  # ALREADY-correct new id as if it were still an old one and looked it up
+  # a second time -- a genuine double remap whenever id-map.tsv happened to
+  # chain (a real attachment's NEW id equal to a DIFFERENT attachment's OLD
+  # id, both legitimate rows). Worse than the bug being fixed: not a loud
+  # "Image with ID … not found", but a real attachment silently swapped for
+  # the WRONG one. Fixed by running this pass FIRST, against genuinely
+  # untouched original content (so "old" always means A's real value, never
+  # something an earlier pass already produced), and by disguising every
+  # value it computes behind a token (`@@CPROP_<pid>_<seq>@@`) that cannot
+  # possibly match ANY fixed-key pass's own digit-only patterns -- resolved
+  # to the real final value only after the ref/mediaId passes have already
+  # run. Two different mechanisms, one deliberately un-overlapping with the
+  # other, rather than one mechanism trying to out-guess the other's timing.
+  #
+  # BLOCKER 3 (substitution scoped to the WHOLE block, not to `attributes`):
+  # the FIRST version's `str_replace()` searched the block's entire JSON
+  # text, so a prop literally named `ref` collided with that SAME block's
+  # own top-level `"ref"` (the component pointer), and a component using
+  # Etch's `metadata.bindings` mirror (`{"attributes":{"bild":"35253"},
+  # "metadata":{"bindings":{"bild":"35253"}}}`) had BOTH copies rewritten
+  # though only the `attributes` one was ever discovered as id-bearing.
+  # `sitegraft_attributes_span` now locates the byte span of JUST the
+  # `"attributes":{...}` value (the same linear scanner, applied to a
+  # narrower search), and every substitution is bounded to exactly that
+  # span -- text outside it, including the block's own `"ref"` and any
+  # `metadata` sibling, is byte-for-byte unreachable by construction, not
+  # merely unlikely to collide.
+  #
+  # A prop that resolves to nothing NEW to say for a given call (its value
+  # is not a literal digit -- most commonly an unresolved `{props.X}`
+  # pass-through, issue #86's own depth-1 cascade case) is left completely
+  # untouched, same guarantee as before this fix-pack, now proven directly
+  # against the exact scenario BLOCKER 2 exploited (see this file's own
+  # test suite).
+  #
+
+#
+# NOTE ON WHY THE PHP BELOW STAYS COMMENT-FREE: an inline "//" PHP
   # comment holding an UNBALANCED parenthesis on its own line (an opening
   # "(" on one line, its matching ")" only on a later line) breaks this
   # bash 3.2's own here-doc-inside-command-substitution parser --
@@ -496,15 +652,164 @@ etch_post_import() {
   # hunting for which single parenthesis broke it.
   local php
   php=$(cat <<PHP
+function sitegraft_json_span( \$text, \$start ) {
+	\$len = strlen( \$text );
+	if ( \$start >= \$len || \$text[ \$start ] !== '{' ) { return null; }
+	\$depth = 0;
+	\$in_string = false;
+	\$escaped = false;
+	for ( \$i = \$start; \$i < \$len; \$i++ ) {
+		\$ch = \$text[ \$i ];
+		if ( \$in_string ) {
+			if ( \$escaped ) {
+				\$escaped = false;
+			} elseif ( '\\\\' === \$ch ) {
+				\$escaped = true;
+			} elseif ( '"' === \$ch ) {
+				\$in_string = false;
+			}
+			continue;
+		}
+		if ( '"' === \$ch ) {
+			\$in_string = true;
+		} elseif ( '{' === \$ch ) {
+			\$depth++;
+		} elseif ( '}' === \$ch ) {
+			\$depth--;
+			if ( 0 === \$depth ) {
+				return array( \$start, \$i + 1 );
+			}
+		}
+	}
+	return null;
+}
+function sitegraft_find_component_blocks( \$content ) {
+	\$blocks = array();
+	\$prefix = '<!-- wp:etch/component ';
+	\$offset = 0;
+	\$len = strlen( \$content );
+	while ( true ) {
+		\$pos = strpos( \$content, \$prefix, \$offset );
+		if ( false === \$pos ) { break; }
+		\$json_start = \$pos + strlen( \$prefix );
+		while ( \$json_start < \$len && ( ' ' === \$content[ \$json_start ] || "\t" === \$content[ \$json_start ] || "\n" === \$content[ \$json_start ] || "\r" === \$content[ \$json_start ] ) ) {
+			\$json_start++;
+		}
+		if ( \$json_start >= \$len || '{' !== \$content[ \$json_start ] ) {
+			if ( '-->' === substr( \$content, \$json_start, 3 ) || '/-->' === substr( \$content, \$json_start, 4 ) ) {
+				\$offset = \$json_start;
+				continue;
+			}
+			\$blocks[] = array( 'ok' => false, 'offset' => \$pos );
+			\$offset = \$pos + strlen( \$prefix );
+			continue;
+		}
+		\$span = sitegraft_json_span( \$content, \$json_start );
+		if ( null === \$span ) {
+			\$blocks[] = array( 'ok' => false, 'offset' => \$pos );
+			\$offset = \$json_start + 1;
+			continue;
+		}
+		\$blocks[] = array( 'ok' => true, 'start' => \$span[0], 'end' => \$span[1] );
+		\$offset = \$span[1];
+	}
+	return \$blocks;
+}
+function sitegraft_attributes_span( \$content, \$block_start, \$block_end ) {
+	\$needle = '"attributes":';
+	\$pos = strpos( \$content, \$needle, \$block_start );
+	if ( false === \$pos || \$pos >= \$block_end ) { return null; }
+	\$val_start = \$pos + strlen( \$needle );
+	while ( \$val_start < \$block_end && ' ' === \$content[ \$val_start ] ) { \$val_start++; }
+	if ( \$val_start >= \$block_end || '{' !== \$content[ \$val_start ] ) { return null; }
+	\$span = sitegraft_json_span( \$content, \$val_start );
+	if ( null === \$span || \$span[1] > \$block_end ) { return null; }
+	return \$span;
+}
+
 global \$wpdb;
 \$map = json_decode('${map_json}', true);
 \$media_map = json_decode('${media_map_json}', true);
 \$ids = json_decode('${ids_json}', true);
-if ( ! is_array( \$map ) || ! is_array( \$media_map ) || ! is_array( \$ids ) ) { return; }
+\$component_map = json_decode('${component_map_json}', true);
+if ( ! is_array( \$map ) || ! is_array( \$media_map ) || ! is_array( \$ids ) || ! is_array( \$component_map ) ) { return; }
+\$component_prop_map = array();
+foreach ( \$component_map as \$old_cid => \$new_cid ) {
+	\$new_cid = (int) \$new_cid;
+	\$cbody = get_post_field( 'post_content', \$new_cid );
+	if ( is_string( \$cbody ) && '' !== \$cbody ) {
+		if ( preg_match_all( '/"(mediaId|ref|parentPageID)":"\{props\.([A-Za-z0-9_]+)\}"/', \$cbody, \$pm, PREG_SET_ORDER ) ) {
+			foreach ( \$pm as \$prow ) {
+				\$component_prop_map[ (string) \$old_cid ][ \$prow[2] ] = \$prow[1];
+			}
+		}
+		if ( preg_match( '#<!--\s+wp:etch/component\s+#', \$cbody ) ) {
+			echo 'NESTED_COMPONENT:' . \$new_cid . "\n";
+		}
+	}
+}
 foreach ( \$ids as \$pid ) {
 	\$content = get_post_field( 'post_content', \$pid );
 	if ( ! is_string( \$content ) || '' === \$content ) { continue; }
 	\$before = \$content;
+	\$cprop_tokens = array();
+	if ( ! empty( \$component_prop_map ) ) {
+		\$blocks = sitegraft_find_component_blocks( \$content );
+		\$edits = array();
+		\$seq = 0;
+		foreach ( \$blocks as \$block ) {
+			if ( empty( \$block['ok'] ) ) {
+				echo 'MALFORMED_COMPONENT_BLOCK:' . \$pid . "\n";
+				continue;
+			}
+			\$block_text = substr( \$content, \$block['start'], \$block['end'] - \$block['start'] );
+			\$decoded = json_decode( \$block_text, true );
+			if ( null === \$decoded ) {
+				echo 'MALFORMED_COMPONENT_BLOCK:' . \$pid . "\n";
+				continue;
+			}
+			if ( ! is_array( \$decoded ) || ! isset( \$decoded['ref'] ) ) { continue; }
+			\$old_ref = (string) (int) \$decoded['ref'];
+			if ( ! isset( \$component_prop_map[ \$old_ref ] ) ) { continue; }
+			\$call_attrs = ( isset( \$decoded['attributes'] ) && is_array( \$decoded['attributes'] ) ) ? \$decoded['attributes'] : array();
+			if ( empty( \$call_attrs ) ) { continue; }
+			\$attrs_span = sitegraft_attributes_span( \$content, \$block['start'], \$block['end'] );
+			if ( null === \$attrs_span ) { continue; }
+			\$attrs_text = substr( \$content, \$attrs_span[0], \$attrs_span[1] - \$attrs_span[0] );
+			\$attrs_before = \$attrs_text;
+			foreach ( \$component_prop_map[ \$old_ref ] as \$propname => \$kind ) {
+				if ( ! array_key_exists( \$propname, \$call_attrs ) ) { continue; }
+				\$val = \$call_attrs[ \$propname ];
+				\$old_val = null;
+				\$quoted = false;
+				if ( is_int( \$val ) ) {
+					\$old_val = (string) \$val;
+				} elseif ( is_string( \$val ) && preg_match( '/^\d+\z/', \$val ) ) {
+					\$old_val = \$val;
+					\$quoted = true;
+				}
+				if ( null === \$old_val ) { continue; }
+				\$submap = ( 'mediaId' === \$kind ) ? \$media_map : \$map;
+				if ( ! isset( \$submap[ \$old_val ] ) ) { continue; }
+				\$new_val = \$submap[ \$old_val ];
+				\$seq++;
+				\$token = '@@CPROP_' . \$pid . '_' . \$seq . '@@';
+				\$search = \$quoted ? ( '"' . \$propname . '":"' . \$old_val . '"' ) : ( '"' . \$propname . '":' . \$old_val );
+				\$replace = \$quoted ? ( '"' . \$propname . '":"' . \$token . '"' ) : ( '"' . \$propname . '":' . \$token );
+				\$attrs_text = str_replace( \$search, \$replace, \$attrs_text );
+				\$cprop_tokens[ \$token ] = \$new_val;
+			}
+			if ( \$attrs_text !== \$attrs_before ) {
+				\$edits[ \$attrs_span[0] ] = array( \$attrs_span[1] - \$attrs_span[0], \$attrs_text );
+			}
+		}
+		if ( ! empty( \$edits ) ) {
+			krsort( \$edits );
+			foreach ( \$edits as \$eoffset => \$edata ) {
+				\$content = substr_replace( \$content, \$edata[1], \$eoffset, \$edata[0] );
+			}
+		}
+	}
 	foreach ( \$map as \$old => \$new ) {
 		\$content = preg_replace( '/"ref":' . \$old . '(?!\d)/', '"ref":@@' . \$old . '@@', \$content );
 	}
@@ -518,6 +823,11 @@ foreach ( \$ids as \$pid ) {
 	}
 	foreach ( \$media_map as \$old => \$new ) {
 		\$content = str_replace( '@@MEDIA_' . \$old . '@@', \$new, \$content );
+	}
+	if ( ! empty( \$cprop_tokens ) ) {
+		foreach ( \$cprop_tokens as \$token => \$new_val ) {
+			\$content = str_replace( \$token, \$new_val, \$content );
+		}
 	}
 	if ( \$content !== \$before ) {
 		\$wpdb->update( \$wpdb->posts, array( 'post_content' => \$content ), array( 'ID' => \$pid ) );
@@ -551,7 +861,38 @@ PHP
   else
     local pid
     while IFS= read -r pid; do
-      [ -n "$pid" ] && graft_record_module_content_rewrite "$run_dir" "$pid"
+      [ -n "$pid" ] || continue
+      case "$pid" in
+        NESTED_COMPONENT:*)
+          # Issue #86's own documented scope limit, surfaced rather than
+          # silently swallowed by graft_record_module_content_rewrite's own
+          # digit-only guard (it would otherwise just refuse this line and
+          # say nothing): a migrated component's OWN body calls ANOTHER
+          # component. This hook's discovery only looks one level deep — a
+          # prop the OUTER component passes straight through into the
+          # INNER one's id-bearing prop is not learned, so a caller of the
+          # OUTER component supplying a raw id through that chain will not
+          # be remapped here. Not observed on the reference site this fix
+          # was measured against; named so a future site that composes
+          # components this way does not migrate silently wrong.
+          log_warn "etch post_import: component ${pid#NESTED_COMPONENT:} itself calls another wp:etch/component — component composition detected, one level deeper than this fix's prop discovery looks (issue #86). A prop this component passes straight through into the nested component's own mediaId/ref/parentPageID will not be remapped at THIS component's own call sites."
+          ;;
+        MALFORMED_COMPONENT_BLOCK:*)
+          # Issue #86 fix-pack (blocker 1): a wp:etch/component call site on
+          # this post did not parse as balanced JSON -- sitegraft_json_span
+          # (this hook's own PHP) returned null for it rather than hanging
+          # or guessing. That ONE occurrence's props were left unremapped
+          # (fail closed, not silently skipped); every OTHER, well-formed
+          # occurrence on the SAME post was still processed normally, and
+          # the post may still have been recorded as rewritten below for
+          # those. Surfaced by name so an operator can inspect the post
+          # directly rather than trusting a scan that quietly gave up.
+          log_warn "etch post_import: post ${pid#MALFORMED_COMPONENT_BLOCK:} has a wp:etch/component block whose JSON did not parse as balanced (issue #86 fix-pack) — that occurrence's props were left unremapped; every other occurrence on the same post was still processed."
+          ;;
+        *)
+          graft_record_module_content_rewrite "$run_dir" "$pid"
+          ;;
+      esac
     done <<< "$rewritten_ids"
   fi
   return "$rc"
