@@ -768,3 +768,48 @@ MANIFESTEOF
   [ "$prune_line" -lt "$media_sync_line" ]
   [ "$media_sync_line" -lt "$import_attachments_line" ]
 }
+
+@test "phase_graft's dry-run preview shows media_sync rerunning whenever prune is about to rerun, matching what the real run does (issue #36 fix-pack, BLOCKED-2)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  touch "${run_dir}/backup.complete"
+  cat > "${run_dir}/manifest.json" <<'MANIFESTEOF'
+{"migrate":{"core-wp":{"post_types":["page","attachment"],"option_keys":[]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}
+MANIFESTEOF
+
+  _issue36_stub_everything_but_ordering
+
+  # Simulates a resume: an earlier REAL pass got as far as media_sync and
+  # prune (both marked done for real) but never finished import_attachments
+  # -- so graft_safety_step_done's own gate reads prune as "not really
+  # done" (import_attachments is a consumer) and reruns it.
+  graft_mark_step "$run_dir" prune
+  graft_mark_step "$run_dir" media_sync
+
+  SITEGRAFT_DRY_RUN=1
+  run phase_graft --profile demo --run "$run_dir" --dry-run
+  [ "$status" -eq 0 ]
+
+  local prune_line=-1 media_sync_line=-1 i
+  for i in "${!lines[@]}"; do
+    case "${lines[$i]}" in
+      "ORDER: prune") prune_line=$i ;;
+      "ORDER: media_sync") media_sync_line=$i ;;
+    esac
+  done
+  [ "$prune_line" -ge 0 ]
+  # The acceptance criterion: media_sync's dry-run preview must show it
+  # rerunning too, even though its on-disk marker (set above) still says
+  # "done" -- exactly matching what a REAL (non-dry-run) pass through this
+  # same on-disk state would do (clear the marker for real, then rerun).
+  # Before the fix this stayed -1: the `rm -f` that would have cleared
+  # media_sync.done is guarded by `is_dry_run`, so under --dry-run the
+  # marker is never cleared and this step is silently skipped from the
+  # preview -- a dry-run under-reporting what the real run will do, the
+  # same class of bug MAJOR-B (above) already fixed once for
+  # graft_mark_step, just in the opposite direction here (an operator
+  # reading this preview would not be told media_sync -- the expensive
+  # step -- reruns).
+  [ "$media_sync_line" -ge 0 ]
+  [ "$prune_line" -lt "$media_sync_line" ]
+}

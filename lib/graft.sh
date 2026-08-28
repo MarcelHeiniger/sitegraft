@@ -2623,6 +2623,22 @@ phase_graft() {
   # --ignore-existing entirely, which would cost a full media re-transfer
   # on every single run — exactly what #11's batching fix-pack just made
   # fast for the opposite reason).
+  #
+  # Scope, named rather than implied (issue #36 fix-pack review): this
+  # fixes the PRUNED-ATTACHMENT case only — a file whose owning post
+  # graft_prune_previous_run deletes. It does NOT touch the class
+  # docs/findings/2026-08-22-first-real-pair.md's F9 describes: a
+  # plugin-generated file under uploads/ (e.g. ACSS's compiled CSS) that
+  # no pruned post owns at all, so prune never removes it and this
+  # reordering never gets a chance to re-sync it — --ignore-existing keeps
+  # B's stale copy forever, regardless of step order. Nor does it touch a
+  # FIRST graft onto a B that already shares files with A (e.g. B cloned
+  # from A): nothing to prune, so every colliding filename is kept exactly
+  # as --ignore-existing/--keep-existing already documents above
+  # (graft_push_dir's own header) — A's version of a same-named-but-
+  # different-bytes file never lands. Both are pre-existing, unfixed by
+  # this PR; see its own PR description for what that means for an
+  # operator.
   graft_step_done "$run_dir" mu_plugin     || { graft_deploy_mu_plugin; graft_mark_step "$run_dir" mu_plugin; }
   # Issue #16: must run before graft_import_wxr (several steps down) —
   # any later than that and the WXR import runs against a B whose
@@ -2716,7 +2732,27 @@ phase_graft() {
   # to find files this prune pass just removed — the issue #36 bug,
   # reproduced a second time inside a single interrupted run instead of
   # across two separate ones.
+  # BLOCKER-2 (issue #36 fix-pack review): `local` alongside the
+  # assignment it guards, not split across two statements — `local x;
+  # x=$(cmd)` is this file's own usual style for capturing a real exit
+  # code, but this is a plain flag with no command substitution to
+  # protect, so the split gains nothing here and only adds a line.
+  local prune_will_rerun=""
   graft_safety_step_done "$run_dir" prune import_attachments import fetch_id_map || {
+    # BLOCKER-2 (issue #36 fix-pack review): set the instant this block is
+    # entered — dry-run or not — because media_sync's own gate (below)
+    # needs to know prune is ABOUT TO rerun before it can decide whether
+    # to show/perform its own rerun. See that gate's own comment for what
+    # this flag fixes: without it, a dry-run preview against a run_dir
+    # whose earlier REAL pass already completed media_sync (marker on
+    # disk) silently omitted media_sync from the preview even though the
+    # matching REAL run — hitting this exact block — clears the marker
+    # and reruns it for real. Same bug class MAJOR-B (this file's own
+    # comment on graft_mark_step) already fixed once, in the opposite
+    # direction: that one was dry-run OVER-reporting (writing markers for
+    # real); this one was dry-run UNDER-reporting (silently skipping a
+    # step the real run performs).
+    prune_will_rerun=1
     # `|| true` on the `rm -f` itself, not just the `is_dry_run ||` in
     # front of it (review, MINOR-E): this whole block is the RHS of a
     # `||` tested against graft_safety_step_done, which is what exempts
@@ -2727,6 +2763,13 @@ phase_graft() {
     # undiagnosed nonzero exit — silently worse than the marker simply
     # staying set. Logged, not swallowed: losing the ability to clear a
     # resumability marker is itself worth telling the operator about.
+    #
+    # This `rm -f` itself STAYS guarded by `is_dry_run` (unlike
+    # media_sync's own gate below, which now no longer trusts its on-disk
+    # marker once prune_will_rerun is set): the marker file is real state
+    # that must not be mutated for real during a preview, exactly like
+    # every other marker-clearing site in this function. prune_will_rerun
+    # is what lets the preview stay accurate WITHOUT that mutation.
     if ! is_dry_run; then
       rm -f "${run_dir}/graft.media_sync.done" "${run_dir}/graft.import_attachments.done" "${run_dir}/graft.import.done" "${run_dir}/graft.fetch_id_map.done" \
         || log_warn "could not clear one or more resumability markers under ${run_dir} before prune — a later resume may not rerun the steps prune is about to invalidate"
@@ -2741,7 +2784,25 @@ phase_graft() {
   # any); this re-pushes A's uploads onto whatever gap that left, so
   # import_attachments (next) finds every file it expects, whether this is
   # a first graft or the twentieth onto the same B.
-  graft_step_done "$run_dir" media_sync    || { graft_media_sync "$run_dir"; graft_mark_step "$run_dir" media_sync; }
+  #
+  # BLOCKER-2 (issue #36 fix-pack review): gated on `[ -z "$prune_will_rerun" ]
+  # && graft_step_done ...`, not a bare `graft_step_done "$run_dir"
+  # media_sync` — when prune_will_rerun is set, this step runs (or, under
+  # --dry-run, shows itself running) UNCONDITIONALLY, ignoring whatever
+  # the on-disk marker currently says. This is what keeps a --dry-run
+  # preview honest: the real run's `rm -f` above only fires when NOT
+  # dry-run, so under a dry-run preview the on-disk marker from an earlier
+  # completed pass would otherwise still read "done" and this step would
+  # silently vanish from the preview — see prune_will_rerun's own comment,
+  # above, for the full reasoning. Cost, not free: on a wrapped-local
+  # (e.g. DDEV) site, graft_pull_dir streams a full, non-incremental
+  # `tar -c -z` of A's entire uploads tree (see that function's own
+  # header) — every prune rerun now re-pays that full transfer, not just
+  # an ssh/bare-local rsync's cheap incremental delta. Accepted
+  # deliberately: it is the exact cost the issue itself named as the more
+  # expensive of its two proposed fixes, arriving here through the resume
+  # path rather than every single run.
+  { [ -z "$prune_will_rerun" ] && graft_step_done "$run_dir" media_sync; } || { graft_media_sync "$run_dir"; graft_mark_step "$run_dir" media_sync; }
   graft_step_done "$run_dir" import_attachments || { graft_import_attachments "$run_dir"; graft_mark_step "$run_dir" import_attachments; }
   graft_step_done "$run_dir" importer_setup || { graft_ensure_importer "$run_dir"; graft_mark_step "$run_dir" importer_setup; }
   graft_step_done "$run_dir" export        || {

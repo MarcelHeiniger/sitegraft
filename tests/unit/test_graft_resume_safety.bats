@@ -778,17 +778,37 @@ _issue36_stub_everything_but_prune_media_sync_import_attachments() {
   touch "${run_dir_2}/graft.export.done" "${run_dir_2}/graft.import.done"
 
   run phase_graft --profile demo --run "$run_dir_2"
+  # NOT a discriminating assertion on its own (verified by hand for this
+  # fix-pack, both directions): under the pre-fix ordering this still
+  # reads 0. phase_graft is called directly here, not via bin/sitegraft,
+  # and bats' `run` disables errexit for the command it captures -- so
+  # even though graft_import_attachments' real `return 1` (on the
+  # pre-fix ordering, once media_sync has skipped the file and prune has
+  # deleted it) is a genuine, load-bearing fail-closed return in
+  # production (bin/sitegraft's own `set -euo pipefail` aborts the whole
+  # script right there -- confirmed separately with a standalone
+  # `env bash -c 'set -euo pipefail; false || { f; echo marked; }'`,
+  # which exits 1), THIS test's own `run phase_graft ...` swallows it:
+  # execution continues past the point that would have aborted a real
+  # `sitegraft graft` invocation, `graft_mark_step` still runs, and
+  # phase_graft finishes and returns 0, logging "graft complete" right
+  # after having logged "failed to import 1 of 1 attachment(s)". Kept as
+  # a sanity check on the FIXED behavior (pass 2 really does succeed
+  # cleanly), not as evidence of anything about the bug -- that's the two
+  # assertions below.
   [ "$status" -eq 0 ]
   [[ "$output" == *"post delete 100 --force"* ]] || false
 
-  # The acceptance criterion itself: B still has the file after the SECOND
-  # graft. Under the pre-fix ordering (media_sync before prune), prune's
-  # delete above would be the LAST thing that ever touches this file --
-  # media_sync already ran and skipped it (already existed on disk at that
-  # point), so it would stay gone and this is exactly the assertion that
-  # catches it (reverting lib/graft.sh's reordering and re-running this
-  # test reproduces that failure: pass 2 fails closed instead, with
-  # "failed to import 1 of 1 attachment(s)").
+  # The acceptance criterion itself, and the ONLY two assertions in this
+  # test actually verified (by hand, both directions) to discriminate the
+  # fix: B still has the file after the SECOND graft, and the batch
+  # genuinely imported it rather than reporting it failed. Under the
+  # pre-fix ordering (media_sync before prune), prune's delete above is
+  # the LAST thing that ever touches this file -- media_sync already ran
+  # and skipped it (already existed on disk at that point) -- so it stays
+  # gone and the batch reports "0 newly imported ... 1 failed" instead;
+  # reverting lib/graft.sh's reordering and re-running this test
+  # reproduces exactly that (mutation-tested for this fix-pack).
   [ -f "$probe_on_b" ]
   [[ "$output" == *"1 newly imported"* ]] || false
 }
