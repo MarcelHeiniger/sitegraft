@@ -1,3 +1,5 @@
+bats_require_minimum_version 1.5.0
+
 # tests/unit/test_phase_restore.bats — phase_restore's control flow: guard
 # clauses, the pre-restore safety snapshot (design doc §6.7, "even a restore
 # has to stay reversible"), and --yes bypassing confirmation. Stubs
@@ -77,9 +79,23 @@ EOF
   [[ "$output" == *"restore.sh"* ]]
 }
 
-@test "phase_restore declines without confirmation when --yes is not passed (no TTY, plain read reads EOF)" {
-  run phase_restore --profile t --run "$RUN_DIR"
+@test "phase_restore declines without confirmation when --yes is not passed, BY THE TTY GUARD and not by a read that happened to see EOF" {
+  run --separate-stderr phase_restore --profile t --run "$RUN_DIR"
   [ "$status" -eq 1 ]
+
+  # The status assertion alone does NOT discriminate: before the [ -t 0 ]
+  # guard existed, this same test passed because the bare `read` hit EOF on
+  # a /dev/null stdin and returned non-zero, which also declined. Both worlds
+  # exit 1, so a status-only test ratifies neither -- measured in review by
+  # deleting the guard entirely and watching all 13 tests in this file stay
+  # green.
+  #
+  # The message is what tells the two apart. It only exists on the guard's
+  # path, so this assertion goes red the moment the guard is removed -- and
+  # it is also the thing an operator scripting `sitegraft restore` actually
+  # needs, since without the guard that run does not decline at all on a
+  # stdin that never reaches EOF: it hangs forever (issue #46).
+  [[ "$stderr" == *"needs --yes"* ]] || false
 }
 
 @test "phase_restore --yes runs restore.sh and takes a pre-restore snapshot of B's db AND wp-content" {
