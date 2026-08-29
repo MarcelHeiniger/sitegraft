@@ -1912,8 +1912,22 @@ phase_restore() {
     log_info "--dry-run: restore will print the commands it would run for both the pre-restore snapshot and restore.sh's execution — neither actually runs, and nothing on B is touched"
   fi
 
+  # issue #46 fix-pack: this `read -r -p` had no `[ -t 0 ]` guard, unlike
+  # graft_check_stack_mismatch's identical confirmation prompt (this file's
+  # sibling in lib/graft.sh, ~line 406), which already gates the same shape
+  # of prompt on stdin being a real TTY. Without the guard, a scripted
+  # `sitegraft restore` run without --yes on a non-interactive stdin that
+  # never reaches EOF (a pipe, a parent shell, a supervised process) blocks
+  # here forever instead of declining — the exact same failure mode #46
+  # documented for a test stub, except this one is production code, reached
+  # by the tool's own last-resort command. Mirrors graft.sh's gate: refuse
+  # loudly and immediately when there is no TTY to prompt, rather than
+  # blocking on a `read` that has nothing to read.
   if [ "$yes" -ne 1 ]; then
-    if command -v gum >/dev/null 2>&1; then
+    if [ ! -t 0 ]; then
+      log_error "restore needs --yes on a non-interactive stdin"
+      return 1
+    elif command -v gum >/dev/null 2>&1; then
       gum confirm "Restore B from ${run_dir}? This overwrites B's current database and wp-content." || return 1
     else
       local ans
