@@ -128,6 +128,43 @@ setup() {
   [ ! -e "${run_dir}/graft.mu_plugin.done" ]
 }
 
+# --- issue #37: a wp eval that hard-fails mid-media-step left the pushed
+# payload/lib pair on B forever — graft_import_attachments only ever removed
+# them (graft_remove_file, twice, right after its own `wp_remote b eval`)
+# on the path where that eval SUCCEEDED; under bin/sitegraft's real
+# `set -euo pipefail`, a non-zero eval aborts the function before either
+# removal runs. The id-remap/domain-remap pair already had exactly this
+# problem fixed for them (NIT-3 above, this same trap) when the media step
+# was still Task 4.2 shaped; the media step (#30) copied their push/eval/
+# remove structure faithfully but landed after that fix and was never added
+# to this trap's own cleanup list. Fixed by adding the two fixed,
+# predictable media-step filenames to the same unconditional cleanup block.
+#
+# Real files on a real (bare-local) SITE_B_WP_PATH, not a stubbed
+# graft_remove_file — the whole point of this test is that the underlying
+# `rm -f` actually runs. SITE_B_SSH_HOST/SITE_B_WP_CMD are unset explicitly
+# (not merely never assigned), same reasoning as the dry-run-trap tests
+# above: an inherited value would silently change which of
+# graft_remove_file's three transfer shapes this test exercises.
+@test "_graft_exit_trap removes the media-import payload and lib file left on B when wp eval fails (issue #37)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local site_b_wp_content="$BATS_TEST_TMPDIR/site-b/wp-content"
+  mkdir -p "$site_b_wp_content"
+  printf '[{"old":10,"rel_path":"2024/01/a.jpg","title":"a"}]' \
+    > "${site_b_wp_content}/sitegraft-media-import-payload.json"
+  printf '<?php // stub media-import-functions.php\n' \
+    > "${site_b_wp_content}/sitegraft-media-import-functions.php"
+
+  unset SITE_B_SSH_HOST SITE_B_WP_CMD
+  SITE_B_WP_PATH="$BATS_TEST_TMPDIR/site-b"
+
+  SITEGRAFT_GRAFT_RUN_DIR="$run_dir" _graft_exit_trap
+
+  [ ! -e "${site_b_wp_content}/sitegraft-media-import-payload.json" ]
+  [ ! -e "${site_b_wp_content}/sitegraft-media-import-functions.php" ]
+}
+
 # --- graft_run_module_post_import creates module-content-rewrites.tsv -----
 # unconditionally (issue #52 fix-pack, review round 3, MAJOR) — lib/verify.
 # sh's guard 1 reads this file's mere PRESENCE (even empty) as "this run's
