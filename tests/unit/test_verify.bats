@@ -208,7 +208,23 @@ setup() {
   # (lib/inventory.sh), so it DRAINS stdin. On a stdin-based loop this
   # reports 1 of 1 -- a full [x] PASS over three keys never looked at.
   wp_remote() { cat >/dev/null; echo '"same"'; }
-  run verify_options_match "$run_dir" "$manifest"
+  # `</dev/null` on the `run` invocation itself (not on the stub) -- this
+  # test's whole point is a stub that drains WHATEVER stdin it inherits, so
+  # redirecting inside the stub would defeat it. `run` runs the command in
+  # a command substitution (bats-core's test_functions.bash), which has no
+  # stdin of its own; without this it inherits bats' own stdin, i.e.
+  # whatever the process that started bats happened to have open. In CI
+  # that is already /dev/null, so this is a no-op there -- but from an
+  # interactive shell, or any parent whose stdin is a pipe that never
+  # reaches EOF, that inherited stdin is exactly what the drain-and-hang
+  # stub reads, and `cat` blocks forever (issue #46: a real 47-minute hang
+  # on a real machine, the whole suite along with it). Pinning it to
+  # /dev/null here makes the test's own stdin behavior deterministic --
+  # `cat` always sees an already-at-EOF fd 0 and returns immediately --
+  # without touching what the stub drains or how many keys land on fd 3,
+  # so the mismatch this test exists to catch (see the header comment
+  # above) is exactly as catchable as before.
+  run verify_options_match "$run_dir" "$manifest" </dev/null
   [ "$status" -eq 0 ]
   [[ "$output" == *"OPTIONS_COMPARED:4:4"* ]] || false
 }
