@@ -496,17 +496,67 @@ backup_verify_db_export() {
   # its input through to EOF regardless of `-n`, so it introduces no new
   # SIGPIPE risk of its own here.
   #
-  # A WordPress install running the SQLite integration plugin never
-  # reaches this check with a false rejection risk to worry about: its
-  # `wp db export` shells out to `sqlite3`, whose dump quotes CREATE TABLE
-  # with no backticks at all (verified: `sqlite3 db .dump` emits `CREATE
-  # TABLE wp_options (...)`, no quoting) — the core-table probe just above
-  # this one, which requires a backtick-quoted `` `wp_options` ``, already
-  # refuses that dump earlier in this same function, on `main` exactly as
-  # on this branch. Not a gap this footer check needs to account for.
-  found=$(gunzip -c "$gz_file" 2>/dev/null | tail -5 | grep -cF -- '-- Dump completed' || true)
+  # A WordPress install running the SQLite integration plugin DOES reach
+  # this check, and needs its own dialect handled correctly rather than
+  # assumed away. CORRECTED (this comment previously claimed sqlite3 never
+  # quotes CREATE TABLE at all — wrong; that was a table created by hand
+  # with no quoting, not what a real drop-in emits). `sqlite3 .dump`
+  # replays `sqlite_master.sql` VERBATIM, with whatever quoting the table
+  # was originally CREATEd with — measured directly. Quoting is therefore a
+  # property of the drop-in that created the tables, not of sqlite3, and it
+  # has changed between releases: v2.x's `WP_SQLite_Translator` used double
+  # quotes, but the current v3.x `WP_SQLite_Driver` (verified against its
+  # own source, class-wp-sqlite-connection.php's `quote_identifier()`)
+  # deliberately uses BACKTICKS — specifically to avoid a documented SQLite
+  # quirk where a misspelled double-quoted identifier silently falls back
+  # to being read as a string literal instead of erroring. So a real,
+  # current `wp db export` on a SQLite-backed B DOES pass the backtick-
+  # quoted core-table probe above and DOES reach this check.
+  #
+  # `wp db export`'s own SQLite path (verified against wp-cli/db-command's
+  # source) shells out to `sqlite3 -init <file containing ".dump"> <copy>
+  # .exit` — a real `.dump`, not something sitegraft has to emulate. That
+  # dump has no mysqldump-shaped footer at all; it has its own, different
+  # one: `.dump` wraps the ENTIRE export in exactly one `BEGIN
+  # TRANSACTION;` / `COMMIT;` pair (verified against a real multi-table
+  # dump) — one COMMIT, for the whole file, at the true end.
+  #
+  # NOT the same thing as mysqldump's own "COMMIT;" — measured, and this is
+  # the trap a same-window "accept either string" version of this check
+  # would fall into: mysqldump/mariadb-dump writes "COMMIT;
+SET
+  # AUTOCOMMIT=..." once PER TABLE (dump_table(), gated on
+  # --no-autocommit, which `wp db export` sets), not once at the true end —
+  # verified against a real 12-table `wp db export`: 12 separate "COMMIT;"
+  # lines, scattered throughout, one right after EVERY table's own data. A
+  # mysqldump-dialect export truncated immediately after any single
+  # table's own per-table COMMIT — before every table after it was ever
+  # written, the exact #99 shape — would still show "COMMIT;" in its last
+  # few lines. Accepting "COMMIT;" generically, for both dialects in the
+  # same tail window, would silently readmit that truncation. The two
+  # dialects need two different markers, checked only against dumps of
+  # their own kind.
+  #
+  # Sniffed from the dump's OWN FIRST line, which only the tool that wrote
+  # the dump controls (never table data, unlike the tail this check reads)
+  # — a mysqldump/mariadb-dump export always opens with a "-- " comment; a
+  # `sqlite3 .dump` always opens with "PRAGMA foreign_keys=OFF;" (verified,
+  # unconditional). `head -1` (not `-q`-style anything), same SIGPIPE-
+  # under-pipefail reasoning as the rest of this function — `|| true` keeps
+  # a pipe closed early by `head` from turning into a false failure here.
+  local first_line
+  first_line=$(gunzip -c "$gz_file" 2>/dev/null | head -1 || true)
+  local marker marker_desc
+  if [[ "$first_line" == "PRAGMA foreign_keys"* ]]; then
+    marker='COMMIT;'
+    marker_desc="a SQLite export's closing COMMIT;"
+  else
+    marker='-- Dump completed'
+    marker_desc="mysqldump's completion marker ('-- Dump completed ...')"
+  fi
+  found=$(gunzip -c "$gz_file" 2>/dev/null | tail -5 | grep -cF -- "$marker" || true)
   if [ "${found:-0}" -eq 0 ]; then
-    log_error "backup verification failed: ${gz_file} has no mysqldump completion marker ('-- Dump completed ...') in its final lines — the export looks truncated, not just missing a table. Re-run the backup; if this keeps happening, check whether B's export died partway (disk full, network drop, killed process)."
+    log_error "backup verification failed: ${gz_file} has no ${marker_desc} in its final lines — the export looks truncated, not just missing a table. Re-run the backup; if this keeps happening, check whether B's export died partway (disk full, network drop, killed process)."
     return 1
   fi
 }

@@ -265,6 +265,95 @@ _fake_dump_rows() {
   [ "$status" -eq 0 ]
 }
 
+# --- SQLite dialect (WP_SQLite_Driver v3.x) ---
+#
+# Built through the REAL export mechanism, not a hand-shaped fixture: a
+# real `sqlite3` binary, tables CREATEd with the exact backtick quoting
+# the current v3.x driver's own `quote_identifier()` uses (verified
+# against its source, class-wp-sqlite-connection.php), and the export
+# itself run as `sqlite3 -init <file with ".dump"> <db> .exit` — the exact
+# invocation `wp db export`'s sqlite_export() shells out to (verified
+# against wp-cli/db-command's own source). Skipped where sqlite3 is not on
+# PATH rather than silently no-op'd — the point is to run for real, not to
+# always look green.
+
+_require_sqlite3() {
+  command -v sqlite3 >/dev/null 2>&1 || skip "sqlite3 not on PATH"
+}
+
+# _sqlite_export_fixture <db_file> — real WordPress-shaped tables
+# (wp_options, wp_posts), backtick-quoted as v3.x's quote_identifier()
+# creates them, some real row data.
+_sqlite_export_fixture() {
+  local db="$1"
+  sqlite3 "$db" '
+CREATE TABLE `wp_options` (`option_id` INTEGER PRIMARY KEY, `option_name` TEXT, `option_value` TEXT);
+INSERT INTO `wp_options` VALUES (1,"siteurl","http://example.test"),(2,"blogname","Test Site");
+CREATE TABLE `wp_posts` (`ID` INTEGER PRIMARY KEY, `post_title` TEXT);
+INSERT INTO `wp_posts` VALUES (1,"Hello world");
+CREATE TABLE `wp_users` (`ID` INTEGER PRIMARY KEY, `user_login` TEXT);
+INSERT INTO `wp_users` VALUES (1,"admin");
+'
+}
+
+@test "backup_verify_db_export accepts a genuine, complete SQLite export (real sqlite3 .dump, backtick-quoted tables as v3.x's driver creates them)" {
+  _require_sqlite3
+  local db="$BATS_TEST_TMPDIR/sqlite-complete.db"
+  _sqlite_export_fixture "$db"
+  printf '.dump\n' > "$BATS_TEST_TMPDIR/sqlite-init.txt"
+  sqlite3 -init "$BATS_TEST_TMPDIR/sqlite-init.txt" "$db" .exit | gzip > "$BATS_TEST_TMPDIR/sqlite-complete.sql.gz"
+  # the fixture really does pass the (backtick-only) core-table probe —
+  # otherwise this test would prove nothing about the footer check below
+  gunzip -c "$BATS_TEST_TMPDIR/sqlite-complete.sql.gz" | grep -qF 'CREATE TABLE `wp_options`'
+  run backup_verify_db_export "$BATS_TEST_TMPDIR/sqlite-complete.sql.gz" "wp_"
+  [ "$status" -eq 0 ]
+}
+
+@test "backup_verify_db_export REJECTS a truncated SQLite export (dies before the closing COMMIT;)" {
+  _require_sqlite3
+  local db="$BATS_TEST_TMPDIR/sqlite-truncated.db"
+  _sqlite_export_fixture "$db"
+  printf '.dump\n' > "$BATS_TEST_TMPDIR/sqlite-init2.txt"
+  # dies after wp_posts, before wp_users and the closing COMMIT; -- same
+  # shape as the mysqldump truncation tests above, this dialect's own
+  # version of it
+  sqlite3 -init "$BATS_TEST_TMPDIR/sqlite-init2.txt" "$db" .exit | head -7 | gzip > "$BATS_TEST_TMPDIR/sqlite-truncated.sql.gz"
+  run backup_verify_db_export "$BATS_TEST_TMPDIR/sqlite-truncated.sql.gz" "wp_"
+  [ "$status" -eq 1 ]
+}
+
+# BLOCKER-class finding (review): a version of this check that accepts
+# "COMMIT;" OR "-- Dump completed" in the SAME tail window, regardless of
+# dialect, is NOT SAFE — it reopens #99 for the mysqldump path specifically.
+# Measured against a real 12-table `wp db export`: mysqldump/mariadb-dump
+# writes "COMMIT;\nSET AUTOCOMMIT=..." once PER TABLE (dump_table(), when
+# --no-autocommit is set, which `wp db export` does), not once at the true
+# end — 12 tables produced 12 separate "COMMIT;" lines scattered through
+# the file, one right after each table's own data. A mysqldump-dialect
+# dump truncated immediately after any ONE table's own per-table COMMIT —
+# before every table after it was ever written — still shows "COMMIT;" in
+# its last few lines. This fixture reproduces exactly that shape (real
+# per-table COMMIT/SET AUTOCOMMIT footer, no real end-of-dump marker) and
+# must be REJECTED despite containing "COMMIT;".
+@test "backup_verify_db_export REJECTS a mysqldump-dialect dump truncated right after one table's own per-table COMMIT, even though it contains the literal string 'COMMIT;' (the trap a dialect-blind fix falls into)" {
+  {
+    printf -- '-- MySQL dump\n'
+    printf 'CREATE TABLE `wp_options` (\n'; _fake_dump_rows 50; printf ');\n'
+    printf 'CREATE TABLE `wp_posts` (\n'; _fake_dump_rows 50; printf ');\n'
+    # both required tables present -- the core-table probe alone would
+    # accept this, same as the earlier anchoring test; this dump's own
+    # per-table footer for wp_posts is what must still get caught
+    printf '/*!40000 ALTER TABLE `wp_posts` ENABLE KEYS */;\n'
+    printf 'UNLOCK TABLES;\n'
+    printf 'COMMIT;\n'
+    printf 'SET AUTOCOMMIT=@OLD_AUTOCOMMIT;\n'
+    # dies here: wp_users, wp_usermeta, etc. never written; no real
+    # "-- Dump completed" footer either
+  } | gzip > "$BATS_TEST_TMPDIR/mysql-mid-table-commit.sql.gz"
+  run backup_verify_db_export "$BATS_TEST_TMPDIR/mysql-mid-table-commit.sql.gz" "wp_"
+  [ "$status" -eq 1 ]
+}
+
 @test "backup_verify_db_export fails when the dump has a completion-looking line that is NOT mysqldump's own footer (must match the real marker, not just 'looks done')" {
   {
     printf -- '-- MySQL dump\n'
