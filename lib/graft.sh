@@ -1091,19 +1091,65 @@ graft_import_wxr() {
 
 # design doc §6.4 step 6 / review finding A7: install+activate on B if absent,
 # recording exactly what B had before so graft can put it back afterward.
+# issue #63, case 1 (real — fixed here): this function's pre-state writes
+# used to be bare `printf ... > "$state_file"`, unguarded by is_dry_run,
+# unlike every wp_remote call around them (all routed through run_or_echo).
+# Reachable: phase_graft wires this behind `graft_step_done ... importer_setup
+# || { graft_ensure_importer ...; graft_mark_step ... }`, so ANY invocation
+# that finds the marker missing re-enters this function — real graft or
+# --dry-run alike. A real run that writes state_file (e.g. "absent") and then
+# hard-fails before graft_mark_step (the wp-cli install/activate call right
+# after it failing, under set -euo pipefail) leaves the marker missing with a
+# TRUE prior state recorded on disk. Under --dry-run, wp_remote's own
+# simulation (lib/inventory.sh routes every call, reads included, through
+# run_or_echo) makes both `is-installed` and `is-active` checks above return
+# 0 UNCONDITIONALLY, regardless of B's real state — so the unguarded writes
+# always overwrote that real "absent" with a FABRICATED "installed\nactive\n",
+# for real, on disk.
+#
+# The cost is narrower than an earlier draft of this comment claimed (review,
+# NIT — the earlier version also charged this with "destroys the one true
+# record a later REAL restore needs"; that particular claim doesn't hold, and
+# is not repeated here). The marker being missing is the ONLY way a --dry-run
+# can re-enter this function at all, and that same absence means a later REAL
+# resume ALSO re-enters it — importer_cleanup (which calls
+# graft_restore_importer_state) always comes strictly after importer_setup in
+# phase_graft's own linear step order, within one invocation, so any real run
+# that reaches restore has necessarily already re-derived state_file from a
+# genuine `wp plugin is-installed` first, overwriting whatever a prior
+# --dry-run peek fabricated. The corruption never survives to feed a real
+# restore.
+#
+# What IS real, and what this fixes: within the SAME --dry-run invocation,
+# graft_restore_importer_state reads the state file too, for its own preview
+# of what --dry-run would uninstall/deactivate — so the fabricated
+# "installed\nactive\n" made THAT preview silently show "no action", every
+# time, regardless of what a real resume would actually end up doing. Guarding
+# the writes fixes exactly this: a --dry-run against a fresh run_dir now
+# leaves no file at all (restore's own "no pre-state file was recorded" case,
+# already correct), and a --dry-run against a run_dir with a real prior write
+# now leaves that TRUE value alone, so this same invocation's own restore
+# preview sees it. wp_remote itself is untouched — its calls still run
+# through run_or_echo exactly as before, so the actual wp-cli
+# install/activate call stays correctly simulated under --dry-run.
+#
+# _graft_migrate_one_option_key's own printf (below) looks like the same
+# shape (case 2 of #63) but is DELIBERATELY left unguarded — see that
+# function's own comment for why the two cases are not actually the same
+# bug.
 graft_ensure_importer() {
   local run_dir="$1"
   local state_file="${run_dir}/.wordpress-importer-pre-state"
   if wp_remote b plugin is-installed wordpress-importer >/dev/null 2>&1; then
-    printf 'installed\n' > "$state_file"
+    is_dry_run || printf 'installed\n' > "$state_file"
     if wp_remote b plugin is-active wordpress-importer >/dev/null 2>&1; then
-      printf 'active\n' >> "$state_file"
+      is_dry_run || printf 'active\n' >> "$state_file"
     else
-      printf 'inactive\n' >> "$state_file"
+      is_dry_run || printf 'inactive\n' >> "$state_file"
       run_or_echo wp_remote b plugin activate wordpress-importer
     fi
   else
-    printf 'absent\n' > "$state_file"
+    is_dry_run || printf 'absent\n' > "$state_file"
     run_or_echo wp_remote b plugin install wordpress-importer --activate
   fi
 }
@@ -1989,6 +2035,50 @@ _graft_migrate_one_option_key() {
       'def replace_domain: if type == "string" then split($from) | join($to) else . end; walk(replace_domain)' 2>/dev/null)
     [ -n "$rewritten" ] && value="$rewritten"
   fi
+  # issue #63, case 2 — investigated, LEFT UNGUARDED on purpose (unlike
+  # graft_ensure_importer's own state_file, case 1, which the same issue
+  # DOES fix): core_wp_post_import (modules/core-wp.sh) reads this SAME
+  # file, in this SAME phase_graft invocation, one step later, to preview
+  # its own page_on_front/page_for_posts remap under --dry-run — that
+  # cross-step preview is why this write has always been unconditional,
+  # and it is exercised today: every "graft_migrate_options writes an
+  # option file per key..." test in tests/unit/test_graft_options.bats
+  # runs under SITEGRAFT_DRY_RUN=1 and asserts the file exists afterward.
+  #
+  # The narrower risk #63 actually describes — a --dry-run PEEK, run
+  # against a run_dir left behind by a real migrate_options that crashed
+  # partway through, overwriting an already-correctly-pushed key's
+  # recorded value with a freshly-read value from A, which a later,
+  # separate `sitegraft verify` (lib/verify.sh's verify_options_match,
+  # which trusts this same cached file) could then read as a false
+  # mismatch — is real. An earlier draft of this comment rejected fixing
+  # it by claiming the guard would need "was this run's real value
+  # already recorded" tracking this function doesn't have. That reasoning
+  # was wrong (review, NIT) — the file's own existence already IS that
+  # record, and `if is_dry_run && [ -f "$f" ]; then :; else printf ...; fi`
+  # is a one-line guard, mechanically no different from case 1's fix.
+  # Verified it passes the existing suite (test_graft_options.bats,
+  # test_verify.bats, test_core_wp_module.bats) unchanged.
+  #
+  # The real reason NOT to add it is different, and specific to this
+  # function: `SITEGRAFT_DRY_RUN=0 wp_remote a option get` (above) means
+  # the in-memory $value here is ALWAYS this call's fresh read from A —
+  # the guard would only suppress the FILE write, so the dry-run preview
+  # LINE below (`run_or_echo wp_remote b option update ...`) still shows
+  # the correct, current value regardless. But core_wp_post_import does
+  # NOT read that in-memory value — it reads the FILE, one step later, in
+  # THIS SAME invocation. Measured directly: with the guard applied and a
+  # pre-existing option-page_on_front.value on disk from an earlier real
+  # run, a --dry-run preview of THIS SAME invocation reads the STALE
+  # cached old_id for its own page_on_front remap preview, while a real
+  # resume against the identical run_dir re-derives and writes the FRESH
+  # value first, then remaps against THAT. The guard would trade "a
+  # --dry-run peek can corrupt a cached file for a later, separate verify
+  # run" for "a --dry-run preview can quietly disagree with what the real
+  # resume in the SAME invocation actually ends up doing" — the stronger
+  # invariant of the two (this is exactly why the A-side read above is
+  # forced real in the first place: an inaccurate preview is worse than a
+  # stale cache). Flagged, not fixed.
   printf '%s' "$value" > "${run_dir}/option-${key}.value"
   case "$key" in
     page_on_front|page_for_posts) return 0 ;; # remapped by core_wp_post_import, §9.3
@@ -2510,10 +2600,72 @@ _graft_exit_trap() {
   # already succeeded" guard the mu-plugin cleanup above relies on) —
   # `graft_remove_file`'s underlying `rm -f` is a silent no-op if the file
   # was already removed normally or never existed.
+  #
+  # Fixed filenames cut both ways (review, fix-pack round 2): they let this
+  # block run unconditionally with no per-run state to track, but they also
+  # mean the trap of an ABORTED graft can remove the live payload of a
+  # DIFFERENT, CONCURRENT graft against the same B — pre-existing for the
+  # id/domain-remap trio, now extended to the media pair and the WXR
+  # staging directory below by the same shape. Concurrent grafts against one
+  # B are not a supported configuration this codebase defends against
+  # anywhere else either; noted, not solved here.
+  #
+  # Issue #37: the media-import payload and its lib file (graft_import_
+  # attachments, above) follow the EXACT same push-then-remove-after-eval
+  # shape as the id/domain-remap pair just above, and were left OUT of this
+  # list when the media step landed (#30) — the one abort case that
+  # actually mattered, because it's the one this trap is FOR. Unlike the
+  # remap payloads (WordPress-internal integer IDs, an already-public
+  # domain string), the media payload is the interesting one to actually
+  # leave behind: it carries A's attachment IDs, their relative paths under
+  # uploads/, and every migrated post's title — a listing of the source
+  # site's media, sitting in wp-content, served by B's web server, for as
+  # long as the operator takes to notice the abort and re-run. Same
+  # filenames as graft_push_media_import_lib/graft_push_remap_payload
+  # always use (fixed, not per-run), same silent-no-op-if-absent cleanup.
+  #
+  # Fix-pack round 2 (review, BLOCKER-1): the above closed the media
+  # payload but missed a bigger hole in the exact same trap. graft_import_wxr
+  # (above), wrapped-local B branch, stages A's ENTIRE WXR export under
+  # "${SITE_B_WP_PATH}/wp-content/sitegraft-import-$$/" and only removes it
+  # (graft_remove_dir) AFTER its own import loop finishes — a `wp import`
+  # that exits non-zero partway through the loop aborts before that removal,
+  # same shape as every case above, and this one was never added to this
+  # list at all. This is the most sensitive artifact this trap now covers:
+  # every migrated post's full post_content and excerpt, its author, and
+  # any custom field WordPress's own exporter includes in the WXR — not
+  # just IDs, paths and titles. `$$` is the CURRENT shell's PID, a bash
+  # special parameter, not a `local` — it reads correctly from inside this
+  # trap for the same reason SITEGRAFT_GRAFT_RUN_DIR has to be a global
+  # above (measured: unlike a `local run_dir`, `$$` never goes out of
+  # scope), so the exact path graft_import_wxr computed is mechanically
+  # reconstructible here with no extra state to carry. graft_remove_dir
+  # itself is not ssh-aware (see its own header comment) — harmless here
+  # regardless, since this container_dir shape is only ever created on the
+  # branch where SITE_B_SSH_HOST is unset in the first place; on a genuine
+  # ssh-remote B, this call is inert (nothing was ever staged at this path,
+  # local or remote). The equivalent ssh-remote leak
+  # (/tmp/sitegraft-import-$$ on B, /tmp/sitegraft-export-$$ on A, both
+  # cleared only on SUCCESS) is the same class but lower exposure — neither
+  # sits under a web-served directory — and is flagged, not fixed, here.
+  #
+  # MINOR (review, round 2): every removal below used to be a silent
+  # `2>/dev/null || true`, indistinguishable from "already gone" whether B
+  # was actually reachable or not — measured live with B unreachable: the
+  # trap emitted nothing while every one of these stayed on B. B being
+  # unreachable is itself one of the more likely reasons a graft aborts in
+  # the first place, which is exactly when a silent cleanup attempt is
+  # least trustworthy. `leftover` collects the name of anything this block
+  # could not remove and reports it in one line, naming names, once.
   if [ -n "$rd" ] && [ -n "${SITE_B_WP_PATH:-}" ]; then
-    graft_remove_file b "${SITE_B_WP_PATH}/wp-content/sitegraft-id-remap-payload.json" 2>/dev/null || true
-    graft_remove_file b "${SITE_B_WP_PATH}/wp-content/sitegraft-domain-remap-payload.json" 2>/dev/null || true
-    graft_remove_file b "${SITE_B_WP_PATH}/wp-content/sitegraft-content-remap-functions.php" 2>/dev/null || true
+    local leftover=""
+    graft_remove_file b "${SITE_B_WP_PATH}/wp-content/sitegraft-id-remap-payload.json" 2>/dev/null || leftover="${leftover}sitegraft-id-remap-payload.json "
+    graft_remove_file b "${SITE_B_WP_PATH}/wp-content/sitegraft-domain-remap-payload.json" 2>/dev/null || leftover="${leftover}sitegraft-domain-remap-payload.json "
+    graft_remove_file b "${SITE_B_WP_PATH}/wp-content/sitegraft-content-remap-functions.php" 2>/dev/null || leftover="${leftover}sitegraft-content-remap-functions.php "
+    graft_remove_file b "${SITE_B_WP_PATH}/wp-content/sitegraft-media-import-payload.json" 2>/dev/null || leftover="${leftover}sitegraft-media-import-payload.json "
+    graft_remove_file b "${SITE_B_WP_PATH}/wp-content/sitegraft-media-import-functions.php" 2>/dev/null || leftover="${leftover}sitegraft-media-import-functions.php "
+    graft_remove_dir b "${SITE_B_WP_PATH}/wp-content/sitegraft-import-$$" 2>/dev/null || leftover="${leftover}sitegraft-import-$$/ "
+    [ -z "$leftover" ] || log_warn "graft interrupted or failed — could not remove from B's wp-content (is B reachable?): ${leftover}— may still hold migrated post content, attachment metadata, or both; clean up by hand once B is reachable again"
   fi
   if declare -F sitegraft_cleanup >/dev/null 2>&1; then
     sitegraft_cleanup || true
