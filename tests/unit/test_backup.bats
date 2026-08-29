@@ -225,6 +225,46 @@ _fake_dump_rows() {
   [[ "$output" == *"Dump completed"* ]] || false
 }
 
+# BLOCKER fix (review): the footer check above must be ANCHORED to the end
+# of the dump, not searched anywhere in it. `wp_options` is dumped FIRST —
+# before mysqldump ever gets near the tables that would actually prove
+# completion — and is exactly where UpdraftPlus/Duplicator/All-in-One WP
+# Migration park log rows and prior-dump fragments as option values. A site
+# that has ever run one of those plugins can carry the literal string
+# "-- Dump completed on ..." as ordinary DATA inside wp_options, long
+# before the real export dies partway through wp_posts. An unanchored
+# `grep` over the whole file would accept that as proof of completion —
+# exactly the #99 defect this whole function exists to close, just moved
+# one layer down. Measured red against the unanchored form, green against
+# `tail -5 | grep`.
+@test "backup_verify_db_export fails a truncated dump even when the literal completion string appears earlier as ordinary DATA (wp_options poisoned by a prior UpdraftPlus/Duplicator log row)" {
+  {
+    printf -- '-- MySQL dump\n'
+    printf 'CREATE TABLE `wp_options` (\n'
+    printf "INSERT INTO wp_options VALUES (1,'updraft_log','-- Dump completed on 2020-01-01 00:00:00 (leftover from a previous plugin backup)');\n"
+    _fake_dump_rows 50
+    printf ');\n'
+    printf 'CREATE TABLE `wp_posts` (\n'; _fake_dump_rows 50; printf ');\n'
+    # dies here -- no real footer, wp_usermeta/wp_users/etc never written
+  } | gzip > "$BATS_TEST_TMPDIR/poisoned-truncated.sql.gz"
+  run backup_verify_db_export "$BATS_TEST_TMPDIR/poisoned-truncated.sql.gz" "wp_"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Dump completed"* ]] || false
+}
+
+@test "backup_verify_db_export accepts a genuine --skip-dump-date footer ('-- Dump completed' with no timestamp)" {
+  {
+    printf -- '-- MySQL dump\n'
+    printf 'CREATE TABLE `wp_options` (\n'; _fake_dump_rows 50; printf ');\n'
+    printf 'CREATE TABLE `wp_posts` (\n'; _fake_dump_rows 50; printf ');\n'
+    printf '/*M!100616 SET NOTE_VERBOSITY=@OLD_NOTE_VERBOSITY */;\n'
+    printf '\n'
+    printf -- '-- Dump completed\n'
+  } | gzip > "$BATS_TEST_TMPDIR/skipdate-complete.sql.gz"
+  run backup_verify_db_export "$BATS_TEST_TMPDIR/skipdate-complete.sql.gz" "wp_"
+  [ "$status" -eq 0 ]
+}
+
 @test "backup_verify_db_export fails when the dump has a completion-looking line that is NOT mysqldump's own footer (must match the real marker, not just 'looks done')" {
   {
     printf -- '-- MySQL dump\n'
@@ -1221,6 +1261,34 @@ OLD
   [ -x "${snap}/restore.sh" ]
   # ... and the restore it was a net for really did remove that addition
   [ ! -e "${B_ROOT}/wp-content/themes/GRAFTED.css" ]
+}
+
+# NIT (review): before this fix, a pre-restore safety-snapshot failure left
+# the operator with nothing but the failing tool's own raw stderr — no
+# sitegraft-level line saying the snapshot subshell itself failed. This
+# matters most exactly here, on the emergency path: an operator running
+# `restore` under pressure deserves to be told plainly that the safety net
+# could not be built, not left to infer it from a bare tar diagnostic.
+@test "phase_restore's pre-restore safety snapshot names its own failure, not just raw tar stderr, and never runs the restore itself" {
+  _wrapped_fixture
+  _wrapped_profile
+  printf 'grafted\n' > "${B_ROOT}/wp-content/themes/GRAFTED.css"
+  local real_tar; real_tar=$(command -v tar)
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/tar" <<STUB
+#!/usr/bin/env bash
+if [ "\$1" = "czf" ]; then
+  exit 1
+fi
+exec "$real_tar" "\$@"
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/tar"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+  run phase_restore --profile w --run "$RUN_DIR" --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"safety snapshot failed"* ]] || false
+  # the restore itself never ran: the "addition" is still there
+  [ -f "${B_ROOT}/wp-content/themes/GRAFTED.css" ]
 }
 
 @test "phase_restore --dry-run fails when the restore.sh preview itself fails (a preview that cannot run is not a green light)" {

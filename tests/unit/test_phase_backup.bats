@@ -129,6 +129,11 @@ EOF
   run jq -e '.checksums_protected_pre_graft.fakebooking | startswith("sha256:")' "${RUN_DIR}/manifest.json"
   [ "$status" -eq 0 ]
   [[ "$backup_output" == *"to restore this backup"* ]] || false
+  # NIT (review): the success message used to say "core tables present"
+  # without ever naming the completion marker, even though that marker is
+  # now the load-bearing signal — exactly the false reassurance #99 itself
+  # cites as the pattern to avoid.
+  [[ "$backup_output" == *"completion marker present"* ]] || false
 }
 
 # issue #52 / ADR 0008's "Required regardless" list: phase_backup must also
@@ -321,6 +326,11 @@ EOF
   run phase_backup --profile t --run "$RUN_DIR"
   [ "$status" -ne 0 ]
   [ ! -e "${RUN_DIR}/backup.complete" ]
+  # NIT (review): the backup/restore subshell used to abort silently here —
+  # no sitegraft-level summary, just whatever the failing tool itself wrote
+  # to stderr. An operator relying on this for the restore path deserves a
+  # log line that says the subshell failed, not just raw tool output.
+  [[ "$output" == *"backup failed"* ]] || false
 }
 
 @test "phase_backup fails, and writes no backup.complete, when the database export fails while leaving a plausible dump" {
@@ -341,6 +351,7 @@ EOF
   run phase_backup --profile t --run "$RUN_DIR"
   [ "$status" -ne 0 ]
   [ ! -e "${RUN_DIR}/backup.complete" ]
+  [[ "$output" == *"backup failed"* ]] || false
 }
 
 @test "phase_backup writes no backup.complete when the restore.sh generator fails" {
@@ -441,13 +452,17 @@ SITE_B_WP_PATH="${B_ROOT}"
 SITE_B_WP_CMD="env -- wp"
 SITEGRAFT_STATE_DIR="${SITEGRAFT_STATE_DIR}"
 EOF
+  # exit 1, not an arbitrary non-zero: measured against real GNU tar
+  # (1.35) as its own exit status for "file shrank/changed while being
+  # read" — a complete archive, tar still reports failure. Same fixture
+  # shape as test_backup_pipefail.bats's own tar stand-in.
   local real_tar; real_tar=$(command -v tar)
   mkdir -p "$BATS_TEST_TMPDIR/bin"
   cat > "$BATS_TEST_TMPDIR/bin/tar" <<STUB
 #!/usr/bin/env bash
 if [ "\$1" = "czf" ]; then
   "$real_tar" "\$@"
-  exit 2
+  exit 1
 fi
 exec "$real_tar" "\$@"
 STUB

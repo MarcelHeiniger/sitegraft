@@ -20,12 +20,19 @@ setup() {
 
 # _install_fake_tar_failing_on_create — a `tar` stand-in for BOTH ends of a
 # pipe: behaves exactly like real tar, except the create ("-c") side always
-# writes a complete, valid archive for what it read and then exits 2 —
-# the real-world shape of a tar that hit a non-fatal-to-the-archive problem
-# and still reports failure (e.g. "file changed as we read it"). The
-# extract ("-x") side is unmodified real tar, so it always succeeds on the
-# complete stream it receives — reproducing the exact swallow: the
-# pipeline's LAST command exits 0 regardless of what the first one did.
+# writes a complete, valid archive for what it read and then exits 1 —
+# measured against real GNU tar (1.35): racing a truncation against a
+# large in-progress read produces "File shrank by N bytes; padding with
+# zeros", exit status 1, with the archive itself still complete (tar pads
+# and continues). Exit 1 is GNU tar's own non-fatal class for exactly this
+# ("some files differ / changed while being read"); exit 2 is reserved for
+# a genuinely fatal, archive-aborting error (measured separately: a
+# Permission Denied read failure exits 2 and the archive is missing the
+# unreadable entry entirely — a different, ALSO real failure shape, just
+# not the one this fixture fabricates). The extract ("-x") side is
+# unmodified real tar, so it always succeeds on the complete stream it
+# receives — reproducing the exact swallow: the pipeline's LAST command
+# exits 0 regardless of what the first one did.
 _install_fake_tar_failing_on_create() {
   local real_tar; real_tar=$(command -v tar)
   mkdir -p "$BATS_TEST_TMPDIR/bin"
@@ -34,7 +41,7 @@ _install_fake_tar_failing_on_create() {
 for a in "\$@"; do
   if [ "\$a" = "-c" ]; then
     "$real_tar" "\$@"
-    exit 2
+    exit 1
   fi
 done
 exec "$real_tar" "\$@"
@@ -108,6 +115,21 @@ STUB
 # diagnostic is indistinguishable from a real failure, so it is warned about
 # rather than trusted). Adding `set -o pipefail;` must not turn that
 # deliberate tolerance into a hard failure — the `|| true` still has to win.
+#
+# NOTE (review, measured): this test is VACUOUS on macOS/bsdtar, the
+# platform it was written and is run on. bsdtar's `-k` on a collision exits
+# 0 on its own — measured directly, no `Cannot open: File exists` diagnostic
+# at all — so this test passes identically whether or not `${tolerate_exit}`
+# is even present; it exercises nothing about the fix under test here. GNU
+# tar's `-k` on the same collision exits 2 (measured: "Cannot open: File
+# exists" / "Exiting with failure status due to previous errors") — THAT is
+# the platform (Linux CI, `runs-on: self-hosted`) where `${tolerate_exit}`'s
+# `|| true` is load-bearing and this test has actual discriminating power.
+# Left in for that reason (and because bats has no portable way to force a
+# GNU-tar-shaped exit code here without reintroducing the fake-tar fixture
+# this test is deliberately NOT using, to stay closer to a real tar
+# invocation) — but do not read a green run of this specific test on a Mac
+# as proof the fallback tolerance still works; only CI proves that.
 @test "graft_push_dir --keep-existing fallback (-k, no --skip-old-files) still tolerates an existing-file collision (regression, unchanged by the pipefail fix)" {
   unset SITE_B_SSH_HOST
   local staging="$BATS_TEST_TMPDIR/staging"

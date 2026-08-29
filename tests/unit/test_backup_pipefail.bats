@@ -107,17 +107,24 @@ STUB
   # A `tar` stand-in used for BOTH ends of the pipe (the source side runs
   # through the wrapper prefix, the destination side runs directly — both
   # resolve `tar` off the same PATH). It behaves exactly like real tar
-  # except that the create ("czf") side always exits 2 after writing a
-  # complete, valid archive — the real-world shape of a tar that hit a
-  # non-fatal-to-the-archive problem (e.g. a file changed while being read)
-  # and still exits non-zero. The extract ("xzf") side is unmodified real
-  # tar, so it succeeds on the complete stream it receives — reproducing
-  # the exact swallow: the pipeline's last command exits 0.
+  # except that the create ("czf") side always exits 1 after writing a
+  # complete, valid archive — measured against real GNU tar (1.35): racing
+  # a truncation against a large in-progress read produces "File shrank by
+  # N bytes; padding with zeros", exit status 1, with the archive itself
+  # still complete (tar pads and continues). Exit 1 is GNU tar's own
+  # non-fatal class for exactly this ("some files differ / changed while
+  # being read"); exit 2 is reserved for a genuinely fatal, archive-
+  # aborting error (measured separately: a Permission Denied read failure
+  # exits 2 and the archive is missing the unreadable entry entirely — a
+  # different, ALSO real failure shape, just not the one this test
+  # fabricates). The extract ("xzf") side is unmodified real tar, so it
+  # succeeds on the complete stream it receives — reproducing the exact
+  # swallow: the pipeline's last command exits 0.
   cat > "$BATS_TEST_TMPDIR/bin/tar" <<STUB
 #!/usr/bin/env bash
 if [ "\$1" = "czf" ]; then
   "$real_tar" "\$@"
-  exit 2
+  exit 1
 fi
 exec "$real_tar" "\$@"
 STUB
