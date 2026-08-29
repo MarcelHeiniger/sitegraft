@@ -94,3 +94,31 @@ jobs:
           set -euo pipefail
           find . -path ./.git -prune -o -name '*.php' -print0 \
             | xargs -0 -n1 php -l
+
+  stdin-hang-guard:
+    name: Stdin-hang guard (issue #102)
+    runs-on: ubuntu-latest
+    # 20 min: normal full runs take a handful of minutes (see the script's
+    # own header for the measurement); this leaves room for the per-test
+    # 30s cap (tests/lint/no-blocking-stdin-reads.sh) to trip on more than
+    # one file without the JOB timeout racing the guard's own timeout.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      # Same runtime dependencies as the unit-tests job -- this runs the
+      # identical tests/unit/ suite, just under a stdin that never reaches
+      # EOF instead of ubuntu-latest's default /dev/null. See that job's
+      # own comment for why each package is here.
+      - name: Install bats and sitegraft's runtime dependencies
+        run: sudo apt-get update && sudo apt-get install -y bats jq rsync perl openssh-client curl
+
+      - name: tests/lint/no-blocking-stdin-reads.sh
+        # CI's stdin is already /dev/null, which is exactly why this repo
+        # has shipped this bug class four times: a bare `read`/`cat` hits
+        # instant EOF there and reads as "declined correctly." This job
+        # runs the same suite under a stdin that stays open and never
+        # delivers EOF instead, so a blocking read has something to block
+        # on. See the script's own header for the full reasoning, and how
+        # BATS_TEST_TIMEOUT's 30s per-test cap was measured.
+        run: tests/lint/no-blocking-stdin-reads.sh
