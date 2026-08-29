@@ -5,6 +5,13 @@ bats_require_minimum_version 1.5.0
 # graft resumes at the sub-step after the last marker, never from scratch").
 setup() {
   load '../../lib/core.sh'
+  # lib/backup.sh: graft_local_prefix (lib/graft.sh) is a thin wrapper over
+  # _backup_local_exec_prefix, needed by the wrapped-local-B trap cleanup
+  # test below (issue #37, BLOCKER-1) — graft.sh itself only ever assumes
+  # backup.sh is already sourced (bin/sitegraft's "graft" case does this),
+  # same as every other test file that exercises a wrapped-local path
+  # (e.g. tests/unit/test_graft_ssh_file_transfer.bats's own setup).
+  load '../../lib/backup.sh'
   load '../../lib/graft.sh'
 }
 
@@ -165,6 +172,91 @@ setup() {
   [ ! -e "${site_b_wp_content}/sitegraft-media-import-functions.php" ]
 }
 
+# --- issue #37, BLOCKER-1 (review, fix-pack round 2): graft_import_wxr's own
+# wrapped-local-B branch stages A's ENTIRE WXR export under
+# "${SITE_B_WP_PATH}/wp-content/sitegraft-import-$$/" and only removes it
+# (graft_remove_dir) AFTER its own per-file `wp import` loop finishes. A
+# `wp import` that exits non-zero partway through that loop aborts before
+# the removal, same shape as the media-import pair just above, and this one
+# was never added to the trap's cleanup list at all — the most sensitive
+# artifact this trap covers: full post_content/excerpt, authors, and any
+# custom field WordPress's own exporter includes, not just IDs and titles.
+#
+# `$$` is a bash special parameter (the current shell's PID), not a `local`
+# — it reads back correctly from inside this trap for the identical reason
+# SITEGRAFT_GRAFT_RUN_DIR has to be a plain global above: measured directly,
+# `$$` inside this test body and `$$` inside _graft_exit_trap called from
+# the SAME test body are the same value, so the exact path graft_import_wxr
+# would have computed is reconstructible here with no extra state.
+#
+# SITE_B_WP_CMD is a real wrapper ("env -- wp") so this exercises the actual
+# wrapped-local branch of graft_local_prefix/graft_remove_dir, not the
+# bare-local one the sibling test above already covers implicitly.
+@test "_graft_exit_trap removes the staged WXR import directory left on a wrapped-local B when wp import fails (issue #37, BLOCKER-1)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local site_b="$BATS_TEST_TMPDIR/site-b"
+  local container_dir="${site_b}/wp-content/sitegraft-import-$$"
+  mkdir -p "$container_dir"
+  printf '<?xml version="1.0"?><rss><channel><wp:wxr_version>1.2</wp:wxr_version><item><wp:post_id>5</wp:post_id><wp:post_type>page</wp:post_type></item></channel></rss>' \
+    > "${container_dir}/export.xml"
+
+  unset SITE_B_SSH_HOST
+  SITE_B_WP_PATH="$site_b"
+  SITE_B_WP_CMD="env -- wp"
+
+  SITEGRAFT_GRAFT_RUN_DIR="$run_dir" _graft_exit_trap
+
+  [ ! -e "$container_dir" ]
+}
+
+# --- MINOR (review, fix-pack round 2): every removal in the block above used
+# to be a silent `2>/dev/null || true`, indistinguishable from "already
+# removed" whether B was reachable or not. B being unreachable is itself one
+# of the more likely reasons a graft aborts at all — exactly when a silent
+# cleanup attempt is least trustworthy, and precisely when the media payload
+# and the WXR export (both now confirmed to carry real content, not just
+# IDs) are most likely to still be sitting on B. `leftover` collects what
+# could not be removed and reports it once, naming names, instead of the
+# trap staying silent about them.
+@test "_graft_exit_trap warns, naming what it could not remove, when B is unreachable (issue #37, MINOR: cleanup failure must not be silent)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  unset SITE_B_SSH_HOST SITE_B_WP_CMD
+  SITE_B_WP_PATH="$BATS_TEST_TMPDIR/site-b"
+
+  # Simulates B being unreachable: every removal this trap block attempts
+  # fails, regardless of which of graft_remove_file's three transfer shapes
+  # it would otherwise take.
+  graft_remove_file() { return 1; }
+  graft_remove_dir() { return 1; }
+
+  SITEGRAFT_GRAFT_RUN_DIR="$run_dir"
+  run _graft_exit_trap
+
+  [[ "$output" == *"sitegraft-id-remap-payload.json"* ]] || false
+  [[ "$output" == *"sitegraft-domain-remap-payload.json"* ]] || false
+  [[ "$output" == *"sitegraft-content-remap-functions.php"* ]] || false
+  [[ "$output" == *"sitegraft-media-import-payload.json"* ]] || false
+  [[ "$output" == *"sitegraft-media-import-functions.php"* ]] || false
+  [[ "$output" == *"sitegraft-import-"* ]] || false
+}
+
+@test "_graft_exit_trap stays silent about cleanup when every removal succeeds (issue #37, MINOR: no false alarms on the happy abort path)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  unset SITE_B_SSH_HOST SITE_B_WP_CMD
+  SITE_B_WP_PATH="$BATS_TEST_TMPDIR/site-b"
+
+  graft_remove_file() { return 0; }
+  graft_remove_dir() { return 0; }
+
+  SITEGRAFT_GRAFT_RUN_DIR="$run_dir"
+  run _graft_exit_trap
+
+  [[ "$output" != *"could not remove"* ]] || false
+}
+
 # --- graft_run_module_post_import creates module-content-rewrites.tsv -----
 # unconditionally (issue #52 fix-pack, review round 3, MAJOR) — lib/verify.
 # sh's guard 1 reads this file's mere PRESENCE (even empty) as "this run's
@@ -285,6 +377,28 @@ _major4_stub_everything_but_the_marker_block() {
   profile_load() {
     SITE_A_ALIAS=a; SITE_B_ALIAS=b
     unset SITE_A_SSH_HOST SITE_B_SSH_HOST
+    # Review, fix-pack round 2 (BLOCKER): SITE_B_WP_PATH was NOT unset here,
+    # unlike the two SSH_HOST vars right above it. A real profile_load
+    # (lib/profile.sh) exports SITE_B_WP_PATH on every real invocation --
+    # this stub REPLACES profile_load, but does not run in a vacuum: if the
+    # invoking shell already has SITE_B_WP_PATH set (exported from an
+    # earlier real sitegraft run in the same shell, or from whatever
+    # environment bats itself inherited), it leaks straight through into
+    # these tests. The two BLOCKER-B tests below call the REAL phase_graft,
+    # which arms the REAL _graft_exit_trap -- and that trap's own cleanup
+    # block (lib/graft.sh) runs unconditionally whenever SITE_B_WP_PATH is
+    # non-empty, with no notion of "this is only a test fixture's path".
+    # Measured live (same technique the dry-run-trap tests above already
+    # document for exactly this class of leak): with SITE_B_WP_PATH
+    # exported to a real directory before running this file, `bats
+    # tests/unit/test_graft_phase_wiring.bats` deleted real files planted
+    # there -- 3 of them on main, 5 once issue #37's fix-pack extended the
+    # trap's own cleanup list, growing with every filename that list ever
+    # gains. Explicit `unset`, not "just never assigned in this stub" --
+    # the whole point is to override whatever the invoking shell already
+    # exported, the same reasoning the dry-run-trap tests give for their
+    # own explicit unset.
+    unset SITE_B_WP_PATH
     return 0
   }
   modules_discover() { SITEGRAFT_MODULES=""; }
@@ -687,6 +801,12 @@ _blocker1_stub_everything_but_domain_check() {
   profile_load() {
     SITE_A_ALIAS=a; SITE_B_ALIAS=b
     unset SITE_A_SSH_HOST SITE_B_SSH_HOST
+    # Same leak, same fix, as _major4_stub_everything_but_the_marker_block's
+    # own profile_load stub above (see its comment for the measured
+    # reproduction) -- this stub also replaces profile_load ahead of a REAL
+    # phase_graft call below, so SITE_B_WP_PATH needs the same explicit
+    # unset, not just SSH_HOST.
+    unset SITE_B_WP_PATH
     return 0
   }
   modules_discover() { SITEGRAFT_MODULES=""; }
@@ -757,6 +877,12 @@ _issue16_stub_everything_but_ordering() {
   profile_load() {
     SITE_A_ALIAS=a; SITE_B_ALIAS=b
     unset SITE_A_SSH_HOST SITE_B_SSH_HOST
+    # Same leak, same fix, as _major4_stub_everything_but_the_marker_block's
+    # own profile_load stub above (see its comment for the measured
+    # reproduction) -- this stub also replaces profile_load ahead of a REAL
+    # phase_graft call below, so SITE_B_WP_PATH needs the same explicit
+    # unset, not just SSH_HOST.
+    unset SITE_B_WP_PATH
     return 0
   }
   modules_discover() { SITEGRAFT_MODULES="etch"; }
@@ -913,6 +1039,12 @@ _issue36_stub_everything_but_ordering() {
   profile_load() {
     SITE_A_ALIAS=a; SITE_B_ALIAS=b
     unset SITE_A_SSH_HOST SITE_B_SSH_HOST
+    # Same leak, same fix, as _major4_stub_everything_but_the_marker_block's
+    # own profile_load stub above (see its comment for the measured
+    # reproduction) -- this stub also replaces profile_load ahead of a REAL
+    # phase_graft call below, so SITE_B_WP_PATH needs the same explicit
+    # unset, not just SSH_HOST.
+    unset SITE_B_WP_PATH
     return 0
   }
   modules_discover() { SITEGRAFT_MODULES=""; }
