@@ -73,10 +73,18 @@ backup_db_export() {
   local dest_dir="$1"
   log_info "exporting B database to ${dest_dir}/b-db.sql.gz ..."
   mkdir -p "$dest_dir"
+  # `set -o pipefail;` at the head of every string below — issue #99: a
+  # `bash -c` child does NOT inherit bin/sitegraft's own `set -o pipefail`
+  # (verified: a freshly started child bash has default SHELLOPTS). Without
+  # it, `<producer> | gzip > file`'s exit status is gzip's alone — an export
+  # that dies mid-stream still leaves gzip a clean EOF to close out
+  # successfully, so a genuinely truncated dump was reported as backup
+  # success. See lib/backup.sh's git history / issue #99 for the measured
+  # reproduction.
   if [ -n "${SITE_B_SSH_HOST:-}" ]; then
-    run_or_echo bash -c "ssh '${SITE_B_SSH_HOST}' \"${SITE_B_WP_CMD} --path='${SITE_B_WP_PATH}' db export - --add-drop-table\" | gzip > '${dest_dir}/b-db.sql.gz'"
+    run_or_echo bash -c "set -o pipefail; ssh '${SITE_B_SSH_HOST}' \"${SITE_B_WP_CMD} --path='${SITE_B_WP_PATH}' db export - --add-drop-table\" | gzip > '${dest_dir}/b-db.sql.gz'"
   else
-    run_or_echo bash -c "${SITE_B_WP_CMD} --path='${SITE_B_WP_PATH}' db export - --add-drop-table | gzip > '${dest_dir}/b-db.sql.gz'"
+    run_or_echo bash -c "set -o pipefail; ${SITE_B_WP_CMD} --path='${SITE_B_WP_PATH}' db export - --add-drop-table | gzip > '${dest_dir}/b-db.sql.gz'"
   fi
 }
 
@@ -198,7 +206,12 @@ backup_wp_content() {
       # right (`${SITE_B_WP_PATH}/wp-content/`, no dirname) — only the
       # design doc's own illustration had the bug, and it's what this new
       # tar branch was modeled on.
-      run_or_echo bash -c "${prefix} tar czf - -C '${SITE_B_WP_PATH}' wp-content | tar xzf - -C '${dest_dir}' --strip-components=1"
+      # `set -o pipefail;` — issue #99, same swallow as backup_db_export's
+      # own comment above: without it this pipeline's exit status is the
+      # EXTRACTING tar's alone, so a source tar that dies partway through
+      # (still writing a complete, valid archive for what it did manage to
+      # read) is reported as a successful wp-content backup.
+      run_or_echo bash -c "set -o pipefail; ${prefix} tar czf - -C '${SITE_B_WP_PATH}' wp-content | tar xzf - -C '${dest_dir}' --strip-components=1"
     else
       run_or_echo rsync -avz "${SITE_B_WP_PATH}/wp-content/" "${dest_dir}/"
     fi
@@ -359,7 +372,18 @@ backup_write_wp_content_manifest() {
   local archive_count
   archive_count=$( ( cd "$archive_dir" && find . -mindepth 1 -print0 ) | tr -dc '\0' | wc -c | tr -d ' ' )
   if [ "$count" -ne "$archive_count" ]; then
-    log_error "backup aborted: B's wp-content holds ${count} path(s) but the archive pulled from it (${archive_dir}) holds ${archive_count}. Either the pull was partial, or B was written to while it ran. Both make this backup unsafe to restore from — a restore would delete files that were never additions. Re-run the backup with B quiescent."
+    # issue #99: this is only ever reached when the pull ITSELF reported
+    # success — phase_backup calls backup_wp_content, checks its exit
+    # status (`|| exit 1`), and only then calls this function, so any
+    # tool-reported transfer failure (tar or rsync) already aborted one
+    # step earlier, before this cross-check ever ran. Say that explicitly,
+    # rather than leaving an operator to suspect a swallowed error that
+    # (with backup_wp_content's own `set -o pipefail;` fix) no longer
+    # happens: what remains genuinely ambiguous is either a race (B changed
+    # between the listing this manifest is built from and the pull) or a
+    # transfer tool that dropped something without ever reporting it as a
+    # failure (rare, but not something an exit code alone can rule out).
+    log_error "backup aborted: B's wp-content holds ${count} path(s) but the archive pulled from it (${archive_dir}) holds ${archive_count}. The pull itself reported success — this cross-check exists for what an exit code cannot catch: either B was written to between the listing and the pull (re-run with B quiescent), or the transfer silently dropped something without reporting an error (check its output above for anything unusual). Both make this backup unsafe to restore from — a restore would delete files that were never additions."
     rm -f "$partial"
     return 1
   fi
@@ -428,6 +452,144 @@ backup_verify_db_export() {
       return 1
     fi
   done
+  # issue #99: gzip validity and the size floor above cannot see a dump that
+  # is SHORT rather than corrupt — an export that dies mid-stream still
+  # produces a perfectly valid, complete gzip stream for whatever it had
+  # written before it died. And the core-table probe above only sees up to
+  # "posts", which sits in the MIDDLE of an alphabetical mysqldump table
+  # list — a die AFTER wp_posts (wp_usermeta, wp_users, wp_terms,
+  # wp_comments never written) is structurally invisible to it.
+  #
+  # mysqldump/mariadb-dump write a single, unconditional completion comment
+  # as the LAST line of every export they finish — verified against a real
+  # `wp db export` run (WordPress 6.x + MariaDB 12.3.3, not assumed from
+  # memory of the format), present even for a database with a single table
+  # and for one with none of its own. A dump that stops before that line
+  # stopped mid-write, full stop, regardless of which tables happen to have
+  # been captured before the cut. mariadb-dump's own source (write_footer())
+  # emits one of two literal forms depending on --dump-date:
+  #   "-- Dump completed on <timestamp>"   (default)
+  #   "-- Dump completed"                  (--skip-dump-date)
+  # — matched on the shared "-- Dump completed" prefix so both are accepted.
+  #
+  # ANCHORED to the last 5 lines, not searched anywhere in the file. An
+  # unanchored `grep` over the whole decompressed dump is a real false
+  # negative, not a hypothetical: `wp_options` is dumped FIRST — before this
+  # very check's own core-table probe even runs — and is exactly where
+  # UpdraftPlus/Duplicator/All-in-One WP Migration park log rows and dump
+  # fragments from a PREVIOUS backup. A site that has ever used one of those
+  # plugins can carry an `option_value` containing the literal string
+  # "-- Dump completed on ..." as ordinary DATA, long before the real
+  # export dies partway through. Measured: a dump truncated right after
+  # `wp_posts` (no real footer) but carrying that string in an
+  # `wp_options` row is wrongly ACCEPTED by an unanchored search and
+  # correctly REJECTED once anchored to the tail. 5 lines covers
+  # mariadb-dump's fixed trailing sequence (the SET-restore lines, a blank
+  # line, then the comment itself) with margin, verified against both a
+  # real dump and a fabricated one carrying the poisoned string.
+  #
+  # `grep -c` (not `-q`), for the exact SIGPIPE-under-pipefail reason
+  # documented on the core-table probe above: `-q` would exit on first
+  # match and can kill a still-writing `gunzip` with SIGPIPE on a large
+  # dump, which `set -o pipefail` then reports as this pipeline's own
+  # failure even though the marker was found. `tail` itself always reads
+  # its input through to EOF regardless of `-n`, so it introduces no new
+  # SIGPIPE risk of its own here.
+  #
+  # A WordPress install running the SQLite integration plugin DOES reach
+  # this check, and needs its own dialect handled correctly rather than
+  # assumed away. CORRECTED (this comment previously claimed sqlite3 never
+  # quotes CREATE TABLE at all — wrong; that was a table created by hand
+  # with no quoting, not what a real drop-in emits). `sqlite3 .dump`
+  # replays `sqlite_master.sql` VERBATIM, with whatever quoting the table
+  # was originally CREATEd with — measured directly. Quoting is therefore a
+  # property of the drop-in that created the tables, not of sqlite3, and it
+  # has changed between releases: v2.x's `WP_SQLite_Translator` used double
+  # quotes, but the current v3.x `WP_SQLite_Driver` (verified against its
+  # own source, class-wp-sqlite-connection.php's `quote_identifier()`)
+  # deliberately uses BACKTICKS — specifically to avoid a documented SQLite
+  # quirk where a misspelled double-quoted identifier silently falls back
+  # to being read as a string literal instead of erroring. So a real,
+  # current `wp db export` on a SQLite-backed B DOES pass the backtick-
+  # quoted core-table probe above and DOES reach this check.
+  #
+  # `wp db export`'s own SQLite path (verified against wp-cli/db-command's
+  # source) shells out to `sqlite3 -init <file containing ".dump"> <copy>
+  # .exit` — a real `.dump`, not something sitegraft has to emulate. That
+  # dump has no mysqldump-shaped footer at all; it has its own, different
+  # one: `.dump` wraps the ENTIRE export in exactly one `BEGIN
+  # TRANSACTION;` / `COMMIT;` pair (verified against a real multi-table
+  # dump) — one COMMIT, for the whole file, at the true end.
+  #
+  # NOT the same thing as mysqldump's own "COMMIT;" — measured, and this is
+  # the trap a same-window "accept either string" version of this check
+  # would fall into: mysqldump/mariadb-dump writes a per-table
+  # "COMMIT;" / "SET AUTOCOMMIT=..." pair once PER TABLE (dump_table(),
+  # gated on the --no-autocommit flag — CORRECTED, prior round: no flag
+  # from `wp db export` is needed to turn this on. That flag's own struct
+  # entry (mysqldump.cc: `{"no-autocommit", ..., GET_BOOL, OPT_ARG, 1, 0,
+  # 0, 0, 0, 0}` — the "1" is its def_value) defaults it ON; the plain C
+  # initializer `no_autocommit=0` earlier in the same file is overwritten
+  # by that def_value before any command-line argument is ever read, a
+  # known my_getopt quirk. Verified from that source, not assumed — and
+  # independently, empirically confirmed: a real 12-table `wp db export`
+  # against MariaDB 11, no autocommit-related flag passed anywhere, still
+  # produced 12 separate "COMMIT;" lines, scattered throughout, one right
+  # after EVERY table's own data. A mysqldump-dialect export truncated
+  # immediately after any single table's own per-table COMMIT — before
+  # every table after it was ever written, the exact #99 shape — would
+  # still show "COMMIT;" in its last few lines. Accepting "COMMIT;"
+  # generically, for both dialects in the same tail window, would silently
+  # readmit that truncation. The two dialects need two different markers,
+  # checked only against dumps of their own kind.
+  #
+  # BOTH markers ANCHORED TO A WHOLE LINE, not matched as a substring
+  # anywhere within one — a second, narrower version of the same tail-
+  # anchoring problem solved above, and just as real: "COMMIT;" is
+  # ordinary SQL vocabulary that shows up in ordinary WordPress content (a
+  # post about transactions, a code snippet, a plugin's own log line), and
+  # measured directly — a SQLite export truncated right after `wp_posts`,
+  # before `wp_users` and the real closing COMMIT, but with a `wp_posts`
+  # row whose content happens to contain the substring "COMMIT;" is wrongly
+  # ACCEPTED by an unanchored `grep -cF` and correctly REJECTED once
+  # anchored to the FULL line (`grep -cx`). The mysqldump marker gets the
+  # same treatment for the same reason, anchored to the START of a line
+  # (`grep -c '^...'`) rather than to the full line, because the marker's
+  # own line takes two shapes: "-- Dump completed on <date>" normally, and
+  # a bare "-- Dump completed" under --skip-dump-date (both measured, and
+  # both documented above). A start-of-line anchor covers the two; a
+  # full-line anchor would reject the second.
+  #
+  # Sniffed from the dump's OWN FIRST line, which only the tool that wrote
+  # the dump controls (never table data, unlike the tail this check reads)
+  # — a `sqlite3 .dump` always opens with "PRAGMA foreign_keys=OFF;"
+  # (verified, unconditional). mysqldump/mariadb-dump's own first line is
+  # NOT a reliable "-- " comment to sniff FOR — measured directly against a
+  # real MariaDB 11 dump: its actual first line is
+  # "/*M!999999\- enable the sandbox mode */", a versioned MariaDB
+  # directive, not a "-- "-prefixed comment at all (a prior round of this
+  # same comment claimed otherwise, unverified). So the mysqldump/mariadb
+  # dialect is the FALLBACK here — anything that doesn't match the SQLite
+  # signature — rather than something separately sniffed for; the two
+  # dialects genuinely in scope for `wp db export` don't need a positive
+  # match on both sides to be told apart. `head -1` (not `-q`-style
+  # anything), same SIGPIPE-under-pipefail reasoning as the rest of this
+  # function — `|| true` keeps a pipe closed early by `head` from turning
+  # into a false failure here.
+  local first_line
+  first_line=$(gunzip -c "$gz_file" 2>/dev/null | head -1 || true)
+  local found marker_desc
+  if [[ "$first_line" == "PRAGMA foreign_keys"* ]]; then
+    found=$(gunzip -c "$gz_file" 2>/dev/null | tail -5 | grep -cx -- 'COMMIT;' || true)
+    marker_desc="a SQLite export's closing COMMIT;"
+  else
+    found=$(gunzip -c "$gz_file" 2>/dev/null | tail -5 | grep -c -- '^-- Dump completed' || true)
+    marker_desc="mysqldump's completion marker ('-- Dump completed ...')"
+  fi
+  if [ "${found:-0}" -eq 0 ]; then
+    log_error "backup verification failed: ${gz_file} has no ${marker_desc} in its final lines — the export looks truncated, not just missing a table. Re-run the backup; if this keeps happening, check whether B's export died partway (disk full, network drop, killed process)."
+    return 1
+  fi
 }
 
 # backup_verify_wp_content <dir> — companion sanity check for the wp-content
@@ -1640,7 +1802,7 @@ phase_backup() {
     if [ -f "${run_dir}/backup/b-db.sql.gz" ]; then
       chmod 600 "${run_dir}/backup/b-db.sql.gz"
     fi
-  ) || return 1
+  ) || { log_error "backup failed while exporting/archiving B — see the transfer tool's own output above for the reason (db export, wp-content pull, or wp-content manifest). No backup.complete was written."; return 1; }
 
   local manifest
   manifest=$(cat "${run_dir}/manifest.json")
@@ -1658,7 +1820,12 @@ phase_backup() {
       log_error "backup verification failed: ${run_dir}/backup/b-wp-content.manifest is missing or empty — without it, restore.sh cannot return B's wp-content to exactly this state and will refuse to remove anything"
       return 1
     fi
-    log_info "backup artifacts verified: valid gzip, core tables present, wp-content non-empty, wp-content manifest recorded"
+    # issue #99 (review NIT): the completion-marker check is now the
+    # load-bearing signal that the export actually finished (the core-table
+    # probe alone cannot see a die-after-posts truncation) — say so here,
+    # not just "core tables present", which is the exact reassurance #99
+    # cites as a false one.
+    log_info "backup artifacts verified: valid gzip, mysqldump completion marker present, core tables present, wp-content non-empty, wp-content manifest recorded"
 
     # design doc §6.3: checksums of the protected tables/options exports,
     # using the exact same normalization backup_checksum defines above, and
@@ -1810,7 +1977,7 @@ phase_restore() {
     if [ -f "${pre_restore_dir}/backup/b-db.sql.gz" ]; then
       chmod 600 "${pre_restore_dir}/backup/b-db.sql.gz"
     fi
-  ) || return 1
+  ) || { log_error "pre-restore safety snapshot failed while exporting/archiving B — see the transfer tool's own output above for the reason (db export, wp-content pull, or wp-content manifest). Refusing to restore without a safety net: B was not touched."; return 1; }
   backup_generate_restore_script "$pre_restore_dir" || {
     log_error "could not generate a restore.sh for the pre-restore safety snapshot at ${pre_restore_dir} — refusing to run the restore without a usable way back. Nothing on B was touched."
     return 1

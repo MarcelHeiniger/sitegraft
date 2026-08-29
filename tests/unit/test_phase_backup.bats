@@ -72,6 +72,10 @@ EOF
       printf 'CREATE TABLE `wp_posts` (\n'
       for i in $(seq 1 30); do printf "INSERT INTO t VALUES (%d,'%s%s');\n" "$i" "$RANDOM" "$RANDOM"; done
       printf ');\n'
+      # issue #99: backup_verify_db_export now requires mysqldump's own
+      # completion marker, not just core-table presence — this stub stands
+      # in for an export that genuinely finished, so it has to look like one.
+      printf -- '-- Dump completed on 2026-08-19 10:00:00\n'
     } | gzip > "${dest_dir}/b-db.sql.gz"
   }
   backup_wp_content() {
@@ -125,6 +129,11 @@ EOF
   run jq -e '.checksums_protected_pre_graft.fakebooking | startswith("sha256:")' "${RUN_DIR}/manifest.json"
   [ "$status" -eq 0 ]
   [[ "$backup_output" == *"to restore this backup"* ]] || false
+  # NIT (review): the success message used to say "core tables present"
+  # without ever naming the completion marker, even though that marker is
+  # now the load-bearing signal — exactly the false reassurance #99 itself
+  # cites as the pattern to avoid.
+  [[ "$backup_output" == *"completion marker present"* ]] || false
 }
 
 # issue #52 / ADR 0008's "Required regardless" list: phase_backup must also
@@ -317,6 +326,11 @@ EOF
   run phase_backup --profile t --run "$RUN_DIR"
   [ "$status" -ne 0 ]
   [ ! -e "${RUN_DIR}/backup.complete" ]
+  # NIT (review): the backup/restore subshell used to abort silently here —
+  # no sitegraft-level summary, just whatever the failing tool itself wrote
+  # to stderr. An operator relying on this for the restore path deserves a
+  # log line that says the subshell failed, not just raw tool output.
+  [[ "$output" == *"backup failed"* ]] || false
 }
 
 @test "phase_backup fails, and writes no backup.complete, when the database export fails while leaving a plausible dump" {
@@ -337,6 +351,7 @@ EOF
   run phase_backup --profile t --run "$RUN_DIR"
   [ "$status" -ne 0 ]
   [ ! -e "${RUN_DIR}/backup.complete" ]
+  [[ "$output" == *"backup failed"* ]] || false
 }
 
 @test "phase_backup writes no backup.complete when the restore.sh generator fails" {
@@ -346,6 +361,113 @@ EOF
   # exist must not be marked complete, because `graft` accepts any run dir that
   # carries the marker.
   backup_generate_restore_script() { return 1; }
+  run phase_backup --profile t --run "$RUN_DIR"
+  [ "$status" -ne 0 ]
+  [ ! -e "${RUN_DIR}/backup.complete" ]
+}
+
+# --- issue #99 acceptance, end to end -------------------------------------
+# Everything above stubs backup_db_export/backup_wp_content (this file's own
+# setup()) so phase_backup's OWN control flow can be tested fast and in
+# isolation. These two tests re-load the real lib/backup.sh so the actual
+# `bash -c "set -o pipefail; ..."` pipelines run for real, proving the full
+# chain the issue's acceptance criteria describe end to end — not just that
+# phase_backup trusts whatever exit status it's handed (already covered
+# above) or that the low-level functions fail on their own in isolation
+# (test_backup_pipefail.bats).
+#
+# `load` re-SOURCES the whole file, which restores BOTH backup_db_export
+# and backup_wp_content to their real implementations, not just the one
+# each test means to exercise — found live writing these: the first attempt
+# left the other one real too, so it went through its OWN wrapper-prefixed
+# ssh/wp invocation with no `wp` stub on PATH at all, failed for THAT
+# unrelated reason before ever reaching the code path under test, and the
+# test passed for the wrong reason. Each test below re-stubs the sibling
+# function immediately after `load`, deliberately, so only the one function
+# named in its own title runs for real.
+
+@test "phase_backup (real backup_db_export): an export that dies mid-stream fails the backup, before completion (issue #99 acceptance)" {
+  load '../../lib/backup.sh'
+  backup_wp_content() {
+    local dest_dir="$1"
+    mkdir -p "${dest_dir}/themes"
+    touch "${dest_dir}/themes/dummy-theme.txt"
+  }
+  # The stub dump below deliberately writes BOTH core tables the old
+  # table-probe checked (options, posts) with real bulk — clears the
+  # 200-byte floor, and would have satisfied the pre-issue-#99
+  # backup_verify_db_export outright — then dies WITHOUT mysqldump's
+  # completion footer. This is the issue's own measured shape (truncated
+  # after posts, before usermeta), so a false green here would mean neither
+  # the pipefail fix nor the footer-check fix is doing its job, not just
+  # one of the two.
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/wp" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+  *" db export "*)
+    printf -- '-- MySQL dump\n'
+    printf 'CREATE TABLE `wp_options` (\n'
+    for i in $(seq 1 50); do printf "INSERT INTO t VALUES (%d,'%s%s');\n" "$i" "$RANDOM" "$RANDOM"; done
+    printf ');\n'
+    printf 'CREATE TABLE `wp_posts` (\n'
+    for i in $(seq 1 50); do printf "INSERT INTO t VALUES (%d,'%s%s');\n" "$i" "$RANDOM" "$RANDOM"; done
+    printf ');\n'
+    exit 1
+    ;;
+esac
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/wp"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+  run phase_backup --profile t --run "$RUN_DIR"
+  [ "$status" -ne 0 ]
+  [ ! -e "${RUN_DIR}/backup.complete" ]
+}
+
+@test "phase_backup (real backup_wp_content): a source-side tar that exits non-zero fails the backup, before completion, even though extraction succeeded (issue #99 acceptance)" {
+  load '../../lib/backup.sh'
+  backup_db_export() {
+    local dest_dir="$1"
+    mkdir -p "$dest_dir"
+    {
+      printf -- '-- MySQL dump\n'
+      printf 'CREATE TABLE `wp_options` (\n'
+      local i; for i in $(seq 1 30); do printf "INSERT INTO t VALUES (%d,'%s%s');\n" "$i" "$RANDOM" "$RANDOM"; done
+      printf ');\n'
+      printf 'CREATE TABLE `wp_posts` (\n'
+      for i in $(seq 1 30); do printf "INSERT INTO t VALUES (%d,'%s%s');\n" "$i" "$RANDOM" "$RANDOM"; done
+      printf ');\n'
+      printf -- '-- Dump completed on 2026-08-19 10:00:00\n'
+    } | gzip > "${dest_dir}/b-db.sql.gz"
+  }
+  # backup_wp_content's OWN wrapped-local branch (tar | tar) only runs when
+  # SITE_B_WP_CMD names a wrapper — setup()'s profile uses a bare "wp"
+  # (bare-local, plain rsync, no pipe to break). Rewrite it to a wrapper so
+  # this test actually exercises the pipe.
+  cat > "${SITEGRAFT_PROFILES_DIR}/t.conf" <<EOF
+SITE_A_ALIAS="a"
+SITE_A_WP_PATH="/var/www/a"
+SITE_B_ALIAS="b"
+SITE_B_WP_PATH="${B_ROOT}"
+SITE_B_WP_CMD="env -- wp"
+SITEGRAFT_STATE_DIR="${SITEGRAFT_STATE_DIR}"
+EOF
+  # exit 1, not an arbitrary non-zero: measured against real GNU tar
+  # (1.35) as its own exit status for "file shrank/changed while being
+  # read" — a complete archive, tar still reports failure. Same fixture
+  # shape as test_backup_pipefail.bats's own tar stand-in.
+  local real_tar; real_tar=$(command -v tar)
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/tar" <<STUB
+#!/usr/bin/env bash
+if [ "\$1" = "czf" ]; then
+  "$real_tar" "\$@"
+  exit 1
+fi
+exec "$real_tar" "\$@"
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/tar"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
   run phase_backup --profile t --run "$RUN_DIR"
   [ "$status" -ne 0 ]
   [ ! -e "${RUN_DIR}/backup.complete" ]

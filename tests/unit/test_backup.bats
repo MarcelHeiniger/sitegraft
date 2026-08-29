@@ -200,6 +200,204 @@ _fake_dump_rows() {
   [ "$status" -eq 0 ]
 }
 
+# issue #99: the two core-table probes above only see up to wp_posts, which
+# in an alphabetical mysqldump/mariadb-dump export sits in the MIDDLE of the
+# table list — this is the exact scenario the issue measured (options,
+# postmeta, posts written, then the exporter dies before wp_usermeta). The
+# probe alone cannot see this: both tables it checks for are already
+# present. Verified against a real `wp db export` run (WordPress 6.x +
+# MariaDB 12.3.3, no fixture/fabrication): every completed export — even of
+# a database with a single table, even of one with none of its own — ends
+# with an unconditional "-- Dump completed on ..." comment, mysqldump's own
+# marker that it reached the end, not sitegraft's invention.
+@test "backup_verify_db_export fails when core tables are present but the dump has no mysqldump completion footer (issue #99: truncated past wp_posts, invisible to the table probe)" {
+  {
+    printf -- '-- MySQL dump\n'
+    printf 'CREATE TABLE `wp_options` (\n'; _fake_dump_rows 50; printf ');\n'
+    printf 'CREATE TABLE `wp_postmeta` (\n'; _fake_dump_rows 50; printf ');\n'
+    printf 'CREATE TABLE `wp_posts` (\n'; _fake_dump_rows 50; printf ');\n'
+    # dies here: wp_usermeta, wp_users, wp_terms, wp_comments never written,
+    # and no "-- Dump completed on ..." footer either — exactly the
+    # measured shape from the issue.
+  } | gzip > "$BATS_TEST_TMPDIR/truncated-past-posts.sql.gz"
+  run backup_verify_db_export "$BATS_TEST_TMPDIR/truncated-past-posts.sql.gz" "wp_"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Dump completed"* ]] || false
+}
+
+# BLOCKER fix (review): the footer check above must be ANCHORED to the end
+# of the dump, not searched anywhere in it. `wp_options` is dumped FIRST —
+# before mysqldump ever gets near the tables that would actually prove
+# completion — and is exactly where UpdraftPlus/Duplicator/All-in-One WP
+# Migration park log rows and prior-dump fragments as option values. A site
+# that has ever run one of those plugins can carry the literal string
+# "-- Dump completed on ..." as ordinary DATA inside wp_options, long
+# before the real export dies partway through wp_posts. An unanchored
+# `grep` over the whole file would accept that as proof of completion —
+# exactly the #99 defect this whole function exists to close, just moved
+# one layer down. Measured red against the unanchored form, green against
+# `tail -5 | grep`.
+@test "backup_verify_db_export fails a truncated dump even when the literal completion string appears earlier as ordinary DATA (wp_options poisoned by a prior UpdraftPlus/Duplicator log row)" {
+  {
+    printf -- '-- MySQL dump\n'
+    printf 'CREATE TABLE `wp_options` (\n'
+    printf "INSERT INTO wp_options VALUES (1,'updraft_log','-- Dump completed on 2020-01-01 00:00:00 (leftover from a previous plugin backup)');\n"
+    _fake_dump_rows 50
+    printf ');\n'
+    printf 'CREATE TABLE `wp_posts` (\n'; _fake_dump_rows 50; printf ');\n'
+    # dies here -- no real footer, wp_usermeta/wp_users/etc never written
+  } | gzip > "$BATS_TEST_TMPDIR/poisoned-truncated.sql.gz"
+  run backup_verify_db_export "$BATS_TEST_TMPDIR/poisoned-truncated.sql.gz" "wp_"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Dump completed"* ]] || false
+}
+
+@test "backup_verify_db_export accepts a genuine --skip-dump-date footer ('-- Dump completed' with no timestamp)" {
+  {
+    printf -- '-- MySQL dump\n'
+    printf 'CREATE TABLE `wp_options` (\n'; _fake_dump_rows 50; printf ');\n'
+    printf 'CREATE TABLE `wp_posts` (\n'; _fake_dump_rows 50; printf ');\n'
+    printf '/*M!100616 SET NOTE_VERBOSITY=@OLD_NOTE_VERBOSITY */;\n'
+    printf '\n'
+    printf -- '-- Dump completed\n'
+  } | gzip > "$BATS_TEST_TMPDIR/skipdate-complete.sql.gz"
+  run backup_verify_db_export "$BATS_TEST_TMPDIR/skipdate-complete.sql.gz" "wp_"
+  [ "$status" -eq 0 ]
+}
+
+# --- SQLite dialect (WP_SQLite_Driver v3.x) ---
+#
+# Built through the REAL export mechanism, not a hand-shaped fixture: a
+# real `sqlite3` binary, tables CREATEd with the exact backtick quoting
+# the current v3.x driver's own `quote_identifier()` uses (verified
+# against its source, class-wp-sqlite-connection.php), and the export
+# itself run as `sqlite3 -init <file with ".dump"> <db> .exit` — the exact
+# invocation `wp db export`'s sqlite_export() shells out to (verified
+# against wp-cli/db-command's own source). Skipped where sqlite3 is not on
+# PATH rather than silently no-op'd — the point is to run for real, not to
+# always look green.
+
+_require_sqlite3() {
+  command -v sqlite3 >/dev/null 2>&1 || skip "sqlite3 not on PATH"
+}
+
+# _sqlite_export_fixture <db_file> — real WordPress-shaped tables
+# (wp_options, wp_posts), backtick-quoted as v3.x's quote_identifier()
+# creates them, some real row data.
+_sqlite_export_fixture() {
+  local db="$1"
+  sqlite3 "$db" '
+CREATE TABLE `wp_options` (`option_id` INTEGER PRIMARY KEY, `option_name` TEXT, `option_value` TEXT);
+INSERT INTO `wp_options` VALUES (1,"siteurl","http://example.test"),(2,"blogname","Test Site");
+CREATE TABLE `wp_posts` (`ID` INTEGER PRIMARY KEY, `post_title` TEXT);
+INSERT INTO `wp_posts` VALUES (1,"Hello world");
+CREATE TABLE `wp_users` (`ID` INTEGER PRIMARY KEY, `user_login` TEXT);
+INSERT INTO `wp_users` VALUES (1,"admin");
+'
+}
+
+@test "backup_verify_db_export accepts a genuine, complete SQLite export (real sqlite3 .dump, backtick-quoted tables as v3.x's driver creates them)" {
+  _require_sqlite3
+  local db="$BATS_TEST_TMPDIR/sqlite-complete.db"
+  _sqlite_export_fixture "$db"
+  printf '.dump\n' > "$BATS_TEST_TMPDIR/sqlite-init.txt"
+  sqlite3 -init "$BATS_TEST_TMPDIR/sqlite-init.txt" "$db" .exit | gzip > "$BATS_TEST_TMPDIR/sqlite-complete.sql.gz"
+  # the fixture really does pass the (backtick-only) core-table probe —
+  # otherwise this test would prove nothing about the footer check below
+  gunzip -c "$BATS_TEST_TMPDIR/sqlite-complete.sql.gz" | grep -qF 'CREATE TABLE `wp_options`'
+  run backup_verify_db_export "$BATS_TEST_TMPDIR/sqlite-complete.sql.gz" "wp_"
+  [ "$status" -eq 0 ]
+}
+
+@test "backup_verify_db_export REJECTS a truncated SQLite export (dies before the closing COMMIT;)" {
+  _require_sqlite3
+  local db="$BATS_TEST_TMPDIR/sqlite-truncated.db"
+  _sqlite_export_fixture "$db"
+  printf '.dump\n' > "$BATS_TEST_TMPDIR/sqlite-init2.txt"
+  # dies after wp_posts, before wp_users and the closing COMMIT; -- same
+  # shape as the mysqldump truncation tests above, this dialect's own
+  # version of it
+  sqlite3 -init "$BATS_TEST_TMPDIR/sqlite-init2.txt" "$db" .exit | head -7 | gzip > "$BATS_TEST_TMPDIR/sqlite-truncated.sql.gz"
+  run backup_verify_db_export "$BATS_TEST_TMPDIR/sqlite-truncated.sql.gz" "wp_"
+  [ "$status" -eq 1 ]
+}
+
+# BLOCKER-class finding (review, round 3): "COMMIT;" is ordinary SQL
+# vocabulary that shows up in ordinary WordPress content -- a post about
+# transactions, a code snippet, a plugin's own log line -- so matching it
+# as a substring ANYWHERE within a tail line (not anchored to the whole
+# line) reopens #99 for the SQLite dialect specifically, and is easier to
+# trigger than the mysqldump-side poisoning above ("-- Dump completed"
+# never occurs in ordinary prose; "COMMIT;" plausibly does). This fixture
+# is built through the real mechanism (real sqlite3, backtick-quoted
+# tables) with a `wp_posts` row whose content contains the literal
+# substring "COMMIT;", truncated before `wp_users` and before the real
+# closing COMMIT.
+@test "backup_verify_db_export REJECTS a truncated SQLite export even when the literal substring 'COMMIT;' appears earlier as ordinary DATA (a post about transactions, poisoning an unanchored match)" {
+  _require_sqlite3
+  local db="$BATS_TEST_TMPDIR/sqlite-poisoned.db"
+  sqlite3 "$db" '
+CREATE TABLE `wp_options` (`option_id` INTEGER PRIMARY KEY, `option_name` TEXT, `option_value` TEXT);
+INSERT INTO `wp_options` VALUES (1,"siteurl","http://example.test"),(2,"blogname","Test Site");
+CREATE TABLE `wp_posts` (`ID` INTEGER PRIMARY KEY, `post_title` TEXT, `post_content` TEXT);
+INSERT INTO `wp_posts` VALUES (1,"How transactions work","Remember to always run COMMIT; after your changes, or theyre lost.");
+CREATE TABLE `wp_users` (`ID` INTEGER PRIMARY KEY, `user_login` TEXT);
+INSERT INTO `wp_users` VALUES (1,"admin");
+'
+  printf '.dump\n' > "$BATS_TEST_TMPDIR/sqlite-init3.txt"
+  # dies right after the poisoned wp_posts row -- wp_users and the real
+  # closing COMMIT; are never written
+  sqlite3 -init "$BATS_TEST_TMPDIR/sqlite-init3.txt" "$db" .exit | head -7 | gzip > "$BATS_TEST_TMPDIR/sqlite-poisoned.sql.gz"
+  # confirm the poison is really there, in the tail window this check
+  # reads, or this test proves nothing about the anchoring
+  gunzip -c "$BATS_TEST_TMPDIR/sqlite-poisoned.sql.gz" | tail -5 | grep -qF 'COMMIT;'
+  run backup_verify_db_export "$BATS_TEST_TMPDIR/sqlite-poisoned.sql.gz" "wp_"
+  [ "$status" -eq 1 ]
+}
+
+# BLOCKER-class finding (review): a version of this check that accepts
+# "COMMIT;" OR "-- Dump completed" in the SAME tail window, regardless of
+# dialect, is NOT SAFE — it reopens #99 for the mysqldump path specifically.
+# Measured against a real 12-table `wp db export`: mysqldump/mariadb-dump
+# writes "COMMIT;\nSET AUTOCOMMIT=..." once PER TABLE (dump_table(), when
+# --no-autocommit is set, which `wp db export` does), not once at the true
+# end — 12 tables produced 12 separate "COMMIT;" lines scattered through
+# the file, one right after each table's own data. A mysqldump-dialect
+# dump truncated immediately after any ONE table's own per-table COMMIT —
+# before every table after it was ever written — still shows "COMMIT;" in
+# its last few lines. This fixture reproduces exactly that shape (real
+# per-table COMMIT/SET AUTOCOMMIT footer, no real end-of-dump marker) and
+# must be REJECTED despite containing "COMMIT;".
+@test "backup_verify_db_export REJECTS a mysqldump-dialect dump truncated right after one table's own per-table COMMIT, even though it contains the literal string 'COMMIT;' (the trap a dialect-blind fix falls into)" {
+  {
+    printf -- '-- MySQL dump\n'
+    printf 'CREATE TABLE `wp_options` (\n'; _fake_dump_rows 50; printf ');\n'
+    printf 'CREATE TABLE `wp_posts` (\n'; _fake_dump_rows 50; printf ');\n'
+    # both required tables present -- the core-table probe alone would
+    # accept this, same as the earlier anchoring test; this dump's own
+    # per-table footer for wp_posts is what must still get caught
+    printf '/*!40000 ALTER TABLE `wp_posts` ENABLE KEYS */;\n'
+    printf 'UNLOCK TABLES;\n'
+    printf 'COMMIT;\n'
+    printf 'SET AUTOCOMMIT=@OLD_AUTOCOMMIT;\n'
+    # dies here: wp_users, wp_usermeta, etc. never written; no real
+    # "-- Dump completed" footer either
+  } | gzip > "$BATS_TEST_TMPDIR/mysql-mid-table-commit.sql.gz"
+  run backup_verify_db_export "$BATS_TEST_TMPDIR/mysql-mid-table-commit.sql.gz" "wp_"
+  [ "$status" -eq 1 ]
+}
+
+@test "backup_verify_db_export fails when the dump has a completion-looking line that is NOT mysqldump's own footer (must match the real marker, not just 'looks done')" {
+  {
+    printf -- '-- MySQL dump\n'
+    printf 'CREATE TABLE `wp_options` (\n'; _fake_dump_rows 50; printf ');\n'
+    printf 'CREATE TABLE `wp_posts` (\n'; _fake_dump_rows 50; printf ');\n'
+    printf -- '-- Backup finished\n'
+  } | gzip > "$BATS_TEST_TMPDIR/fake-footer.sql.gz"
+  run backup_verify_db_export "$BATS_TEST_TMPDIR/fake-footer.sql.gz" "wp_"
+  [ "$status" -eq 1 ]
+}
+
 # --- backup_verify_wp_content ---
 
 @test "backup_verify_wp_content fails when the directory does not exist" {
@@ -549,6 +747,32 @@ _manifest_fixture() {
   SITEGRAFT_DRY_RUN=1 run backup_write_wp_content_manifest "$BATS_TEST_TMPDIR/src5" "$BATS_TEST_TMPDIR/m5"
   [ "$status" -eq 0 ]
   [ ! -e "$BATS_TEST_TMPDIR/m5" ]
+}
+
+# issue #99 (Direction §3): before the pipefail fix, a tar failure inside
+# backup_wp_content was silently discarded, so by the time execution reached
+# HERE (backup_write_wp_content_manifest, called right after it in
+# phase_backup) there was no memory that tar had ever complained — the
+# abort message could only guess between two causes and never named the
+# thrown-away tar error. Now that backup_wp_content's own `bash -c` strings
+# carry `set -o pipefail;`, ANY tool-reported transfer failure already
+# aborts phase_backup one line earlier (`backup_wp_content ... || exit 1`,
+# lib/backup.sh's phase_backup) — this message is only ever reached when
+# the pull itself reported SUCCESS. The message must say that, not
+# perpetuate a "something got thrown away" implication that is no longer
+# true.
+@test "backup_write_wp_content_manifest's count-mismatch message says the pull itself reported success, not that an error was discarded" {
+  _manifest_fixture b7; local wpc="$WPC"
+  mkdir -p "${wpc}/themes/t" "${wpc}/plugins"
+  touch "${wpc}/themes/t/a.css" "${wpc}/plugins/p.php"
+  mkdir -p "$BATS_TEST_TMPDIR/src7/themes"
+  touch "$BATS_TEST_TMPDIR/src7/themes/a.css"   # archive short of B by one entry
+  run backup_write_wp_content_manifest "$BATS_TEST_TMPDIR/src7" "$BATS_TEST_TMPDIR/m7"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"path(s) but the archive"* ]] || false
+  [[ "$output" == *"reported success"* ]] || false
+  [[ "$output" != *"was thrown away"* ]]
+  [[ "$output" != *"was discarded"* ]]
 }
 
 @test "backup_write_wp_content_manifest is owner-only (it lists a real site's file tree)" {
@@ -1159,6 +1383,34 @@ OLD
   [ -x "${snap}/restore.sh" ]
   # ... and the restore it was a net for really did remove that addition
   [ ! -e "${B_ROOT}/wp-content/themes/GRAFTED.css" ]
+}
+
+# NIT (review): before this fix, a pre-restore safety-snapshot failure left
+# the operator with nothing but the failing tool's own raw stderr — no
+# sitegraft-level line saying the snapshot subshell itself failed. This
+# matters most exactly here, on the emergency path: an operator running
+# `restore` under pressure deserves to be told plainly that the safety net
+# could not be built, not left to infer it from a bare tar diagnostic.
+@test "phase_restore's pre-restore safety snapshot names its own failure, not just raw tar stderr, and never runs the restore itself" {
+  _wrapped_fixture
+  _wrapped_profile
+  printf 'grafted\n' > "${B_ROOT}/wp-content/themes/GRAFTED.css"
+  local real_tar; real_tar=$(command -v tar)
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/tar" <<STUB
+#!/usr/bin/env bash
+if [ "\$1" = "czf" ]; then
+  exit 1
+fi
+exec "$real_tar" "\$@"
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/tar"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+  run phase_restore --profile w --run "$RUN_DIR" --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"safety snapshot failed"* ]] || false
+  # the restore itself never ran: the "addition" is still there
+  [ -f "${B_ROOT}/wp-content/themes/GRAFTED.css" ]
 }
 
 @test "phase_restore --dry-run fails when the restore.sh preview itself fails (a preview that cannot run is not a green light)" {
