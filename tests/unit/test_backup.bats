@@ -322,6 +322,39 @@ INSERT INTO `wp_users` VALUES (1,"admin");
   [ "$status" -eq 1 ]
 }
 
+# BLOCKER-class finding (review, round 3): "COMMIT;" is ordinary SQL
+# vocabulary that shows up in ordinary WordPress content -- a post about
+# transactions, a code snippet, a plugin's own log line -- so matching it
+# as a substring ANYWHERE within a tail line (not anchored to the whole
+# line) reopens #99 for the SQLite dialect specifically, and is easier to
+# trigger than the mysqldump-side poisoning above ("-- Dump completed"
+# never occurs in ordinary prose; "COMMIT;" plausibly does). This fixture
+# is built through the real mechanism (real sqlite3, backtick-quoted
+# tables) with a `wp_posts` row whose content contains the literal
+# substring "COMMIT;", truncated before `wp_users` and before the real
+# closing COMMIT.
+@test "backup_verify_db_export REJECTS a truncated SQLite export even when the literal substring 'COMMIT;' appears earlier as ordinary DATA (a post about transactions, poisoning an unanchored match)" {
+  _require_sqlite3
+  local db="$BATS_TEST_TMPDIR/sqlite-poisoned.db"
+  sqlite3 "$db" '
+CREATE TABLE `wp_options` (`option_id` INTEGER PRIMARY KEY, `option_name` TEXT, `option_value` TEXT);
+INSERT INTO `wp_options` VALUES (1,"siteurl","http://example.test"),(2,"blogname","Test Site");
+CREATE TABLE `wp_posts` (`ID` INTEGER PRIMARY KEY, `post_title` TEXT, `post_content` TEXT);
+INSERT INTO `wp_posts` VALUES (1,"How transactions work","Remember to always run COMMIT; after your changes, or theyre lost.");
+CREATE TABLE `wp_users` (`ID` INTEGER PRIMARY KEY, `user_login` TEXT);
+INSERT INTO `wp_users` VALUES (1,"admin");
+'
+  printf '.dump\n' > "$BATS_TEST_TMPDIR/sqlite-init3.txt"
+  # dies right after the poisoned wp_posts row -- wp_users and the real
+  # closing COMMIT; are never written
+  sqlite3 -init "$BATS_TEST_TMPDIR/sqlite-init3.txt" "$db" .exit | head -7 | gzip > "$BATS_TEST_TMPDIR/sqlite-poisoned.sql.gz"
+  # confirm the poison is really there, in the tail window this check
+  # reads, or this test proves nothing about the anchoring
+  gunzip -c "$BATS_TEST_TMPDIR/sqlite-poisoned.sql.gz" | tail -5 | grep -qF 'COMMIT;'
+  run backup_verify_db_export "$BATS_TEST_TMPDIR/sqlite-poisoned.sql.gz" "wp_"
+  [ "$status" -eq 1 ]
+}
+
 # BLOCKER-class finding (review): a version of this check that accepts
 # "COMMIT;" OR "-- Dump completed" in the SAME tail window, regardless of
 # dialect, is NOT SAFE — it reopens #99 for the mysqldump path specifically.

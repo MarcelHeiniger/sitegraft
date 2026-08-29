@@ -523,38 +523,66 @@ backup_verify_db_export() {
   #
   # NOT the same thing as mysqldump's own "COMMIT;" — measured, and this is
   # the trap a same-window "accept either string" version of this check
-  # would fall into: mysqldump/mariadb-dump writes "COMMIT;
-SET
-  # AUTOCOMMIT=..." once PER TABLE (dump_table(), gated on
-  # --no-autocommit, which `wp db export` sets), not once at the true end —
-  # verified against a real 12-table `wp db export`: 12 separate "COMMIT;"
-  # lines, scattered throughout, one right after EVERY table's own data. A
-  # mysqldump-dialect export truncated immediately after any single
-  # table's own per-table COMMIT — before every table after it was ever
-  # written, the exact #99 shape — would still show "COMMIT;" in its last
-  # few lines. Accepting "COMMIT;" generically, for both dialects in the
-  # same tail window, would silently readmit that truncation. The two
-  # dialects need two different markers, checked only against dumps of
-  # their own kind.
+  # would fall into: mysqldump/mariadb-dump writes a per-table
+  # "COMMIT;" / "SET AUTOCOMMIT=..." pair once PER TABLE (dump_table(),
+  # gated on the --no-autocommit flag — CORRECTED, prior round: no flag
+  # from `wp db export` is needed to turn this on. That flag's own struct
+  # entry (mysqldump.cc: `{"no-autocommit", ..., GET_BOOL, OPT_ARG, 1, 0,
+  # 0, 0, 0, 0}` — the "1" is its def_value) defaults it ON; the plain C
+  # initializer `no_autocommit=0` earlier in the same file is overwritten
+  # by that def_value before any command-line argument is ever read, a
+  # known my_getopt quirk. Verified from that source, not assumed — and
+  # independently, empirically confirmed: a real 12-table `wp db export`
+  # against MariaDB 11, no autocommit-related flag passed anywhere, still
+  # produced 12 separate "COMMIT;" lines, scattered throughout, one right
+  # after EVERY table's own data. A mysqldump-dialect export truncated
+  # immediately after any single table's own per-table COMMIT — before
+  # every table after it was ever written, the exact #99 shape — would
+  # still show "COMMIT;" in its last few lines. Accepting "COMMIT;"
+  # generically, for both dialects in the same tail window, would silently
+  # readmit that truncation. The two dialects need two different markers,
+  # checked only against dumps of their own kind.
+  #
+  # BOTH markers ANCHORED TO A WHOLE LINE, not matched as a substring
+  # anywhere within one — a second, narrower version of the same tail-
+  # anchoring problem solved above, and just as real: "COMMIT;" is
+  # ordinary SQL vocabulary that shows up in ordinary WordPress content (a
+  # post about transactions, a code snippet, a plugin's own log line), and
+  # measured directly — a SQLite export truncated right after `wp_posts`,
+  # before `wp_users` and the real closing COMMIT, but with a `wp_posts`
+  # row whose content happens to contain the substring "COMMIT;" is wrongly
+  # ACCEPTED by an unanchored `grep -cF` and correctly REJECTED once
+  # anchored to the FULL line (`grep -cx`). The mysqldump marker gets the
+  # same treatment for the same reason, anchored to the START of a line
+  # (`grep -c '^...'`) since its own line always carries more than just
+  # the marker text on genuine output.
   #
   # Sniffed from the dump's OWN FIRST line, which only the tool that wrote
   # the dump controls (never table data, unlike the tail this check reads)
-  # — a mysqldump/mariadb-dump export always opens with a "-- " comment; a
-  # `sqlite3 .dump` always opens with "PRAGMA foreign_keys=OFF;" (verified,
-  # unconditional). `head -1` (not `-q`-style anything), same SIGPIPE-
-  # under-pipefail reasoning as the rest of this function — `|| true` keeps
-  # a pipe closed early by `head` from turning into a false failure here.
+  # — a `sqlite3 .dump` always opens with "PRAGMA foreign_keys=OFF;"
+  # (verified, unconditional). mysqldump/mariadb-dump's own first line is
+  # NOT a reliable "-- " comment to sniff FOR — measured directly against a
+  # real MariaDB 11 dump: its actual first line is
+  # "/*M!999999\- enable the sandbox mode */", a versioned MariaDB
+  # directive, not a "-- "-prefixed comment at all (a prior round of this
+  # same comment claimed otherwise, unverified). So the mysqldump/mariadb
+  # dialect is the FALLBACK here — anything that doesn't match the SQLite
+  # signature — rather than something separately sniffed for; the two
+  # dialects genuinely in scope for `wp db export` don't need a positive
+  # match on both sides to be told apart. `head -1` (not `-q`-style
+  # anything), same SIGPIPE-under-pipefail reasoning as the rest of this
+  # function — `|| true` keeps a pipe closed early by `head` from turning
+  # into a false failure here.
   local first_line
   first_line=$(gunzip -c "$gz_file" 2>/dev/null | head -1 || true)
-  local marker marker_desc
+  local found marker_desc
   if [[ "$first_line" == "PRAGMA foreign_keys"* ]]; then
-    marker='COMMIT;'
+    found=$(gunzip -c "$gz_file" 2>/dev/null | tail -5 | grep -cx -- 'COMMIT;' || true)
     marker_desc="a SQLite export's closing COMMIT;"
   else
-    marker='-- Dump completed'
+    found=$(gunzip -c "$gz_file" 2>/dev/null | tail -5 | grep -c -- '^-- Dump completed' || true)
     marker_desc="mysqldump's completion marker ('-- Dump completed ...')"
   fi
-  found=$(gunzip -c "$gz_file" 2>/dev/null | tail -5 | grep -cF -- "$marker" || true)
   if [ "${found:-0}" -eq 0 ]; then
     log_error "backup verification failed: ${gz_file} has no ${marker_desc} in its final lines — the export looks truncated, not just missing a table. Re-run the backup; if this keeps happening, check whether B's export died partway (disk full, network drop, killed process)."
     return 1
