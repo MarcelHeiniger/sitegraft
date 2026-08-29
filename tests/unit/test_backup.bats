@@ -200,6 +200,42 @@ _fake_dump_rows() {
   [ "$status" -eq 0 ]
 }
 
+# issue #99: the two core-table probes above only see up to wp_posts, which
+# in an alphabetical mysqldump/mariadb-dump export sits in the MIDDLE of the
+# table list — this is the exact scenario the issue measured (options,
+# postmeta, posts written, then the exporter dies before wp_usermeta). The
+# probe alone cannot see this: both tables it checks for are already
+# present. Verified against a real `wp db export` run (WordPress 6.x +
+# MariaDB 12.3.3, no fixture/fabrication): every completed export — even of
+# a database with a single table, even of one with none of its own — ends
+# with an unconditional "-- Dump completed on ..." comment, mysqldump's own
+# marker that it reached the end, not sitegraft's invention.
+@test "backup_verify_db_export fails when core tables are present but the dump has no mysqldump completion footer (issue #99: truncated past wp_posts, invisible to the table probe)" {
+  {
+    printf -- '-- MySQL dump\n'
+    printf 'CREATE TABLE `wp_options` (\n'; _fake_dump_rows 50; printf ');\n'
+    printf 'CREATE TABLE `wp_postmeta` (\n'; _fake_dump_rows 50; printf ');\n'
+    printf 'CREATE TABLE `wp_posts` (\n'; _fake_dump_rows 50; printf ');\n'
+    # dies here: wp_usermeta, wp_users, wp_terms, wp_comments never written,
+    # and no "-- Dump completed on ..." footer either — exactly the
+    # measured shape from the issue.
+  } | gzip > "$BATS_TEST_TMPDIR/truncated-past-posts.sql.gz"
+  run backup_verify_db_export "$BATS_TEST_TMPDIR/truncated-past-posts.sql.gz" "wp_"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Dump completed"* ]] || false
+}
+
+@test "backup_verify_db_export fails when the dump has a completion-looking line that is NOT mysqldump's own footer (must match the real marker, not just 'looks done')" {
+  {
+    printf -- '-- MySQL dump\n'
+    printf 'CREATE TABLE `wp_options` (\n'; _fake_dump_rows 50; printf ');\n'
+    printf 'CREATE TABLE `wp_posts` (\n'; _fake_dump_rows 50; printf ');\n'
+    printf -- '-- Backup finished\n'
+  } | gzip > "$BATS_TEST_TMPDIR/fake-footer.sql.gz"
+  run backup_verify_db_export "$BATS_TEST_TMPDIR/fake-footer.sql.gz" "wp_"
+  [ "$status" -eq 1 ]
+}
+
 # --- backup_verify_wp_content ---
 
 @test "backup_verify_wp_content fails when the directory does not exist" {
@@ -549,6 +585,32 @@ _manifest_fixture() {
   SITEGRAFT_DRY_RUN=1 run backup_write_wp_content_manifest "$BATS_TEST_TMPDIR/src5" "$BATS_TEST_TMPDIR/m5"
   [ "$status" -eq 0 ]
   [ ! -e "$BATS_TEST_TMPDIR/m5" ]
+}
+
+# issue #99 (Direction §3): before the pipefail fix, a tar failure inside
+# backup_wp_content was silently discarded, so by the time execution reached
+# HERE (backup_write_wp_content_manifest, called right after it in
+# phase_backup) there was no memory that tar had ever complained — the
+# abort message could only guess between two causes and never named the
+# thrown-away tar error. Now that backup_wp_content's own `bash -c` strings
+# carry `set -o pipefail;`, ANY tool-reported transfer failure already
+# aborts phase_backup one line earlier (`backup_wp_content ... || exit 1`,
+# lib/backup.sh's phase_backup) — this message is only ever reached when
+# the pull itself reported SUCCESS. The message must say that, not
+# perpetuate a "something got thrown away" implication that is no longer
+# true.
+@test "backup_write_wp_content_manifest's count-mismatch message says the pull itself reported success, not that an error was discarded" {
+  _manifest_fixture b7; local wpc="$WPC"
+  mkdir -p "${wpc}/themes/t" "${wpc}/plugins"
+  touch "${wpc}/themes/t/a.css" "${wpc}/plugins/p.php"
+  mkdir -p "$BATS_TEST_TMPDIR/src7/themes"
+  touch "$BATS_TEST_TMPDIR/src7/themes/a.css"   # archive short of B by one entry
+  run backup_write_wp_content_manifest "$BATS_TEST_TMPDIR/src7" "$BATS_TEST_TMPDIR/m7"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"path(s) but the archive"* ]] || false
+  [[ "$output" == *"reported success"* ]] || false
+  [[ "$output" != *"was thrown away"* ]]
+  [[ "$output" != *"was discarded"* ]]
 }
 
 @test "backup_write_wp_content_manifest is owner-only (it lists a real site's file tree)" {

@@ -74,7 +74,14 @@ graft_pull_dir() {
       log_info "source directory does not exist on ${alias_lc} yet (nothing to pull): ${src_dir}"
       return 0
     fi
-    run_or_echo bash -c "${prefix} tar -c -z -f - -C '${src_dir}' . | tar -x -z -f - -C '${host_dest_dir}'"
+    # `set -o pipefail;` — issue #99: a `bash -c` child does not inherit
+    # bin/sitegraft's own `set -o pipefail`, so without this the pipeline's
+    # exit status is the EXTRACTING tar's alone — a source tar that dies
+    # partway through (still emitting a complete, valid archive for what it
+    # did manage to read) is reported as a successful pull. This function's
+    # own callers already check its return value; that check is only as
+    # good as the status being checked, which was the wrong one before this.
+    run_or_echo bash -c "set -o pipefail; ${prefix} tar -c -z -f - -C '${src_dir}' . | tar -x -z -f - -C '${host_dest_dir}'"
   else
     if ! is_dry_run && [ ! -d "$src_dir" ]; then
       log_info "source directory does not exist on ${alias_lc} yet (nothing to pull): ${src_dir}"
@@ -148,7 +155,14 @@ graft_push_dir() {
         log_warn "the tar reachable through this site's wrapper has no --skip-old-files; falling back to -k, whose exit status cannot distinguish an already-present file from a real extraction error. Check the transferred tree by hand if this run behaves oddly."
       fi
     fi
-    run_or_echo bash -c "${prefix} mkdir -p '${dest_dir}' && { tar -c -z -f - -C '${host_src_dir}' . | ${prefix} tar ${untar_opts} -C '${dest_dir}'; }${tolerate_exit}"
+    # `set -o pipefail;` — issue #99, same swallow as graft_pull_dir's own
+    # comment above, mirrored here (plain create / prefixed extract instead
+    # of prefixed create / plain extract). This only fixes what status the
+    # `tar | tar` pipeline reports; `${tolerate_exit}` (the deliberate
+    # `|| true` of the -k fallback, above) still gets the last word when it
+    # applies — pipefail changes what status that `|| true` discards, never
+    # whether it discards it.
+    run_or_echo bash -c "set -o pipefail; ${prefix} mkdir -p '${dest_dir}' && { tar -c -z -f - -C '${host_src_dir}' . | ${prefix} tar ${untar_opts} -C '${dest_dir}'; }${tolerate_exit}"
   else
     run_or_echo mkdir -p "$dest_dir"
     if [ "$mode" = "--keep-existing" ]; then
