@@ -1828,16 +1828,22 @@ verify_migrated_content_changed_from_pregraft() {
 # absent/verify_nav_present in this file, so the caller can say exactly what
 # was established: `HTTP_SMOKE:matched` (body genuinely checked and
 # contains it) vs `HTTP_SMOKE:not-compared` (200 confirmed, body never
-# looked at). Deliberately still a PASS either way, not INCOMPLETE — decided
-# consciously, not by omission: this check is documented above as
-# best-effort by design (no SITE_B_URL is even required), and "not
-# compared" is a known fact about what ran, not an uncertainty about
-# whether B is correct. What changes is only the WORDING, never whether the
-# run counts as complete.
+# looked at) vs `HTTP_SMOKE:no-curl` (issue #32 fix-pack NIT 1 -- curl
+# itself is unavailable, so not even the status code was checked). curl is
+# never `require_cmd`'d anywhere in this codebase, so that last path is live
+# today, not provisioning for later. Deliberately still a PASS either way,
+# not INCOMPLETE — decided consciously, not by omission: this check is
+# documented above as best-effort by design (no SITE_B_URL is even
+# required), and "not compared"/"no curl" are known facts about what ran,
+# not an uncertainty about whether B is correct. What changes is only the
+# WORDING, never whether the run counts as complete. A success path added
+# later WITHOUT one of these markers is a different matter — see phase_
+# verify's own default branch for it, same fail-closed convention every
+# other marker-reading case in this file uses.
 verify_http_smoke() {
   local url="$1" marker="${2:-}"
   [ -n "$url" ] || return 0
-  command -v curl >/dev/null 2>&1 || { log_warn "curl not found — skipping the HTTP smoke check (best-effort only)"; return 0; }
+  command -v curl >/dev/null 2>&1 || { log_warn "curl not found — skipping the HTTP smoke check (best-effort only)"; echo "HTTP_SMOKE:no-curl"; return 0; }
 
   local code
   code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$url" 2>/dev/null || echo "000")
@@ -2043,22 +2049,55 @@ phase_verify() {
     echo "- [ ] **HARD FAIL: could not recompute protected data checksums** — the recompute itself failed (wp-cli unreachable, or a read \`backup_compute_protected_checksums\` needs failed); see above. A broken read here casts doubt on every table this run was supposed to be protecting, so it is reported as a failure, never silently treated as \"nothing changed\"." >> "$report"
     hard_fail=1
   else
-    # A legitimately empty protect-set (this run's manifest declared nothing
-    # to protect, or every declared module's `tables` list was empty) is a
-    # KNOWN fact read straight from the manifest, not a verified comparison
-    # — reported as such, distinctly from a real match, so the report never
-    # claims to have compared data it never had.
-    local pre_graft_count
-    pre_graft_count=$(echo "$manifest" | jq '.checksums_protected_pre_graft // {} | length')
-    if [ "$pre_graft_count" -eq 0 ]; then
-      echo "- [x] protected data unchanged (not applicable — 0 protected set(s) were declared in this run's manifest, so there was nothing to compare)" >> "$report"
+    # Issue #33 fix-pack (round 2, review finding): what phase_verify reads
+    # here is the PRE-GRAFT SNAPSHOT (checksums_protected_pre_graft) --
+    # captured by `backup`, a DIFFERENT phase than the recompute above,
+    # which reads B's LIVE current state regardless of whether backup ever
+    # ran. Those are two different facts, and the first round of this fix
+    # collapsed them: `.checksums_protected_pre_graft // {}` treated an
+    # ABSENT key the same as a PRESENT-and-empty one, both read as "0
+    # declared, not applicable, PASS". They are not the same. A `backup
+    # --dry-run` manifest never computes a real snapshot at all and leaves
+    # the key OUT entirely (asserted by an existing test) -- reachable for
+    # real via `backup --dry-run` followed by a genuine `graft` and
+    # `verify`, not hypothetical. Whatever `.protect` itself declares, an
+    # absent snapshot means protected data was never captured pre-graft, so
+    # nothing here can be verified either way -- printing a PASS in that
+    # state is the exact defect this issue exists to close, reintroduced by
+    # the first round of its own fix.
+    #
+    # Presence is therefore tested FIRST, before ever reading a value out of
+    # it -- same discipline the domain check's own `has("from")` guard
+    # already uses in this function (Viktor's re-review of PR #26, N4/N5),
+    # for the identical reason: a missing key is a different fact from a
+    # present-and-empty one, and only one of them justifies a pass.
+    if ! echo "$manifest" | jq -e 'has("checksums_protected_pre_graft")' >/dev/null 2>&1; then
+      echo "- [ ] protected data unchanged: **UNVERIFIED — no pre-graft protected-data snapshot exists in this manifest** (backup never captured one -- a \`backup --dry-run\` manifest, or a run that reached verify without going through backup at all -- so protected data cannot be verified for this run, regardless of what this manifest's \`protect\` section declares)" >> "$report"
+      incomplete=$((incomplete + 1))
+      incomplete_names="${incomplete_names}protected-data-checksums "
     else
-      local checksum_diff
-      if checksum_diff=$(verify_compare_checksums "$manifest" "$recomputed" 2>>"$report"); then
-        echo "- [x] protected data unchanged (${pre_graft_count} protected set(s) compared)" >> "$report"
+      # A real backup run writes a key for every protect module that has
+      # actual TABLES (see backup_compute_protected_checksums's own header
+      # comment) -- a module can be DECLARED (the shared fixture's own
+      # `_unclaimed`) while carrying zero tables, which is why the count
+      # below is worded as "0 table(s)", never "0 protected set(s) were
+      # declared" (review finding: the fixture's `_unclaimed` module IS
+      # declared, it simply has nothing to snapshot). That distinction is a
+      # KNOWN fact read straight from the manifest, not a verified
+      # comparison -- reported as such, distinctly from a real match, so the
+      # report never claims to have compared data it never had.
+      local pre_graft_count
+      pre_graft_count=$(echo "$manifest" | jq '.checksums_protected_pre_graft | length')
+      if [ "$pre_graft_count" -eq 0 ]; then
+        echo "- [x] protected data unchanged (not applicable — this run's manifest declared 0 protected table(s) to snapshot, so there was nothing to compare)" >> "$report"
       else
-        echo "- [ ] **HARD FAIL: protected data changed** — ${checksum_diff}" >> "$report"
-        hard_fail=1
+        local checksum_diff
+        if checksum_diff=$(verify_compare_checksums "$manifest" "$recomputed" 2>>"$report"); then
+          echo "- [x] protected data unchanged (${pre_graft_count} protected set(s) compared)" >> "$report"
+        else
+          echo "- [ ] **HARD FAIL: protected data changed** — ${checksum_diff}" >> "$report"
+          hard_fail=1
+        fi
       fi
     fi
   fi
@@ -2562,13 +2601,18 @@ phase_verify() {
   local front_title=""
   if [ -n "$site_b_url" ]; then
     front_title=$(wp_remote b post get "$(wp_remote b option get page_on_front 2>/dev/null || echo "")" --field=post_title 2>/dev/null || echo "")
-    # Issue #32: verify_http_smoke now echoes which of its two success
-    # outcomes applied (see its own header comment) — read it here instead
-    # of assuming "returns 200" also means "with expected content". A
-    # success with no recognizable marker (curl missing, or a future
-    # success path added without one) falls to the same fail-closed default
-    # every other marker-reading case in this file uses: never assume the
-    # strongest claim just because something returned 0.
+    # Issue #32: verify_http_smoke now echoes which of its success outcomes
+    # applied (see its own header comment) — read it here instead of
+    # assuming "returns 200" also means "with expected content". `no-curl`
+    # is a KNOWN fact (curl genuinely is not on this machine — live today,
+    # since curl is never `require_cmd`'d anywhere in this codebase),
+    # ticked not-applicable like the no-SITE_B_URL case below. A success
+    # with NO recognizable marker at all (a future success path added
+    # without one) is a DIFFERENT thing — the check's own bookkeeping went
+    # out of sync — and gets the same fail-closed default every other
+    # marker-reading case in this file uses (issue #32 fix-pack, NIT 1):
+    # UNVERIFIED, counted toward INCOMPLETE, never silently assumed to be
+    # whichever outcome happens to read best.
     local smoke_output="" smoke_rc=0
     smoke_output=$(verify_http_smoke "$site_b_url" "$front_title" 2>>"$report") || smoke_rc=$?
     if [ "$smoke_rc" -eq 0 ]; then
@@ -2579,8 +2623,13 @@ phase_verify() {
         *HTTP_SMOKE:not-compared*)
           echo "- [x] HTTP smoke check: ${site_b_url} returns 200 (body not compared — no front-page title available to match against) (best-effort)" >> "$report"
           ;;
+        *HTTP_SMOKE:no-curl*)
+          echo "- [x] HTTP smoke check (not applicable — curl not found on this machine; best-effort check skipped)" >> "$report"
+          ;;
         *)
-          echo "- [x] HTTP smoke check (not applicable — best-effort check did not run; see above)" >> "$report"
+          echo "- [ ] HTTP smoke check: **UNVERIFIED — the check reported success without saying which of its outcomes applied** (a success path added without its marker — see lib/verify.sh's verify_http_smoke)" >> "$report"
+          incomplete=$((incomplete + 1))
+          incomplete_names="${incomplete_names}http-smoke "
           ;;
       esac
     else

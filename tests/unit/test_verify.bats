@@ -1377,6 +1377,23 @@ _verify_component_prop_run_captured_php() {
   [ "$status" -eq 1 ]
 }
 
+# --- Issue #32 fix-pack, NIT 1: curl is never `require_cmd`'d anywhere in
+# this codebase, so "curl not found" is a live path today, not provisioning
+# for later — it must report its own distinct outcome (HTTP_SMOKE:no-curl),
+# never bare success with no marker at all (which phase_verify now reads as
+# UNVERIFIED, the wrong claim for a case that is actually a known fact).
+# `command` is shadowed here to fake ONLY curl's absence (`builtin command`
+# falls through to the real builtin for everything else bats itself needs).
+@test "verify_http_smoke reports HTTP_SMOKE:no-curl distinctly when curl itself is unavailable (issue #32 fix-pack, NIT 1)" {
+  command() {
+    if [ "$1" = "-v" ] && [ "$2" = "curl" ]; then return 1; fi
+    builtin command "$@"
+  }
+  run verify_http_smoke "https://b.example.com" "Home"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"HTTP_SMOKE:no-curl"* ]] || false
+}
+
 # --- _verify_wxr_items_remapped (shared helper, issue #52) ------------------
 # Real end-to-end tests: genuine WXR file(s) on disk, the genuine php CLI
 # driver (lib/php/verify-content-remap-cli.php) — the one place in this
@@ -1958,7 +1975,40 @@ EOF
   graft_check_orphan_parents() { echo ""; }
   run phase_verify --profile t --run "$RUN_DIR"
   [ "$status" -eq 0 ]
-  grep -qF -- "- [x] protected data unchanged (not applicable — 0 protected set(s) were declared in this run's manifest, so there was nothing to compare)" "${RUN_DIR}/verify-report.md"
+  grep -qF -- "- [x] protected data unchanged (not applicable — this run's manifest declared 0 protected table(s) to snapshot, so there was nothing to compare)" "${RUN_DIR}/verify-report.md"
+}
+
+# --- Issue #33 fix-pack round 2 (review finding, BLOCKER): the first round
+# of this fix collapsed "the manifest genuinely declared nothing to
+# protect" and "no pre-graft snapshot exists at all" onto the same PASS.
+# Reproduced exactly as measured: a manifest whose protect module DOES
+# declare a table, but whose checksums_protected_pre_graft key is entirely
+# ABSENT -- the real shape `backup --dry-run` produces (asserted by
+# tests/unit/test_phase_backup.bats' own "writes no completion marker or
+# checksums" test), reachable by running a genuine graft/verify against a
+# dry-run backup's manifest. This must never print a PASS: protected data
+# was never snapshotted, so nothing here was verified either way.
+@test "phase_verify's checksum check is INCOMPLETE, never a PASS, when the manifest has no pre-graft snapshot at all (issue #33 fix-pack round 2)" {
+  setup_phase_verify_fixture
+  jq 'del(.checksums_protected_pre_graft) | .protect = {"fakebooking": {"tables": ["fakebooking_reservations"]}}' "${RUN_DIR}/manifest.json" > "${RUN_DIR}/manifest.json.tmp" && mv "${RUN_DIR}/manifest.json.tmp" "${RUN_DIR}/manifest.json"
+  wp_remote() {
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
+    local alias_lc="$1"; shift
+    case "$1" in
+      eval) echo "wp_" ;; # inventory_table_prefix succeeds -- the recompute itself is fine
+      db) echo "SOME CONTENT" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 2 ]
+  grep -q "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md"
+  grep -qF -- "no pre-graft protected-data snapshot exists in this manifest" "${RUN_DIR}/verify-report.md"
+  ! grep -qF -- "protected data unchanged (not applicable" "${RUN_DIR}/verify-report.md"
+  ! grep -qF -- "protected set(s) compared" "${RUN_DIR}/verify-report.md"
 }
 
 # --- phase_verify: domain check wiring (scoped, fail-closed) ----------------
@@ -2981,6 +3031,68 @@ EOF
   run phase_verify --profile t --run "$RUN_DIR"
   [ "$status" -eq 0 ]
   grep -qF -- "- [x] HTTP smoke check: https://b.example.com returns 200 with expected content (best-effort)" "${RUN_DIR}/verify-report.md"
+}
+
+# --- Issue #32 fix-pack, NIT 1: curl genuinely unavailable is a KNOWN fact
+# (curl is never `require_cmd`'d anywhere in this codebase, so this is live
+# today), reported as a ticked not-applicable — same category as the
+# no-SITE_B_URL case, not an uncertainty.
+@test "phase_verify's HTTP smoke line says NOT APPLICABLE, distinctly, when curl itself is unavailable (issue #32 fix-pack, NIT 1)" {
+  setup_phase_verify_fixture
+  printf 'SITE_B_URL="https://b.example.com"
+' >> "${SITEGRAFT_PROFILES_DIR}/t.conf"
+  command() {
+    if [ "$1" = "-v" ] && [ "$2" = "curl" ]; then return 1; fi
+    builtin command "$@"
+  }
+  wp_remote() {
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
+    local alias_lc="$1"; shift
+    case "$1" in
+      eval) echo "wp_" ;;
+      db) echo "" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  grep -qF -- "- [x] HTTP smoke check (not applicable — curl not found on this machine; best-effort check skipped)" "${RUN_DIR}/verify-report.md"
+}
+
+# --- Issue #32 fix-pack, NIT 1: a success with NO recognizable marker at
+# all (a future success path added without one) is a different defect than
+# "curl missing" or "body not compared" — the check's own bookkeeping went
+# out of sync. Same fail-closed default every other marker-reading case in
+# this file uses: UNVERIFIED, counted toward INCOMPLETE, never silently
+# assumed to be the strongest claim. This default is UNREACHABLE as this
+# file stands (every real success path echoes its own marker) — kept, and
+# tested anyway, for the same reason the sibling defaults in this file are:
+# an untested guard is the guard the next refactor deletes with nothing to
+# say otherwise.
+@test "phase_verify reports the HTTP smoke check as UNVERIFIED when it succeeds without saying which of its outcomes applied (issue #32 fix-pack, NIT 1)" {
+  setup_phase_verify_fixture
+  printf 'SITE_B_URL="https://b.example.com"
+' >> "${SITEGRAFT_PROFILES_DIR}/t.conf"
+  verify_http_smoke() { return 0; } # a future success path that forgot its marker
+  wp_remote() {
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 2 ]
+  grep -q "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md"
+  grep "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md" | grep -qi "http-smoke"
+  grep -qF -- "HTTP smoke check: **UNVERIFIED — the check reported success without saying which of its outcomes applied**" "${RUN_DIR}/verify-report.md"
 }
 
 # --- N3: the manifest is read by `jq` in every check below, but was never
