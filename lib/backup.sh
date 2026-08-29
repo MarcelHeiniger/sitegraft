@@ -554,8 +554,11 @@ backup_verify_db_export() {
   # ACCEPTED by an unanchored `grep -cF` and correctly REJECTED once
   # anchored to the FULL line (`grep -cx`). The mysqldump marker gets the
   # same treatment for the same reason, anchored to the START of a line
-  # (`grep -c '^...'`) since its own line always carries more than just
-  # the marker text on genuine output.
+  # (`grep -c '^...'`) rather than to the full line, because the marker's
+  # own line takes two shapes: "-- Dump completed on <date>" normally, and
+  # a bare "-- Dump completed" under --skip-dump-date (both measured, and
+  # both documented above). A start-of-line anchor covers the two; a
+  # full-line anchor would reject the second.
   #
   # Sniffed from the dump's OWN FIRST line, which only the tool that wrote
   # the dump controls (never table data, unlike the tail this check reads)
