@@ -459,6 +459,13 @@ verify_domain_absent() {
 # phase_verify to pick the right report line. A success path added later
 # without a marker is reported as UNVERIFIED rather than silently inheriting
 # one of the three claims.
+#
+# The INCOMPLETE (2) case is similarly not one undifferentiated reason:
+# `PAGE_ON_FRONT:non-numeric-map-entry` (issue #69) marks the specific
+# sub-case of "id-map.tsv has an entry, but its column 2 is not a numeric
+# id" apart from the plain "the value file was never written this run" case
+# — the two are different facts about what happened and phase_verify reports
+# them with different wording (see its own `front_rc -eq 2` handling).
 verify_page_on_front() {
   local run_dir="$1" id_map_tsv="$2" manifest="$3"
   echo "$manifest" | jq -e '[.migrate[].option_keys[]?] | index("page_on_front") != null' >/dev/null 2>&1 \
@@ -478,6 +485,30 @@ verify_page_on_front() {
     log_error "A's page_on_front (page ${old_front_id}) has no corresponding entry in id-map.tsv — the remap did not happen (or the ID mapper was missing, or the imported post silently failed), so B's page_on_front cannot be verified against it"
     return 1
   fi
+  # Issue #69: this lookup has no `$3` type filter -- any id-map.tsv row
+  # whose column 1 numerically matches old_front_id wins, whatever column 3
+  # says. Identical shape to core_wp_post_import's own page_on_front/
+  # page_for_posts WRITE lookup (modules/core-wp.sh), closed there for #61:
+  # a legacy id-map.tsv written before that fix can carry a `term:` row
+  # whose column 2 is the literal string "Array" (PHP's array-to-string
+  # coercion from the since-removed wp_import_insert_term handler — see that
+  # function's own comment for the full history). A numeric collision
+  # between old_front_id and such a row's column 1 would land "Array" in
+  # expected_new_id here too. Unlike the write side, this is a READ: the
+  # value is only ever compared against B's live option, so the worst case
+  # is a FALSE HARD FAIL on the collision, never a corrupting write — which
+  # is why this was split out as non-blocking (issue #69). Still worth
+  # closing: a false hard fail sends someone hunting a migration bug that
+  # does not exist. Guarded on shape, same as the write side: a non-numeric
+  # column 2 is reported as uncheckable (INCOMPLETE, not a hard fail),
+  # rather than compared against B's live value as though it were a real id.
+  case "$expected_new_id" in
+    *[!0-9]*)
+      log_error "A's page_on_front (page ${old_front_id}) maps to a non-numeric id in id-map.tsv ('${expected_new_id}') — refusing to treat this as B's expected page_on_front. This row was almost certainly written by an older sitegraft version (see modules/core-wp.sh's identical guard on the write side); report this with the run directory."
+      echo "PAGE_ON_FRONT:non-numeric-map-entry"
+      return 2
+      ;;
+  esac
 
   local live_front_id
   live_front_id=$(wp_remote b option get page_on_front 2>/dev/null || echo "")
@@ -1786,6 +1817,23 @@ verify_migrated_content_changed_from_pregraft() {
 # it — a 200 serving a blank page, a caching layer's stale error page, or an
 # unrelated default page all still return 200 and would pass a status-only
 # check.
+#
+# Issue #32: when no marker is available (the caller's own front-page title
+# lookup came back empty), the OLD version of this function silently skipped
+# the body comparison and returned bare success — indistinguishable, to the
+# caller, from "the marker was checked and matched". phase_verify's report
+# line claimed BOTH "returns 200" AND "with expected content" regardless,
+# having established only the first. Every success path below now echoes a
+# marker on stdout, same convention as verify_page_on_front/verify_domain_
+# absent/verify_nav_present in this file, so the caller can say exactly what
+# was established: `HTTP_SMOKE:matched` (body genuinely checked and
+# contains it) vs `HTTP_SMOKE:not-compared` (200 confirmed, body never
+# looked at). Deliberately still a PASS either way, not INCOMPLETE — decided
+# consciously, not by omission: this check is documented above as
+# best-effort by design (no SITE_B_URL is even required), and "not
+# compared" is a known fact about what ran, not an uncertainty about
+# whether B is correct. What changes is only the WORDING, never whether the
+# run counts as complete.
 verify_http_smoke() {
   local url="$1" marker="${2:-}"
   [ -n "$url" ] || return 0
@@ -1797,12 +1845,15 @@ verify_http_smoke() {
     log_error "HTTP smoke check: ${url} returned ${code}, expected 200"
     return 1
   fi
-  [ -n "$marker" ] || return 0
+  if [ -z "$marker" ]; then
+    echo "HTTP_SMOKE:not-compared"
+    return 0
+  fi
 
   local body
   body=$(curl -sS --max-time 10 "$url" 2>/dev/null || echo "")
   case "$body" in
-    *"$marker"*) : ;;
+    *"$marker"*) echo "HTTP_SMOKE:matched" ;;
     *)
       log_error "HTTP smoke check: ${url} returned 200 but its rendered body does not contain the expected marker ('${marker}') — a green status code is not proof the page actually rendered (build green != route OK)"
       return 1
@@ -1967,14 +2018,49 @@ phase_verify() {
   # table-suffix-to-live-prefix resolution, both reused verbatim from
   # backup_compute_protected_checksums, lib/backup.sh — never a second,
   # independently-drifting implementation) ----------------------------------
-  local recomputed
-  recomputed=$(backup_compute_protected_checksums b "$manifest" 2>>"$report") || recomputed='{}'
-  local checksum_diff
-  if checksum_diff=$(verify_compare_checksums "$manifest" "$recomputed" 2>>"$report"); then
-    echo "- [x] protected data unchanged" >> "$report"
-  else
-    echo "- [ ] **HARD FAIL: protected data changed** — ${checksum_diff}" >> "$report"
+  #
+  # Issue #33: the old `|| recomputed='{}'` fallback turned a genuine
+  # recompute failure (wp-cli unreachable, `inventory_table_prefix` erroring,
+  # any read `backup_compute_protected_checksums` needs to do its job) into
+  # an EMPTY map, then let the comparison below proceed against it. With a
+  # non-empty `checksums_protected_pre_graft` that still hard-fails (empty
+  # can't match populated) — but the exposure is the run where the pre-graft
+  # map is ITSELF `{}` (nothing was declared protected): empty compared
+  # against empty matches, and the report printed "protected data unchanged"
+  # / PASS on a run where nothing was computed and nothing could have been.
+  # Reproduced directly (stub the recompute to fail against the shared
+  # fixture's empty pre-graft map — see the test alongside this comment).
+  #
+  # The same argument #26 already applied to the orphan-parent query — a
+  # broken read casts doubt on every other read in the run, so the query
+  # failing is a hard failure, not a silent "found nothing" — applies here
+  # and had not been applied: a recompute failure is now reported as a
+  # failure, never substituted with a value that happens to look like a
+  # clean result.
+  local recomputed recompute_rc=0
+  recomputed=$(backup_compute_protected_checksums b "$manifest" 2>>"$report") || recompute_rc=$?
+  if [ "$recompute_rc" -ne 0 ]; then
+    echo "- [ ] **HARD FAIL: could not recompute protected data checksums** — the recompute itself failed (wp-cli unreachable, or a read \`backup_compute_protected_checksums\` needs failed); see above. A broken read here casts doubt on every table this run was supposed to be protecting, so it is reported as a failure, never silently treated as \"nothing changed\"." >> "$report"
     hard_fail=1
+  else
+    # A legitimately empty protect-set (this run's manifest declared nothing
+    # to protect, or every declared module's `tables` list was empty) is a
+    # KNOWN fact read straight from the manifest, not a verified comparison
+    # — reported as such, distinctly from a real match, so the report never
+    # claims to have compared data it never had.
+    local pre_graft_count
+    pre_graft_count=$(echo "$manifest" | jq '.checksums_protected_pre_graft // {} | length')
+    if [ "$pre_graft_count" -eq 0 ]; then
+      echo "- [x] protected data unchanged (not applicable — 0 protected set(s) were declared in this run's manifest, so there was nothing to compare)" >> "$report"
+    else
+      local checksum_diff
+      if checksum_diff=$(verify_compare_checksums "$manifest" "$recomputed" 2>>"$report"); then
+        echo "- [x] protected data unchanged (${pre_graft_count} protected set(s) compared)" >> "$report"
+      else
+        echo "- [ ] **HARD FAIL: protected data changed** — ${checksum_diff}" >> "$report"
+        hard_fail=1
+      fi
+    fi
   fi
 
   # --- migrated option values (finding B3; count-vs-selected reporting is
@@ -2149,7 +2235,20 @@ phase_verify() {
         ;;
     esac
   elif [ "$front_rc" -eq 2 ]; then
-    echo "- [ ] page_on_front: **UNVERIFIED — selected for migration but its recorded value was never written this run** (see above; not a hard fail on its own, but not a pass)" >> "$report"
+    case "$front_output" in
+      # Issue #69: a non-numeric id-map.tsv entry is a DIFFERENT reason to be
+      # unable to verify than "the value file was never written" — the value
+      # WAS written this run, it is id-map.tsv's row that cannot be trusted.
+      # Reported distinctly, same discipline as every other marker in this
+      # function: never reuse one INCOMPLETE line's wording for a cause it
+      # does not actually describe.
+      *PAGE_ON_FRONT:non-numeric-map-entry*)
+        echo "- [ ] page_on_front: **UNVERIFIED — id-map.tsv's entry for A's front page is not a numeric id, so it cannot be trusted as B's expected page_on_front** (see above; not a hard fail on its own, but not a pass)" >> "$report"
+        ;;
+      *)
+        echo "- [ ] page_on_front: **UNVERIFIED — selected for migration but its recorded value was never written this run** (see above; not a hard fail on its own, but not a pass)" >> "$report"
+        ;;
+    esac
     incomplete=$((incomplete + 1))
     incomplete_names="${incomplete_names}page_on_front "
   else
@@ -2463,8 +2562,27 @@ phase_verify() {
   local front_title=""
   if [ -n "$site_b_url" ]; then
     front_title=$(wp_remote b post get "$(wp_remote b option get page_on_front 2>/dev/null || echo "")" --field=post_title 2>/dev/null || echo "")
-    if verify_http_smoke "$site_b_url" "$front_title" 2>>"$report"; then
-      echo "- [x] HTTP smoke check: ${site_b_url} returns 200 with expected content (best-effort)" >> "$report"
+    # Issue #32: verify_http_smoke now echoes which of its two success
+    # outcomes applied (see its own header comment) — read it here instead
+    # of assuming "returns 200" also means "with expected content". A
+    # success with no recognizable marker (curl missing, or a future
+    # success path added without one) falls to the same fail-closed default
+    # every other marker-reading case in this file uses: never assume the
+    # strongest claim just because something returned 0.
+    local smoke_output="" smoke_rc=0
+    smoke_output=$(verify_http_smoke "$site_b_url" "$front_title" 2>>"$report") || smoke_rc=$?
+    if [ "$smoke_rc" -eq 0 ]; then
+      case "$smoke_output" in
+        *HTTP_SMOKE:matched*)
+          echo "- [x] HTTP smoke check: ${site_b_url} returns 200 with expected content (best-effort)" >> "$report"
+          ;;
+        *HTTP_SMOKE:not-compared*)
+          echo "- [x] HTTP smoke check: ${site_b_url} returns 200 (body not compared — no front-page title available to match against) (best-effort)" >> "$report"
+          ;;
+        *)
+          echo "- [x] HTTP smoke check (not applicable — best-effort check did not run; see above)" >> "$report"
+          ;;
+      esac
     else
       echo "- [ ] HTTP smoke check FAILED (best-effort, not a hard fail — see above): ${site_b_url}" >> "$report"
     fi

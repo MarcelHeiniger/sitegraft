@@ -639,6 +639,31 @@ setup() {
   [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }
 
+# --- Issue #69: the id-map.tsv lookup has no `$3` type filter and no digit
+# guard on column 2 — the identical unguarded shape closed on the WRITE side
+# in modules/core-wp.sh (PR #61's fix-pack). A legacy id-map.tsv written
+# before that fix can carry a `term:` row whose column 2 is the literal
+# string "Array" (PHP's array-to-string coercion from the since-removed
+# wp_import_insert_term handler). On a numeric collision between A's real
+# old_front_id and such a row's column 1, the OLD code would compare "Array"
+# against B's live page_on_front and report a FALSE HARD FAIL — never a
+# corrupting write (this is a read), but a false alarm that sends someone
+# hunting a migration bug that does not exist. The exact fixture shape is
+# the issue's own: `5\tArray\tterm:category`, column 2 = "Array".
+@test "verify_page_on_front refuses a non-numeric id-map.tsv entry rather than comparing it against B's live value (issue #69)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '"5"' > "${run_dir}/option-page_on_front.value" # A's front page: page 5
+  local tsv="${run_dir}/id-map.tsv"
+  printf '5\tArray\tterm:category\n' > "$tsv" # legacy garbage row, column 1 numerically collides with old_front_id
+  wp_remote() { echo "SHOULD NOT BE CALLED — a non-numeric map entry must never reach a live comparison against B"; }
+  run verify_page_on_front "$run_dir" "$tsv" '{"migrate":{"core-wp":{"option_keys":["page_on_front"]}}}'
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"non-numeric"* ]] || false
+  [[ "$output" == *"PAGE_ON_FRONT:non-numeric-map-entry"* ]] || false
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
 # --- verify_nav_present ------------------------------------------------------
 
 @test "verify_nav_present fails when wp_navigation was migrated but B has no navigation post" {
@@ -1884,6 +1909,58 @@ EOF
   grep -q "protected data unchanged" "${RUN_DIR}/verify-report.md"
 }
 
+# --- Issue #33: a total failure of the checksum recompute must be reported
+# as a failure, never substituted with an empty map. The shared fixture's
+# manifest already has checksums_protected_pre_graft: {} — the exact
+# reproduction shape the issue describes: empty pre-graft compared against
+# the {} the old `|| recomputed='{}'` fallback produced matches trivially,
+# so the OLD code printed "protected data unchanged" / PASS on a run where
+# the recompute never ran at all. Failing `eval` here fails
+# inventory_table_prefix, which is what makes backup_compute_protected_
+# checksums itself return non-zero (its own `|| return 1`) — a real failure
+# of the recompute machinery, not a stubbing accident.
+@test "phase_verify HARD FAILs when the checksum recompute itself fails, rather than substituting an empty map (issue #33)" {
+  setup_phase_verify_fixture
+  wp_remote() {
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
+    local alias_lc="$1"; shift
+    case "$1" in
+      eval) return 1 ;; # inventory_table_prefix fails -- wp-cli unreachable
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 1 ]
+  grep -q "HARD FAIL: could not recompute protected data checksums" "${RUN_DIR}/verify-report.md"
+  ! grep -q "protected data unchanged" "${RUN_DIR}/verify-report.md"
+}
+
+# --- Issue #33, second half of the acceptance criteria: a protect-set that
+# is LEGITIMATELY empty (this run's manifest genuinely declared nothing to
+# protect -- the shared fixture's own case) must be reported AS a known
+# fact, distinctly from a real verified match, not folded into the same
+# "protected data unchanged" tick a genuine comparison earns.
+@test "phase_verify's checksum line says NOT APPLICABLE, distinctly, when nothing was declared protected in the manifest" {
+  setup_phase_verify_fixture # checksums_protected_pre_graft: {}, protect: {_unclaimed: {tables: []}}
+  wp_remote() {
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
+    local alias_lc="$1"; shift
+    case "$1" in
+      eval) echo "wp_" ;; # inventory_table_prefix succeeds this time
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  grep -qF -- "- [x] protected data unchanged (not applicable — 0 protected set(s) were declared in this run's manifest, so there was nothing to compare)" "${RUN_DIR}/verify-report.md"
+}
+
 # --- phase_verify: domain check wiring (scoped, fail-closed) ----------------
 
 @test "phase_verify hard-fails when the domain check finds a real hit" {
@@ -2740,6 +2817,34 @@ EOF
   [ "$front_line" = "- [x] page_on_front (not applicable — A's own recorded value says A never configured a front page)" ]
 }
 
+# --- Issue #69, phase_verify wiring level: a non-numeric id-map.tsv entry
+# must land in the INCOMPLETE bucket under its OWN wording, distinct from
+# "the value file was never written this run" -- that line is false here,
+# the value WAS written; it is the id-map.tsv row that cannot be trusted.
+# The stub below makes the live `wp_remote b option get page_on_front` call
+# an immediate test failure if reached at all -- proving the guard stops the
+# comparison before it ever gets there, not merely that the wording changed.
+@test "phase_verify's page_on_front line says NON-NUMERIC MAP ENTRY, distinctly, when id-map.tsv's entry for A's front page is not a numeric id (issue #69)" {
+  setup_phase_verify_fixture
+  printf '5\tArray\tterm:category\n' > "${RUN_DIR}/id-map.tsv" # legacy garbage row, replaces the shared fixture's clean 5->105 mapping
+  wp_remote() {
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
+    local alias_lc="$1"; shift
+    case "$1" in
+      db) echo "" ;;
+      option) echo "SHOULD NOT BE CALLED" ;; # a non-numeric map entry must never reach a live comparison
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 2 ]
+  grep -q "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md"
+  grep -qF -- "id-map.tsv's entry for A's front page is not a numeric id" "${RUN_DIR}/verify-report.md"
+  ! grep -qF -- "SHOULD NOT BE CALLED" "${RUN_DIR}/verify-report.md"
+}
+
 # The three branches above are selected by a marker the function itself
 # prints. A fourth success path added later without a marker must not
 # silently inherit one of the three claims — the default is UNVERIFIED, in
@@ -2805,6 +2910,77 @@ EOF
   [ "$status" -eq 0 ]
   grep -qF -- "- [x] HTTP smoke check (not applicable — no SITE_B_URL configured in this profile)" "${RUN_DIR}/verify-report.md"
   ! grep -qF -- "- [ ] HTTP smoke check skipped" "${RUN_DIR}/verify-report.md"
+}
+
+# --- Issue #32: the report line used to claim BOTH "returns 200" AND "with
+# expected content" whenever B's front-page title came back empty -- the
+# body comparison was skipped entirely, but the wording did not change.
+# Reproduced directly here: SITE_B_URL is configured, but the `post`
+# stub (matching phase_verify's own front-title lookup) returns nothing, the
+# same shape as an empty/unreadable front-page title on a real site.
+@test "phase_verify's HTTP smoke line says BODY NOT COMPARED, distinctly, when no front-page title is available to match against (issue #32)" {
+  setup_phase_verify_fixture
+  printf 'SITE_B_URL="https://b.example.com"\n' >> "${SITEGRAFT_PROFILES_DIR}/t.conf"
+  curl() {
+    for a in "$@"; do
+      case "$a" in
+        -o) echo "200"; return 0 ;;
+      esac
+    done
+    printf '<html><body>irrelevant, must never be compared</body></html>'
+  }
+  wp_remote() {
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
+    local alias_lc="$1"; shift
+    case "$1" in
+      eval) echo "wp_" ;;
+      db) echo "" ;;
+      option) echo "105" ;;
+      post) return 0 ;; # --field=post_title: empty title -- the exact shape this issue is about
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  grep -qF -- "- [x] HTTP smoke check: https://b.example.com returns 200 (body not compared — no front-page title available to match against) (best-effort)" "${RUN_DIR}/verify-report.md"
+  ! grep -qF -- "with expected content" "${RUN_DIR}/verify-report.md"
+}
+
+# --- Same wiring, opposite outcome: a genuine front-page title IS available
+# and the body genuinely contains it -- the original, stronger wording must
+# still appear for a check that was actually able to compare. Paired with
+# the test above so together they prove the report line discriminates
+# rather than always printing one or the other.
+@test "phase_verify's HTTP smoke line says WITH EXPECTED CONTENT when B's front-page title is genuinely found in the response body (issue #32)" {
+  setup_phase_verify_fixture
+  printf 'SITE_B_URL="https://b.example.com"\n' >> "${SITEGRAFT_PROFILES_DIR}/t.conf"
+  curl() {
+    for a in "$@"; do
+      case "$a" in
+        -o) echo "200"; return 0 ;;
+      esac
+    done
+    printf '<html><body>Welcome Home</body></html>'
+  }
+  wp_remote() {
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
+    local alias_lc="$1"; shift
+    case "$1" in
+      eval) echo "wp_" ;;
+      db) echo "" ;;
+      option) echo "105" ;;
+      post)
+        for a in "$@"; do [ "$a" = "--field=post_title" ] && { echo "Home"; return 0; }; done
+        return 0
+        ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  grep -qF -- "- [x] HTTP smoke check: https://b.example.com returns 200 with expected content (best-effort)" "${RUN_DIR}/verify-report.md"
 }
 
 # --- N3: the manifest is read by `jq` in every check below, but was never
