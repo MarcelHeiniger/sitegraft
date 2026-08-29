@@ -90,8 +90,11 @@
 # (line ~457), _plan_confirm_strong (line ~473), and the plain-prompt
 # fallback in _plan_prompt_items (line ~550) are three bare `read -r -p`
 # calls with NO `[ -t 0 ]` guard anywhere in the file — the exact shape of
-# issue #102's occurrence #4 (phase_restore), and in fact occurrence #1
-# the issue itself names (lib/plan.sh, "found live"). They are reachable
+# issue #102's occurrence #4 (phase_restore), in the SAME FILE as
+# occurrence #1 the issue names (lib/plan.sh's fd0-contention bug at
+# line ~507, already fixed, comment in place: "MAJOR bug fixed here,
+# found live"). These three are a distinct, residual defect in that file,
+# not occurrence #1 itself — occurrence #1 is fixed. They are reachable
 # in production via plan_resolve_stack: a `sitegraft plan` invoked from a
 # pipe or a supervisor, without gum on PATH, blocks forever the same way
 # phase_restore used to. This job is GREEN on that code today, because
@@ -113,11 +116,14 @@
 # prompt to a human, never a data read — none of the ~15 legitimate
 # `while IFS= read -r x <&3; do ... done` loops in lib/ use `-p`, because
 # they're not prompting anyone. Across this repo, `grep -rn 'read -r\? -p'
-# lib/*.sh bin/sitegraft modules/*.sh` returns exactly 5 hits: 2 already
-# `[ -t 0 ]`-guarded (lib/backup.sh's phase_restore, lib/graft.sh's
+# lib/*.sh bin/sitegraft modules/*.sh` returns 7 raw hits — run it and
+# check, rather than trust this comment — 2 of which are comment lines
+# that quote the pattern while discussing it (lib/backup.sh:1915,
+# lib/plan.sh:514), not call sites. The other 5 ARE the call sites: 2
+# already `[ -t 0 ]`-guarded (lib/backup.sh's phase_restore, lib/graft.sh's
 # graft_check_stack_mismatch) and the 3 unguarded ones above — zero false
-# positives, unlike a bare-`read` scan, which would also flag the fd3
-# loops. "Not *this* static lint" (a `[ -t 0 ]`-proximity scan, too
+# positives among actual code, unlike a bare-`read` scan, which would also
+# flag the fd3 loops. "Not *this* static lint" (a `[ -t 0 ]`-proximity scan, too
 # context-sensitive to do reliably) is not the same claim as "no static
 # lint could ever help here" — a `grep -c 'read -r\? -p' | grep -v
 # '\[ -t 0 \]'`-style check on `-p` specifically is narrow enough to be
@@ -173,7 +179,13 @@
 
 set -uo pipefail
 
+# BATS_TIMEOUT_SECS is the public override knob (env var of this exact
+# name); captured into a plain, non-BATS_-prefixed variable immediately so
+# the later `unset "${!BATS_@}"` (see below -- it clears inherited bats
+# bookkeeping before the nested `bats` invocation) can't wipe the value
+# this script itself still needs on its last line.
 BATS_TIMEOUT_SECS="${BATS_TIMEOUT_SECS:-120}"
+timeout_secs="$BATS_TIMEOUT_SECS"
 
 root="${1:-}"
 if [ -z "$root" ]; then
@@ -260,11 +272,47 @@ rm -rf "$fifo_dir"
 trap 'exec 9<&- 2>/dev/null || true' EXIT
 
 printf 'no-blocking-stdin-reads: running %s under a stdin that never reaches EOF (BATS_TEST_TIMEOUT=%ss)\n' \
-  "$unit_dir" "$BATS_TIMEOUT_SECS" >&2
+  "$unit_dir" "$timeout_secs" >&2
+
+# bats-core exports a long list of BATS_* bookkeeping vars for whichever
+# test is CURRENTLY running -- BATS_TEST_NAME, BATS_RUN_TMPDIR,
+# BATS_TEST_NUMBER, BATS_SUITE_TEST_NUMBER, BATS_TEST_FILENAME, and more
+# (confirmed live: `run env` inside a bats test lists ~20 of them, all
+# exported). If this script is itself invoked from inside a bats test --
+# exactly what tests/unit/test_no_blocking_stdin_reads.bats does, to test
+# THIS script -- those vars leak into the nested `bats` invocation below
+# by default. `unset "${!BATS_@}"` clears every BATS_*-prefixed variable
+# (env or shell) in one step -- safe here specifically because
+# `timeout_secs` above already captured the one value this script still
+# needs from that namespace, so nothing downstream depends on a
+# BATS_*-named variable surviving this line. This makes the script's own
+# `bats` invocation self-contained regardless of what environment called
+# it, rather than requiring every caller to know to sanitize the
+# environment first.
+#
+# NOT the fix for the specific corruption this guard's own test suite hit
+# on ubuntu-latest's apt-installed bats (1.10.0) -- worth being precise
+# about, since it would be easy to assume it was and stop looking.
+# Diagnosed and fixed instead in
+# tests/unit/test_no_blocking_stdin_reads.bats: bats 1.10.0's
+# preprocessor scans a .bats file's raw text for lines starting with
+# `@test` to find that file's own tests, context-blind to heredocs --
+# so a fixture built with `cat > file <<'EOF' / @test "..." { / ... /
+# EOF` puts a real `@test "..." {` line at column 0 of the OUTER test
+# file's own source, and bats 1.10.0 miscounts it as a second test
+# belonging to that file (confirmed: `bats --count` went 7 -> 9 the
+# moment those fixtures were heredocs; not reproduced on bats 1.14.0,
+# where upstream had already fixed the preprocessor -- which is exactly
+# why this passed locally and failed in CI). That test file's
+# write_fixture_bats() helper builds fixtures with `printf` instead, so
+# no line of the OUTER file's own source ever starts with `@test`. This
+# unset is a separate, narrower piece of environment hygiene, kept
+# because it is still correct and harmless, not because it was the fix.
+unset "${!BATS_@}"
 
 # `9<&-` after `0<&9`: fd 9 has done its job once duplicated onto fd 0 for
 # bats' own stdin; leaving it open past that point would leak it into bats
 # and every test process it forks. Harmless in practice (nothing reads fd
 # 9 by that number), but free to close and more honest about what this
 # process actually needs.
-BATS_TEST_TIMEOUT="$BATS_TIMEOUT_SECS" bats "$unit_dir" 0<&9 9<&-
+BATS_TEST_TIMEOUT="$timeout_secs" bats "$unit_dir" 0<&9 9<&-
