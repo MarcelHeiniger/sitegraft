@@ -10,10 +10,17 @@
 
 - **Language:** plain bash, bash 3.2 compatible (stock macOS) — see
   `docs/decisions/0003-bash-compatibility.md`. No Python, no Node, no WP plugin.
-- **Runtime dependencies:** `ssh`, `rsync` (never `scp`), `wp-cli` (on A, on B, or
-  via a local wrapper such as `ddev exec --raw -p <project> -- wp` — see the
-  design doc §5.1 for why `--raw` is required), `jq` (manifest JSON parsing),
-  `gum` (interactive UI, fallback `fzf`, fallback plain text prompts).
+- **Runtime dependencies:** `ssh`, `rsync` (never `scp`), `wp-cli` (on A, on
+  B, or via a local wrapper such as `ddev exec --raw -p <project> -- wp` —
+  see the design doc §5.1 for why `--raw` is required), `jq` (manifest JSON
+  parsing), `gum` (interactive UI, fallback `fzf`, fallback plain text
+  prompts). **One call site has a stricter rsync requirement, not a
+  repo-wide one:** `restore.sh`'s ssh-remote wp-content step needs the
+  ORCHESTRATOR's `rsync` to be GNU-compatible >= 3.2.4 (default arg-
+  escaping) — see `docs/decisions/0010-ssh-remote-rsync-protect-args.md`.
+  Every other `rsync` invocation in this codebase (`backup_wp_content`,
+  and `lib/graft.sh`'s file-transfer helpers) has no such floor and is not
+  covered by that ADR.
 - **Test-only dependencies:** `bats-core` (unit tests for `lib/`'s pure functions),
   `ddev` (2-disposable-site integration harness).
 - **No database of its own.** All data flows through A and B's own WordPress

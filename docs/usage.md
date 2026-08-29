@@ -10,7 +10,17 @@ see [`README.md`](../README.md) instead — this document is the detail behind i
   Linux/WSL works too.
 - **ssh**, **rsync** — sitegraft never uses `scp`. Both sites (A and B) must be
   reachable over SSH with `wp-cli` installed, or be local sites the orchestrator
-  can drive directly (see "Local sites and DDEV" below).
+  can drive directly (see "Local sites and DDEV" below). **Restoring to an
+  ssh-remote B needs a LOCAL `rsync` >= 3.2.4** (Homebrew's on macOS, apt's
+  on Debian/Ubuntu — both already what the install command below gives you)
+  — that is the version GNU rsync started backslash-escaping the remote
+  path by default, which is what keeps B's SSH shell from interpreting a
+  path containing a space or a shell metacharacter. macOS's own bundled
+  `/usr/bin/rsync` (`openrsync`, a different codebase) never escapes
+  anything and is not a substitute; `restore.sh`'s ssh-remote wp-content
+  step refuses up front, rather than silently, if it resolves that one
+  instead. Nothing is required of B's own `rsync` — only the orchestrator's.
+  See `docs/decisions/0010-ssh-remote-rsync-protect-args.md`.
 - **`wp-cli`** — on both A and B (directly, or through a wrapper like DDEV's).
 - **`jq`** — manifest parsing.
 - **`gum`** — interactive selection prompts (menus, confirmations). Falls back to
@@ -435,7 +445,12 @@ overwriting-without-deleting, and it never deletes on a guess. An old run
 directory taken before manifests existed therefore needs a fresh `backup`. For the
 symlink case specifically: replace the symlink with a real directory (moving
 whatever it points to back under `wp-content` first, if that is genuinely where it
-belongs) and re-run `restore`, or apply this backup by hand outside sitegraft.
+belongs) and re-run `restore`, or apply this backup by hand outside sitegraft. For
+the normalization case: `restore.sh` cannot resolve it for you (it depends on
+nothing that normalizes Unicode — see `docs/decisions/0009-restore-unicode-normalization-refusal.md`
+for why that is a deliberate limit, not an oversight) — for each path it prints,
+find the same file on B under its current spelling and rename it on B's
+filesystem to match the byte sequence printed, then re-run `restore`.
 
 `--dry-run` is a real preview here, not a printed command line: it runs
 `restore.sh --dry-run`, which reads B, lists every path it would remove, and writes
