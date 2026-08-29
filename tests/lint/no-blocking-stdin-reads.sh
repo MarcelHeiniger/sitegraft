@@ -180,10 +180,8 @@
 set -uo pipefail
 
 # BATS_TIMEOUT_SECS is the public override knob (env var of this exact
-# name); captured into a plain, non-BATS_-prefixed variable immediately so
-# the later `unset "${!BATS_@}"` (see below -- it clears inherited bats
-# bookkeeping before the nested `bats` invocation) can't wipe the value
-# this script itself still needs on its last line.
+# name). Captured into a plain, non-BATS_-prefixed variable immediately;
+# used as $timeout_secs from here on.
 BATS_TIMEOUT_SECS="${BATS_TIMEOUT_SECS:-120}"
 timeout_secs="$BATS_TIMEOUT_SECS"
 
@@ -274,41 +272,32 @@ trap 'exec 9<&- 2>/dev/null || true' EXIT
 printf 'no-blocking-stdin-reads: running %s under a stdin that never reaches EOF (BATS_TEST_TIMEOUT=%ss)\n' \
   "$unit_dir" "$timeout_secs" >&2
 
-# bats-core exports a long list of BATS_* bookkeeping vars for whichever
-# test is CURRENTLY running -- BATS_TEST_NAME, BATS_RUN_TMPDIR,
-# BATS_TEST_NUMBER, BATS_SUITE_TEST_NUMBER, BATS_TEST_FILENAME, and more
-# (confirmed live: `run env` inside a bats test lists ~20 of them, all
-# exported). If this script is itself invoked from inside a bats test --
-# exactly what tests/unit/test_no_blocking_stdin_reads.bats does, to test
-# THIS script -- those vars leak into the nested `bats` invocation below
-# by default. `unset "${!BATS_@}"` clears every BATS_*-prefixed variable
-# (env or shell) in one step -- safe here specifically because
-# `timeout_secs` above already captured the one value this script still
-# needs from that namespace, so nothing downstream depends on a
-# BATS_*-named variable surviving this line. This makes the script's own
-# `bats` invocation self-contained regardless of what environment called
-# it, rather than requiring every caller to know to sanitize the
-# environment first.
-#
-# NOT the fix for the specific corruption this guard's own test suite hit
-# on ubuntu-latest's apt-installed bats (1.10.0) -- worth being precise
-# about, since it would be easy to assume it was and stop looking.
-# Diagnosed and fixed instead in
-# tests/unit/test_no_blocking_stdin_reads.bats: bats 1.10.0's
-# preprocessor scans a .bats file's raw text for lines starting with
-# `@test` to find that file's own tests, context-blind to heredocs --
-# so a fixture built with `cat > file <<'EOF' / @test "..." { / ... /
-# EOF` puts a real `@test "..." {` line at column 0 of the OUTER test
-# file's own source, and bats 1.10.0 miscounts it as a second test
-# belonging to that file (confirmed: `bats --count` went 7 -> 9 the
-# moment those fixtures were heredocs; not reproduced on bats 1.14.0,
-# where upstream had already fixed the preprocessor -- which is exactly
-# why this passed locally and failed in CI). That test file's
-# write_fixture_bats() helper builds fixtures with `printf` instead, so
-# no line of the OUTER file's own source ever starts with `@test`. This
-# unset is a separate, narrower piece of environment hygiene, kept
-# because it is still correct and harmless, not because it was the fix.
-unset "${!BATS_@}"
+# A previous revision of this script blanket-cleared every BATS_*-named
+# variable here (`unset "${!BATS_@}"`), on the theory that inherited
+# per-test bookkeeping from an outer bats process (this script IS invoked
+# from inside one: tests/unit/test_no_blocking_stdin_reads.bats, to test
+# THIS script) could corrupt a nested `bats` invocation. Measured, that
+# theory was both wrong about the real corruption's cause (the actual
+# cause -- bats 1.10.0's heredoc-blind preprocessor -- is documented in
+# that test file's own header) AND actively broke this exact nested
+# invocation on Homebrew's bats (1.14.0, this repo's other dev machine):
+# a bats test's PATH has bats' own libexec dir prepended ahead of the
+# installed shim, so a bare `bats` lookup from inside a test resolves
+# DIRECTLY to the internal, non-self-locating
+# .../libexec/bats-core/bats script -- which does not compute BATS_ROOT/
+# BATS_LIBDIR itself (only the shim at e.g. /opt/homebrew/bin/bats does,
+# via its own `${BASH_SOURCE[0]}` resolution, on every invocation) and
+# simply trusts them to already be set. Confirmed live: with the blanket
+# unset in place, that produces `//bats-core/validator.bash: No such
+# file or directory` and the nested run fails outright; without it, the
+# outer bats process's own correctly-computed BATS_ROOT/BATS_LIBDIR are
+# already present in the inherited environment and the internal script
+# uses them correctly. No unset here at all, on either platform: not
+# needed (proven on ubuntu-latest/bats 1.10.0 -- the real corruption
+# there was fixed elsewhere, not by this), and actively wrong on
+# Homebrew/bats 1.14.0. This paragraph exists so a future "let's harden
+# this by clearing the environment" instinct checks this measurement
+# first rather than reintroducing the same breakage.
 
 # `9<&-` after `0<&9`: fd 9 has done its job once duplicated onto fd 0 for
 # bats' own stdin; leaving it open past that point would leak it into bats
