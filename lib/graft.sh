@@ -2297,6 +2297,10 @@ graft_ci_glob() {
   for (( i = 0; i < len; i++ )); do
     c="${s:i:1}"
     case "$c" in
+      # A glob range, so collation-dependent in principle. Swept across C,
+      # POSIX, en_US.UTF-8, fr_FR.UTF-8, de_DE.UTF-8 and tr_TR.UTF-8 (the
+      # dotless-i trap): identical output in all six. Recorded here so the
+      # next reader does not have to repeat the sweep to trust this line.
       [A-Za-z])
         local lc uc
         lc=$(printf '%s' "$c" | tr '[:upper:]' '[:lower:]')
