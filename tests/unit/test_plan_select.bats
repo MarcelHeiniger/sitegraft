@@ -362,6 +362,7 @@ setup_never_eof_fifo() {
 a: three" ]
 }
 
+
 # --- issue #113: the gum/fzf branches themselves. Every test above pins
 # PATH=/usr/bin:/bin, so only the plain-`read` fallback ever ran; the
 # branch that actually executes on an operator's machine (gum installed,
@@ -380,8 +381,24 @@ a: three" ]
 # does the minimum the real caller logic needs to complete:
 #   - `gum confirm ...` exits $GUM_STUB_EXIT (default 0) -- gum confirm's
 #     own signal for "operator picked Yes" (0) vs "No" (1).
-#   - `gum choose ...` / `fzf ...` pass stdin straight through to stdout,
-#     standing in for --selected='*' / ctrl-a:select-all (everything kept).
+#   - `gum choose ...` exits $GUM_CHOOSE_STUB_EXIT (default 0) and, only
+#     when that's 0, passes stdin straight through to stdout -- standing
+#     in for --selected='*' (everything pre-kept). A non-zero exit (gum
+#     choose's own signal for the operator abandoning the picker --
+#     confirmed live against real gum 0.17.0: 1 headless, 130 on Escape)
+#     prints nothing, matching what real gum does when there is no
+#     selection to hand back.
+#   - `fzf ...` is the same shape, gated on $FZF_STUB_EXIT instead --
+#     these are two separate buttons, not one shared knob, precisely so a
+#     test can hold "gum choose succeeded" and "fzf was never reached"
+#     (or vice versa) independently. This is also the fix for a gap the
+#     reviewer found in an earlier version of this file: `choose`/`fzf`
+#     had no exit-code button of their own and always exited 0, so
+#     lib/plan.sh reducing either dispatch's real invocation to
+#     `... || true` (swallowing a genuine abandon into "kept everything")
+#     was a mutant nothing here could turn red -- the confirm functions
+#     had GUM_STUB_EXIT to prove the identical class of bug, choose/fzf
+#     did not.
 # Written fresh into $BATS_TEST_TMPDIR/bin per test (same convention as
 # the `wp`/`tar` stubs in test_phase_backup.bats), never onto this bats
 # process's own PATH -- only the `env PATH=...` subshell each test runs
@@ -393,8 +410,14 @@ setup_gum_stub() {
 #!/usr/bin/env bash
 for arg in "$@"; do printf 'ARG:%s\n' "$arg" >&2; done
 case "${1:-}" in
-  confirm) exit "${GUM_STUB_EXIT:-0}" ;;
-  choose) cat ;;
+  confirm)
+    exit "${GUM_STUB_EXIT:-0}"
+    ;;
+  choose)
+    code="${GUM_CHOOSE_STUB_EXIT:-0}"
+    [ "$code" -eq 0 ] && cat
+    exit "$code"
+    ;;
 esac
 STUB
   chmod +x "$BATS_TEST_TMPDIR/bin/gum"
@@ -405,9 +428,32 @@ setup_fzf_stub() {
   cat > "$BATS_TEST_TMPDIR/bin/fzf" <<'STUB'
 #!/usr/bin/env bash
 for arg in "$@"; do printf 'ARG:%s\n' "$arg" >&2; done
-cat
+code="${FZF_STUB_EXIT:-0}"
+[ "$code" -eq 0 ] && cat
+exit "$code"
 STUB
   chmod +x "$BATS_TEST_TMPDIR/bin/fzf"
+}
+
+# --- issue #113 follow-up (both reviewers, after the mutation report on
+# the first round): an exact-string equality on the whole argv sequence
+# is a stricter property than what this proxy exists to prove -- a
+# harmless reordering of two independent flags (gum/fzf don't themselves
+# care which comes first) would fail these assertions even though
+# nothing about the actual barrier weakened. What the property actually
+# needs is membership -- "each of these exact argv entries was passed"
+# -- plus a count check so an entry can't quietly go missing while an
+# unrelated one is added to keep the total looking right. That combination
+# still turns C1-C4 (each drops or blanks a real argv entry) red, while
+# surviving a reordering that changes nothing observable.
+assert_argv() {
+  local got="$1" want_count="$2"
+  shift 2
+  [ "$(grep -c '^ARG:' <<< "$got")" -eq "$want_count" ]
+  local want
+  for want in "$@"; do
+    grep -qxF "$want" <<< "$got"
+  done
 }
 
 @test "_plan_confirm_strong invokes gum confirm with the strong Yes-I-understand/Cancel flags, not a bare confirm (issue #113, mutation C1)" {
@@ -418,10 +464,11 @@ STUB
     _plan_confirm_strong "ok?"
   '
   [ "$status" -eq 0 ]
-  [ "$stderr" = "ARG:confirm
-ARG:--affirmative=Yes, I understand
-ARG:--negative=Cancel
-ARG:ok?" ]
+  assert_argv "$stderr" 4 \
+    "ARG:confirm" \
+    "ARG:--affirmative=Yes, I understand" \
+    "ARG:--negative=Cancel" \
+    "ARG:ok?"
 }
 
 @test "_plan_confirm_strong propagates a gum decline instead of treating it as acceptance" {
@@ -462,11 +509,17 @@ ARG:ok?" ]
     _plan_prompt_items "$items"
   '
   [ "$status" -eq 0 ]
+  # The stdout check below only exercises the stub's own `cat` passthrough
+  # (see setup_gum_stub) -- it proves items flow through the pipe intact,
+  # nothing about which flags gum was actually invoked with. That's the
+  # argv assertion's job, below; it carries essentially all of this test's
+  # weight against C1-class mutants.
   [ "$output" = "a: one
 a: two" ]
-  [ "$stderr" = "ARG:choose
-ARG:--no-limit
-ARG:--selected=*" ]
+  assert_argv "$stderr" 3 \
+    "ARG:choose" \
+    "ARG:--no-limit" \
+    "ARG:--selected=*"
 }
 
 @test "_plan_prompt_items falls back to fzf -m --bind ctrl-a:select-all when gum is unavailable (issue #113)" {
@@ -478,9 +531,56 @@ ARG:--selected=*" ]
     _plan_prompt_items "$items"
   '
   [ "$status" -eq 0 ]
+  # Same caveat as the gum choose test above: this only proves the stub's
+  # `cat` passthrough ran, not which flags fzf received -- the argv
+  # assertion below is what actually discriminates a weakened dispatch.
   [ "$output" = "a: one
 a: two" ]
-  [ "$stderr" = "ARG:-m
-ARG:--bind
-ARG:ctrl-a:select-all" ]
+  assert_argv "$stderr" 3 \
+    "ARG:-m" \
+    "ARG:--bind" \
+    "ARG:ctrl-a:select-all"
+}
+
+# --- issue #113 follow-up: the tests above prove the DISPATCH (which
+# flags gum/fzf were called with). They do not prove the RESULT is
+# trustworthy when the operator abandons the picker instead of
+# confirming a selection -- gum choose and fzf both signal that by
+# exiting non-zero (confirmed live against real gum 0.17.0: 1 headless,
+# 130 on Escape), and lib/plan.sh:705's plan_select_interactive depends
+# on that signal reaching it unaltered: `kept=$(_plan_prompt_items
+# "$items") || { log_error ...; return 1; }` exists specifically so an
+# abandoned selection can never freeze a manifest built from a guessed
+# `kept` list -- the exact class of bug CLAUDE.md's first rule opens
+# with. A `... | gum choose ... || true` (or the fzf equivalent) at the
+# real dispatch site would swallow that non-zero into 0, turning
+# "operator hit Escape" into "operator kept everything" -- silently, the
+# same shape as C1/C2 above but on the choose/fzf sites instead of
+# confirm. Proven by asserting the STUB's own exit code (a stand-in for a
+# real abandoned gum/fzf) survives all the way back out of
+# _plan_prompt_items unchanged, not just "some non-zero status" -- a
+# hard-coded `return 1` swallowing the real code would also pass a
+# weaker assertion.
+@test "_plan_prompt_items propagates gum choose's own abandon exit status, not the pre-picked selection (issue #113 follow-up)" {
+  setup_gum_stub
+  run --separate-stderr env PATH="$BATS_TEST_TMPDIR/bin:/usr/bin:/bin" GUM_CHOOSE_STUB_EXIT=130 bash -c '
+    source lib/core.sh; source lib/plan.sh
+    _plan_require_tty() { return 0; }
+    items=$(printf "a: one\na: two")
+    _plan_prompt_items "$items"
+  '
+  [ "$status" -eq 130 ]
+  [ -z "$output" ]
+}
+
+@test "_plan_prompt_items propagates fzf's own abandon exit status, not the pre-picked selection (issue #113 follow-up)" {
+  setup_fzf_stub
+  run --separate-stderr env PATH="$BATS_TEST_TMPDIR/bin:/usr/bin:/bin" FZF_STUB_EXIT=130 bash -c '
+    source lib/core.sh; source lib/plan.sh
+    _plan_require_tty() { return 0; }
+    items=$(printf "a: one\na: two")
+    _plan_prompt_items "$items"
+  '
+  [ "$status" -eq 130 ]
+  [ -z "$output" ]
 }
