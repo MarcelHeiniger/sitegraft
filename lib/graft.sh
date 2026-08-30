@@ -2260,6 +2260,71 @@ graft_migrate_options() {
 # ONCE before its own loop starts (issue #73) — this function does not
 # repeat that check per key.
 #
+# graft_ci_glob <string> — builds a bash GLOB PATTERN that matches
+# <string> case-insensitively and LITERALLY (every character that would
+# otherwise be a glob metacharacter to `${var//pattern/replacement}` is
+# escaped), for use with that exact expansion. Two review-round-3 nits in
+# one helper (both apply to the SAME substitution below, so one fix
+# addresses both):
+#
+#  1. `${var//pattern/replacement}` is a glob match, not a literal one —
+#     a domain containing `*`, `?`, or `[` (it comes from the manifest,
+#     not a hardcoded constant — a hand-edited or `SITEGRAFT_MANIFEST_
+#     PREFILLED` manifest can put anything there) would otherwise be
+#     interpreted as a WILDCARD instead of matched literally. Every
+#     non-letter character this function does not itself special-case is
+#     passed through unescaped ONLY because it cannot be a bash glob
+#     metacharacter (`.`, `-`, digits) — `\`, `*`, `?`, `[`, `]` are, and
+#     are backslash-escaped here.
+#  2. The removal this pattern feeds must be CASE-INSENSITIVE, to match
+#     the case-insensitive `grep -i` search that follows it — plain
+#     bash pattern matching has no case-insensitive mode this codebase
+#     can rely on (`shopt -s nocasematch` is exactly the kind of "exists
+#     but behaves differently across bash builds" construct CLAUDE.md's
+#     own bash-3.2-portability section already warns against). Each
+#     letter becomes a `[Aa]`-style bracket alternation instead.
+#
+# A per-character loop, not `sed`/`awk`/`perl`: this codebase has no
+# dependency on any of those for case-INSENSITIVE literal substitution
+# (GNU sed's `I` flag and gawk's `IGNORECASE` are not portable to macOS's
+# built-in sed/awk, which this tool also runs under), and a hostname is
+# short enough that a loop costs nothing measurable.
+graft_ci_glob() {
+  local s="$1" out="" c i len
+  len=${#s}
+  # shellcheck disable=SC1003 # not an unfinished escape: bq deliberately holds one literal backslash character as data, same pattern and same disable as sq()'s own (lib/inventory.sh)
+  local bq='\'
+  for (( i = 0; i < len; i++ )); do
+    c="${s:i:1}"
+    case "$c" in
+      [A-Za-z])
+        local lc uc
+        lc=$(printf '%s' "$c" | tr '[:upper:]' '[:lower:]')
+        uc=$(printf '%s' "$c" | tr '[:lower:]' '[:upper:]')
+        out="${out}[${lc}${uc}]"
+        ;;
+      "$bq" | '*' | '?' | '[' | ']')
+        out="${out}${bq}${c}"
+        ;;
+      *)
+        out="${out}${c}"
+        ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+# graft_ci_remove_all <value> <needle> — every occurrence of <needle>
+# removed from <value>, case-insensitively, <needle> treated as a literal
+# string (via graft_ci_glob, immediately above). Empty <needle> is a
+# deliberate no-op, not a match-everything glob.
+graft_ci_remove_all() {
+  local value="$1" needle="$2"
+  [ -n "$needle" ] || { printf '%s' "$value"; return 0; }
+  local pattern; pattern=$(graft_ci_glob "$needle")
+  printf '%s' "${value//$pattern/}"
+}
+
 # Returns 1 only for a key shape that cannot be migrated at all (comma or
 # whitespace — see the case block below). "A has no such key" is a
 # legitimate, logged skip, not a failure — it returns 0.
@@ -2406,39 +2471,68 @@ _graft_migrate_one_option_key() {
     esac
     if [ -n "$domain_no_scheme" ]; then
       local domain_no_scheme_escaped="${domain_no_scheme//\//\\/}"
-      # Review, second round: a systematic false positive, not an
-      # occasional one -- whenever A's host is a literal SUBSTRING of B's
-      # (the ordinary apex/www shape: "example.com" -> "www.example.com"),
-      # a value the rewrite pass corrected PERFECTLY still contains B's
-      # own new host, and B's host still contains A's host as a
-      # substring -- so the plain check above fires on every single
-      # correctly-migrated key, every time, unconditionally. A warning
-      # that fires unconditionally is a warning nobody reads, which
-      # destroys exactly the visibility this issue exists to add. Fixed
-      # by removing every occurrence of B's own (scheme-stripped, both
-      # plain and escaped) host from the value FIRST, then searching what
-      # remains: a genuine leftover reference to A (e.g. a bare
-      # "//example.com" nobody rewrote) has no reason to sit next to or
-      # inside an instance of B's host, so it survives this removal and
-      # is still caught; an instance of B's host that merely happens to
-      # CONTAIN A's host as a substring does not survive it, and so no
-      # longer matches. Verified both directions (this function's own
-      # tests): the false positive on a clean www-prefixed rewrite is
-      # gone, and a real leftover "//example.com" is still flagged.
-      local value_for_domain_check="$value"
       local domain_to_no_scheme="$domain_to"
       case "$domain_to_no_scheme" in
         [Hh][Tt][Tt][Pp][Ss]://*) domain_to_no_scheme="${domain_to_no_scheme#????????}" ;;
         [Hh][Tt][Tt][Pp]://*) domain_to_no_scheme="${domain_to_no_scheme#???????}" ;;
       esac
-      if [ -n "$domain_to_no_scheme" ]; then
+      # Review, third round: round 2's fix (strip B's host from the value
+      # before searching for A's) is UNSAFE in exactly the reverse shape
+      # from the one it was built for. It assumed stripping B could only
+      # ever remove text that "belongs to" a legitimate B occurrence --
+      # false whenever B's host is a SUBSTRING of A's (the www -> apex
+      # consolidation: domain_from "www.example.com", domain_to
+      # "example.com"): stripping B ("example.com") also eats the tail of
+      # a GENUINE, un-rewritten A residue ("www.example.com"), because
+      # that residue's own text literally contains B's host as a
+      # substring too -- "www.example.com" minus "example.com" leaves
+      # "www.", destroying the very evidence being searched for. Measured
+      # by review: a real leftover reference, including the pilot's own
+      # blob-stored-in-a-string shape, went undetected in this direction
+      # -- while the "clean rewrite" case in this SAME direction was
+      # never at risk to begin with (a short host can never coincidentally
+      # "contain" a longer one, so it can never look like a false A match
+      # regardless of stripping).
+      #
+      # Fixed by making the strip CONDITIONAL on which host is the longer
+      # one, rather than always stripping B. Only ONE direction has a
+      # false-positive risk to guard against in the first place: B's host
+      # can only ever be mistaken for containing A's host when B is
+      # STRICTLY LONGER than A (only then can a legitimate, correctly-
+      # written B occurrence textually contain A's shorter host as a
+      # substring, e.g. "www.example.com" containing "example.com"). When
+      # A is the same length or longer, that containment is impossible in
+      # either direction -- B (shorter-or-equal) cannot "read as" A
+      # (longer) -- so the value is searched AS-IS, with nothing to strip
+      # and nothing to accidentally destroy. This is provably correct in
+      # BOTH directions (verified by this function's own tests, covering
+      # both the apex/www and the reverse www/apex shapes, the pilot's
+      # blob-in-a-string form included) and reduces to round 2's original,
+      # unconditional strip exactly when B is strictly longer -- the one
+      # case round 2 was actually built for.
+      #
+      # The strip itself is now case-insensitive and glob-safe
+      # (graft_ci_remove_all/graft_ci_glob, defined above this function),
+      # not bash's own `${var//pattern/}` directly -- two more review
+      # findings, closed together since they're the same substitution:
+      # a B host written in a different case than domain_to itself
+      # (`WWW.EXAMPLE.COM`) used to survive un-stripped and reproduce the
+      # apex/www false positive by accident, since the case-SENSITIVE
+      # strip missed it while the case-INSENSITIVE `grep -i` below still
+      # matched what was left; and `${var//$pattern/}` treats `$pattern`
+      # as a GLOB, not a literal string -- harmless for an ordinary
+      # hostname (`.` is already literal in glob syntax) but domain_to
+      # comes from the manifest, which a hand-edited or
+      # SITEGRAFT_MANIFEST_PREFILLED run can put anything into.
+      local value_for_domain_check="$value"
+      if [ "${#domain_to_no_scheme}" -gt "${#domain_no_scheme}" ]; then
         local domain_to_no_scheme_escaped="${domain_to_no_scheme//\//\\/}"
-        value_for_domain_check="${value_for_domain_check//$domain_to_no_scheme/}"
-        value_for_domain_check="${value_for_domain_check//$domain_to_no_scheme_escaped/}"
+        value_for_domain_check=$(graft_ci_remove_all "$value_for_domain_check" "$domain_to_no_scheme")
+        value_for_domain_check=$(graft_ci_remove_all "$value_for_domain_check" "$domain_to_no_scheme_escaped")
       fi
       if printf '%s' "$value_for_domain_check" | grep -qiF -- "$domain_no_scheme" \
         || printf '%s' "$value_for_domain_check" | grep -qiF -- "$domain_no_scheme_escaped"; then
-        log_warn "graft: option '${key}' may still reference A's domain ('${domain_from}') after the domain rewrite — pushing it to B anyway (this is a WARNING, not a refusal — see issue #83). Review '${key}' on B by hand once this graft finishes: a case/scheme-different or protocol-relative form of A's domain, or one embedded inside a JSON blob stored as a string, is exactly what this check exists to surface but the automatic rewrite above could not reach. This check is intentionally wide (a plain, case-insensitive substring search for '${domain_no_scheme}', with every occurrence of B's own host already removed from the value first) and can still occasionally flag a coincidental match that is not actually a broken reference — treat it as a lead to check by hand, not a certainty."
+        log_warn "graft: option '${key}' may still reference A's domain ('${domain_from}') after the domain rewrite — pushing it to B anyway (this is a WARNING, not a refusal — see issue #83). Review '${key}' on B by hand once this graft finishes: a case/scheme-different or protocol-relative form of A's domain, or one embedded inside a JSON blob stored as a string, is exactly what this check exists to surface but the automatic rewrite above could not reach. This check is intentionally wide (a plain, case-insensitive substring search for '${domain_no_scheme}') and can still occasionally flag a coincidental match that is not actually a broken reference — treat it as a lead to check by hand, not a certainty."
       fi
     fi
   fi

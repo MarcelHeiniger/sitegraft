@@ -84,10 +84,17 @@ one buried in a JSON blob stored as a string (the pilot's own
 fixture — remeasured by review across 6 realistic forms, 6/6 caught, none
 refused), and no longer false-positives on the apex/www shape (A's host a
 substring of B's own) after a second review round found it firing on every
-single correctly-rewritten key. Covers option values only, is a heuristic
-substring search, and does not touch post content (`#88` below is a different
-mechanism, still open). See `docs/todo.md`'s own "Done" entry for the full
-detail, including the precise (non-overclaimed) percent-encoding scope note.
+single correctly-rewritten key. A third review round then found the round-2
+fix for THAT unsafe in the reverse (www/apex) shape, silently hiding real
+residues instead — including the pilot's own blob-in-a-string one; fixed by
+making the strip direction-conditional (only when B's host is strictly
+longer than A's, the one direction with any false-positive risk at all) and
+case-insensitive/glob-safe (`graft_ci_glob`/`graft_ci_remove_all`,
+`lib/graft.sh`), verified and mutation-tested in both directions. Covers
+option values only, is a heuristic substring search, and does not touch post
+content (`#88` below is a different mechanism, still open). See
+`docs/todo.md`'s own "Done" entry for the full detail, including the precise
+(non-overclaimed) percent-encoding scope note.
 
 ### Done by hand on the pilot target, outside the tool
 

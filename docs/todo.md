@@ -166,11 +166,32 @@
       apex/www migration shape ("example.com" -> "www.example.com"),
       where A's host is a literal substring of B's own — a value the
       rewrite corrected perfectly still triggered the warning, because
-      B's own new host still contains A's old one. Fixed by stripping
-      every occurrence of B's own (scheme-stripped) host from the value
-      before searching for A's; verified both directions (a clean rewrite
-      of that shape no longer warns, a genuine leftover reference still
-      does).
+      B's own new host still contains A's old one. The round-2 fix
+      (stripping every occurrence of B's host from the value before
+      searching for A's) turned out to be UNSAFE in the reverse migration
+      shape (www -> apex, "www.example.com" -> "example.com", at least as
+      common a real shape): stripping B's SHORTER host also ate the tail
+      of a genuine, never-rewritten A residue that happened to contain
+      B's host as a substring too, hiding real leftovers — including the
+      pilot's own JSON-blob-in-a-string shape, the reason this whole
+      check exists. Third round fix: the strip only ever runs when B's
+      host is STRICTLY LONGER than A's (the one direction where a clean
+      B occurrence can textually "contain" A's host at all); otherwise
+      the value is searched as-is, with nothing to strip and nothing to
+      accidentally destroy — provably correct in both directions, not
+      merely re-balanced. The strip itself (`graft_ci_remove_all`/
+      `graft_ci_glob`, `lib/graft.sh`) is also now case-insensitive and
+      glob-safe: a same-shape false positive used to reproduce by
+      accident whenever B's host appeared in a different case than
+      `domain_to` itself (case-sensitive stripping missed it, the
+      case-insensitive final `grep -i` still matched what was left), and
+      `${var//pattern/}` treats its pattern as a bash GLOB, not a literal
+      string — harmless for an ordinary hostname but `domain_to` comes
+      from the manifest, which a hand-edited or
+      `SITEGRAFT_MANIFEST_PREFILLED` run can put anything into. Verified
+      in both directions with tests covering the plain leftover, the
+      pilot's blob-in-a-string leftover, and the clean rewrite, for both
+      the apex/www and the www/apex shapes; mutation-tested.
 
       Scope, stated precisely so this is not overclaimed: OPTION VALUES
       only, a heuristic substring search, and does not touch post CONTENT

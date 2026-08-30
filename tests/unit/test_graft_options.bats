@@ -474,6 +474,104 @@ setup() {
   [[ "$output" == *"WARNING, not a refusal"* ]] || false
 }
 
+# --- Review, third round: the REVERSE direction ---------------------------
+#
+# domain_from's host ("www.example.com") is the LONGER one here, and
+# domain_to's host ("example.com") is a substring of it -- the www ->
+# apex consolidation, at least as common a real migration shape as the
+# apex -> www direction above. Round 2's original fix (unconditionally
+# stripping domain_to's host from the value before searching) is UNSAFE
+# in exactly this direction: stripping "example.com" out of a genuine,
+# never-rewritten "www.example.com" residue also eats the "example.com"
+# tail of that SAME residue, leaving "www." behind and hiding the
+# evidence -- measured to genuinely happen, not a hypothetical. These
+# three tests are the regression guards for that: a real residue must
+# still be caught (including the pilot's own JSON-blob-in-a-string
+# shape, the reason this whole check exists), and a value that was
+# ACTUALLY rewritten cleanly to the (shorter) apex must not warn.
+@test "graft_migrate_options still WARNS on a genuine leftover reference to A when A's host is LONGER than B's own (www -> apex, review third round)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_global_stylesheets"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  # Protocol-relative, same technique the apex -> www direction's own
+  # "genuine leftover" test above uses (and for the identical reason): a
+  # fixture with the FULL scheme ("https://www.example.com") is exactly
+  # what the jq rewrite pass's own exact-substring match DOES catch and
+  # correct on its own -- it would never reach this function's detection
+  # code as a residue at all, so it would not actually exercise what this
+  # test is for. Protocol-relative is one of the forms the rewrite cannot
+  # reach (its own header comment), so it survives to be checked here.
+  local fixture
+  fixture=$(php -r 'echo json_encode(["css" => "body{src:url(//www.example.com/wp-content/fonts/heading-sans.woff2)}"]);')
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then printf '%s' "$fixture"; else echo "[dry-run] wp_remote b $*"; fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest" "https://www.example.com" "https://example.com"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARNING, not a refusal"* ]] || false
+}
+
+@test "graft_migrate_options still WARNS on the pilot's own JSON-blob-stored-as-a-string shape when A's host is LONGER than B's own (www -> apex, review third round)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_global_stylesheets"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  local fixture
+  fixture=$(php -r 'echo json_encode(json_encode(["css" => "body{src:url(https://www.example.com/wp-content/fonts/heading-sans.woff2)}"]));')
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then printf '%s' "$fixture"; else echo "[dry-run] wp_remote b $*"; fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest" "https://www.example.com" "https://example.com"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARNING, not a refusal"* ]] || false
+}
+
+@test "graft_migrate_options does NOT warn on a clean www -> apex rewrite (A's host LONGER than B's own, review third round)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_global_stylesheets"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  local fixture
+  fixture=$(php -r 'echo json_encode(["css" => "body{src:url(https://example.com/wp-content/fonts/heading-sans.woff2)}"]);')
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then printf '%s' "$fixture"; else echo "[dry-run] wp_remote b $*"; fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest" "https://www.example.com" "https://example.com"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"WARNING, not a refusal"* ]] || false
+}
+
+# Direct unit coverage for the two small helpers themselves
+# (lib/graft.sh), not just the end-to-end graft_migrate_options behavior
+# above -- pins the two nits closed together (case-insensitivity, and
+# glob-safety) independently of the length-conditional wiring around them.
+@test "graft_ci_glob builds a case-insensitive, glob-escaped pattern that removes an UPPERCASE occurrence via graft_ci_remove_all" {
+  run graft_ci_remove_all "prefix WWW.EXAMPLE.COM suffix" "www.example.com"
+  [ "$status" -eq 0 ]
+  [ "$output" = "prefix  suffix" ]
+}
+
+@test "graft_ci_remove_all treats the needle as a LITERAL string, not a glob -- a needle containing '*' does not act as a wildcard" {
+  # A needle designed so a real (un-escaped) glob '*' would greedily
+  # consume everything between its two literal ends ("a" ... "z"),
+  # including the text this test's own assertions require to survive --
+  # not just "does the literal needle still get removed" (which an
+  # unescaped '*' also happens to do, so would not discriminate the bug).
+  run graft_ci_remove_all "start aXXXz end, and a*z end2" "a*z"
+  [ "$status" -eq 0 ]
+  [ "$output" = "start aXXXz end, and  end2" ]
+}
+
+@test "graft_ci_remove_all is a no-op (returns the value unchanged) for an empty needle" {
+  run graft_ci_remove_all "unchanged value" ""
+  [ "$status" -eq 0 ]
+  [ "$output" = "unchanged value" ]
+}
+
 # Fix-pack bug found live (DDEV harness, MAJOR-B's new graft --dry-run
 # assertion, running end to end for the first time): every other test in
 # this file stubs wp_remote WITHOUT checking is_dry_run at all, so it
