@@ -442,21 +442,67 @@ _plan_url_origin() {
   fi
 }
 
+# _plan_require_tty <what> — shared guard for every confirmation helper
+# below (issue #103): refuses immediately when stdin is not a real
+# interactive terminal, instead of letting `gum`/`read` block on a stdin
+# that may never reach EOF (a pipe, a parent shell, a supervised process).
+# Same class of bug as issue #46/phase_restore (lib/backup.sh, fixed in
+# #101), and the same signal lib/graft.sh's graft_check_stack_mismatch
+# already gates its own prompt on (~line 406) — this mirrors both rather
+# than inventing a third shape.
+#
+# Unconditional, i.e. checked BEFORE looking for gum/fzf, not only in the
+# bare-`read` fallback: gum/fzf also need a real controlling terminal to
+# render, and restore's/graft's existing guards are placed the same way
+# (before, not inside, their own gum branch) — consistency with both, not
+# a new policy invented here.
+#
+# `plan` has no --yes-style bypass the way `restore` does, because it
+# already has a fully non-interactive path that skips every function this
+# guards entirely: SITEGRAFT_MANIFEST_PREFILLED (see phase_plan below) —
+# a scripted run never reaches _plan_confirm/_plan_confirm_strong/
+# _plan_prompt_items in the first place, so a refusal here always means
+# "run without a real terminal AND without that path," and the message
+# below points there rather than at a flag that doesn't exist.
+_plan_require_tty() {
+  local what="$1"
+  if [ -t 0 ]; then
+    return 0
+  fi
+  log_error "plan needs a real interactive terminal to ${what} — refusing rather than blocking on a stdin that may never reach EOF. Re-run 'sitegraft plan' from a real interactive terminal, or drive this run from a SITEGRAFT_MANIFEST_PREFILLED manifest instead (design doc §6.2)."
+  return 1
+}
+
 # _plan_confirm <prompt> — plain yes/no. gum if available, else a bare `read`
 # defaulting to "no" (an unattended/non-interactive shell with no gum reads
 # EOF on the `read`, which bash reports as a failing read — falls through to
 # the [ "${ans:-n}" = "y" ] check, which is false; declining by default on an
 # unanswerable prompt is the safe direction for every caller of this
-# function).
+# function). The `read` itself is split into _plan_confirm_plain below
+# specifically so it stays unit-testable with a fed (non-TTY) stdin even
+# though _plan_confirm itself now refuses on exactly that stdin shape —
+# see _plan_confirm_plain's own comment.
 _plan_confirm() {
   local prompt="$1"
+  _plan_require_tty "confirm '${prompt}'" || return 1
   if command -v gum >/dev/null 2>&1; then
     gum confirm "$prompt"
   else
-    local ans
-    read -r -p "${prompt} [y/N] " ans
-    [ "${ans:-n}" = "y" ]
+    _plan_confirm_plain "$prompt"
   fi
+}
+
+# The bare-`read` half of _plan_confirm, split out so it can still be
+# exercised directly by feeding it an answer on a redirected (non-TTY)
+# stdin in tests — _plan_confirm's own new [ -t 0 ] guard (issue #103)
+# would otherwise refuse before any such answer was ever read, the same
+# split _plan_apply_selection already uses relative to
+# plan_select_interactive, for the same reason (see that function's own
+# comment).
+_plan_confirm_plain() {
+  local prompt="$1" ans
+  read -r -p "${prompt} [y/N] " ans
+  [ "${ans:-n}" = "y" ]
 }
 
 # Deliberately a different, harder-to-trigger confirmation than _plan_confirm
@@ -466,13 +512,19 @@ _plan_confirm() {
 # automatic.
 _plan_confirm_strong() {
   local prompt="$1"
+  _plan_require_tty "confirm '${prompt}' (strong confirmation)" || return 1
   if command -v gum >/dev/null 2>&1; then
     gum confirm --affirmative="Yes, I understand" --negative="Cancel" "$prompt"
   else
-    local ans
-    read -r -p "${prompt} Type YES (all caps) to confirm: " ans
-    [ "$ans" = "YES" ]
+    _plan_confirm_strong_plain "$prompt"
   fi
+}
+
+# See _plan_confirm_plain's comment — same split, same reason.
+_plan_confirm_strong_plain() {
+  local prompt="$1" ans
+  read -r -p "${prompt} Type YES (all caps) to confirm: " ans
+  [ "$ans" = "YES" ]
 }
 
 # Presents a flat list of "module: item" toggles built from the manifest's
@@ -497,66 +549,78 @@ _plan_prompt_items() {
   if [ -z "$items" ]; then
     return 0
   fi
+  _plan_require_tty "select migrate items" || return 1
   if command -v gum >/dev/null 2>&1; then
     printf '%s\n' "$items" | gum choose --no-limit --selected='*'
   elif command -v fzf >/dev/null 2>&1; then
     printf '%s\n' "$items" | fzf -m --bind 'ctrl-a:select-all'
   else
     log_warn "neither gum nor fzf found — falling back to a plain yes/no prompt per item"
-    # MAJOR bug fixed here (found live, reproduced before this fix): `done <<<
-    # "$items"` redirects fd0 for the WHOLE while loop, so the inner `read -r
-    # -p "Keep...` ans` — which also defaults to reading fd0 — consumed the
-    # NEXT item line as its own answer instead of prompting the operator.
-    # Reproduced with 3 items and answers y/n/y: every item came out kept
-    # regardless of the typed answers, a silent, wrong selection with no
-    # error. Fix: the outer loop reads items from fd3 (bound only to this
-    # while loop, via `done 3<<< "$items"`), leaving fd0 entirely free for
-    # the inner interactive prompt — the same plain `read -r -p` used
-    # (unmodified, on purpose, for consistency) by _plan_confirm/
-    # _plan_confirm_strong above, which read fd0 without incident because
-    # nothing else in those functions ever contends for it.
-    local line ans kept_buf=""
-    while IFS= read -r line <&3; do
-      [ -n "$line" ] || continue
-      # Durcissement (Step 6, tracked from Viktor's Step 2 review, non-
-      # blocking at the time): checking `read`'s own exit status here,
-      # not just `${ans:-y}`, is the fix. A real operator pressing Enter on
-      # this [Y/n] prompt returns 0 with ans="" — that IS a genuine answer
-      # (silence means "accept the pre-picked default", the same UX gum's
-      # own `--selected='*'` pre-checks everywhere else in this file) and
-      # legitimately keeps defaulting to "kept" below. EOF is a different
-      # signal entirely: `read` returns non-zero when stdin is closed/
-      # exhausted before a line was ever delivered (no TTY, output piped
-      # from something that ended, a forgotten redirect) — nobody answered
-      # anything. Before this fix, `${ans:-y}` could not tell the two
-      # apart: on EOF, ans is also unset, so it silently took the SAME "y"
-      # (keep/migrate) branch as a real Enter press — for a tool whose
-      # entire job is not touching data nobody explicitly approved moving,
-      # defaulting an unanswerable prompt to "migrate this" is the least
-      # conservative of the two wrong directions. Fail-safe direction
-      # chosen here: abort the whole selection rather than guess.
-      #
-      # Buffered into $kept_buf rather than printed line-by-line as each
-      # item is answered (a deliberate change from the pre-fix version):
-      # nothing is written to stdout at all until every item has a real
-      # answer. If EOF hits partway through, this function's stdout is
-      # completely empty — not just "missing the unanswered items", the
-      # already-answered ones ahead of it are withheld too — so the
-      # all-or-nothing guarantee holds even for a hypothetical future
-      # caller that reads this function's stdout without checking its exit
-      # status (plan_select_interactive itself does check it, via its own
-      # `|| return 1`, but this makes the function's own contract safe on
-      # its own terms rather than relying solely on the caller).
-      if ! read -r -p "Keep '${line}'? [Y/n] " ans; then
-        log_error "selection interrupted: no operator answer for '${line}' (stdin hit EOF, not a real Enter keystroke) — aborting the whole selection rather than guessing. No manifest will be frozen from this run. Re-run 'sitegraft plan' from a real interactive terminal, or use SITEGRAFT_MANIFEST_PREFILLED for a scripted/non-interactive run (design doc §6.2)."
-        return 1
-      fi
-      case "${ans:-y}" in
-        y|Y|'') kept_buf="${kept_buf}${line}"$'\n' ;;
-      esac
-    done 3<<< "$items"
-    printf '%s' "$kept_buf"
+    _plan_prompt_items_plain "$items"
   fi
+}
+
+# The plain-fallback half of _plan_prompt_items, split out (same reason as
+# _plan_confirm_plain above, issue #103) so it can still be exercised
+# directly by feeding it answers on a redirected (non-TTY) stdin in tests
+# — _plan_prompt_items's own [ -t 0 ] guard would otherwise refuse before
+# any of the logic below (including the MAJOR fd-collision fix and the EOF
+# hardening, both documented below) ever ran.
+_plan_prompt_items_plain() {
+  local items="$1"
+  # MAJOR bug fixed here (found live, reproduced before this fix): `done <<<
+  # "$items"` redirects fd0 for the WHOLE while loop, so the inner `read -r
+  # -p "Keep...` ans` — which also defaults to reading fd0 — consumed the
+  # NEXT item line as its own answer instead of prompting the operator.
+  # Reproduced with 3 items and answers y/n/y: every item came out kept
+  # regardless of the typed answers, a silent, wrong selection with no
+  # error. Fix: the outer loop reads items from fd3 (bound only to this
+  # while loop, via `done 3<<< "$items"`), leaving fd0 entirely free for
+  # the inner interactive prompt — the same plain `read -r -p` used
+  # (unmodified, on purpose, for consistency) by _plan_confirm_plain/
+  # _plan_confirm_strong_plain above, which read fd0 without incident
+  # because nothing else in those functions ever contends for it.
+  local line ans kept_buf=""
+  while IFS= read -r line <&3; do
+    [ -n "$line" ] || continue
+    # Hardening (Step 6, tracked from Viktor's Step 2 review, non-
+    # blocking at the time): checking `read`'s own exit status here,
+    # not just `${ans:-y}`, is the fix. A real operator pressing Enter on
+    # this [Y/n] prompt returns 0 with ans="" — that IS a genuine answer
+    # (silence means "accept the pre-picked default", the same UX gum's
+    # own `--selected='*'` pre-checks everywhere else in this file) and
+    # legitimately keeps defaulting to "kept" below. EOF is a different
+    # signal entirely: `read` returns non-zero when stdin is closed/
+    # exhausted before a line was ever delivered (no TTY, output piped
+    # from something that ended, a forgotten redirect) — nobody answered
+    # anything. Before this fix, `${ans:-y}` could not tell the two
+    # apart: on EOF, ans is also unset, so it silently took the SAME "y"
+    # (keep/migrate) branch as a real Enter press — for a tool whose
+    # entire job is not touching data nobody explicitly approved moving,
+    # defaulting an unanswerable prompt to "migrate this" is the least
+    # conservative of the two wrong directions. Fail-safe direction
+    # chosen here: abort the whole selection rather than guess.
+    #
+    # Buffered into $kept_buf rather than printed line-by-line as each
+    # item is answered (a deliberate change from the pre-fix version):
+    # nothing is written to stdout at all until every item has a real
+    # answer. If EOF hits partway through, this function's stdout is
+    # completely empty — not just "missing the unanswered items", the
+    # already-answered ones ahead of it are withheld too — so the
+    # all-or-nothing guarantee holds even for a hypothetical future
+    # caller that reads this function's stdout without checking its exit
+    # status (plan_select_interactive itself does check it, via its own
+    # `|| return 1`, but this makes the function's own contract safe on
+    # its own terms rather than relying solely on the caller).
+    if ! read -r -p "Keep '${line}'? [Y/n] " ans; then
+      log_error "selection interrupted: no operator answer for '${line}' (stdin hit EOF, not a real Enter keystroke) — aborting the whole selection rather than guessing. No manifest will be frozen from this run. Re-run 'sitegraft plan' from a real interactive terminal, or use SITEGRAFT_MANIFEST_PREFILLED for a scripted/non-interactive run (design doc §6.2)."
+      return 1
+    fi
+    case "${ans:-y}" in
+      y|Y|'') kept_buf="${kept_buf}${line}"$'\n' ;;
+    esac
+  done 3<<< "$items"
+  printf '%s' "$kept_buf"
 }
 
 # _plan_apply_selection <manifest_json> <kept_items> — pure(ish) half of
@@ -633,7 +697,7 @@ plan_select_interactive() {
   # comment and multiple other spots for why bare reliance on `set -e`
   # propagating out of a `var=$(...)` assignment is not trusted here).
   # Needed for real, not just defensive: this is the propagation path for
-  # _plan_prompt_items' EOF durcissement fix above — an aborted selection
+  # _plan_prompt_items' EOF hardening fix above — an aborted selection
   # (gum/fzf cancelled, or the plain-fallback EOF case) must stop
   # plan_select_interactive from ever handing a guessed/partial `kept` list
   # to _plan_apply_selection, and must stop phase_plan from freezing a
@@ -865,7 +929,7 @@ _phase_plan_build() {
       return 1
     }
     manifest=$(plan_custom_code_gate "$manifest" "$(cat "${run_dir}/scan-b.json")") || return 1
-    # `|| return 1` added to both calls below (Step 6 durcissement pass) for
+    # `|| return 1` added to both calls below (Step 6 hardening pass) for
     # the same reason plan_custom_code_gate already has it just above —
     # consistency, and the real fix for plan_select_interactive: without
     # this, an aborted selection (see _plan_prompt_items' EOF handling)

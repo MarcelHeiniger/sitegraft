@@ -159,8 +159,9 @@ EOF
 
 @test "guard actually catches a hung test -- proves the check can fail, not just that it ran" {
   # A bare `read` against inherited stdin: the same shape as the real
-  # historical regressions (phase_restore, and lib/plan.sh's still-open
-  # ones under issue #103), planted in a throwaway fixture. Uses a short
+  # historical regressions (phase_restore, and lib/plan.sh's three
+  # confirmation helpers, fixed under issue #103), planted in a throwaway
+  # fixture. Uses a short
   # BATS_TIMEOUT_SECS override, not the shipped 120s default, so this
   # file stays fast -- the 120s default is proven separately (this
   # script's own header, and this PR's description) against the real

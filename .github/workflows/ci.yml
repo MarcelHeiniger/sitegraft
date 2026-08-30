@@ -70,7 +70,52 @@ jobs:
         # installed explicitly rather than relying on the runner image
         # happening to already have them. gzip is always in base Ubuntu;
         # shasum ships in the `perl` package; ssh is `openssh-client`.
-        run: sudo apt-get update && sudo apt-get install -y bats jq rsync perl openssh-client curl
+        #
+        # php-cli and php-xml (issue #106): a slice of this suite — the
+        # "captured PHP execution-proof" tests, which run the tool's own
+        # real PHP (lib/php/*.php) rather than a copy of its logic, which
+        # is exactly what gives those tests their value — needs a working
+        # `php` on PATH with the xml/dom extension. They were passing only
+        # because ubuntu-latest happens to ship both already. Measured
+        # directly, twice for stability, against a bare `ubuntu:24.04`
+        # container running ONLY the packages this job installed before
+        # this fix (bats jq rsync perl openssh-client curl): 43 tests fail
+        # every time, across test_bin_sitegraft.bats, test_etch_module.bats,
+        # test_graft_options.bats, test_graft_resume_safety.bats, and
+        # test_verify.bats (42 of the 43 — the last one is the git finding
+        # below) — NOT the "12 tests in 3 files" this issue's own report
+        # named, an earlier measurement against a smaller slice of this
+        # suite (more captured-PHP tests have landed since, in #83/#107/
+        # #111). php-cli alone is not enough: lib/php/wxr-content-
+        # functions.php's XMLReader-based parser (chosen over DOMDocument
+        # specifically to bound memory on large WXR exports — see that
+        # file's own header) needs the `dom`/`xml` extension, which
+        # Debian/Ubuntu ships as the separate `php-xml` package, not
+        # bundled into `php-cli`. With both packages installed, the same
+        # bare-container run is clean at 1068/1068, also reproduced twice.
+        #
+        # git (issue #106 sweep): tests/lint/no-fatal-parameter-expansion.sh
+        # prefers `git ls-files` (respects .gitignore) over a find-based
+        # fallback, and one of its own tests
+        # ("guard sees a brand-new file that has not been git added yet",
+        # test_no_fatal_parameter_expansion.bats) exercises that git path
+        # directly, with no guard of its own — same undeclared-by-luck
+        # shape as php: ubuntu-latest ships git (actions/checkout needs
+        # it), a bare image does not. That test is the 43rd failure above,
+        # and is fixed by the same measured re-run.
+        #
+        # sqlite3 (issue #106 sweep, Marcel's call): NOT one of the 43
+        # measured failures above -- the 3 tests in test_backup.bats that
+        # need a real `sqlite3` binary (backup_verify_db_export against a
+        # genuine `sqlite3 .dump`) already guard themselves with
+        # `_require_sqlite3`, which `skip`s cleanly when it's absent, so
+        # this was never a silent-luck defect the way php/git were: a
+        # missing sqlite3 shows up as a visible skip, not a false green.
+        # Declared anyway, on Marcel's explicit call rather than the
+        # issue's own acceptance criteria: it's a one-word, no-cost change
+        # that turns those 3 tests from "never actually run in CI" into
+        # "run for real," which is the same spirit #106 closes for php.
+        run: sudo apt-get update && sudo apt-get install -y bats jq rsync perl openssh-client curl git php-cli php-xml sqlite3
 
       - name: bats tests/unit/
         # Canonical run command per CLAUDE.md. Integration tests
@@ -117,9 +162,10 @@ jobs:
       # Same runtime dependencies as the unit-tests job -- this runs the
       # identical tests/unit/ suite, just under a stdin that never reaches
       # EOF instead of ubuntu-latest's default /dev/null. See that job's
-      # own comment for why each package is here.
+      # own comment for why each package is here (issue #106: git,
+      # php-cli, php-xml, sqlite3).
       - name: Install bats and sitegraft's runtime dependencies
-        run: sudo apt-get update && sudo apt-get install -y bats jq rsync perl openssh-client curl
+        run: sudo apt-get update && sudo apt-get install -y bats jq rsync perl openssh-client curl git php-cli php-xml sqlite3
 
       - name: tests/lint/no-blocking-stdin-reads.sh
         # CI's stdin is already /dev/null, which is exactly why this repo
@@ -128,6 +174,9 @@ jobs:
         # runs the same suite under a stdin that stays open and never
         # delivers EOF instead, so a blocking read has something to block
         # on. See the script's own header for the full reasoning -- and
-        # its SCOPE section for what this job does NOT catch yet (a live
-        # occurrence in lib/plan.sh, tracked as issue #103).
+        # its SCOPE section for what this job structurally cannot catch: a
+        # test that supplies its own stdin (as most confirmation-prompt
+        # tests correctly do) is immunized from this dynamic guard by
+        # construction. lib/plan.sh's three confirmation helpers were a
+        # live example of that gap (issue #103, fixed).
         run: tests/lint/no-blocking-stdin-reads.sh
