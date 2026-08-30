@@ -94,3 +94,40 @@ jobs:
           set -euo pipefail
           find . -path ./.git -prune -o -name '*.php' -print0 \
             | xargs -0 -n1 php -l
+
+  stdin-hang-guard:
+    name: Stdin-hang guard (issue #102)
+    runs-on: ubuntu-latest
+    # 20 min: measured normal (non-hanging) full runs are ~2-3 minutes
+    # under this exact harness (see the script's own header). The per-test
+    # cap is 120s (also justified there, from a full-suite measurement,
+    # not a partial sample) -- so this ceiling has room for roughly 8-10
+    # SIMULTANEOUS test-level hangs before the JOB timeout races ahead of
+    # the guard's own per-test one. That is not a promise every hang gets
+    # individually named and reported: past that count, GitHub kills the
+    # job and whatever TAP output made it out names only the first
+    # culprits, not all of them. Accepted degradation, not a guarantee --
+    # a real regression is very unlikely to hang double-digit tests at
+    # once (the four historical occurrences each hung exactly one), and
+    # the job still goes red either way.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      # Same runtime dependencies as the unit-tests job -- this runs the
+      # identical tests/unit/ suite, just under a stdin that never reaches
+      # EOF instead of ubuntu-latest's default /dev/null. See that job's
+      # own comment for why each package is here.
+      - name: Install bats and sitegraft's runtime dependencies
+        run: sudo apt-get update && sudo apt-get install -y bats jq rsync perl openssh-client curl
+
+      - name: tests/lint/no-blocking-stdin-reads.sh
+        # CI's stdin is already /dev/null, which is exactly why this repo
+        # has shipped this bug class four times: a bare `read`/`cat` hits
+        # instant EOF there and reads as "declined correctly." This job
+        # runs the same suite under a stdin that stays open and never
+        # delivers EOF instead, so a blocking read has something to block
+        # on. See the script's own header for the full reasoning -- and
+        # its SCOPE section for what this job does NOT catch yet (a live
+        # occurrence in lib/plan.sh, tracked as issue #103).
+        run: tests/lint/no-blocking-stdin-reads.sh
