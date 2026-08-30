@@ -405,6 +405,7 @@ _major4_stub_everything_but_the_marker_block() {
   graft_sync_stack() { :; }
   graft_check_stack_precondition() { return 0; }
   graft_media_sync() { :; }
+  graft_fonts_sync() { :; }
   graft_deploy_mu_plugin() { :; }
   graft_prune_previous_run() {
     echo "STUB: graft_prune_previous_run $*"
@@ -467,7 +468,7 @@ EOF
   # entering the marker-clearing block even though import_attachments and
   # import genuinely finished.
   local step
-  for step in stack_sync media_sync mu_plugin prune import_attachments importer_setup export import; do
+  for step in stack_sync media_sync fonts_sync mu_plugin prune import_attachments importer_setup export import; do
     touch "${run_dir}/graft.${step}.done"
   done
   [ ! -f "${run_dir}/graft.fetch_id_map.done" ]
@@ -550,7 +551,7 @@ EOF
 {"migrate":{"core-wp":{"post_types":["page"],"option_keys":[]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}
 EOF
   local step
-  for step in stack_sync media_sync mu_plugin prune import_attachments importer_setup export import; do
+  for step in stack_sync media_sync fonts_sync mu_plugin prune import_attachments importer_setup export import; do
     touch "${run_dir}/graft.${step}.done"
   done
 
@@ -611,7 +612,7 @@ EOF
 {"migrate":{"core-wp":{"post_types":["page"],"option_keys":[]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}
 EOF
   local step
-  for step in stack_sync media_sync mu_plugin prune import_attachments importer_setup export import; do
+  for step in stack_sync media_sync fonts_sync mu_plugin prune import_attachments importer_setup export import; do
     touch "${run_dir}/graft.${step}.done"
   done
 
@@ -701,7 +702,7 @@ EOF
   # Every step through fetch_id_map already completed for real -- but
   # export/ is empty right now (its .xml file(s) removed since).
   local step
-  for step in stack_sync media_sync mu_plugin prune import_attachments importer_setup export import fetch_id_map; do
+  for step in stack_sync media_sync fonts_sync mu_plugin prune import_attachments importer_setup export import fetch_id_map; do
     touch "${run_dir}/graft.${step}.done"
   done
   printf '101\t5001\tpage\n' > "${run_dir}/id-map.tsv"
@@ -760,7 +761,7 @@ EOF
 EOF
   # Every step through fetch_id_map already completed for real.
   local step
-  for step in stack_sync media_sync mu_plugin prune import_attachments importer_setup export import fetch_id_map; do
+  for step in stack_sync media_sync fonts_sync mu_plugin prune import_attachments importer_setup export import fetch_id_map; do
     touch "${run_dir}/graft.${step}.done"
   done
   printf '101\t5001\tpage\n' > "${run_dir}/id-map.tsv"
@@ -808,7 +809,7 @@ EOF
 {"migrate":{"core-wp":{"post_types":["page"],"option_keys":[]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}
 EOF
   local step
-  for step in stack_sync media_sync mu_plugin prune import_attachments importer_setup export import fetch_id_map; do
+  for step in stack_sync media_sync fonts_sync mu_plugin prune import_attachments importer_setup export import fetch_id_map; do
     touch "${run_dir}/graft.${step}.done"
   done
   printf '101\t5001\tpage\n' > "${run_dir}/id-map.tsv"
@@ -856,7 +857,7 @@ EOF
 {"migrate":{"core-wp":{"post_types":["page"],"option_keys":[]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}
 EOF
   local step
-  for step in stack_sync media_sync mu_plugin prune import_attachments importer_setup export import fetch_id_map; do
+  for step in stack_sync media_sync fonts_sync mu_plugin prune import_attachments importer_setup export import fetch_id_map; do
     touch "${run_dir}/graft.${step}.done"
   done
   # This run's own real export never happened to write anything (marker
@@ -915,6 +916,7 @@ _blocker1_stub_everything_but_domain_check() {
   graft_sync_stack() { :; }
   graft_check_stack_precondition() { return 0; }
   graft_media_sync() { :; }
+  graft_fonts_sync() { :; }
   graft_deploy_mu_plugin() { :; }
   graft_prune_previous_run() { :; }
   graft_import_attachments() { :; }
@@ -948,7 +950,7 @@ MANIFESTEOF
   # earlier, rc10 pass -- INCLUDING remap_domain, whose in-function guard
   # did not exist yet at the time it ran and "succeeded".
   local step
-  for step in stack_sync media_sync mu_plugin prune import_attachments importer_setup export import fetch_id_map mu_cleanup importer_cleanup remap_ids remap_featured_images remap_domain; do
+  for step in stack_sync media_sync fonts_sync mu_plugin prune import_attachments importer_setup export import fetch_id_map mu_cleanup importer_cleanup remap_ids remap_featured_images remap_domain; do
     touch "${run_dir}/graft.${step}.done"
   done
 
@@ -991,6 +993,7 @@ _issue16_stub_everything_but_ordering() {
   graft_sync_stack() { :; }
   graft_check_stack_precondition() { return 0; }
   graft_media_sync() { :; }
+  graft_fonts_sync() { :; }
   graft_deploy_mu_plugin() { :; }
   graft_migrate_post_type_defining_options() { echo "ORDER: register_post_type_options"; }
   graft_prune_previous_run() { :; }
@@ -1156,6 +1159,7 @@ _issue36_stub_everything_but_ordering() {
   graft_migrate_post_type_defining_options() { :; }
   graft_prune_previous_run() { echo "ORDER: prune"; }
   graft_media_sync() { echo "ORDER: media_sync"; }
+  graft_fonts_sync() { echo "ORDER: fonts_sync"; }
   graft_import_attachments() { echo "ORDER: import_attachments"; }
   graft_ensure_importer() { :; }
   graft_export_wxr() { :; }
@@ -1198,19 +1202,24 @@ MANIFESTEOF
   run phase_graft --profile demo --run "$run_dir" --dry-run
   [ "$status" -eq 0 ]
 
-  local prune_line=-1 media_sync_line=-1 import_attachments_line=-1 i
+  local prune_line=-1 media_sync_line=-1 fonts_sync_line=-1 import_attachments_line=-1 i
   for i in "${!lines[@]}"; do
     case "${lines[$i]}" in
       "ORDER: prune") prune_line=$i ;;
       "ORDER: media_sync") media_sync_line=$i ;;
+      "ORDER: fonts_sync") fonts_sync_line=$i ;;
       "ORDER: import_attachments") import_attachments_line=$i ;;
     esac
   done
   [ "$prune_line" -ge 0 ]
   [ "$media_sync_line" -ge 0 ]
+  [ "$fonts_sync_line" -ge 0 ]
   [ "$import_attachments_line" -ge 0 ]
   [ "$prune_line" -lt "$media_sync_line" ]
   [ "$media_sync_line" -lt "$import_attachments_line" ]
+  # Issue #83: graft_fonts_sync must actually run as part of a real graft
+  # (the "$fonts_sync_line -ge 0" check above), not merely exist as a
+  # callable function that phase_graft forgot to call.
 }
 
 @test "phase_graft's dry-run preview shows media_sync rerunning whenever prune is about to rerun, matching what the real run does (issue #36 fix-pack, BLOCKED-2)" {
@@ -1275,7 +1284,7 @@ MANIFESTEOF
   mkdir -p "$run_dir_dry"
   touch "${run_dir_dry}/backup.complete"
   printf '%s' "$manifest_json" > "${run_dir_dry}/manifest.json"
-  for step in stack_sync mu_plugin prune media_sync import_attachments importer_setup export import; do
+  for step in stack_sync mu_plugin prune media_sync fonts_sync import_attachments importer_setup export import; do
     touch "${run_dir_dry}/graft.${step}.done"
   done
 
@@ -1291,7 +1300,7 @@ MANIFESTEOF
   mkdir -p "$run_dir_real"
   touch "${run_dir_real}/backup.complete"
   printf '%s' "$manifest_json" > "${run_dir_real}/manifest.json"
-  for step in stack_sync mu_plugin prune media_sync import_attachments importer_setup export import; do
+  for step in stack_sync mu_plugin prune media_sync fonts_sync import_attachments importer_setup export import; do
     touch "${run_dir_real}/graft.${step}.done"
   done
 

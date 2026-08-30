@@ -209,7 +209,20 @@ done
 case "$sub" in
   plugin) exit 0 ;;   # is-installed / is-active -- always "yes"
   post) exit 0 ;;     # post list -- prints nothing (no leftovers); still logged above
-  eval) echo '[]' ;;  # attachment-metadata collection (graft_import_attachments, BEFORE import): "A has no attachments" -- keeps that step a clean no-op so this test reaches the import step it actually cares about
+  eval)
+    # Issue #83 review fix-pack: graft_font_dir (lib/graft.sh) also
+    # sends a `wp eval` now, asking for wp_get_font_dir()['path'] --
+    # distinguished from the attachment-metadata eval below by
+    # grepping the sent PHP source itself (available in "$*"), not by
+    # a second sub-case, since both share the bare `eval` subcommand.
+    # Empty is the CORRECT answer for a fixture site that never used
+    # the Font Library -- the exact no-op graft_fonts_sync expects
+    # (its own header comment), not a workaround.
+    case "$*" in
+      *wp_get_font_dir*) : ;;
+      *) echo '[]' ;;
+    esac
+    ;;
   export)
     dir=""
     for a in "$@"; do
@@ -363,7 +376,20 @@ done
 case "$sub" in
   plugin) exit 0 ;;   # is-installed / is-active -- always "yes"
   post) exit 0 ;;     # post list -- prints nothing (no leftovers)
-  eval) echo '[]' ;;  # attachment-metadata collection: "A has no attachments"
+  eval)
+    # Issue #83 review fix-pack: graft_font_dir (lib/graft.sh) also
+    # sends a `wp eval` now, asking for wp_get_font_dir()['path'] --
+    # distinguished from the attachment-metadata eval below by
+    # grepping the sent PHP source itself (available in "$*"), not by
+    # a second sub-case, since both share the bare `eval` subcommand.
+    # Empty is the CORRECT answer for a fixture site that never used
+    # the Font Library -- the exact no-op graft_fonts_sync expects
+    # (its own header comment), not a workaround.
+    case "$*" in
+      *wp_get_font_dir*) : ;;
+      *) echo '[]' ;;
+    esac
+    ;;
   export)
     dir=""
     for a in "$@"; do
@@ -547,7 +573,20 @@ done
 case "$sub" in
   plugin) exit 0 ;;
   post) exit 0 ;;
-  eval) echo '[]' ;;
+  eval)
+    # Issue #83 review fix-pack: graft_font_dir (lib/graft.sh) also
+    # sends a `wp eval` now, asking for wp_get_font_dir()['path'] --
+    # distinguished from the attachment-metadata eval below by
+    # grepping the sent PHP source itself (available in "$*"), not by
+    # a second sub-case, since both share the bare `eval` subcommand.
+    # Empty is the CORRECT answer for a fixture site that never used
+    # the Font Library -- the exact no-op graft_fonts_sync expects
+    # (its own header comment), not a workaround.
+    case "$*" in
+      *wp_get_font_dir*) : ;;
+      *) echo '[]' ;;
+    esac
+    ;;
   export)
     dir=""
     for a in "$@"; do
@@ -663,6 +702,12 @@ _issue36_stub_everything_but_prune_media_sync_import_attachments() {
   graft_check_stack_precondition() { return 0; }
   graft_deploy_mu_plugin() { :; }
   graft_migrate_post_type_defining_options() { :; }
+  # Not part of this test's own subject (issue #36 is about media/
+  # attachments, not fonts) -- stubbed out so this test's own `wp_remote`
+  # stub (below, keyed only on `eval`/`post`, not on WHICH eval was sent)
+  # is never asked to answer graft_font_dir's font_dir query with data
+  # shaped for something else entirely.
+  graft_fonts_sync() { :; }
   graft_ensure_importer() { :; }
   graft_export_wxr() { :; }
   graft_integrity_gate() { return 0; }

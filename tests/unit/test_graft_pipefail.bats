@@ -163,3 +163,57 @@ STUB
   # unchanged.
   [ "$(cat "${dest}/photo.jpg")" = "existing" ]
 }
+
+# --- Review fix-pack (issue #83, nit 1): a src_dir/dest_dir containing a
+# shell-meaningful character -----------------------------------------------
+#
+# Every existing test above passes graft_pull_dir/graft_push_dir a src_dir/
+# dest_dir this test SUITE constructs, but every REAL call site before
+# issue #83 did too: SITE_*_WP_PATH plus a relative path this tool itself
+# picked (wp-content/uploads, wp-content/themes/<slug>, an export staging
+# dir), never a value read back from evaluating PHP on the site itself.
+# graft_font_dir (this issue) changed that: font_dir_a/font_dir_b come from
+# wp_get_font_dir()['path'], filterable via WordPress's own `font_dir`
+# filter — the first time either function's src_dir/dest_dir is genuinely
+# site-controlled, not orchestrator-controlled.
+#
+# Both wrapped-local branches used to interpolate their directory argument
+# as a hand-written `'${var}'` — single-quote wrapped, but with no escaping
+# of an embedded single quote. That quote closes the string early; whatever
+# follows ("s-fonts' . | tar -x ...", for a directory literally named
+# "it's-fonts") is then re-parsed as shell syntax it was never meant to be.
+# Fixed by routing both through `sq()` (the same helper this file's ssh
+# branches already use) instead of a bare `'...'` wrap.
+#
+# These tests exercise the REAL wrapped-local path (SITE_*_WP_CMD="env --
+# wp", same convention every test above already uses) against a directory
+# that genuinely exists on disk with a single quote in its name — proving
+# the fix on real tar execution, not a mocked string comparison.
+
+@test "graft_pull_dir (wrapped-local) handles a source directory whose name contains a single quote (issue #83 review fix-pack: font_dir is site-controlled, not always shell-safe)" {
+  unset SITE_A_SSH_HOST
+  local a_root="$BATS_TEST_TMPDIR/site-a"
+  local quoted_dir="${a_root}/wp-content/it's-fonts"
+  mkdir -p "$quoted_dir"
+  printf 'x' > "${quoted_dir}/face.woff2"
+  SITE_A_WP_PATH="$a_root"
+  SITE_A_WP_CMD="env -- wp"
+
+  run graft_pull_dir a "$quoted_dir" "$BATS_TEST_TMPDIR/staging"
+  [ "$status" -eq 0 ]
+  [ -f "$BATS_TEST_TMPDIR/staging/face.woff2" ]
+}
+
+@test "graft_push_dir (wrapped-local) handles a destination directory whose name contains a single quote (issue #83 review fix-pack: font_dir is site-controlled, not always shell-safe)" {
+  unset SITE_B_SSH_HOST
+  local staging="$BATS_TEST_TMPDIR/staging"
+  mkdir -p "$staging"
+  printf 'x' > "${staging}/face.woff2"
+  local quoted_dest="${BATS_TEST_TMPDIR}/site-b/wp-content/it's-fonts"
+  SITE_B_WP_PATH="$BATS_TEST_TMPDIR/site-b"
+  SITE_B_WP_CMD="env -- wp"
+
+  run graft_push_dir b "$staging" "$quoted_dest"
+  [ "$status" -eq 0 ]
+  [ -f "${quoted_dest}/face.woff2" ]
+}

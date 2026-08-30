@@ -37,6 +37,35 @@ sq() {
   printf "'%s'" "$s"
 }
 
+# ssh_test_dir_rc <host> <path> [ssh_key] — the RAW exit status of
+# `ssh [-i ssh_key] -- <host> "test -d <path>"`. Deliberately NOT a
+# boolean: 0 means the directory exists, 1 is `test -d`'s own "does not
+# exist" status, and anything else (255 most commonly — ssh's own
+# connection/authentication failure code) means the question was never
+# actually answered. Collapsing those into "not 0, so absent" is exactly
+# the defect issue #83's review fix-pack found in graft_ssh_path_exists
+# (lib/graft.sh): on a dedicated-key profile whose ssh connection failed
+# for real (wrong key, host unreachable, auth refused), the font sync
+# silently skipped, marked its step done, and reported the graft a
+# success — never having synced anything, and never retrying on resume.
+# CLAUDE.md's own rule: "A check must distinguish 'verified true' from
+# 'could not verify'... report unknown, never OK."
+#
+# Shared by inventory_check_path_topology (below) and graft_ssh_path_exists
+# (lib/graft.sh) so SITE_<ALIAS>_SSH_KEY handling (issue #75) cannot drift
+# between the two again — it did exactly once, when graft_ssh_path_exists's
+# first draft re-implemented this probe from scratch instead of reusing it,
+# and silently dropped the `-i "$ssh_key"` inventory_check_path_topology
+# already had.
+ssh_test_dir_rc() {
+  local host="$1" path="$2" ssh_key="${3:-}"
+  if [ -n "$ssh_key" ]; then
+    ssh -i "$ssh_key" -- "$host" "test -d $(sq "$path")" >/dev/null 2>&1
+  else
+    ssh -- "$host" "test -d $(sq "$path")" >/dev/null 2>&1
+  fi
+}
+
 # wp_remote <alias: a|b> <wp-cli args...>
 # Dispatches to SSH+wp-cli if SITE_<ALIAS>_SSH_HOST is set, else runs the local
 # wp command (plain `wp`, or a wrapper like `ddev exec --raw -p <project> --
@@ -250,11 +279,13 @@ inventory_check_path_topology() {
   SITEGRAFT_DRY_RUN=0
   local wp_ok=0 host_ok=0
   wp_remote "$alias_lc" option get siteurl >/dev/null 2>&1 && wp_ok=1
-  if [ -n "$ssh_key" ]; then
-    ssh -i "$ssh_key" -- "$host" "test -d $(sq "$path")" >/dev/null 2>&1 && host_ok=1
-  else
-    ssh -- "$host" "test -d $(sq "$path")" >/dev/null 2>&1 && host_ok=1
-  fi
+  # ssh_test_dir_rc's own three-valued contract collapses to a plain
+  # boolean here on purpose: this check only ever needs "did wp-cli's
+  # path resolve on the host's own filesystem, yes or no" — a transport/
+  # auth failure (rc 255) is exactly as unusable to this check as a
+  # genuinely missing directory (rc 1), since either way the topology
+  # cannot be confirmed and this function must refuse (below).
+  ssh_test_dir_rc "$host" "$path" "$ssh_key" && host_ok=1
   SITEGRAFT_DRY_RUN="$saved_dry_run"
 
   if [ "$wp_ok" = "0" ]; then

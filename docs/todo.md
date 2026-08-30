@@ -21,10 +21,6 @@
       Same defect as #16 one level up, and **worse**: the completeness gate counts
       items, so a post whose terms were dropped still lands and the gate passes.
       Not triggered on the pilot site (the option does not exist there).
-- [ ] **#83 — `wp-content/fonts/` is never synced.** Media sync covers only
-      `wp-content/uploads/`; WordPress 6.5+ writes the Font Library to a sibling
-      directory. The page renders with a fallback font and nothing reports it.
-      Worked around by hand on the pilot.
 - [ ] **#88 — spaced JSON.** Every rewrite pass matches the compact form only; a
       spaced call site is left untouched, by two independent causes. Pre-existing
       (#84/#85 miss it identically), never emitted by WordPress's serializer.
@@ -37,6 +33,16 @@
       blocks carrying id references.
 - [ ] Consider making the HTTP smoke marker configurable per profile — it
       currently looks for "Home" and false-fails on any non-English site.
+- [ ] **Every `ssh` call in this repo is missing `-o BatchMode=yes -o
+      ConnectTimeout=<n>`.** Pre-existing, not introduced by #83's fix-pack —
+      noted while adding `ssh_test_dir_rc` (`lib/inventory.sh`), which is a
+      probe run mid-graft and inherits the same gap: without `BatchMode=yes`,
+      a host whose key auth fails can fall back to an interactive password
+      prompt, which blocks a run this tool otherwise treats as fully
+      unattended; without a `ConnectTimeout`, an unreachable host hangs on
+      the OS's own TCP timeout instead of failing promptly. Worth fixing
+      once, for every `ssh` invocation in the codebase, not piecemeal per
+      call site.
 
 ## Backlog
 
@@ -94,6 +100,115 @@
 
 ## Done
 
+- [x] **#83 — `wp-content/fonts/` is never synced.** `graft_fonts_sync`
+      (`lib/graft.sh`) syncs it alongside `graft_media_sync`, reading the
+      real font directory from `wp_get_font_dir()` on both A and B (never
+      hardcoded — the path is filterable via `font_dir`), same
+      `--keep-existing` safety as media. `wp_get_font_dir()` COMPUTES/
+      FILTERS the path; it does not CREATE the directory (that only
+      happens on WordPress's own first real font upload), so a non-empty
+      path with nothing on disk yet is the ORDINARY case for any A that
+      has simply never used the Font Library.
+
+      The ssh-remote pull branch went through TWO review rounds to get
+      this right. Round 1: the branch had no existence check at all and
+      aborted the whole graft on the routine rsync-against-absent-source
+      exit 23. Round 2, on the fix for round 1: the existence probe
+      (`graft_ssh_path_exists`) collapsed EVERY non-zero ssh exit into
+      "absent, nothing to pull" — including ssh's own connection/auth
+      failure code (255), which meant a dedicated `SITE_A_SSH_KEY` profile
+      whose ssh connection genuinely failed skipped the sync SILENTLY,
+      marked the step done, and reported the graft a success, never
+      retrying on resume (before issue #83 existed at all, that same
+      profile failed LOUDLY at rsync instead — round 1's own fix had
+      turned a noisy failure into a silent false success). Fixed by making
+      the probe three-valued (exists / confirmed absent / could not
+      determine) via a shared `ssh_test_dir_rc` helper
+      (`lib/inventory.sh`, factored out of `inventory_check_path_topology`'s
+      own pre-existing probe so `SITE_<ALIAS>_SSH_KEY` handling, issue
+      #75, cannot drift between the two again) — "could not determine" is
+      now a hard failure, never a no-op. Both rounds mutation-tested. A
+      having fonts while B cannot resolve a Font Library directory of its
+      own at all is, separately, also a hard failure, not a silent drop.
+
+      Known, deliberate gap, not built here: this syncs the FILES only.
+      Core WordPress 6.5's Font Library also registers
+      `wp_font_face`/`wp_font_family` posts in the database, and no
+      module migrates those — on a site that genuinely uses core's Font
+      Library admin UI (not Etch, which references font files by URL
+      from its own CSS option and never touches these post types), B
+      would receive the files with no post pointing at them. YAGNI until
+      a real site needs it; noted so it is never silently assumed solved.
+
+      Also addresses — not "closes"; see the scope note below — the
+      issue's own detection half: `_graft_migrate_one_option_key` (shared
+      by `graft_migrate_options`/
+      `graft_migrate_post_type_defining_options`) now WARNS (`log_warn`,
+      does NOT refuse the push) when a migrated OPTION's value still
+      appears to reference A's domain after the rewrite pass. Widened on
+      review to a case-insensitive, scheme-agnostic (`http`/`https`/
+      protocol-relative `//host`) raw-byte search — what actually catches
+      the pilot's own `etch_global_stylesheets` shape (a JSON blob stored
+      AS A STRING, double-escaped by `wp option get --format=json` in a
+      way the rewrite's exact-substring match cannot parse; proven with a
+      real `php json_encode()` fixture in `tests/unit/test_graft_options.bats`,
+      not a fabricated string `--format=json` never produces; remeasured
+      by review against all 6 realistic forms — case, scheme,
+      protocol-relative, the JSON-blob-in-a-string shape, and two more —
+      6/6 caught, none refused). Downgraded from an earlier hard refusal:
+      no flag anywhere in this CLI can skip a single option key, this step
+      runs AFTER the WXR import, so a refusal abandons a half-migrated B
+      and every resume repeats the identical refusal — not a practicable
+      remedy mid-migration.
+
+      Second review round also found the widened check false-positiving
+      SYSTEMATICALLY (every key, every run, not occasionally) on the
+      apex/www migration shape ("example.com" -> "www.example.com"),
+      where A's host is a literal substring of B's own — a value the
+      rewrite corrected perfectly still triggered the warning, because
+      B's own new host still contains A's old one. The round-2 fix
+      (stripping every occurrence of B's host from the value before
+      searching for A's) turned out to be UNSAFE in the reverse migration
+      shape (www -> apex, "www.example.com" -> "example.com", at least as
+      common a real shape): stripping B's SHORTER host also ate the tail
+      of a genuine, never-rewritten A residue that happened to contain
+      B's host as a substring too, hiding real leftovers — including the
+      pilot's own JSON-blob-in-a-string shape, the reason this whole
+      check exists. Third round fix: the strip only ever runs when B's
+      host is STRICTLY LONGER than A's (the one direction where a clean
+      B occurrence can textually "contain" A's host at all); otherwise
+      the value is searched as-is, with nothing to strip and nothing to
+      accidentally destroy — provably correct in both directions, not
+      merely re-balanced. The strip itself (`graft_ci_remove_all`/
+      `graft_ci_glob`, `lib/graft.sh`) is also now case-insensitive and
+      glob-safe: a same-shape false positive used to reproduce by
+      accident whenever B's host appeared in a different case than
+      `domain_to` itself (case-sensitive stripping missed it, the
+      case-insensitive final `grep -i` still matched what was left), and
+      `${var//pattern/}` treats its pattern as a bash GLOB, not a literal
+      string — harmless for an ordinary hostname but `domain_to` comes
+      from the manifest, which a hand-edited or
+      `SITEGRAFT_MANIFEST_PREFILLED` run can put anything into. Verified
+      in both directions with tests covering the plain leftover, the
+      pilot's blob-in-a-string leftover, and the clean rewrite, for both
+      the apex/www and the www/apex shapes; mutation-tested.
+
+      Scope, stated precisely so this is not overclaimed: OPTION VALUES
+      only, a heuristic substring search, and does not touch post CONTENT
+      at all — #88's own class below (block-attribute id rewrites inside
+      WXR-imported post content matching only the compact JSON form) is a
+      completely separate mechanism and remains open, unaffected by this
+      fix. `verify_domain_absent` (`lib/verify.sh`) remains the second,
+      independent check, covering both options and post content, via a
+      separate `sitegraft verify` run. What this check still cannot see:
+      a deliberately over-encoded value (percent-encoding/HTML entities
+      CAN alter any byte, including a hostname's own letters — measured;
+      an earlier draft of this same entry overclaimed that they could
+      not) — what IS true is that no conventional WordPress/PHP encoder
+      (`rawurlencode()`, `esc_url()`, `htmlspecialchars()`) touches an
+      unreserved character, so the forms those actually produce are still
+      caught; a hand-crafted, non-conventionally-encoded value is not, and
+      was never this check's claimed scope.
 - [x] **`modules/acss.sh` (Automatic.css) — shipped.** The
       `TODO_VERIFY_LEGACY_ACSS_SLUG` blocker (the pre-4.0 plugin folder name) is
       closed: both folder names have now been observed on real installs on

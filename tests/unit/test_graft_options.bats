@@ -284,6 +284,294 @@ setup() {
   [[ "$stored" != *"a.example.com"* ]] || false
 }
 
+# Issue #83's own detection half, not just its sync half (docs/status.md's
+# own record of the real pilot: `etch_global_stylesheets` had to be fixed
+# BY HAND after a graft that reported success, because the jq rewrite pass
+# above never reached it).
+#
+# Review fix-pack, decided together (not reopened here): this is now a
+# WARNING (`log_warn`), never a refusal -- no flag in this CLI can skip a
+# single option key, this function runs AFTER the WXR import, so a refusal
+# abandons a half-migrated B with every resume replaying the same refusal,
+# and the old message pointed an operator at hand-editing A's production
+# database, which is not practicable mid-migration. In exchange the check
+# is now WIDE: case-insensitive, scheme-agnostic (http/https/protocol-
+# relative), and matched on raw bytes rather than decoded JSON structure,
+# so it reaches a domain reference buried inside a JSON blob that is
+# itself stored as a STRING value.
+#
+# This fixture is real `php json_encode()` output, not a hand-fabricated
+# string `--format=json` never produces (the exact gap review flagged
+# before this fix-pack): Etch stores `etch_global_stylesheets` as a JSON
+# blob inside a STRING option value (not a native PHP array WordPress
+# would decode on its own), so `wp option get --format=json` runs
+# `json_encode()` TWICE — once implicitly already baked into the stored
+# string, once again to transport the option's own string value. The
+# result: every `/` the pilot's own CSS URL contains is escaped TWICE
+# (`\\\/` in the raw wp-cli output), a shape the rewrite's `jq ...
+# split($from)` — which only ever looks for the PLAIN, once-escaped
+# `https://a.example.com` — genuinely cannot match. Verified directly
+# (measured outside this test, not merely asserted): piping this exact
+# fixture through the real rewrite pass leaves `a.example.com` in the
+# pushed value and never introduces `b.example.com` at all -- the rewrite
+# is a full no-op on this shape. `php` generates the fixture at test time
+# so its exact escaping is never hand-transcribed (and cannot drift from
+# what real `json_encode()` produces).
+@test "graft_migrate_options WARNS (but still pushes to B) when Etch's own JSON-blob-stored-as-a-string shape survives the rewrite pass — issue #83 review fix-pack, realistic php json_encode fixture" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_global_stylesheets"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  local fixture
+  fixture=$(php -r 'echo json_encode(json_encode(["css" => "body{src:url(https://a.example.com/wp-content/fonts/heading-sans.woff2)}"]));')
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then
+      printf '%s' "$fixture"
+    else
+      echo "[dry-run] wp_remote b $*"
+    fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest" "https://a.example.com" "https://b.example.com"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"etch_global_stylesheets"* ]] || false
+  [[ "$output" == *"WARNING, not a refusal"* ]] || false
+  # Still pushed -- this is the whole point of the warning/refusal trade:
+  # the write is NOT blocked, and the option's own cache file IS written
+  # (core_wp_post_import's own --dry-run preview, §9.3, still needs it).
+  [[ "$output" == *"[dry-run] wp_remote b option update etch_global_stylesheets"* ]] || false
+  [ -f "${run_dir}/option-etch_global_stylesheets.value" ]
+}
+
+@test "graft_migrate_options WARNS on a protocol-relative reference to A's host that the rewrite's exact-scheme match cannot see (realistic php json_encode fixture)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"core-wp":{"option_keys":["some_key"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  local fixture
+  fixture=$(php -r 'echo json_encode(["logo" => "//a.example.com/logo.png"]);')
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then printf '%s' "$fixture"; else echo "[dry-run] wp_remote b $*"; fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest" "https://a.example.com" "https://b.example.com"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARNING, not a refusal"* ]] || false
+}
+
+@test "graft_migrate_options WARNS on the other scheme (http when domain_from says https) that the rewrite's exact-scheme match cannot see (realistic php json_encode fixture)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"core-wp":{"option_keys":["some_key"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  local fixture
+  fixture=$(php -r 'echo json_encode(["logo" => "http://a.example.com/logo.png"]);')
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then printf '%s' "$fixture"; else echo "[dry-run] wp_remote b $*"; fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest" "https://a.example.com" "https://b.example.com"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARNING, not a refusal"* ]] || false
+}
+
+@test "graft_migrate_options WARNS on a differently-cased host that the rewrite's case-sensitive match cannot see (realistic php json_encode fixture)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"core-wp":{"option_keys":["some_key"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  local fixture
+  fixture=$(php -r 'echo json_encode(["logo" => "https://A.EXAMPLE.COM/logo.png"]);')
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then printf '%s' "$fixture"; else echo "[dry-run] wp_remote b $*"; fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest" "https://a.example.com" "https://b.example.com"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARNING, not a refusal"* ]] || false
+}
+
+# Companion to the four warnings above: the SAME check must stay quiet
+# when nothing of A's is left -- proven by mutation (this repo's own
+# CLAUDE.md convention), not merely asserted. Removing the widened check
+# entirely leaves this test green and the four above red; keeping it
+# leaves all five green -- together they show the check discriminates
+# rather than always firing.
+@test "graft_migrate_options does NOT warn on a value the rewrite pass fully corrected (residue check stays quiet on a clean rewrite)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_global_stylesheets"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then
+      echo '"https://a.example.com/wp-content/fonts/heading-sans.woff2"'
+    else
+      echo "[dry-run] wp_remote b $*"
+    fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest" "https://a.example.com" "https://b.example.com"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"WARNING, not a refusal"* ]] || false
+  [ -f "${run_dir}/option-etch_global_stylesheets.value" ]
+}
+
+@test "graft_migrate_options does NOT warn when domain_from and this option's value are simply unrelated (no coincidental match)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"core-wp":{"option_keys":["blogdescription"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then echo '"Just another WordPress site"'; else echo "[dry-run] wp_remote b $*"; fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest" "https://a.example.com" "https://b.example.com"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"WARNING, not a refusal"* ]] || false
+}
+
+# Review, second round: measured as a SYSTEMATIC false positive, not an
+# occasional one -- domain_from's host being a literal substring of
+# domain_to's host is the ordinary apex/www migration shape ("example.com"
+# -> "www.example.com"), and before this fix the check fired on it for
+# EVERY key, every time, regardless of whether the rewrite actually
+# missed anything. A warning that always fires is a warning nobody reads
+# -- the exact opposite of what widening the check (BLOCKER 2) was for.
+@test "graft_migrate_options does NOT warn when A's host is a substring of B's own host and the value was correctly rewritten (apex -> www, review fix-pack)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_global_stylesheets"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  local fixture
+  fixture=$(php -r 'echo json_encode(["css" => "body{src:url(https://www.example.com/wp-content/fonts/heading-sans.woff2)}"]);')
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then printf '%s' "$fixture"; else echo "[dry-run] wp_remote b $*"; fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest" "https://example.com" "https://www.example.com"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"WARNING, not a refusal"* ]] || false
+}
+
+# The other half of the same fix, verified in the same shape: stripping
+# B's own host from the value before searching must not also hide a
+# GENUINE leftover reference to A that happens to sit in that exact
+# apex/www pair -- only an actual occurrence of B's host is removed, an
+# unrelated bare reference to A's host survives and is still caught.
+@test "graft_migrate_options still WARNS on a genuine leftover reference to A even when A's host is a substring of B's own host (apex -> www, review fix-pack)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_global_stylesheets"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  local fixture
+  fixture=$(php -r 'echo json_encode(["css" => "body{src:url(//example.com/wp-content/fonts/heading-sans.woff2)}"]);')
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then printf '%s' "$fixture"; else echo "[dry-run] wp_remote b $*"; fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest" "https://example.com" "https://www.example.com"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARNING, not a refusal"* ]] || false
+}
+
+# --- Review, third round: the REVERSE direction ---------------------------
+#
+# domain_from's host ("www.example.com") is the LONGER one here, and
+# domain_to's host ("example.com") is a substring of it -- the www ->
+# apex consolidation, at least as common a real migration shape as the
+# apex -> www direction above. Round 2's original fix (unconditionally
+# stripping domain_to's host from the value before searching) is UNSAFE
+# in exactly this direction: stripping "example.com" out of a genuine,
+# never-rewritten "www.example.com" residue also eats the "example.com"
+# tail of that SAME residue, leaving "www." behind and hiding the
+# evidence -- measured to genuinely happen, not a hypothetical. These
+# three tests are the regression guards for that: a real residue must
+# still be caught (including the pilot's own JSON-blob-in-a-string
+# shape, the reason this whole check exists), and a value that was
+# ACTUALLY rewritten cleanly to the (shorter) apex must not warn.
+@test "graft_migrate_options still WARNS on a genuine leftover reference to A when A's host is LONGER than B's own (www -> apex, review third round)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_global_stylesheets"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  # Protocol-relative, same technique the apex -> www direction's own
+  # "genuine leftover" test above uses (and for the identical reason): a
+  # fixture with the FULL scheme ("https://www.example.com") is exactly
+  # what the jq rewrite pass's own exact-substring match DOES catch and
+  # correct on its own -- it would never reach this function's detection
+  # code as a residue at all, so it would not actually exercise what this
+  # test is for. Protocol-relative is one of the forms the rewrite cannot
+  # reach (its own header comment), so it survives to be checked here.
+  local fixture
+  fixture=$(php -r 'echo json_encode(["css" => "body{src:url(//www.example.com/wp-content/fonts/heading-sans.woff2)}"]);')
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then printf '%s' "$fixture"; else echo "[dry-run] wp_remote b $*"; fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest" "https://www.example.com" "https://example.com"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARNING, not a refusal"* ]] || false
+}
+
+@test "graft_migrate_options still WARNS on the pilot's own JSON-blob-stored-as-a-string shape when A's host is LONGER than B's own (www -> apex, review third round)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_global_stylesheets"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  local fixture
+  fixture=$(php -r 'echo json_encode(json_encode(["css" => "body{src:url(https://www.example.com/wp-content/fonts/heading-sans.woff2)}"]));')
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then printf '%s' "$fixture"; else echo "[dry-run] wp_remote b $*"; fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest" "https://www.example.com" "https://example.com"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARNING, not a refusal"* ]] || false
+}
+
+@test "graft_migrate_options does NOT warn on a clean www -> apex rewrite (A's host LONGER than B's own, review third round)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_global_stylesheets"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  local fixture
+  fixture=$(php -r 'echo json_encode(["css" => "body{src:url(https://example.com/wp-content/fonts/heading-sans.woff2)}"]);')
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then printf '%s' "$fixture"; else echo "[dry-run] wp_remote b $*"; fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest" "https://www.example.com" "https://example.com"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"WARNING, not a refusal"* ]] || false
+}
+
+# Direct unit coverage for the two small helpers themselves
+# (lib/graft.sh), not just the end-to-end graft_migrate_options behavior
+# above -- pins the two nits closed together (case-insensitivity, and
+# glob-safety) independently of the length-conditional wiring around them.
+@test "graft_ci_glob builds a case-insensitive, glob-escaped pattern that removes an UPPERCASE occurrence via graft_ci_remove_all" {
+  run graft_ci_remove_all "prefix WWW.EXAMPLE.COM suffix" "www.example.com"
+  [ "$status" -eq 0 ]
+  [ "$output" = "prefix  suffix" ]
+}
+
+@test "graft_ci_remove_all treats the needle as a LITERAL string, not a glob -- a needle containing '*' does not act as a wildcard" {
+  # A needle designed so a real (un-escaped) glob '*' would greedily
+  # consume everything between its two literal ends ("a" ... "z"),
+  # including the text this test's own assertions require to survive --
+  # not just "does the literal needle still get removed" (which an
+  # unescaped '*' also happens to do, so would not discriminate the bug).
+  run graft_ci_remove_all "start aXXXz end, and a*z end2" "a*z"
+  [ "$status" -eq 0 ]
+  [ "$output" = "start aXXXz end, and  end2" ]
+}
+
+@test "graft_ci_remove_all is a no-op (returns the value unchanged) for an empty needle" {
+  run graft_ci_remove_all "unchanged value" ""
+  [ "$status" -eq 0 ]
+  [ "$output" = "unchanged value" ]
+}
+
 # Fix-pack bug found live (DDEV harness, MAJOR-B's new graft --dry-run
 # assertion, running end to end for the first time): every other test in
 # this file stubs wp_remote WITHOUT checking is_dry_run at all, so it
