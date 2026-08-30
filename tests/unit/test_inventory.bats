@@ -220,6 +220,39 @@ EOF
   [ "$status" -eq 1 ]
 }
 
+# issue #107: `wp db tables | jq -R -s -c 'split("\n") | map(select(length
+# > 0))'` used to have no exit-status check on the wp-cli call at all —
+# `jq -R -s -c` accepts completely empty stdin and turns it into a valid,
+# empty `[]`, so a failing `wp db tables` (permissions, connectivity, a
+# broken wp-cli wrapper) read as "this site genuinely has zero tables"
+# instead of aborting the scan. Stdout deliberately left empty here (what
+# a real failing `wp db tables` produces) with the failure signaled only
+# by the non-zero return and a stderr message, so this is load-bearing for
+# the exit-status check specifically, not for some incidental shape of the
+# stub's stdout.
+@test "inventory_scan_site fails the scan, and does not write a scan file, when 'wp db tables' fails (issue #107)" {
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$*" in
+      "post-type list --format=json") echo '[]' ;;
+      "option list --unserialize --format=json") echo '[]' ;;
+      "db tables --format=list --all-tables-with-prefix")
+        echo "wp-cli error: could not connect to database" >&2
+        return 1
+        ;;
+      "plugin list --format=json") echo '[]' ;;
+      "theme list --status=active --format=json") echo '[{"name":"t"}]' ;;
+      "menu list --format=json") echo '[]' ;;
+      *) echo '[]' ;;
+    esac
+  }
+  local out="$BATS_TEST_TMPDIR/scan-a.json"
+  run --separate-stderr inventory_scan_site a "$out"
+  [ "$status" -ne 0 ]
+  [[ "$stderr" == *"wp db tables"* ]] || false
+  [ ! -e "$out" ]
+}
+
 @test "inventory_scan_site aliases wp-cli's real 'name' field to 'stylesheet' for active_theme (found via live DDEV harness run)" {
   # wp-cli's real `theme list --format=json` field is "name", never
   # "stylesheet" (verified against a real install) — but the design doc's

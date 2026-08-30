@@ -551,7 +551,15 @@ graft_integrity_gate() {
   # NDJSON on stdout, silently corrupting $ndjson below. Belt: reduce the
   # noise at its source.
   local ndjson rc stderr_file tmp_dir
-  tmp_dir=$(sitegraft_mktemp_dir)
+  # issue #109: checked explicitly, not just hardened at the source.
+  # graft_integrity_gate is itself called as `graft_integrity_gate ... ||
+  # return 1` by its own caller, which disables errexit for this
+  # function's entire call tree (verified live) — sitegraft_mktemp_dir's
+  # own `return 1` on a failed mktemp would otherwise be silently
+  # absorbed here, leaving tmp_dir empty and stderr_file a bare
+  # "/stderr" (unwritable, so the php call below would fail for an
+  # unrelated reason with no diagnostic naming the real cause).
+  tmp_dir=$(sitegraft_mktemp_dir) || return 1
   stderr_file="${tmp_dir}/stderr"
   ndjson=$(php -d display_errors=stderr "${SITEGRAFT_ROOT}/lib/php/wxr-item-ids-cli.php" "$file" 2>"$stderr_file") && rc=0 || rc=$?
   local err_text=""
@@ -1413,7 +1421,41 @@ graft_verify_import_completeness() {
   # SITEGRAFT_TMP_REGISTRY, which bin/sitegraft's own sitegraft_cleanup
   # EXIT trap sweeps on every exit, interrupted or not — this is that
   # mechanism's first production caller in this file.
-  local tmp_dir; tmp_dir=$(sitegraft_mktemp_dir)
+  #
+  # issue #109: checked explicitly, same reasoning as
+  # graft_integrity_gate's identical call above — its own only production
+  # caller, phase_graft (lib/graft.sh), calls this function as
+  # `if graft_verify_import_completeness ...; then :; else ...; fi`, NOT
+  # `|| return`. Corrected here (an earlier draft of this comment claimed
+  # `... || return 1/2`, and invented a `sitegraft verify` caller that
+  # does not exist — grepped, not a second one calls this function
+  # anywhere in bin/ or lib/): bash disables errexit for a command's
+  # entire call tree while it is the TESTED condition of `if`, the same
+  # as it does for the left side of `||`/`&&` (verified live, both
+  # forms) — so sitegraft_mktemp_dir's own loud failure would still be
+  # silently absorbed here without this explicit check, regardless of
+  # which of the two syntaxes the real caller happens to use.
+  #
+  # 3, not 1 or 2 (reviewer-mandated correction, second fix-pack): a
+  # failed sitegraft_mktemp_dir is an ENVIRONMENT problem (TMPDIR full,
+  # read-only, or missing) that has nothing to do with what the staged
+  # WXR export contains, and it must not be folded into either existing
+  # code. Not 1: phase_graft's own rc=1 branch clears
+  # import_attachments.done/import.done/fetch_id_map.done and reruns
+  # graft_prune_previous_run on retry — correct ONLY for issue #53's real
+  # case (wordpress-importer genuinely skipped a present, readable item),
+  # and actively destructive here: this failure happens before the staged
+  # WXR is ever even read, so B's already-migrated content would be
+  # deleted for a cause a retry cannot fix (measured: an unfixed rc=1
+  # here reproduces exactly that against phase_graft's real branching).
+  # Not 2 either, even though rc=2's own handling also touches no marker:
+  # rc=2's message names ${run_dir}/export specifically ("missing its
+  # staged WXR export, or has one that fails to parse") — misleading for
+  # a TMPDIR failure, which never reached the export file at all. See
+  # phase_graft's own rc=3 branch (lib/graft.sh, next to its rc=2
+  # sibling) for the distinct, accurate message and identical
+  # no-marker-touched handling.
+  local tmp_dir; tmp_dir=$(sitegraft_mktemp_dir) || return 3
 
   # lib/php/wxr-item-ids-cli.php: one `php` invocation, NDJSON on stdout,
   # hard failure (never a silent empty result) the moment ANY listed file
@@ -3119,6 +3161,49 @@ phase_graft() {
       # cheap recovery path (remove it, re-run) stated before the
       # expensive ones.
       log_error "run directory ${run_dir} is missing its staged WXR export, or has one that fails to parse, even though its own markers say every earlier step already completed. Before assuming real data loss: check ${run_dir}/export for anything that was NOT produced by this run's own export step (a hand-added file, a leftover test artifact, or anything left behind by an earlier experiment against this same run_dir) — every .xml found there is treated as part of this run's own export, and a single foreign or malformed one is enough to trigger this exact message. This cannot self-heal via a simple retry of 'sitegraft graft' — a retry would delete the content this run already migrated onto B while never regenerating (or removing) whatever is actually wrong in export/, per issue #53/#54's own fix-pack (see graft_verify_import_completeness's header). No resumability marker was changed by this failure. Once export/ genuinely holds only this run's own file(s) again, re-running 'sitegraft verify' (or graft) will re-check correctly with no further action needed; if it still fails, start a fresh run (scan -> plan -> backup -> graft) against a clean run directory, or restore B from the pre-graft backup if you suspect real data loss."
+      return 1
+    elif [ "$verify_rc" -eq 3 ]; then
+      # issue #109 fix-pack (reviewer-mandated correction): rc=3 is a
+      # DIFFERENT failure than rc=2's own "staged export is missing or
+      # unparseable" — it means graft_verify_import_completeness could
+      # not even attempt the check, because sitegraft_mktemp_dir failed
+      # (TMPDIR full, read-only, or missing — see the error printed
+      # above this one for the actual cause). Kept as its own code
+      # rather than folded into rc=2: rc=2's own message above points an
+      # operator at ${run_dir}/export — actively misleading for an
+      # environment problem that has nothing to do with the staged WXR
+      # export, which was never even reached. Same safe handling as
+      # rc=2 regardless: this is an environment failure, not evidence
+      # that anything is wrong with what this run already did to B, so
+      # no resumability marker is touched — the rc=1 branch below
+      # (real "wordpress-importer skipped a present item") is the only
+      # one that may safely trigger prune-and-reimport, exactly because
+      # it is the only one where the staged WXR itself was confirmed
+      # readable.
+      log_error "could not verify this run's WXR import completeness against B: a temporary directory could not be created (see the error above for the cause — typically TMPDIR full, read-only, or missing). This is an ENVIRONMENT problem, not a sign that anything is wrong with what this run already did to B or with its staged WXR export. No resumability marker was touched. Fix the environment issue and re-run 'sitegraft graft' (or 'sitegraft verify') against this same run directory — it will re-check from where it left off."
+      return 1
+    elif [ "$verify_rc" -ne 1 ]; then
+      # issue #109 fix-pack (second review round, reviewer-mandated): the
+      # chain above used to end at rc=3's own `fi`, so every value that
+      # was neither 2 nor 3 — including a value that does not exist
+      # today — fell through unconditionally into the rc=1 branch below,
+      # which clears four resumability markers and arms
+      # graft_prune_previous_run. That fallthrough is harmless right now
+      # only because graft_verify_import_completeness's own return
+      # values are exactly {0, 1, 2, 3} (read every `return` in that
+      # function to confirm — its own header comment enumerates them),
+      # so "not 2, not 3" and "confirmed 1" happen to coincide today. A
+      # future rc=4 would not: it would silently take the SAME
+      # destructive path as a confirmed, readable "wordpress-importer
+      # skipped an item" failure, on nothing more than the absence of a
+      # branch that recognized it — an unverified guess treated as a
+      # known-safe case, the exact class of defect the rest of this PR
+      # closes one layer down (#107's own `.tables: []`, #109's own
+      # silent empty tmp_dir). Closed at the chain itself: an
+      # unrecognized code now gets the same no-marker-touched treatment
+      # as rc=2/rc=3 — refuse to guess, never default "unknown" to
+      # "known safe".
+      log_error "graft_verify_import_completeness returned an unexpected status (${verify_rc}) while verifying this run's WXR import completeness against B. phase_graft does not know how to interpret this return code safely, so it is refusing to guess — no resumability marker was touched, and 'sitegraft graft' will NOT automatically retry. Check the output above for the real cause before re-running against this run directory; if this is not a transient environment issue, this may be a bug in sitegraft itself — please report it along with that output."
       return 1
     fi
 

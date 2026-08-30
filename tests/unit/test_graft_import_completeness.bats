@@ -1,3 +1,4 @@
+bats_require_minimum_version 1.5.0
 # tests/unit/test_graft_import_completeness.bats — graft_verify_import_completeness
 # (issue #53). wordpress-importer INSERTS, never updates: an item it reports
 # as "already exists" is skipped with no wp_import_insert_post fired at all
@@ -60,6 +61,48 @@ _write_wxr() {
 }
 
 # --- happy path --------------------------------------------------------------
+
+@test "graft_verify_import_completeness returns 3 (not 1, not 2), without leaking a bare '/stderr' path, when sitegraft_mktemp_dir cannot create a temp dir (issue #109)" {
+  # Same mechanism as lib/graft.sh's other sitegraft_mktemp_dir caller
+  # (graft_integrity_gate, see tests/unit/test_graft_integrity_gate.bats'
+  # sibling test): this function's own only production caller,
+  # phase_graft (lib/graft.sh), calls it as
+  # `if graft_verify_import_completeness ...; then :; else ...; fi` --
+  # not `|| return` (an earlier draft of this comment claimed that, and a
+  # `sitegraft verify` caller that does not exist; corrected). Bash
+  # disables errexit for a command's entire call tree while it is the
+  # TESTED condition of `if`, same as the left side of `||`/`&&`, so this
+  # only proves the fix if the tmp_dir assignment here checks
+  # sitegraft_mktemp_dir's own exit status explicitly.
+  #
+  # rc=3, specifically (reviewer-mandated correction): NOT 1 (phase_graft
+  # treats rc=1 as "safe to retry", clears four resumability markers, and
+  # reruns graft_prune_previous_run for real -- destructive here, since
+  # this failure happens before the staged WXR is ever even read) and
+  # NOT 2 (phase_graft's own rc=2 message names run_dir/export
+  # specifically, which this failure never reached -- misleading). See
+  # this function's own header comment, and phase_graft's rc=3 branch,
+  # for the full reasoning.
+  #
+  # Content of the staged .xml is irrelevant -- execution reaches
+  # sitegraft_mktemp_dir before the file is ever parsed, as long as at
+  # least one *.xml exists under run_dir/export.
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "${run_dir}/export"
+  echo 'placeholder' > "${run_dir}/export/export.xml"
+  local missing_tmpdir="$BATS_TEST_TMPDIR/does-not-exist"
+  local probe="$BATS_TEST_TMPDIR/probe.sh"
+  {
+    echo "SITEGRAFT_ROOT='${SITEGRAFT_ROOT}'"
+    echo ". '${BATS_TEST_DIRNAME}/../../lib/core.sh'"
+    echo ". '${BATS_TEST_DIRNAME}/../../lib/graft.sh'"
+    echo "graft_verify_import_completeness '${run_dir}' 'page'"
+  } > "$probe"
+  TMPDIR="$missing_tmpdir" run --separate-stderr bash "$probe"
+  [ "$status" -eq 3 ]
+  [[ "$stderr" != *"/stderr"* ]] || false
+  [[ "$output" != *"/stderr"* ]] || false
+}
 
 @test "graft_verify_import_completeness passes when every non-attachment item landed in id-map.tsv" {
   local run_dir="$BATS_TEST_TMPDIR/run"

@@ -1642,9 +1642,11 @@ backup_prefix_tables_csv() {
 # mismatch message on. An omitted argument, an unparseable one, AND a
 # genuinely empty array `[]` all fall through to the generic message
 # instead — `[]` is what a scan that saw nothing at all looks like
-# (including a failed `wp db tables` swallowed by lib/inventory.sh:302's
-# unguarded pipe), and "the scan saw nothing" must read as "unknown",
-# never as "confirmed this table doesn't exist".
+# (including a failed `wp db tables`, which lib/inventory.sh's own
+# inventory_scan_site now refuses to swallow into an empty array — issue
+# #107 — but this guard stays as defense in depth for a scan file written
+# before that fix, or edited by hand), and "the scan saw nothing" must
+# read as "unknown", never as "confirmed this table doesn't exist".
 backup_compute_protected_checksums() {
   local alias_lc="$1" manifest="$2" scan_b_tables_json="${3:-}"
   local prefix
@@ -1660,14 +1662,17 @@ backup_compute_protected_checksums() {
   # `type == "array"` and set have_scan_tables=1, which then reported EVERY
   # declared table as a module/site mismatch — accusing the module for a
   # scan that saw nothing at all. Reachable through the exact default this
-  # issue is about, one layer up: lib/inventory.sh:302 builds scan-b.json's
-  # `.tables` via `wp_remote ... db tables | jq -R -s -c ...`, with no
-  # `pipefail` and no `||` — a failing `wp db tables` (permissions,
-  # connectivity) is swallowed by the pipe into an empty array rather than
-  # aborting the scan. An empty scan result means "unknown whether B has
-  # this table", the identical "empty vs. unread" conflation this whole
-  # issue exists to close, not "confirmed absent" — so it must not be
-  # allowed to accuse a module of a mismatch it cannot actually see.
+  # issue is about, one layer up: lib/inventory.sh's inventory_scan_site
+  # built scan-b.json's `.tables` via `wp_remote ... db tables | jq -R -s
+  # -c ...` with no exit-status check on the wp-cli call, so a failing `wp
+  # db tables` (permissions, connectivity) was swallowed by the pipe into
+  # an empty array rather than aborting the scan — fixed at that source by
+  # issue #107, which now fails the scan outright instead. This guard is
+  # kept regardless, as defense in depth for a scan file predating that
+  # fix or edited by hand: an empty scan result means "unknown whether B
+  # has this table", the identical "empty vs. unread" conflation this
+  # whole issue exists to close, not "confirmed absent" — so it must not
+  # be allowed to accuse a module of a mismatch it cannot actually see.
   local have_scan_tables=0
   if [ -n "$scan_b_tables_json" ] && echo "$scan_b_tables_json" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
     have_scan_tables=1
@@ -1753,19 +1758,27 @@ backup_compute_protected_checksums() {
     # registered for cleanup on exit, not removed here.
     #
     # tmp_dir's OWN result is verified before use (review, PR #105 round
-    # 2): sitegraft_mktemp_dir's `mktemp -d` is not itself guarded (lib/
-    # core.sh), so a full/read-only TMPDIR makes it echo an empty string
-    # rather than fail loudly. Measured: an unverified `stderr_file` in
-    # that case becomes the bare path "/stderr" — the redirect itself then
-    # fails to open (a real, unrelated error, since "/" is not writable),
-    # so `wp_remote` never even runs, and a table that would have exported
-    # PERFECTLY gets reported as unreadable, with a raw shell redirection
-    # error leaking a filesystem path into the message on top. Falls back
-    # to /dev/null (the exact behavior every call site had before this
-    # fix-pack introduced stderr capture at all) whenever tmp_dir does not
-    # come back as a real, existing directory — this failure mode is about
-    # losing the improved diagnostic, never about losing correctness: the
-    # export itself still runs (or still fails) on its own merits.
+    # 2): at the time, sitegraft_mktemp_dir's `mktemp -d` was not itself
+    # guarded (lib/core.sh), so a full/read-only TMPDIR made it echo an
+    # empty string rather than fail loudly. Measured: an unverified
+    # `stderr_file` in that case becomes the bare path "/stderr" — the
+    # redirect itself then fails to open (a real, unrelated error, since
+    # "/" is not writable), so `wp_remote` never even runs, and a table
+    # that would have exported PERFECTLY gets reported as unreadable, with
+    # a raw shell redirection error leaking a filesystem path into the
+    # message on top. sitegraft_mktemp_dir itself now fails loudly on a
+    # bad mktemp (issue #109) — this check stays regardless, because this
+    # function is called as the left side of `||` by its own caller
+    # (backup_compute_protected_checksums), which disables errexit for
+    # its entire call tree, so even sitegraft_mktemp_dir's own `return 1`
+    # would otherwise be silently absorbed here too (verified live, same
+    # mechanism as lib/graft.sh's two callers fixed by the same issue).
+    # Falls back to /dev/null (the exact behavior every call site had
+    # before this fix-pack introduced stderr capture at all) whenever
+    # tmp_dir does not come back as a real, existing directory — this
+    # failure mode is about losing the improved diagnostic, never about
+    # losing correctness: the export itself still runs (or still fails)
+    # on its own merits.
     local tmp_dir stderr_file="" err_text=""
     tmp_dir=$(sitegraft_mktemp_dir)
     if [ -n "$tmp_dir" ] && [ -d "$tmp_dir" ]; then

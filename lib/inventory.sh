@@ -299,8 +299,35 @@ inventory_scan_site() {
   # `wp db tables` has no --format=json (only "list" or "csv", verified against
   # a real wp-cli install) — request the default newline-separated list and
   # build the JSON array ourselves.
-  tables=$(wp_remote "$alias_lc" db tables --format=list --all-tables-with-prefix \
-    | jq -R -s -c 'split("\n") | map(select(length > 0))')
+  #
+  # issue #107: the network call and the jq transform used to be one
+  # piped assignment (`wp_remote ... | jq -R -s -c '...'`). `jq -R -s -c`
+  # (raw input, slurp) happily accepts completely EMPTY stdin and turns
+  # it into a valid, empty `[]` — so a failing `wp db tables` (permissions,
+  # connectivity, a broken wp-cli wrapper) was swallowed into "B has zero
+  # tables" instead of aborting the scan, the exact "empty vs. unread"
+  # conflation #97 closed one layer up, in the data everything else reads.
+  # `set -o pipefail` alone does not save this the way it saved #99's
+  # `bash -c` pipelines: this pipe runs in-process, under bin/sitegraft's
+  # own `set -o pipefail`, and (verified live) DOES compute the correct
+  # non-zero pipeline status when wp_remote fails — but inventory_scan_site
+  # is always invoked as `inventory_scan_site ... || exit 1` (this file's
+  # own "every step needs its own || exit 1" comment, phase_scan's
+  # subshell), and bash disables errexit for a command's entire call tree
+  # while it is the tested side of `||`/`&&`/`if` — so even that correct
+  # non-zero status was silently discarded and execution fell through to
+  # the next line with $tables holding jq's manufactured "[]". Fixed by
+  # splitting the call from the transform and checking the call's own
+  # exit status explicitly, the same way every other required field in
+  # this function already does (see $post_types, $options above) rather
+  # than trusting a shell option that a caller three frames up can
+  # silently defeat.
+  local tables_raw
+  if ! tables_raw=$(wp_remote "$alias_lc" db tables --format=list --all-tables-with-prefix); then
+    log_error "site '${alias_lc}': 'wp db tables' failed — cannot enumerate its tables (permissions, connectivity, or a broken wp-cli wrapper). Refusing to record an empty table list as if the site genuinely had none."
+    return 1
+  fi
+  tables=$(printf '%s' "$tables_raw" | jq -R -s -c 'split("\n") | map(select(length > 0))')
   plugins=$(wp_remote "$alias_lc" plugin list --format=json)
   # `wp theme list --format=json`'s real field for the theme slug is "name"
   # (verified live against a real install) — design doc §6.1/§12 documents
