@@ -103,69 +103,83 @@ core_wp: page"
   [ "$output" = "$manifest" ]
 }
 
-# --- _plan_confirm / _plan_confirm_strong: only the non-gum plain-`read`
-# fallback is exercisable without a TTY. Feeds input via a heredoc <<< so
-# `read` doesn't block. PATH is pinned to /usr/bin:/bin (excludes
-# /opt/homebrew/bin) so this test exercises the fallback deterministically —
-# found live in this fix-pack: these tests silently started taking the gum
+# --- _plan_confirm_plain / _plan_confirm_strong_plain: the bare-`read`
+# logic split out of _plan_confirm/_plan_confirm_strong (issue #103) so it
+# stays exercisable without a TTY. Feeds input via a heredoc <<< so `read`
+# doesn't block. Called directly (not through _plan_confirm/
+# _plan_confirm_strong) precisely so these tests bypass those functions'
+# own [ -t 0 ] guard, which would otherwise refuse before any of this ever
+# ran, since a heredoc is not a TTY either — see
+# "_plan_confirm/_plan_confirm_strong/_plan_prompt_items refuse instead of
+# blocking" below for what proves the GUARDED entry points themselves.
+# PATH is pinned to /usr/bin:/bin (excludes /opt/homebrew/bin) purely to
+# keep these deterministic regardless of what's installed locally — found
+# live in this fix-pack: these tests silently started taking the gum
 # branch instead, and failed, the moment `brew install gum` (done to verify
 # the MINOR gum-flag finding below) put a real gum on PATH. Relying on "gum
-# happens not to be installed" was never a safe test precondition.
-@test "_plan_confirm returns success when the plain fallback is answered y" {
-  run env PATH=/usr/bin:/bin bash -c 'source lib/core.sh; source lib/plan.sh; _plan_confirm "ok?" <<< "y"'
+# happens not to be installed" was never a safe test precondition (moot for
+# _plan_confirm_plain/_plan_confirm_strong_plain themselves, which never
+# look for gum at all, but kept for consistency with the rest of this
+# file's invocations).
+@test "_plan_confirm_plain returns success when answered y" {
+  run env PATH=/usr/bin:/bin bash -c 'source lib/core.sh; source lib/plan.sh; _plan_confirm_plain "ok?" <<< "y"'
   [ "$status" -eq 0 ]
 }
 
-@test "_plan_confirm returns failure (safe default) when the plain fallback is answered n" {
-  run env PATH=/usr/bin:/bin bash -c 'source lib/core.sh; source lib/plan.sh; _plan_confirm "ok?" <<< "n"'
+@test "_plan_confirm_plain returns failure (safe default) when answered n" {
+  run env PATH=/usr/bin:/bin bash -c 'source lib/core.sh; source lib/plan.sh; _plan_confirm_plain "ok?" <<< "n"'
   [ "$status" -eq 1 ]
 }
 
-@test "_plan_confirm_strong requires the literal typed YES, not y" {
-  run env PATH=/usr/bin:/bin bash -c 'source lib/core.sh; source lib/plan.sh; _plan_confirm_strong "ok?" <<< "y"'
+@test "_plan_confirm_strong_plain requires the literal typed YES, not y" {
+  run env PATH=/usr/bin:/bin bash -c 'source lib/core.sh; source lib/plan.sh; _plan_confirm_strong_plain "ok?" <<< "y"'
   [ "$status" -eq 1 ]
-  run env PATH=/usr/bin:/bin bash -c 'source lib/core.sh; source lib/plan.sh; _plan_confirm_strong "ok?" <<< "YES"'
+  run env PATH=/usr/bin:/bin bash -c 'source lib/core.sh; source lib/plan.sh; _plan_confirm_strong_plain "ok?" <<< "YES"'
   [ "$status" -eq 0 ]
 }
 
-# --- _plan_prompt_items' plain fallback (no gum, no fzf): MAJOR bug found
-# live by Viktor's review of PR #2 and reproduced before this fix — `done <<<
-# "$items"` redirected fd0 for the whole while loop, so the inner `read -r -p
-# "Keep..." ans` (also defaulting to fd0) silently consumed the NEXT item
-# line as its own answer instead of prompting. Reproduced live with 3 items
-# and answers y/n/y: every item came out "kept" regardless of the typed
-# answers. Fixed by reading items from fd3 (`done 3<<< "$items"`), leaving
-# fd0 free for the interactive prompt. Each scenario below runs in a fresh
-# `bash -c` subprocess (like the _plan_confirm tests above) — items are
-# baked into the script text (fd3's here-string), answers arrive on stdin
-# (fd0), exactly mirroring how a real terminal session would separate "what
-# to ask" from "what was typed."
-@test "_plan_prompt_items plain fallback respects each individual y/n/y answer, not the same one for everything (MAJOR, reproduced live before the fix)" {
+# --- _plan_prompt_items_plain: the plain-fallback logic split out of
+# _plan_prompt_items (issue #103), same reason as _plan_confirm_plain
+# above — _plan_prompt_items's own [ -t 0 ] guard would otherwise refuse
+# before any of this ran, since none of the stdin shapes below are a real
+# TTY. MAJOR bug found live by Viktor's review of PR #2 and reproduced
+# before that fix — `done <<< "$items"` redirected fd0 for the whole while
+# loop, so the inner `read -r -p "Keep..." ans` (also defaulting to fd0)
+# silently consumed the NEXT item line as its own answer instead of
+# prompting. Reproduced live with 3 items and answers y/n/y: every item
+# came out "kept" regardless of the typed answers. Fixed by reading items
+# from fd3 (`done 3<<< "$items"`), leaving fd0 free for the interactive
+# prompt. Each scenario below runs in a fresh `bash -c` subprocess (like
+# the _plan_confirm_plain tests above) — items are baked into the script
+# text (fd3's here-string), answers arrive on stdin (fd0), exactly
+# mirroring how a real terminal session would separate "what to ask" from
+# "what was typed."
+@test "_plan_prompt_items_plain respects each individual y/n/y answer, not the same one for everything (MAJOR, reproduced live before the fix)" {
   run --separate-stderr env PATH=/usr/bin:/bin bash -c '
     source lib/core.sh; source lib/plan.sh
     items=$(printf "a: one\na: two\na: three")
-    _plan_prompt_items "$items"
+    _plan_prompt_items_plain "$items"
   ' <<< $'y\nn\ny'
   [ "$status" -eq 0 ]
   [ "$output" = "a: one
 a: three" ]
 }
 
-@test "_plan_prompt_items plain fallback keeps nothing when every answer is n" {
+@test "_plan_prompt_items_plain keeps nothing when every answer is n" {
   run --separate-stderr env PATH=/usr/bin:/bin bash -c '
     source lib/core.sh; source lib/plan.sh
     items=$(printf "a: one\na: two")
-    _plan_prompt_items "$items"
+    _plan_prompt_items_plain "$items"
   ' <<< $'n\nn'
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 }
 
-@test "_plan_prompt_items plain fallback defaults each item to kept on an empty answer ([Y/n])" {
+@test "_plan_prompt_items_plain defaults each item to kept on an empty answer ([Y/n])" {
   run --separate-stderr env PATH=/usr/bin:/bin bash -c '
     source lib/core.sh; source lib/plan.sh
     items=$(printf "a: one\na: two")
-    _plan_prompt_items "$items"
+    _plan_prompt_items_plain "$items"
   ' <<< $'\n\n'
   [ "$status" -eq 0 ]
   [ "$output" = "a: one
@@ -181,33 +195,33 @@ a: two" ]
 # approved. Fixed: `read`'s own non-zero exit status on EOF is checked
 # explicitly, and the function aborts (returns 1, prints nothing further)
 # instead of guessing.
-@test "_plan_prompt_items plain fallback aborts (does not guess 'kept') when stdin hits genuine EOF, not answered" {
+@test "_plan_prompt_items_plain aborts (does not guess 'kept') when stdin hits genuine EOF, not answered" {
   run --separate-stderr env PATH=/usr/bin:/bin bash -c '
     source lib/core.sh; source lib/plan.sh
     items=$(printf "a: one\na: two")
-    _plan_prompt_items "$items"
+    _plan_prompt_items_plain "$items"
   ' < /dev/null
   [ "$status" -eq 1 ]
   [ -z "$output" ]
   [[ "$stderr" == *"selection interrupted"* ]] || false
 }
 
-@test "_plan_prompt_items plain fallback aborts mid-selection on EOF, discarding any already-answered items too (no partial guess)" {
+@test "_plan_prompt_items_plain aborts mid-selection on EOF, discarding any already-answered items too (no partial guess)" {
   run --separate-stderr env PATH=/usr/bin:/bin bash -c '
     source lib/core.sh; source lib/plan.sh
     items=$(printf "a: one\na: two\na: three")
-    _plan_prompt_items "$items"
+    _plan_prompt_items_plain "$items"
   ' <<< $'y'
   [ "$status" -eq 1 ]
   [ -z "$output" ]
   [[ "$stderr" == *"selection interrupted"* ]] || false
 }
 
-@test "_plan_prompt_items plain fallback still works normally when every item is genuinely answered (real Enter keystrokes, not EOF)" {
+@test "_plan_prompt_items_plain still works normally when every item is genuinely answered (real Enter keystrokes, not EOF)" {
   run --separate-stderr env PATH=/usr/bin:/bin bash -c '
     source lib/core.sh; source lib/plan.sh
     items=$(printf "a: one\na: two")
-    _plan_prompt_items "$items"
+    _plan_prompt_items_plain "$items"
   ' <<< $'y\ny\n'
   [ "$status" -eq 0 ]
   [ "$output" = "a: one
@@ -222,4 +236,83 @@ a: two" ]
   ' < /dev/null
   [ "$status" -eq 1 ]
   [[ "$stderr" == *"manifest not frozen"* ]] || false
+}
+
+# --- issue #103: _plan_confirm / _plan_confirm_strong / _plan_prompt_items
+# refuse on a non-TTY stdin instead of blocking. Every test above proves
+# these three functions decline correctly when stdin happens to hit EOF
+# (a heredoc, /dev/null) -- that alone does not prove the fix, because a
+# `read` against a stdin that EVENTUALLY reaches EOF was already returning
+# non-zero before this fix too (same "both worlds exit 1" trap
+# test_phase_restore.bats's own #46 guard test documents). What actually
+# distinguishes the fix is a stdin that NEVER reaches EOF: before this
+# fix, that hangs forever (confirmed live against lib/plan.sh before this
+# PR, per tests/lint/no-blocking-stdin-reads.sh's own header); after it,
+# these functions refuse immediately, without ever attempting a `read`.
+#
+# Reuses the same never-EOF FIFO technique as
+# tests/lint/no-blocking-stdin-reads.sh: a FIFO this test opens
+# read-write on its own fd (so the open never blocks -- this process is
+# both ends), duplicated onto the child's stdin. Nothing ever writes to
+# it or closes it, so a `read` against it blocks forever; `[ -t 0 ]`
+# against it is false immediately, since a FIFO is never a TTY, so the
+# guard fires without ever reaching a `read` at all. Wrapped in `timeout`
+# (skipped, not failed, where the coreutil is absent -- e.g. a bare macOS
+# dev machine -- matching test_no_blocking_stdin_reads.bats's own
+# fallback) purely as a safety net for THIS test file, in case the guard
+# itself ever regresses: without it, a broken guard would hang this test
+# rather than fail it.
+setup_never_eof_fifo() {
+  local fifo="$BATS_TEST_TMPDIR/never-eof-$$"
+  mkfifo "$fifo"
+  exec 9<>"$fifo"
+  rm -f "$fifo"
+}
+
+@test "_plan_confirm refuses immediately (TTY guard) instead of blocking on a stdin that never reaches EOF" {
+  setup_never_eof_fifo
+  if command -v timeout >/dev/null 2>&1; then
+    run --separate-stderr timeout 10 env PATH=/usr/bin:/bin bash -c 'source lib/core.sh; source lib/plan.sh; _plan_confirm "ok?"' 0<&9
+  else
+    run --separate-stderr env PATH=/usr/bin:/bin bash -c 'source lib/core.sh; source lib/plan.sh; _plan_confirm "ok?"' 0<&9
+  fi
+  exec 9<&-
+  [ "$status" -eq 1 ]
+  [ "$status" -ne 124 ]
+  [[ "$stderr" == *"needs a real interactive terminal"* ]] || false
+}
+
+@test "_plan_confirm_strong refuses immediately (TTY guard) instead of blocking on a stdin that never reaches EOF" {
+  setup_never_eof_fifo
+  if command -v timeout >/dev/null 2>&1; then
+    run --separate-stderr timeout 10 env PATH=/usr/bin:/bin bash -c 'source lib/core.sh; source lib/plan.sh; _plan_confirm_strong "ok?"' 0<&9
+  else
+    run --separate-stderr env PATH=/usr/bin:/bin bash -c 'source lib/core.sh; source lib/plan.sh; _plan_confirm_strong "ok?"' 0<&9
+  fi
+  exec 9<&-
+  [ "$status" -eq 1 ]
+  [ "$status" -ne 124 ]
+  [[ "$stderr" == *"needs a real interactive terminal"* ]] || false
+}
+
+@test "_plan_prompt_items refuses immediately (TTY guard) instead of blocking on a stdin that never reaches EOF" {
+  setup_never_eof_fifo
+  if command -v timeout >/dev/null 2>&1; then
+    run --separate-stderr timeout 10 env PATH=/usr/bin:/bin bash -c '
+      source lib/core.sh; source lib/plan.sh
+      items=$(printf "a: one\na: two")
+      _plan_prompt_items "$items"
+    ' 0<&9
+  else
+    run --separate-stderr env PATH=/usr/bin:/bin bash -c '
+      source lib/core.sh; source lib/plan.sh
+      items=$(printf "a: one\na: two")
+      _plan_prompt_items "$items"
+    ' 0<&9
+  fi
+  exec 9<&-
+  [ "$status" -eq 1 ]
+  [ "$status" -ne 124 ]
+  [ -z "$output" ]
+  [[ "$stderr" == *"needs a real interactive terminal"* ]] || false
 }

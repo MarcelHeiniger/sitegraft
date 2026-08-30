@@ -86,29 +86,30 @@
 #      reachable through that harness is invisible to every job here,
 #      this one included.
 #
-# Both gaps are real today, not hypothetical: lib/plan.sh's _plan_confirm
-# (line ~457), _plan_confirm_strong (line ~473), and the plain-prompt
-# fallback in _plan_prompt_items (line ~550) are three bare `read -r -p`
-# calls with NO `[ -t 0 ]` guard anywhere in the file — the exact shape of
-# issue #102's occurrence #4 (phase_restore), in the SAME FILE as
-# occurrence #1 the issue names (lib/plan.sh's fd0-contention bug at
-# line ~507, already fixed, comment in place: "MAJOR bug fixed here,
-# found live"). These three are a distinct, residual defect in that file,
-# not occurrence #1 itself — occurrence #1 is fixed. They are reachable
-# in production via plan_resolve_stack: a `sitegraft plan` invoked from a
-# pipe or a supervisor, without gum on PATH, blocks forever the same way
-# phase_restore used to. This job is GREEN on that code today, because
-# every test that reaches these functions feeds them an answer on a
-# private stdin. Confirmed by direct execution against this guard's own
-# never-EOF FIFO, outside any test: _plan_confirm blocks indefinitely.
+# Gap 1 was real and demonstrated, not hypothetical, at the time this
+# guard was written: lib/plan.sh's _plan_confirm (line ~457),
+# _plan_confirm_strong (line ~473), and the plain-prompt fallback in
+# _plan_prompt_items (line ~550) were three bare `read -r -p` calls with
+# NO `[ -t 0 ]` guard anywhere in the file — the exact shape of issue
+# #102's occurrence #4 (phase_restore), in the SAME FILE as occurrence #1
+# the issue names (lib/plan.sh's fd0-contention bug at line ~507, already
+# fixed then, comment in place: "MAJOR bug fixed here, found live"). This
+# job was GREEN on that code the whole time, because every test that
+# reached those functions fed them an answer on a private stdin —
+# confirmed live by direct execution against this guard's own never-EOF
+# FIFO, outside any test: _plan_confirm blocked indefinitely.
 #
-# This PR does not fix those three call sites — tracked separately as
-# issue #103. Do not read this guard, or issue #102, as closed by this
-# script alone: it closes the CI-blindness half of the problem (a fixed
-# occurrence now has a regression test that actually proves something),
-# it does not retroactively prove the four historical occurrences are
-# ALL covered by a passing run today, and #103's occurrences are a
-# concrete, live counterexample to that stronger claim.
+# Fixed in issue #103 (a shared _plan_require_tty guard, mirroring
+# graft_check_stack_mismatch's and phase_restore's existing `[ -t 0 ]`
+# checks): all three now refuse immediately on a non-TTY stdin, and
+# tests/unit/test_plan_select.bats proves it against the same kind of
+# never-EOF FIFO this script uses (mutation-tested: removing the guard
+# calls reproduces the hang this comment used to describe). Gap 1 itself
+# — a test that supplies its own stdin is immunized from this dynamic
+# guard by construction, so this script alone can never prove EVERY
+# call site in the repo is `[ -t 0 ]`-guarded — remains a real, general
+# limitation; lib/plan.sh's three functions were simply its most recent
+# concrete example, not the whole of what it means.
 #
 # A discriminant that WOULD have caught #103's occurrences statically,
 # for the record (and a possible future complement to this dynamic guard,
@@ -121,17 +122,26 @@
 # that quote the pattern while discussing it (lib/backup.sh:1915,
 # lib/plan.sh:514), not call sites. The other 5 ARE the call sites: 2
 # already `[ -t 0 ]`-guarded (lib/backup.sh's phase_restore, lib/graft.sh's
-# graft_check_stack_mismatch) and the 3 unguarded ones above — zero false
-# positives among actual code, unlike a bare-`read` scan, which would also
-# flag the fd3 loops. "Not *this* static lint" (a `[ -t 0 ]`-proximity scan, too
-# context-sensitive to do reliably) is not the same claim as "no static
-# lint could ever help here" — a `grep -c 'read -r\? -p' | grep -v
-# '\[ -t 0 \]'`-style check on `-p` specifically is narrow enough to be
-# close to a one-line rule, and a further structural option exists: route
-# every operator prompt through one shared helper (this file already has
-# _plan_confirm/_plan_confirm_strong as a start) and lint "no `read -p`
-# outside that helper." Not built here — left for #103 or a follow-up,
-# since this PR's job is the dynamic guard, not that helper's design.
+# graft_check_stack_mismatch) and the 3 lib/plan.sh ones above — unguarded
+# at the time this comment was first written, fixed since in #103 — zero
+# false positives among actual code, unlike a bare-`read` scan, which
+# would also flag the fd3 loops. "Not *this* static lint" (a
+# `[ -t 0 ]`-proximity scan, too context-sensitive to do reliably) is not
+# the same claim as "no static lint could ever help here" — a `grep -c
+# 'read -r\? -p' | grep -v '\[ -t 0 \]'`-style check on `-p` specifically
+# is narrow enough to be close to a one-line rule, and a further
+# structural option exists: route every operator prompt through one
+# shared helper and lint "no `read -p` outside that helper." #103 took
+# the shared-helper half of that (lib/plan.sh's `_plan_require_tty`,
+# called from `_plan_confirm`/`_plan_confirm_strong`/`_plan_prompt_items`
+# before any of them looks for gum/fzf or reads anything) — the
+# actual bare `read -r -p` calls now live only in `_plan_confirm_plain`/
+# `_plan_confirm_strong_plain`/`_plan_prompt_items_plain`, split out
+# specifically so the guard sits in one place while the read/parse logic
+# stays unit-testable on a fed, non-TTY stdin (see those functions' own
+# comments in lib/plan.sh). The matching lint half — "no `read -p` outside
+# the `_plan_*_plain` helpers" — is still not built; left for a follow-up,
+# same as before.
 #
 # WHY BATS_TIMEOUT_SECS IS WHAT IT IS
 # --------------------------------------
