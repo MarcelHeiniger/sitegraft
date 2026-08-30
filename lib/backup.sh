@@ -1638,19 +1638,38 @@ backup_prefix_tables_csv() {
 #
 # An absent third argument (every 2-arg call site, including every existing
 # unit test) means "no scan-b.json list available to cross-check against",
-# never "B has zero tables" — only a real JSON array turns the mismatch
-# message on, and an empty/omitted argument always falls through to the
-# generic message instead.
+# never "B has zero tables" — only a real, NON-EMPTY JSON array turns the
+# mismatch message on. An omitted argument, an unparseable one, AND a
+# genuinely empty array `[]` all fall through to the generic message
+# instead — `[]` is what a scan that saw nothing at all looks like
+# (including a failed `wp db tables` swallowed by lib/inventory.sh:302's
+# unguarded pipe), and "the scan saw nothing" must read as "unknown",
+# never as "confirmed this table doesn't exist".
 backup_compute_protected_checksums() {
   local alias_lc="$1" manifest="$2" scan_b_tables_json="${3:-}"
   local prefix
   prefix=$(inventory_table_prefix "$alias_lc") || return 1
   # issue #97 review fix-pack: "" (the default above) means "no scan-b.json
-  # table list available" — NOT "B has zero tables". Only a genuine JSON
-  # array turns the mismatch message in the declared-table branch below on;
-  # an empty string, or a value that fails to parse as an array, never does.
+  # table list available" — NOT "B has zero tables". Only a genuine,
+  # NON-EMPTY JSON array turns the mismatch message in the declared-table
+  # branch below on; an empty string, a value that fails to parse as an
+  # array, OR a genuinely empty array `[]`, all fall through to the generic
+  # message instead.
+  #
+  # `and length > 0` (review, PR #105 round 2): a bare `[]` used to pass
+  # `type == "array"` and set have_scan_tables=1, which then reported EVERY
+  # declared table as a module/site mismatch — accusing the module for a
+  # scan that saw nothing at all. Reachable through the exact default this
+  # issue is about, one layer up: lib/inventory.sh:302 builds scan-b.json's
+  # `.tables` via `wp_remote ... db tables | jq -R -s -c ...`, with no
+  # `pipefail` and no `||` — a failing `wp db tables` (permissions,
+  # connectivity) is swallowed by the pipe into an empty array rather than
+  # aborting the scan. An empty scan result means "unknown whether B has
+  # this table", the identical "empty vs. unread" conflation this whole
+  # issue exists to close, not "confirmed absent" — so it must not be
+  # allowed to accuse a module of a mismatch it cannot actually see.
   local have_scan_tables=0
-  if [ -n "$scan_b_tables_json" ] && echo "$scan_b_tables_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+  if [ -n "$scan_b_tables_json" ] && echo "$scan_b_tables_json" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
     have_scan_tables=1
   fi
   local checksums='{}' mod
@@ -1732,11 +1751,28 @@ backup_compute_protected_checksums() {
     # this codebase already uses for exactly this reason (lib/graft.sh's
     # WXR helpers, lib/verify.sh's content-remap CLI) — its directory is
     # registered for cleanup on exit, not removed here.
-    local tmp_dir stderr_file err_text=""
+    #
+    # tmp_dir's OWN result is verified before use (review, PR #105 round
+    # 2): sitegraft_mktemp_dir's `mktemp -d` is not itself guarded (lib/
+    # core.sh), so a full/read-only TMPDIR makes it echo an empty string
+    # rather than fail loudly. Measured: an unverified `stderr_file` in
+    # that case becomes the bare path "/stderr" — the redirect itself then
+    # fails to open (a real, unrelated error, since "/" is not writable),
+    # so `wp_remote` never even runs, and a table that would have exported
+    # PERFECTLY gets reported as unreadable, with a raw shell redirection
+    # error leaking a filesystem path into the message on top. Falls back
+    # to /dev/null (the exact behavior every call site had before this
+    # fix-pack introduced stderr capture at all) whenever tmp_dir does not
+    # come back as a real, existing directory — this failure mode is about
+    # losing the improved diagnostic, never about losing correctness: the
+    # export itself still runs (or still fails) on its own merits.
+    local tmp_dir stderr_file="" err_text=""
     tmp_dir=$(sitegraft_mktemp_dir)
-    stderr_file="${tmp_dir}/stderr"
-    if ! tables_content=$(wp_remote "$alias_lc" db export - --tables="$prefixed_tables_csv" 2>"$stderr_file"); then
-      [ -s "$stderr_file" ] && err_text=$(cat "$stderr_file")
+    if [ -n "$tmp_dir" ] && [ -d "$tmp_dir" ]; then
+      stderr_file="${tmp_dir}/stderr"
+    fi
+    if ! tables_content=$(wp_remote "$alias_lc" db export - --tables="$prefixed_tables_csv" 2>"${stderr_file:-/dev/null}"); then
+      [ -n "$stderr_file" ] && [ -s "$stderr_file" ] && err_text=$(cat "$stderr_file")
       # Review fix-pack (PR #105, design ask): when scan-b.json's own table
       # list is available (see this function's own header comment), a
       # declared table absent from it gets a message that names the actual

@@ -649,6 +649,23 @@ INSERT INTO `wp_users` VALUES (1,"admin");
   [[ "$stderr" != *"module/site mismatch"* ]] || false
 }
 
+@test "backup_compute_protected_checksums never claims a mismatch when scan-b.json's table list is a genuinely EMPTY array (review: [] must not accuse every declared table)" {
+  local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  wp_remote() { return 1; }
+  # scan-b.json's own .tables is [] -- reachable via the same default this
+  # PR fixes one layer up: lib/inventory.sh:302 builds .tables through a
+  # pipe with no pipefail/||, so a failed `wp db tables` is swallowed into
+  # an empty array rather than aborting scan. An empty scan result must
+  # read as "unknown whether B has this table", not "confirmed absent" --
+  # the exact same "empty vs unread" conflation this whole issue exists to
+  # close, one level up.
+  local scan_b_tables='[]'
+  run --separate-stderr backup_compute_protected_checksums b "$manifest" "$scan_b_tables"
+  [ "$status" -eq 1 ]
+  [[ "$stderr" != *"module/site mismatch"* ]] || false
+}
+
 @test "backup_compute_protected_checksums's declared-table error includes mysqldump's own stderr, naming the specific table (issue #97 review, mysqldump names it, log_error used to not)" {
   local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
   inventory_table_prefix() { echo "wp_"; }
@@ -656,6 +673,37 @@ INSERT INTO `wp_users` VALUES (1,"admin");
   run --separate-stderr backup_compute_protected_checksums b "$manifest"
   [ "$status" -eq 1 ]
   [[ "$stderr" == *"Access denied for user"* ]] || false
+}
+
+@test "backup_compute_protected_checksums does not falsely report a successfully-exported table as unreadable when sitegraft_mktemp_dir fails (review round 2)" {
+  local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  # simulates a genuine sitegraft_mktemp_dir failure (a full/read-only
+  # TMPDIR): mktemp -d errors, and the real function's own unguarded
+  # `echo "$dir"` then echoes an empty string -- reproduced here directly,
+  # since forcing the real mktemp to fail portably in a test is not
+  # practical.
+  sitegraft_mktemp_dir() { echo ""; }
+  # this table's export genuinely SUCCEEDS -- the only failure in this run
+  # is the broken tmp_dir, which must never surface as a false read failure
+  # on a table that read fine.
+  wp_remote() { echo "INSERT INTO t VALUES (1);"; }
+  run --separate-stderr backup_compute_protected_checksums b "$manifest"
+  [ "$status" -eq 0 ]
+  run jq -e '.fakebooking | startswith("sha256:")' <<< "$output"
+  [ "$status" -eq 0 ]
+}
+
+@test "backup_compute_protected_checksums's error never leaks a bare unverified stderr-capture path when sitegraft_mktemp_dir fails (review round 2)" {
+  local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  sitegraft_mktemp_dir() { echo ""; }
+  wp_remote() { return 1; }
+  run --separate-stderr backup_compute_protected_checksums b "$manifest"
+  [ "$status" -eq 1 ]
+  [[ "$stderr" != *"/stderr"* ]] || false
+  [[ "$stderr" != *"Read-only"* ]] || false
+  [[ "$stderr" != *"No such file"* ]] || false
 }
 
 # --- issue #14: exact-state restore on a wrapped-local target ---------------
