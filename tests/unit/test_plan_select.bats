@@ -361,3 +361,126 @@ setup_never_eof_fifo() {
   [ "$output" = "a: one
 a: three" ]
 }
+
+# --- issue #113: the gum/fzf branches themselves. Every test above pins
+# PATH=/usr/bin:/bin, so only the plain-`read` fallback ever ran; the
+# branch that actually executes on an operator's machine (gum installed,
+# which is the normal case) was covered by nothing. Measured live before
+# this fix: reducing _plan_confirm_strong's
+# `gum confirm --affirmative="Yes, I understand" --negative="Cancel"` to a
+# bare `gum confirm` (which has the affirmative preselected -- turning
+# design doc §14's hard gate from "type YES" into one accidental Enter
+# keypress) left the full suite at 1071/1071 green.
+#
+# A fake `gum`/`fzf` on PATH is enough to observe this, no new dependency:
+# it records the exact argv it was called with (one arg per line, to a
+# file descriptor separate from stdout -- so a value with an embedded
+# space, like --affirmative="Yes, I understand" itself, can't be confused
+# with two shorter args by a test that only looked at a joined string) and
+# does the minimum the real caller logic needs to complete:
+#   - `gum confirm ...` exits $GUM_STUB_EXIT (default 0) -- gum confirm's
+#     own signal for "operator picked Yes" (0) vs "No" (1).
+#   - `gum choose ...` / `fzf ...` pass stdin straight through to stdout,
+#     standing in for --selected='*' / ctrl-a:select-all (everything kept).
+# Written fresh into $BATS_TEST_TMPDIR/bin per test (same convention as
+# the `wp`/`tar` stubs in test_phase_backup.bats), never onto this bats
+# process's own PATH -- only the `env PATH=...` subshell each test runs
+# in sees it, so it cannot leak into any other test in this file or any
+# other file.
+setup_gum_stub() {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/gum" <<'STUB'
+#!/usr/bin/env bash
+for arg in "$@"; do printf 'ARG:%s\n' "$arg" >&2; done
+case "${1:-}" in
+  confirm) exit "${GUM_STUB_EXIT:-0}" ;;
+  choose) cat ;;
+esac
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/gum"
+}
+
+setup_fzf_stub() {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/fzf" <<'STUB'
+#!/usr/bin/env bash
+for arg in "$@"; do printf 'ARG:%s\n' "$arg" >&2; done
+cat
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/fzf"
+}
+
+@test "_plan_confirm_strong invokes gum confirm with the strong Yes-I-understand/Cancel flags, not a bare confirm (issue #113, mutation C1)" {
+  setup_gum_stub
+  run --separate-stderr env PATH="$BATS_TEST_TMPDIR/bin:/usr/bin:/bin" GUM_STUB_EXIT=0 bash -c '
+    source lib/core.sh; source lib/plan.sh
+    _plan_require_tty() { return 0; }
+    _plan_confirm_strong "ok?"
+  '
+  [ "$status" -eq 0 ]
+  [ "$stderr" = "ARG:confirm
+ARG:--affirmative=Yes, I understand
+ARG:--negative=Cancel
+ARG:ok?" ]
+}
+
+@test "_plan_confirm_strong propagates a gum decline instead of treating it as acceptance" {
+  setup_gum_stub
+  run --separate-stderr env PATH="$BATS_TEST_TMPDIR/bin:/usr/bin:/bin" GUM_STUB_EXIT=1 bash -c '
+    source lib/core.sh; source lib/plan.sh
+    _plan_require_tty() { return 0; }
+    _plan_confirm_strong "ok?"
+  '
+  [ "$status" -eq 1 ]
+}
+
+@test "_plan_confirm invokes plain gum confirm with just the prompt, and does not swallow gum's own exit status (issue #113, mutation C2)" {
+  setup_gum_stub
+  run --separate-stderr env PATH="$BATS_TEST_TMPDIR/bin:/usr/bin:/bin" GUM_STUB_EXIT=0 bash -c '
+    source lib/core.sh; source lib/plan.sh
+    _plan_require_tty() { return 0; }
+    _plan_confirm "ok?"
+  '
+  [ "$status" -eq 0 ]
+  [ "$stderr" = "ARG:confirm
+ARG:ok?" ]
+
+  run --separate-stderr env PATH="$BATS_TEST_TMPDIR/bin:/usr/bin:/bin" GUM_STUB_EXIT=1 bash -c '
+    source lib/core.sh; source lib/plan.sh
+    _plan_require_tty() { return 0; }
+    _plan_confirm "ok?"
+  '
+  [ "$status" -eq 1 ]
+}
+
+@test "_plan_prompt_items invokes gum choose with --no-limit --selected='*' (fully pre-selected), not a bare choose" {
+  setup_gum_stub
+  run --separate-stderr env PATH="$BATS_TEST_TMPDIR/bin:/usr/bin:/bin" bash -c '
+    source lib/core.sh; source lib/plan.sh
+    _plan_require_tty() { return 0; }
+    items=$(printf "a: one\na: two")
+    _plan_prompt_items "$items"
+  '
+  [ "$status" -eq 0 ]
+  [ "$output" = "a: one
+a: two" ]
+  [ "$stderr" = "ARG:choose
+ARG:--no-limit
+ARG:--selected=*" ]
+}
+
+@test "_plan_prompt_items falls back to fzf -m --bind ctrl-a:select-all when gum is unavailable (issue #113)" {
+  setup_fzf_stub
+  run --separate-stderr env PATH="$BATS_TEST_TMPDIR/bin:/usr/bin:/bin" bash -c '
+    source lib/core.sh; source lib/plan.sh
+    _plan_require_tty() { return 0; }
+    items=$(printf "a: one\na: two")
+    _plan_prompt_items "$items"
+  '
+  [ "$status" -eq 0 ]
+  [ "$output" = "a: one
+a: two" ]
+  [ "$stderr" = "ARG:-m
+ARG:--bind
+ARG:ctrl-a:select-all" ]
+}

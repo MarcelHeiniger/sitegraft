@@ -485,8 +485,8 @@ EOF
   [[ "$output" == *"page#102"* ]] || false
 }
 
-# --- issue #73: weighed for this caller too (review — "pèse-le pour ---
-# l'autre appelant"). The same underlying gap BLOCKER-1a/1b/1c/BLOCKER-2
+# --- issue #73: weighed for this caller too (review — "weigh it for ---
+# the other caller too"). The same underlying gap BLOCKER-1a/1b/1c/BLOCKER-2
 # exist to close for THIS function's own purpose (a real, present item
 # must never be silently unaccounted for) applies just as much to a
 # malformed item as to a garbled one: a WXR item missing wp:post_id
