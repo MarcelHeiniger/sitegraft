@@ -1,3 +1,4 @@
+bats_require_minimum_version 1.5.0
 # tests/unit/test_core.bats
 setup() {
   load '../../lib/core.sh'
@@ -105,4 +106,45 @@ setup() {
   } > "$probe"
   TMPDIR="$fake_tmpdir" run bash "$probe"
   [ "$status" -eq 0 ]
+}
+
+@test "sitegraft_mktemp_dir fails loudly, naming the cause, instead of returning an empty path when mktemp -d fails (issue #109)" {
+  # A non-existent TMPDIR makes the underlying `mktemp -d` fail with a real,
+  # measured error ("No such file or directory") — not a synthetic stub.
+  local missing_tmpdir="$BATS_TEST_TMPDIR/does-not-exist"
+  local probe="$BATS_TEST_TMPDIR/probe.sh"
+  {
+    echo ". \"${BATS_TEST_DIRNAME}/../../lib/core.sh\""
+    echo 'sitegraft_mktemp_dir'
+  } > "$probe"
+  TMPDIR="$missing_tmpdir" run --separate-stderr bash "$probe"
+  [ "$status" -ne 0 ]
+  [ -z "$output" ]
+  [[ "$stderr" == *"temp"* ]] || false
+}
+
+@test "sitegraft_cleanup skips an empty registered entry without touching anything else (issue #109 — measured, not assumed)" {
+  # #109 asked, specifically, what the cleanup trap does with an empty
+  # entry — the shape a caller used to be able to register before
+  # sitegraft_mktemp_dir was hardened to fail loudly instead of handing
+  # back "". Measured directly rather than reasoned about: a real
+  # registered dir with a sentinel file sits alongside a genuinely empty
+  # entry, and cleanup must remove the real one and leave everything else
+  # (including the process's own cwd, which an unguarded `rm -rf ""`
+  # could reach) alone.
+  local probe="$BATS_TEST_TMPDIR/probe.sh"
+  {
+    echo ". \"${BATS_TEST_DIRNAME}/../../lib/core.sh\""
+    echo 'sitegraft_register_tmp_dir ""'
+    echo 'realdir=$(mktemp -d)'
+    echo 'touch "${realdir}/sentinel"'
+    echo 'sitegraft_register_tmp_dir "$realdir"'
+    echo '[ -d "$realdir" ] || exit 1'
+    echo 'sitegraft_cleanup'
+    echo '[ -d "$PWD" ] || { echo "cwd was destroyed"; exit 1; }'
+    echo '[ ! -d "$realdir" ] || { echo "real registered dir was NOT cleaned up"; exit 1; }'
+  } > "$probe"
+  run bash "$probe"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
 }

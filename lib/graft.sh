@@ -551,7 +551,15 @@ graft_integrity_gate() {
   # NDJSON on stdout, silently corrupting $ndjson below. Belt: reduce the
   # noise at its source.
   local ndjson rc stderr_file tmp_dir
-  tmp_dir=$(sitegraft_mktemp_dir)
+  # issue #109: checked explicitly, not just hardened at the source.
+  # graft_integrity_gate is itself called as `graft_integrity_gate ... ||
+  # return 1` by its own caller, which disables errexit for this
+  # function's entire call tree (verified live) — sitegraft_mktemp_dir's
+  # own `return 1` on a failed mktemp would otherwise be silently
+  # absorbed here, leaving tmp_dir empty and stderr_file a bare
+  # "/stderr" (unwritable, so the php call below would fail for an
+  # unrelated reason with no diagnostic naming the real cause).
+  tmp_dir=$(sitegraft_mktemp_dir) || return 1
   stderr_file="${tmp_dir}/stderr"
   ndjson=$(php -d display_errors=stderr "${SITEGRAFT_ROOT}/lib/php/wxr-item-ids-cli.php" "$file" 2>"$stderr_file") && rc=0 || rc=$?
   local err_text=""
@@ -1413,7 +1421,18 @@ graft_verify_import_completeness() {
   # SITEGRAFT_TMP_REGISTRY, which bin/sitegraft's own sitegraft_cleanup
   # EXIT trap sweeps on every exit, interrupted or not — this is that
   # mechanism's first production caller in this file.
-  local tmp_dir; tmp_dir=$(sitegraft_mktemp_dir)
+  #
+  # issue #109: checked explicitly, same reasoning as
+  # graft_integrity_gate's identical call above — this function is also
+  # called as `graft_verify_import_completeness ... || return 1/2` by its
+  # own callers (phase_graft, `sitegraft verify`), which disables errexit
+  # for its whole call tree, so sitegraft_mktemp_dir's own loud failure
+  # would otherwise be silently absorbed here too. 1, not 2: an
+  # environment problem (TMPDIR full/RO) unrelated to what the staged WXR
+  # itself contains, so it must not trip the "do not retry the
+  # prune-and-reimport path" signal reserved for return 2 elsewhere in
+  # this function.
+  local tmp_dir; tmp_dir=$(sitegraft_mktemp_dir) || return 1
 
   # lib/php/wxr-item-ids-cli.php: one `php` invocation, NDJSON on stdout,
   # hard failure (never a silent empty result) the moment ANY listed file

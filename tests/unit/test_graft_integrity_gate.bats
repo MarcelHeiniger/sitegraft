@@ -1,3 +1,4 @@
+bats_require_minimum_version 1.5.0
 # tests/unit/test_graft_integrity_gate.bats — graft_integrity_gate (design
 # doc §6.4 step 4): non-empty, has <wp:wxr_version>, >=1 <item>, and every
 # <wp:post_type> found is in the manifest's allowlist. This is a SECURITY
@@ -50,6 +51,36 @@ EOF
   _wxr_wrap '<item><wp:post_id>1</wp:post_id><wp:post_type>page</wp:post_type></item>' > "$f"
   run graft_integrity_gate "$f" '["page","post"]'
   [ "$status" -eq 0 ]
+}
+
+@test "graft_integrity_gate fails cleanly, without leaking a bare '/stderr' path, when sitegraft_mktemp_dir cannot create a temp dir (issue #109)" {
+  # graft_integrity_gate is invoked by its own caller as
+  # `graft_integrity_gate ... || return 1` (lib/graft.sh's phase_graft),
+  # which disables errexit for its entire call tree -- so this only
+  # actually proves the fix if the tmp_dir assignment inside
+  # graft_integrity_gate itself checks sitegraft_mktemp_dir's exit status
+  # explicitly, not merely relies on sitegraft_mktemp_dir being hardened
+  # at the source. Reproduced here the same way: called as the left side
+  # of `||`, same as production.
+  #
+  # A non-existent TMPDIR makes mktemp -d fail for real (measured), which
+  # is what used to make stderr_file collapse to the bare path "/stderr"
+  # -- a redirect target that fails to open on a real filesystem, leaking
+  # a raw path into the output and misreporting an unrelated cause.
+  local f="$BATS_TEST_TMPDIR/good.xml"
+  _wxr_wrap '<item><wp:post_id>1</wp:post_id><wp:post_type>page</wp:post_type></item>' > "$f"
+  local missing_tmpdir="$BATS_TEST_TMPDIR/does-not-exist"
+  local probe="$BATS_TEST_TMPDIR/probe.sh"
+  {
+    echo "SITEGRAFT_ROOT='${SITEGRAFT_ROOT}'"
+    echo ". '${BATS_TEST_DIRNAME}/../../lib/core.sh'"
+    echo ". '${BATS_TEST_DIRNAME}/../../lib/graft.sh'"
+    echo "graft_integrity_gate '${f}' '[\"page\"]' || exit 1"
+  } > "$probe"
+  TMPDIR="$missing_tmpdir" run --separate-stderr bash "$probe"
+  [ "$status" -ne 0 ]
+  [[ "$stderr" != *"/stderr"* ]] || false
+  [[ "$output" != *"/stderr"* ]] || false
 }
 
 @test "graft_integrity_gate fails on an empty file" {

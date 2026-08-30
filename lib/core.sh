@@ -126,9 +126,37 @@ sitegraft_cleanup() {
   return $rc
 }
 
+# issue #109: `mktemp -d` used to go unchecked here. A full/read-only/
+# missing TMPDIR makes it fail with $dir left empty, and — before this
+# guard — the function carried straight on: `chmod 700 ""` (itself a
+# no-op failure, silently discarded by nothing catching it), a genuinely
+# empty string registered with sitegraft_register_tmp_dir (see that
+# function's own header for why an empty entry there is harmless — the
+# cleanup loop's `[ -n "$dir" ] || continue` skips it, verified live, no
+# rm -rf on anything unintended), and `echo ""` handing the empty path
+# back to the caller with $? = 0. Every caller treats this function's
+# result as a real directory it can build a path under
+# (`"$(sitegraft_mktemp_dir)/whatever"`), so a silent empty string became
+# a bare `/whatever` — measured on lib/backup.sh's own stderr-capture
+# caller (PR #105) as a redirect to `/stderr`, which fails on a read-only
+# filesystem and reports a perfectly good table export as unreadable,
+# with a raw filesystem path leaked into the message on top. Fixed at the
+# source rather than patched at each call site: this function is a
+# contract ("hand back a real, usable temp dir, or fail"), and a contract
+# that can silently return garbage isn't one. Two callers still needed
+# their own explicit check on top of this (lib/graft.sh's
+# graft_integrity_gate and graft_verify_import_completeness) because both
+# are invoked as the left side of `||` by their own callers — under
+# bin/sitegraft's `set -euo pipefail`, that disables errexit for their
+# entire call tree (verified live), so even a loud `return 1` here would
+# otherwise be silently absorbed and execution would fall through to the
+# same broken bare-path construction this fix exists to prevent.
 sitegraft_mktemp_dir() {
   local dir
-  dir=$(mktemp -d "${TMPDIR:-/tmp}/sitegraft.XXXXXX")
+  if ! dir=$(mktemp -d "${TMPDIR:-/tmp}/sitegraft.XXXXXX"); then
+    log_error "could not create a temp directory under ${TMPDIR:-/tmp} (mktemp -d failed — check it exists, is writable, and has free space)"
+    return 1
+  fi
   chmod 700 "$dir"
   sitegraft_register_tmp_dir "$dir"
   echo "$dir"
