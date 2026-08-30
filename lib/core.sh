@@ -145,12 +145,20 @@ sitegraft_cleanup() {
 # contract ("hand back a real, usable temp dir, or fail"), and a contract
 # that can silently return garbage isn't one. Two callers still needed
 # their own explicit check on top of this (lib/graft.sh's
-# graft_integrity_gate and graft_verify_import_completeness) because both
-# are invoked as the left side of `||` by their own callers — under
-# bin/sitegraft's `set -euo pipefail`, that disables errexit for their
-# entire call tree (verified live), so even a loud `return 1` here would
-# otherwise be silently absorbed and execution would fall through to the
-# same broken bare-path construction this fix exists to prevent.
+# graft_integrity_gate and graft_verify_import_completeness) because each
+# is invoked by its own real production caller as the TESTED condition
+# of a compound command — graft_integrity_gate as the left side of `||`,
+# graft_verify_import_completeness as an `if`'s condition — and under
+# bin/sitegraft's `set -euo pipefail`, both forms disable errexit for
+# their entire call tree the same way (verified live), so even a loud
+# failure here would otherwise be silently absorbed and execution would
+# fall through to the same broken bare-path construction this fix exists
+# to prevent. graft_verify_import_completeness propagates its own
+# distinct return code (3, not 1) when this fails — see that function's
+# own header for why: its caller, phase_graft, treats different return
+# codes differently, and folding a TMPDIR failure into either existing
+# code would either arm a destructive retry or print a misleading
+# message naming the wrong cause.
 sitegraft_mktemp_dir() {
   local dir
   if ! dir=$(mktemp -d "${TMPDIR:-/tmp}/sitegraft.XXXXXX"); then

@@ -62,17 +62,31 @@ _write_wxr() {
 
 # --- happy path --------------------------------------------------------------
 
-@test "graft_verify_import_completeness fails cleanly, without leaking a bare '/stderr' path, when sitegraft_mktemp_dir cannot create a temp dir (issue #109)" {
-  # Same mechanism and same reason as lib/graft.sh's other
-  # sitegraft_mktemp_dir caller (graft_integrity_gate, see tests/unit/
-  # test_graft_integrity_gate.bats' identical test): this function is
-  # called by phase_graft / `sitegraft verify` as
-  # `graft_verify_import_completeness ... || return 1/2`, which disables
-  # errexit for its whole call tree, so this only proves the fix if the
-  # tmp_dir assignment here checks sitegraft_mktemp_dir's own exit status
-  # explicitly. Content of the staged .xml is irrelevant -- execution
-  # reaches sitegraft_mktemp_dir before the file is ever parsed, as long
-  # as at least one *.xml exists under run_dir/export.
+@test "graft_verify_import_completeness returns 3 (not 1, not 2), without leaking a bare '/stderr' path, when sitegraft_mktemp_dir cannot create a temp dir (issue #109)" {
+  # Same mechanism as lib/graft.sh's other sitegraft_mktemp_dir caller
+  # (graft_integrity_gate, see tests/unit/test_graft_integrity_gate.bats'
+  # sibling test): this function's own only production caller,
+  # phase_graft (lib/graft.sh:3095), calls it as
+  # `if graft_verify_import_completeness ...; then :; else ...; fi` --
+  # not `|| return` (an earlier draft of this comment claimed that, and a
+  # `sitegraft verify` caller that does not exist; corrected). Bash
+  # disables errexit for a command's entire call tree while it is the
+  # TESTED condition of `if`, same as the left side of `||`/`&&`, so this
+  # only proves the fix if the tmp_dir assignment here checks
+  # sitegraft_mktemp_dir's own exit status explicitly.
+  #
+  # rc=3, specifically (reviewer-mandated correction): NOT 1 (phase_graft
+  # treats rc=1 as "safe to retry", clears four resumability markers, and
+  # reruns graft_prune_previous_run for real -- destructive here, since
+  # this failure happens before the staged WXR is ever even read) and
+  # NOT 2 (phase_graft's own rc=2 message names run_dir/export
+  # specifically, which this failure never reached -- misleading). See
+  # this function's own header comment, and phase_graft's rc=3 branch,
+  # for the full reasoning.
+  #
+  # Content of the staged .xml is irrelevant -- execution reaches
+  # sitegraft_mktemp_dir before the file is ever parsed, as long as at
+  # least one *.xml exists under run_dir/export.
   local run_dir="$BATS_TEST_TMPDIR/run"
   mkdir -p "${run_dir}/export"
   echo 'placeholder' > "${run_dir}/export/export.xml"
@@ -82,10 +96,10 @@ _write_wxr() {
     echo "SITEGRAFT_ROOT='${SITEGRAFT_ROOT}'"
     echo ". '${BATS_TEST_DIRNAME}/../../lib/core.sh'"
     echo ". '${BATS_TEST_DIRNAME}/../../lib/graft.sh'"
-    echo "graft_verify_import_completeness '${run_dir}' 'page' || exit 1"
+    echo "graft_verify_import_completeness '${run_dir}' 'page'"
   } > "$probe"
   TMPDIR="$missing_tmpdir" run --separate-stderr bash "$probe"
-  [ "$status" -ne 0 ]
+  [ "$status" -eq 3 ]
   [[ "$stderr" != *"/stderr"* ]] || false
   [[ "$output" != *"/stderr"* ]] || false
 }

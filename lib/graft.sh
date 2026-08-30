@@ -1423,16 +1423,39 @@ graft_verify_import_completeness() {
   # mechanism's first production caller in this file.
   #
   # issue #109: checked explicitly, same reasoning as
-  # graft_integrity_gate's identical call above — this function is also
-  # called as `graft_verify_import_completeness ... || return 1/2` by its
-  # own callers (phase_graft, `sitegraft verify`), which disables errexit
-  # for its whole call tree, so sitegraft_mktemp_dir's own loud failure
-  # would otherwise be silently absorbed here too. 1, not 2: an
-  # environment problem (TMPDIR full/RO) unrelated to what the staged WXR
-  # itself contains, so it must not trip the "do not retry the
-  # prune-and-reimport path" signal reserved for return 2 elsewhere in
-  # this function.
-  local tmp_dir; tmp_dir=$(sitegraft_mktemp_dir) || return 1
+  # graft_integrity_gate's identical call above — its own only production
+  # caller, phase_graft (lib/graft.sh:3095), calls this function as
+  # `if graft_verify_import_completeness ...; then :; else ...; fi`, NOT
+  # `|| return`. Corrected here (an earlier draft of this comment claimed
+  # `... || return 1/2`, and invented a `sitegraft verify` caller that
+  # does not exist — grepped, not a second one calls this function
+  # anywhere in bin/ or lib/): bash disables errexit for a command's
+  # entire call tree while it is the TESTED condition of `if`, the same
+  # as it does for the left side of `||`/`&&` (verified live, both
+  # forms) — so sitegraft_mktemp_dir's own loud failure would still be
+  # silently absorbed here without this explicit check, regardless of
+  # which of the two syntaxes the real caller happens to use.
+  #
+  # 3, not 1 or 2 (reviewer-mandated correction, second fix-pack): a
+  # failed sitegraft_mktemp_dir is an ENVIRONMENT problem (TMPDIR full,
+  # read-only, or missing) that has nothing to do with what the staged
+  # WXR export contains, and it must not be folded into either existing
+  # code. Not 1: phase_graft's own rc=1 branch clears
+  # import_attachments.done/import.done/fetch_id_map.done and reruns
+  # graft_prune_previous_run on retry — correct ONLY for issue #53's real
+  # case (wordpress-importer genuinely skipped a present, readable item),
+  # and actively destructive here: this failure happens before the staged
+  # WXR is ever even read, so B's already-migrated content would be
+  # deleted for a cause a retry cannot fix (measured: an unfixed rc=1
+  # here reproduces exactly that against phase_graft's real branching).
+  # Not 2 either, even though rc=2's own handling also touches no marker:
+  # rc=2's message names ${run_dir}/export specifically ("missing its
+  # staged WXR export, or has one that fails to parse") — misleading for
+  # a TMPDIR failure, which never reached the export file at all. See
+  # phase_graft's own rc=3 branch (lib/graft.sh, next to its rc=2
+  # sibling) for the distinct, accurate message and identical
+  # no-marker-touched handling.
+  local tmp_dir; tmp_dir=$(sitegraft_mktemp_dir) || return 3
 
   # lib/php/wxr-item-ids-cli.php: one `php` invocation, NDJSON on stdout,
   # hard failure (never a silent empty result) the moment ANY listed file
@@ -3138,6 +3161,26 @@ phase_graft() {
       # cheap recovery path (remove it, re-run) stated before the
       # expensive ones.
       log_error "run directory ${run_dir} is missing its staged WXR export, or has one that fails to parse, even though its own markers say every earlier step already completed. Before assuming real data loss: check ${run_dir}/export for anything that was NOT produced by this run's own export step (a hand-added file, a leftover test artifact, or anything left behind by an earlier experiment against this same run_dir) — every .xml found there is treated as part of this run's own export, and a single foreign or malformed one is enough to trigger this exact message. This cannot self-heal via a simple retry of 'sitegraft graft' — a retry would delete the content this run already migrated onto B while never regenerating (or removing) whatever is actually wrong in export/, per issue #53/#54's own fix-pack (see graft_verify_import_completeness's header). No resumability marker was changed by this failure. Once export/ genuinely holds only this run's own file(s) again, re-running 'sitegraft verify' (or graft) will re-check correctly with no further action needed; if it still fails, start a fresh run (scan -> plan -> backup -> graft) against a clean run directory, or restore B from the pre-graft backup if you suspect real data loss."
+      return 1
+    elif [ "$verify_rc" -eq 3 ]; then
+      # issue #109 fix-pack (reviewer-mandated correction): rc=3 is a
+      # DIFFERENT failure than rc=2's own "staged export is missing or
+      # unparseable" — it means graft_verify_import_completeness could
+      # not even attempt the check, because sitegraft_mktemp_dir failed
+      # (TMPDIR full, read-only, or missing — see the error printed
+      # above this one for the actual cause). Kept as its own code
+      # rather than folded into rc=2: rc=2's own message below points an
+      # operator at ${run_dir}/export — actively misleading for an
+      # environment problem that has nothing to do with the staged WXR
+      # export, which was never even reached. Same safe handling as
+      # rc=2 regardless: this is an environment failure, not evidence
+      # that anything is wrong with what this run already did to B, so
+      # no resumability marker is touched — the rc=1 branch below
+      # (real "wordpress-importer skipped a present item") is the only
+      # one that may safely trigger prune-and-reimport, exactly because
+      # it is the only one where the staged WXR itself was confirmed
+      # readable.
+      log_error "could not verify this run's WXR import completeness against B: a temporary directory could not be created (see the error above for the cause — typically TMPDIR full, read-only, or missing). This is an ENVIRONMENT problem, not a sign that anything is wrong with what this run already did to B or with its staged WXR export. No resumability marker was touched. Fix the environment issue and re-run 'sitegraft graft' (or 'sitegraft verify') against this same run directory — it will re-check from where it left off."
       return 1
     fi
 

@@ -305,7 +305,7 @@ inventory_scan_site() {
   # (raw input, slurp) happily accepts completely EMPTY stdin and turns
   # it into a valid, empty `[]` — so a failing `wp db tables` (permissions,
   # connectivity, a broken wp-cli wrapper) was swallowed into "B has zero
-  # tables" instead of aborting the scan, the exact "vide ≠ échoué"
+  # tables" instead of aborting the scan, the exact "empty vs. unread"
   # conflation #97 closed one layer up, in the data everything else reads.
   # `set -o pipefail` alone does not save this the way it saved #99's
   # `bash -c` pipelines: this pipe runs in-process, under bin/sitegraft's
