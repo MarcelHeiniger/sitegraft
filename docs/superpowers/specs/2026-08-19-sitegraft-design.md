@@ -478,7 +478,7 @@ Produced by `plan`, frozen, consumed as-is by `graft`. JSON, parsed via `jq`.
 
 ```jsonc
 {
-  "sitegraft_manifest_version": 1,
+  "sitegraft_manifest_version": 2,
   "profile": "example",
   "created_at": "2026-08-19T10:00:00Z",
   "frozen": true,
@@ -533,7 +533,8 @@ Produced by `plan`, frozen, consumed as-is by `graft`. JSON, parsed via `jq`.
     }
   },
   "checksums_protected_pre_graft": {
-    "example-plugin": "sha256:…"
+    "example-plugin": "sha256:…",
+    "_unclaimed:wp_actionscheduler_actions": "unreadable"
   },
   "content_checksums_pre_graft": {
     "16": "sha256:…"
@@ -602,6 +603,21 @@ Validation rules (`lib/manifest.sh :: manifest_validate`):
 - `checksums_protected_pre_graft` and `content_checksums_pre_graft` are both
   computed and written by the `backup` phase (not by `plan`), and consumed
   by `verify`.
+- `checksums_protected_pre_graft`'s per-entry value is either `"sha256:<hex>"`
+  (the table was read, whether or not its content was empty) or the literal
+  string `"unreadable"` (issue #97, `sitegraft_manifest_version` 2: the table
+  could not be exported at all — a locked table, a permissions error, or a
+  declared table this install does not actually have — and MUST NOT be
+  checksummed as though its content were empty, which is indistinguishable
+  from a table that really is empty). A DECLARED module's table hits this
+  sentinel only in transit — `backup_compute_protected_checksums`
+  (`lib/backup.sh`) hard-fails the whole computation instead of ever writing
+  it for that case, so it never reaches the manifest. Only an
+  `_unclaimed:<table>` key (default-deny tables no module claims) is ever
+  actually PERSISTED as `"unreadable"` — `verify_compare_checksums`
+  (`lib/verify.sh`) treats that value, on either side of the pre/post-graft
+  comparison, as its own third outcome (NOT VERIFIED), never as a match and
+  never as a change.
 
 ## 5. Profile + credentials format
 

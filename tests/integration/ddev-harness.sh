@@ -516,7 +516,7 @@ echo "==> confirmed: plan refuses to write a manifest when B's custom-code signa
 echo "==> running plan (non-interactive: positive case, real acknowledgment carried from scan-b.json)"
 GOOD_PREFILLED="${RUN_DIR}/manifest-prefilled-good.json"
 jq -n --argjson signals "$(jq -c '.custom_code_signals' "${RUN_DIR}/scan-b.json")" '{
-  sitegraft_manifest_version: 1,
+  sitegraft_manifest_version: 2,
   frozen: false,
   migrate: {},
   protect: {},
@@ -939,7 +939,7 @@ echo "==> writing a real migrate/protect manifest for the graft run (the earlier
 DOMAIN_A="https://${PROJECT_A}.ddev.site"
 DOMAIN_B="https://${PROJECT_B}.ddev.site"
 jq -n --arg da "$DOMAIN_A" --arg db "$DOMAIN_B" '{
-  sitegraft_manifest_version: 1,
+  sitegraft_manifest_version: 2,
   frozen: true,
   migrate: {
     # wp_navigation included here (beyond page/post) specifically so Step 5
@@ -1434,7 +1434,17 @@ if grep -q "HARD FAIL" "$VERIFY_REPORT"; then
   cat "$VERIFY_REPORT" >&2
   exit 1
 fi
-grep -q "protected data unchanged" "$VERIFY_REPORT"
+# issue #97 review fix-pack (PR #105): a bare `grep -q "protected data
+# unchanged"` also matches the new INCOMPLETE line
+# ("- [ ] protected data unchanged: **UNVERIFIED for ... protected
+# set(s)**...", lib/verify.sh) that PR introduced for a table unreadable on
+# at least one side of a run -- this exact gate would have stayed blind to
+# that regression on a graft that should cleanly PASS. Anchored on the
+# actual PASS tick ("- [x] protected data unchanged", never printed by the
+# INCOMPLETE branch) so this line alone, not just the later `Result: PASS`
+# check (which does also catch it, just less specifically), fails on the
+# state this PR invents.
+grep -q -- "- \[x\] protected data unchanged" "$VERIFY_REPORT"
 grep -q "migrated options match A's values on B" "$VERIFY_REPORT"
 grep -q "page_on_front resolves to the correctly remapped page" "$VERIFY_REPORT"
 grep -q "A's domain string is absent from the content graft imported" "$VERIFY_REPORT"

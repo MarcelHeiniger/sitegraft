@@ -268,6 +268,46 @@ EOF
   [ "$status" -eq 0 ]
 }
 
+# --- issue #97 review fix-pack (PR #105): phase_backup wires scan-b.json's
+# own `.tables` list through to backup_compute_protected_checksums' optional
+# third argument, so a declared table absent from that list gets the
+# actionable module/site-mismatch message rather than the generic one (see
+# that function's own header comment).
+@test "phase_backup names a module/site mismatch when scan-b.json is present and never saw the declared table" {
+  printf '{"tables":["wp_options","wp_posts","wp_users"]}' > "${RUN_DIR}/scan-b.json"
+  wp_remote() {
+    local alias_lc="$1"; shift
+    for a in "$@"; do
+      case "$a" in
+        --tables=wp_fakebooking_reservations) return 1 ;;
+      esac
+    done
+    echo "INSERT INTO wp_fakebooking_reservations VALUES (1);"
+  }
+  run phase_backup --profile t --run "$RUN_DIR"
+  [ "$status" -eq 1 ]
+  [ ! -f "${RUN_DIR}/backup.complete" ]
+  [[ "$output" == *"module/site mismatch"* ]] || false
+  [[ "$output" == *"fakebooking"* ]] || false
+}
+
+@test "phase_backup still fails, generically (no false mismatch claim), when scan-b.json does not exist for this run" {
+  [ ! -f "${RUN_DIR}/scan-b.json" ]
+  wp_remote() {
+    local alias_lc="$1"; shift
+    for a in "$@"; do
+      case "$a" in
+        --tables=wp_fakebooking_reservations) return 1 ;;
+      esac
+    done
+    echo "INSERT INTO wp_fakebooking_reservations VALUES (1);"
+  }
+  run phase_backup --profile t --run "$RUN_DIR"
+  [ "$status" -eq 1 ]
+  [[ "$output" != *"module/site mismatch"* ]] || false
+  [[ "$output" == *"could not compute protected-data checksums"* ]] || false
+}
+
 @test "phase_backup writes the backup dir/files and manifest.json as owner-only" {
   phase_backup --profile t --run "$RUN_DIR"
   local dir_mode db_mode manifest_mode complete_mode

@@ -77,7 +77,16 @@ verify_compare_checksums() {
     log_warn "table(s) could not be read on at least one side of this run and were excluded from the changed/unchanged comparison — not verified this run, neither confirmed unchanged nor flagged as changed: $(echo "$unread" | jq -r 'map(sub("^_unclaimed:"; "")) | join(", ")')"
   fi
 
-  if [ "$(echo "$soft" | jq 'length')" != "0" ]; then
+  # soft_count is read by phase_verify, below, alongside unread_count — an
+  # unread table and a genuinely CHANGED unclaimed table are two different
+  # findings, and both can be true in the same run (review, PR #105, mineur
+  # 4: measured — a table that could not be read on one side, plus a wholly
+  # separate unclaimed table whose checksum really did move). Without this,
+  # phase_verify's INCOMPLETE line could only ever say "the rest matched",
+  # which is exactly wrong on a run where part of "the rest" is the soft
+  # warning printed just above.
+  local soft_count; soft_count=$(echo "$soft" | jq 'length')
+  if [ "$soft_count" != "0" ]; then
     log_warn "unclaimed table(s) on B changed during this run: $(echo "$soft" | jq -r 'join(", ")') — no module declares them, so this is reported rather than failed. Expected for tables WordPress writes on its own (the action scheduler, sessions, usermeta after a login). If any of these hold data that must be guaranteed untouched, write a module declaring them."
   fi
 
@@ -89,12 +98,14 @@ verify_compare_checksums() {
 
   # Consumed by phase_verify, below, to move the report's "protected data
   # unchanged" line into its own INCOMPLETE bucket instead of the plain PASS
-  # tick when this is non-zero — the same parseable-suffix convention
-  # verify_options_match already uses (OPTIONS_COMPARED:) for the identical
-  # reason: a caller downstream of a `run`/`$(...)` capture needs a count
-  # this function alone can produce, without a second, independently-
-  # drifting recount in phase_verify.
-  echo "UNREADABLE_COUNT:${unread_count}"
+  # tick when unread_count is non-zero, and to word that line accurately
+  # when soft_count is ALSO non-zero — the same parseable-suffix convention
+  # verify_options_match already uses (OPTIONS_COMPARED:), extended to a
+  # second field the same way CONTENT_MATCH's own marker already carries
+  # three (this file, verify_migrated_content_matches_source) — a caller
+  # downstream of a `run`/`$(...)` capture needs these counts, without a
+  # second, independently-drifting recount in phase_verify.
+  echo "UNREADABLE_COUNT:${unread_count}:${soft_count}"
 }
 
 # verify_options_match <run_dir> <manifest_json> — design doc §6.5, review
@@ -2085,8 +2096,17 @@ phase_verify() {
   # and had not been applied: a recompute failure is now reported as a
   # failure, never substituted with a value that happens to look like a
   # clean result.
+  # issue #97 review fix-pack (PR #105): scan-b.json's own `.tables` list,
+  # read the identical way phase_backup does (lib/backup.sh) and for the
+  # identical reason — see backup_compute_protected_checksums' own header
+  # comment. Left "" (generic message only) on any read/parse failure; a
+  # missing scan-b.json is not itself a verify failure.
+  local scan_b_tables=""
+  if [ -f "${run_dir}/scan-b.json" ]; then
+    scan_b_tables=$(jq -c '.tables // empty' "${run_dir}/scan-b.json" 2>/dev/null) || scan_b_tables=""
+  fi
   local recomputed recompute_rc=0
-  recomputed=$(backup_compute_protected_checksums b "$manifest" 2>>"$report") || recompute_rc=$?
+  recomputed=$(backup_compute_protected_checksums b "$manifest" "$scan_b_tables" 2>>"$report") || recompute_rc=$?
   if [ "$recompute_rc" -ne 0 ]; then
     echo "- [ ] **HARD FAIL: could not recompute protected data checksums** — the recompute itself failed (wp-cli unreachable, or a read \`backup_compute_protected_checksums\` needs failed); see above. A broken read here casts doubt on every table this run was supposed to be protecting, so it is reported as a failure, never silently treated as \"nothing changed\"." >> "$report"
     hard_fail=1
@@ -2135,20 +2155,44 @@ phase_verify() {
       else
         local checksum_diff
         if checksum_diff=$(verify_compare_checksums "$manifest" "$recomputed" 2>>"$report"); then
-          # issue #97: verify_compare_checksums' own UNREADABLE_COUNT: line
-          # (see its header comment) — an `_unclaimed` table that could not
-          # be read on at least one side of this run. A declared module's
-          # own read failure never reaches here at all (it already hard-
-          # fails the recompute above, #33's path) — so this can only ever
-          # be an out-of-scope table, and is reported through the SAME
-          # three-valued INCOMPLETE bucket every other "could not verify"
-          # finding in this phase already uses, never folded into the plain
-          # "[x] ... compared" tick, which is exactly the false-green shape
-          # this issue exists to close.
-          local unread_count="${checksum_diff##*UNREADABLE_COUNT:}"
-          case "$unread_count" in ''|*[!0-9]*) unread_count=0 ;; esac
+          # issue #97: verify_compare_checksums' own UNREADABLE_COUNT:<n>:<m>
+          # line (see its header comment) — n = tables unread on at least
+          # one side, m = OTHER unclaimed tables that genuinely changed. A
+          # declared module's own read failure never reaches here at all
+          # (it already hard-fails the recompute above, #33's path) — so an
+          # unread table here can only ever be out-of-scope, reported
+          # through the SAME three-valued INCOMPLETE bucket every other
+          # "could not verify" finding in this phase already uses, never
+          # folded into the plain "[x] ... compared" tick, which is exactly
+          # the false-green shape this issue exists to close.
+          #
+          # Review fix-pack (PR #105, NIT 7): defaults BEFORE parsing are
+          # set to the FAIL-SAFE extreme — "assume every declared set is
+          # unread" (n = pre_graft_count) and "assume something else also
+          # changed" (m = 1, i.e. non-zero) — not to 0/0. An unparseable or
+          # missing marker is exactly the kind of anomaly that should route
+          # toward INCOMPLETE and the more cautious wording below, never
+          # silently toward the plain PASS tick a stray `=0` fallback would
+          # produce. Symmetric with verify_options_match's own
+          # OPTIONS_COMPARED contract: unreachable today (this function
+          # always emits the marker as its last line on the success path),
+          # defended anyway, same direction as this file's #33 guard and
+          # CLAUDE.md's first rule (report unknown, never OK).
+          local unread_count="$pre_graft_count" soft_count=1
+          case "$checksum_diff" in
+            *UNREADABLE_COUNT:*)
+              local fields="${checksum_diff##*UNREADABLE_COUNT:}"
+              local parsed_unread="${fields%%:*}" parsed_soft="${fields#*:}"
+              case "$parsed_unread" in ''|*[!0-9]*) : ;; *) unread_count="$parsed_unread" ;; esac
+              case "$parsed_soft" in ''|*[!0-9]*) : ;; *) soft_count="$parsed_soft" ;; esac
+              ;;
+          esac
           if [ "$unread_count" -gt 0 ]; then
-            echo "- [ ] protected data unchanged: **UNVERIFIED for ${unread_count} of ${pre_graft_count} protected set(s)** — could not be read on at least one side of this run (see warning(s) above); the rest matched" >> "$report"
+            if [ "$soft_count" -gt 0 ]; then
+              echo "- [ ] protected data unchanged: **UNVERIFIED for ${unread_count} of ${pre_graft_count} protected set(s)** — could not be read on at least one side of this run (see warning(s) above); at least one OTHER unclaimed table also reported changed above — do not assume the rest matched" >> "$report"
+            else
+              echo "- [ ] protected data unchanged: **UNVERIFIED for ${unread_count} of ${pre_graft_count} protected set(s)** — could not be read on at least one side of this run (see warning(s) above); the rest matched" >> "$report"
+            fi
             incomplete=$((incomplete + 1))
             incomplete_names="${incomplete_names}protected-data-checksums(unreadable) "
           else

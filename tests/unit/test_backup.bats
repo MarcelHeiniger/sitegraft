@@ -600,6 +600,64 @@ INSERT INTO `wp_users` VALUES (1,"admin");
   [ "$status" -eq 0 ]
 }
 
+# --- issue #97 review fix-pack (PR #105): a DECLARED table's export failure
+# used to name only the CSV of every table the module declares, never which
+# one actually failed, and never distinguished "this table does not exist on
+# B at all" (a module/site mismatch) from "it exists but could not be read
+# right now". Measured live against a real MariaDB 11 (see
+# backup_compute_protected_checksums' own header comment): mysqldump exits 6
+# with "Couldn't find table: ..." identically for an ABSENT table and for one
+# that exists but this wp-cli user has no privilege on — the two are
+# genuinely indistinguishable from wp_remote's exit status or stderr text
+# alone. What CAN be told apart, from data already on disk, is whether the
+# table appears at all in scan-b.json's own `.tables` list — passed in here
+# as an OPTIONAL third argument.
+@test "backup_compute_protected_checksums names the mismatch when the declared table is absent from scan-b.json's own table list (issue #97 review)" {
+  local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  wp_remote() { echo "mysqldump: Couldn't find table: \"wp_fakebooking_reservations\"" >&2; return 1; }
+  # scan-b.json saw OTHER tables, but never this one
+  local scan_b_tables='["wp_options","wp_posts","wp_users"]'
+  run --separate-stderr backup_compute_protected_checksums b "$manifest" "$scan_b_tables"
+  [ "$status" -eq 1 ]
+  [[ "$stderr" == *"module/site mismatch"* ]] || false
+  [[ "$stderr" == *"wp_fakebooking_reservations"* ]] || false
+  [[ "$stderr" == *"fakebooking"* ]] || false
+}
+
+@test "backup_compute_protected_checksums does NOT claim a mismatch when scan-b.json's table list DOES contain the declared table (something else is wrong)" {
+  local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  wp_remote() { echo "mysqldump: Couldn't find table: \"wp_fakebooking_reservations\"" >&2; return 1; }
+  # scan-b.json DID see this exact table -- read failure is something else
+  # (permissions, a lock), not an absent table
+  local scan_b_tables='["wp_options","wp_posts","wp_fakebooking_reservations"]'
+  run --separate-stderr backup_compute_protected_checksums b "$manifest" "$scan_b_tables"
+  [ "$status" -eq 1 ]
+  [[ "$stderr" != *"module/site mismatch"* ]] || false
+  [[ "$stderr" == *"wp_fakebooking_reservations"* ]] || false
+}
+
+@test "backup_compute_protected_checksums never claims a mismatch when scan-b.json's table list was not supplied at all (unknown, not confirmed absent)" {
+  local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  wp_remote() { return 1; }
+  # no third argument at all -- same call shape every pre-existing 2-arg
+  # call site (including phase_backup's callers before this fix-pack) uses
+  run --separate-stderr backup_compute_protected_checksums b "$manifest"
+  [ "$status" -eq 1 ]
+  [[ "$stderr" != *"module/site mismatch"* ]] || false
+}
+
+@test "backup_compute_protected_checksums's declared-table error includes mysqldump's own stderr, naming the specific table (issue #97 review, mysqldump names it, log_error used to not)" {
+  local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  wp_remote() { echo "mysqldump: Got error: 1045: Access denied for user" >&2; return 1; }
+  run --separate-stderr backup_compute_protected_checksums b "$manifest"
+  [ "$status" -eq 1 ]
+  [[ "$stderr" == *"Access denied for user"* ]] || false
+}
+
 # --- issue #14: exact-state restore on a wrapped-local target ---------------
 # `restore` used to leave behind, on a wrapped-local B, every file a graft had
 # added to wp-content: the copied theme, the copied plugins, new uploads. The

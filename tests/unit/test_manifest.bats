@@ -15,7 +15,7 @@ setup() {
 @test "manifest_new produces a schema-complete skeleton (design doc §4)" {
   run manifest_new "https://a.example.com" "https://b.example.com"
   [ "$status" -eq 0 ]
-  echo "$output" | jq -e '.sitegraft_manifest_version == 1' >/dev/null
+  echo "$output" | jq -e '.sitegraft_manifest_version == 2' >/dev/null
   echo "$output" | jq -e '.migrate == {}' >/dev/null
   echo "$output" | jq -e '.protect == {}' >/dev/null
   echo "$output" | jq -e '.clean.enabled == false' >/dev/null
