@@ -653,13 +653,13 @@ INSERT INTO `wp_users` VALUES (1,"admin");
   local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
   inventory_table_prefix() { echo "wp_"; }
   wp_remote() { return 1; }
-  # scan-b.json's own .tables is [] -- reachable via the same default this
-  # PR fixes one layer up: lib/inventory.sh:302 builds .tables through a
-  # pipe with no pipefail/||, so a failed `wp db tables` is swallowed into
-  # an empty array rather than aborting scan. An empty scan result must
-  # read as "unknown whether B has this table", not "confirmed absent" --
-  # the exact same "empty vs unread" conflation this whole issue exists to
-  # close, one level up.
+  # scan-b.json's own .tables is []. inventory_scan_site no longer PRODUCES
+  # that from a failed `wp db tables` -- issue #107 closed the swallowing
+  # pipe there, and a failing enumeration now aborts the scan instead. This
+  # guard stands for the cases that outlive that fix: a scan file written
+  # before it, or hand-edited. An empty table list must read as "unknown
+  # whether B has this table", never as "confirmed absent" -- the same
+  # "empty vs unread" conflation this issue exists to close.
   local scan_b_tables='[]'
   run --separate-stderr backup_compute_protected_checksums b "$manifest" "$scan_b_tables"
   [ "$status" -eq 1 ]
