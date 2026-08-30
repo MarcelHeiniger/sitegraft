@@ -60,6 +60,29 @@ graft_ssh_host() {
   printf '%s' "${!host_var:-}"
 }
 
+# graft_ssh_path_exists <host> <path> — true (exit 0) iff <path> is a
+# directory on <host>, reachable over ssh. Same "any non-zero means
+# absent" posture graft_pull_dir's own local existence check already uses
+# (its own header/body just below) — a permission error and a genuinely
+# missing directory are not distinguished here either, on purpose: either
+# way there is nothing this run can safely pull.
+#
+# Added for issue #83's ssh-remote gap: graft_fonts_sync's ssh branch used
+# to rsync A's font directory unconditionally, with no equivalent to
+# graft_pull_dir's own "source directory does not exist yet" no-op. On any
+# ssh-remote A running WordPress 6.5+ that has never actually used the
+# Font Library — the ORDINARY case, not an edge case — wp_get_font_dir()
+# still returns a real, non-empty path (it computes/filters the path; it
+# does not create the directory, which is only ever created by WordPress
+# itself on the first real font upload). Measured: rsync against that
+# absent path exits 23, graft_fonts_sync's own `|| return $?` propagates
+# it, and phase_graft aborts the entire graft over a directory that was
+# never supposed to exist yet.
+graft_ssh_path_exists() {
+  local host="$1" path="$2"
+  ssh -- "$host" "test -d $(sq "$path")" >/dev/null 2>&1
+}
+
 # graft_pull_dir <alias> <src_dir_on_alias> <host_dest_dir> — pull a whole
 # directory FROM <alias> (A or B) TO the orchestrator. Mirrors
 # backup_wp_content's tar-through-the-wrapper technique for a wrapped-local
@@ -81,7 +104,16 @@ graft_pull_dir() {
     # did manage to read) is reported as a successful pull. This function's
     # own callers already check its return value; that check is only as
     # good as the status being checked, which was the wrong one before this.
-    run_or_echo bash -c "set -o pipefail; ${prefix} tar -c -z -f - -C '${src_dir}' . | tar -x -z -f - -C '${host_dest_dir}'"
+    #
+    # Review fix-pack (nit 1): `src_dir` is quoted via `sq()`, not a bare
+    # `'${src_dir}'`, because issue #83 made this the first caller
+    # (graft_font_dir, via graft_fonts_sync) whose src_dir did not come
+    # from the profile or a path this tool itself built -- it comes from
+    # evaluating PHP on the site (wp_get_font_dir(), filterable). A hand
+    # `'...'` wrap does not escape an embedded single quote; `sq()` does.
+    # `host_dest_dir` stays unquoted-by-sq: it is always this run's own
+    # orchestrator-side staging path, never site-controlled.
+    run_or_echo bash -c "set -o pipefail; ${prefix} tar -c -z -f - -C $(sq "$src_dir") . | tar -x -z -f - -C '${host_dest_dir}'"
   else
     if ! is_dry_run && [ ! -d "$src_dir" ]; then
       log_info "source directory does not exist on ${alias_lc} yet (nothing to pull): ${src_dir}"
@@ -162,7 +194,15 @@ graft_push_dir() {
     # `|| true` of the -k fallback, above) still gets the last word when it
     # applies — pipefail changes what status that `|| true` discards, never
     # whether it discards it.
-    run_or_echo bash -c "set -o pipefail; ${prefix} mkdir -p '${dest_dir}' && { tar -c -z -f - -C '${host_src_dir}' . | ${prefix} tar ${untar_opts} -C '${dest_dir}'; }${tolerate_exit}"
+    # Review fix-pack (nit 1): `dest_dir` (both uses) is quoted via `sq()`,
+    # not a bare `'${dest_dir}'` -- same reasoning as graft_pull_dir's own
+    # fix just above, mirrored for the write side: issue #83's font_dir_b
+    # is the first dest_dir this function ever receives that did not come
+    # from the profile/this tool's own path construction, and a hand
+    # `'...'` wrap does not escape an embedded single quote. `host_src_dir`
+    # stays unquoted-by-sq: it is always this run's own orchestrator-side
+    # staging path, never site-controlled.
+    run_or_echo bash -c "set -o pipefail; ${prefix} mkdir -p $(sq "$dest_dir") && { tar -c -z -f - -C '${host_src_dir}' . | ${prefix} tar ${untar_opts} -C $(sq "$dest_dir"); }${tolerate_exit}"
   else
     run_or_echo mkdir -p "$dest_dir"
     if [ "$mode" = "--keep-existing" ]; then
@@ -533,6 +573,30 @@ graft_font_dir() {
     log_error "graft: could not determine ${alias_lc}'s font directory (wp eval failed) — refusing to guess a path for wp-content/fonts"
     return 1
   fi
+  # Review fix-pack (nit 1): this is the first value graft_fonts_sync's
+  # callers (graft_pull_dir/graft_push_dir, both below) ever pass as a
+  # source/destination directory that did NOT come from the profile or
+  # from a path this tool itself constructed -- it comes from evaluating
+  # PHP on the SITE (wp_get_font_dir()['path'], filterable via `font_dir`).
+  # A non-empty result that is not a genuine absolute path is refused
+  # outright here, at the one place every caller of this function goes
+  # through, rather than trusted downstream -- graft_push_dir's own
+  # wrapped-local branch interpolates its dest_dir argument into a
+  # `bash -c` string, and while that interpolation is ALSO hardened
+  # separately (see its own comment), failing closed on a malformed path
+  # before it ever reaches a shell string is the first, cheapest line of
+  # defense. Empty is still the legitimate "no Font Library" case (handled
+  # by the caller, unchanged) -- this only rejects a NON-empty value that
+  # is not a real absolute path.
+  if [ -n "$result" ]; then
+    case "$result" in
+      /*) : ;;
+      *)
+        log_error "graft: ${alias_lc}'s wp_get_font_dir() returned a non-absolute path ('${result}') -- refusing to use it as a sync source/destination. This should never happen for a genuine WordPress Font Library path; if a plugin/theme filters font_dir to something unusual, fix that filter or set up the migration by hand for wp-content/fonts instead."
+        return 1
+        ;;
+    esac
+  fi
   printf '%s' "$result"
 }
 
@@ -577,7 +641,26 @@ graft_fonts_sync() {
   mkdir -p "$staging" || return $?
   log_info "pulling A's fonts to the orchestrator..."
   if [ -n "${SITE_A_SSH_HOST:-}" ]; then
-    run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${font_dir_a%/}/" "${staging}/" || return $?
+    # Review fix-pack (BLOCKER 1): this branch used to rsync unconditionally
+    # -- graft_pull_dir's own equivalent (the `else` branch just below) has
+    # ALWAYS treated a missing source directory as "nothing to pull, not an
+    # error" (its own header comment), but this ssh branch bypasses
+    # graft_pull_dir entirely (issue #77's own reasoning: graft_pull_dir
+    # never consults SITE_*_SSH_HOST, so it cannot be routed through
+    # unmodified for a remote A) and had no equivalent check of its own.
+    # wp_get_font_dir() COMPUTES and FILTERS a path; it does not CREATE the
+    # directory -- that only happens on WordPress's own first real font
+    # upload. So font_dir_a is routinely non-empty on any WP 6.5+ A that has
+    # simply never used the Font Library yet -- the ORDINARY case, not an
+    # edge case -- with nothing on disk at that path. Measured before this
+    # fix: rsync against that absent source exits 23, this function's own
+    # `|| return $?` propagates it, and phase_graft aborted the entire graft
+    # over a directory that was never supposed to exist yet.
+    if ! is_dry_run && ! graft_ssh_path_exists "$SITE_A_SSH_HOST" "$font_dir_a"; then
+      log_info "source directory does not exist on a yet (nothing to pull): ${font_dir_a}"
+    else
+      run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${font_dir_a%/}/" "${staging}/" || return $?
+    fi
   else
     graft_pull_dir a "$font_dir_a" "$staging" || return $?
   fi
@@ -2201,50 +2284,77 @@ _graft_migrate_one_option_key() {
       'def replace_domain: if type == "string" then split($from) | join($to) else . end; walk(replace_domain)' 2>/dev/null)
     [ -n "$rewritten" ] && value="$rewritten"
     # Issue #83's own detection half, not just its sync half: a value that
-    # STILL contains A's raw domain string after the rewrite pass just
-    # above is exactly the silent-loss shape the issue describes — the
-    # measured real-site case (docs/status.md) needed
-    # `etch_global_stylesheets` fixed BY HAND after a graft that reported
-    # success, because this rewrite did not reach it (the jq walk above
-    # only ever rewrites a value that parsed as JSON in the first place —
-    # `rewritten` comes back empty, and `value` keeps A's ORIGINAL,
-    # unrewritten bytes, for a value `option get --format=json` could not
-    # decode; a differently-cased or differently-schemed host, documented
-    # as verify_domain_absent's own known scope limit — lib/verify.sh —
-    # slips through it identically). Checked here with a plain substring
-    # test, not jq: `value` is the exact text this function is about to
-    # push to B with `wp option update`, so the question is simply "does
-    # the raw byte sequence still contain A's domain", the same question
-    # `sitegraft_domain_present()` (lib/php/content-remap-functions.php)
-    # answers for verify_domain_absent's own scope, just answered here,
-    # inside `graft` itself, before the value ever reaches B — no separate
-    # `sitegraft verify` invocation required to notice it.
+    # STILL references A's domain after the rewrite pass just above is
+    # exactly the silent-loss shape the issue describes — the measured
+    # real-site case (docs/status.md) needed `etch_global_stylesheets`
+    # fixed BY HAND after a graft that reported success, because the jq
+    # rewrite above did not reach it.
     #
-    # Both the plain form AND its JSON-escaped form (`https:\/\/...`) are
-    # checked, same two-form discipline sitegraft_domain_present already
-    # uses (its own header comment explains why a value can legitimately
-    # carry either byte sequence). The escaped variant is built with
-    # bash's own `${var//pattern/replacement}`, NOT the hand-rolled
-    # "plain + escaped" double-pass this file's own comment three lines
-    # above warns broke silently — that bug was about MATCHING a literal
-    # backslash already present in the pattern; this is the opposite
-    # direction (INSERTING one into a freshly-built string with no
-    # existing backslash in it to be misread as glob-escape syntax), which
-    # is not the same trap — verified directly: `${s//\//\\/}` on
-    # "https://a.example.com" produces the literal 21-byte string
-    # "https:\/\/a.example.com", matched correctly by the `case` below.
+    # Review fix-pack, two decisions made together (deliberately not
+    # reopened — see the PR discussion): this is a WARNING
+    # (`log_warn`), never a refusal. A first version of this check
+    # returned 1 and blocked the push. Measured consequence: no flag in
+    # this CLI can skip/override a single option key (`--force`,
+    # `--skip`, `SITEGRAFT_ALLOW*` — none exist), and this function runs
+    # AFTER the WXR import (phase_graft's own ordering), so a refusal
+    # here abandons a graft that has already half-landed on B, and every
+    # resume replays the identical refusal. The message pointed an
+    # operator at hand-editing A's production database, which is not a
+    # practicable remedy mid-migration. "Fail closed" (CLAUDE.md's first
+    # rule) is for a step that COULD NOT do its job; this step can push
+    # the value, and the condition it detects is not something a retry
+    # fixes. In exchange, the check below is WIDE, not narrow — a warning
+    # can afford false positives that a hard refusal could not.
     #
-    # Fails the whole step (never a warning-and-continue): pushing a value
-    # known to still name A would report success while B's live option
-    # keeps pointing at A, exactly the "run is green, the defect is
-    # silent" failure mode CLAUDE.md's first rule exists to stop.
-    local domain_from_escaped="${domain_from//\//\\/}"
-    case "$value" in
-      *"$domain_from"*|*"$domain_from_escaped"*)
-        log_error "graft: option '${key}' still references A's domain ('${domain_from}') after the domain rewrite — refusing to push it to B as migrated. This is issue #83's own failure class: a value that LOOKS migrated but keeps pointing at A (a font/asset URL the rewrite could not parse or match is the case that was measured live). Inspect '${key}' on A by hand for the exact reference this misses before re-running — a differently-cased host, a scheme this manifest's domain_from does not spell the same way, or a value shape 'wp option get --format=json' did not return as parseable JSON are the known causes."
-        return 1
-        ;;
+    # What it catches: any of A's domain string, in ANY of these forms,
+    # ANYWHERE in the value about to be pushed --
+    #   - plain and JSON-escaped ("https://a.example.com" / "https:\/\/a.example.com")
+    #   - case-different host ("HTTPS://A.EXAMPLE.COM")
+    #   - the other scheme (http:// when domain_from says https://, or vice versa)
+    #   - protocol-relative ("//a.example.com")
+    #   - the domain's host substring nested inside a JSON blob that is
+    #     itself stored as a STRING value (the pilot's own
+    #     `etch_global_stylesheets` shape) — matched however deep, because
+    #     this checks raw bytes, not decoded JSON structure
+    # by matching case-insensitively (`grep -iF`) against the SCHEME-
+    # STRIPPED domain ("a.example.com", not "https://a.example.com") —
+    # dropping the scheme is what makes http/https and protocol-relative
+    # forms match the same needle, and grep's `-i` is what makes case
+    # differences match. Both the plain and JSON-escaped-slash spelling of
+    # that needle are checked (mirrors sitegraft_domain_present's own
+    # two-form discipline, lib/php/content-remap-functions.php), since
+    # escaping only ever touches `/`, `"`, `\` and control characters —
+    # never the alphanumeric/hyphen/dot characters an ordinary hostname is
+    # made of. Because escaping never touches those characters either,
+    # URL-encoding and HTML-entity-encoding a plain hostname is a non-issue
+    # for this same reason: an ordinary domain contains no character that
+    # either encoding would ever alter, so both are already covered here
+    # at no extra cost -- deliberately not built as separate cases.
+    # `grep -F` (fixed string, no regex) so a domain containing regex
+    # metacharacters (a literal `.`, most commonly) is matched literally,
+    # not as a pattern.
+    #
+    # `value` at this point is the exact text this function is about to
+    # push to B with `wp option update` — checking it directly (not a
+    # separate wp-cli round trip) is what lets this run inside `graft`
+    # itself, before B ever sees the value, with no separate `sitegraft
+    # verify` invocation required to notice it. `verify_domain_absent`
+    # (lib/verify.sh) remains the second, independent line of defense —
+    # unchanged by this fix-pack — for the same class of leftover
+    # reference, on B's LIVE value, and for migrated post content this
+    # function never sees at all.
+    local domain_no_scheme="$domain_from"
+    case "$domain_no_scheme" in
+      [Hh][Tt][Tt][Pp][Ss]://*) domain_no_scheme="${domain_no_scheme#????????}" ;;
+      [Hh][Tt][Tt][Pp]://*) domain_no_scheme="${domain_no_scheme#???????}" ;;
     esac
+    if [ -n "$domain_no_scheme" ]; then
+      local domain_no_scheme_escaped="${domain_no_scheme//\//\\/}"
+      if printf '%s' "$value" | grep -qiF -- "$domain_no_scheme" \
+        || printf '%s' "$value" | grep -qiF -- "$domain_no_scheme_escaped"; then
+        log_warn "graft: option '${key}' may still reference A's domain ('${domain_from}') after the domain rewrite — pushing it to B anyway (this is a WARNING, not a refusal — see issue #83). Review '${key}' on B by hand once this graft finishes: a case/scheme-different or protocol-relative form of A's domain, or one embedded inside a JSON blob stored as a string, is exactly what this check exists to surface but the automatic rewrite above could not reach. This check is intentionally wide (a plain, case-insensitive substring search for '${domain_no_scheme}') and can occasionally flag a coincidental match that is not actually a broken reference — treat it as a lead to check by hand, not a certainty."
+      fi
+    fi
   fi
   # issue #63, case 2 — investigated, LEFT UNGUARDED on purpose (unlike
   # graft_ensure_importer's own state_file, case 1, which the same issue

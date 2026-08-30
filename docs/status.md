@@ -66,18 +66,30 @@ bolted on outside the sentinel discipline that could point an image at a
 does not cover the shapes where these defects live — it went green on three
 broken builds this session).
 
-`#83` (`wp-content/fonts/` never synced) is fixed: `graft_fonts_sync` now syncs
-the Font Library directory (read live via `wp_get_font_dir()` on each side, not
-hardcoded) the same way media is synced, and `graft_migrate_options` now refuses
-a migrated option whose value still names A's domain after the rewrite pass —
-exactly the `etch_global_stylesheets` shape the pilot needed fixed by hand (see
-"Done by hand" below, now automated, not a standing workaround). See
-`docs/todo.md`'s own "Done" entry for the detail.
+`#83` (`wp-content/fonts/` never synced) is fixed for the FILES: `graft_fonts_sync`
+now syncs the Font Library directory (read live via `wp_get_font_dir()` on each
+side, not hardcoded, including the ssh-remote pull — an absent-directory
+regression caught in review before merge) the same way media is synced. Not
+fixed: the `wp_font_face`/`wp_font_family` DATABASE posts core's own Font
+Library UI creates — no module migrates those (deliberate, YAGNI; Etch itself
+never uses them). The issue's detection half is now a WARNING, not a refusal —
+`graft_migrate_options` logs (never blocks) when a migrated OPTION's value still
+appears to reference A's domain, widened after review to catch a case/scheme-
+different or protocol-relative host, or one buried in a JSON blob stored as a
+string (the pilot's own `etch_global_stylesheets` shape, proven with a real
+`php json_encode()` fixture) — but this covers option values only, is a
+heuristic substring search, and does not touch post content (`#88` below is a
+different mechanism, still open). See `docs/todo.md`'s own "Done" entry for the
+full detail.
 
 ### Done by hand on the pilot target, outside the tool
 
 Copying `wp-content/fonts/` and rewriting the source host inside
-`etch_global_stylesheets` (#83, now fixed — see above). Two items left to
+`etch_global_stylesheets` (#83). The FILE copy is now automatic (see above) —
+the DOMAIN rewrite for this specific shape is still something an operator may
+have to finish by hand: it is now a logged WARNING instead of total silence,
+not a guaranteed automatic fix, precisely because the pilot's own value is one
+of the forms the rewrite pass genuinely cannot parse. Two items left to
 Marcel's judgement: Etch's AI API key was copied to the target along with the
 rest of its settings, and the HTTP smoke check fails on a false positive (it
 looks for "Home" in a German page).
