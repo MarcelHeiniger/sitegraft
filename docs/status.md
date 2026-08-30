@@ -68,19 +68,26 @@ broken builds this session).
 
 `#83` (`wp-content/fonts/` never synced) is fixed for the FILES: `graft_fonts_sync`
 now syncs the Font Library directory (read live via `wp_get_font_dir()` on each
-side, not hardcoded, including the ssh-remote pull — an absent-directory
-regression caught in review before merge) the same way media is synced. Not
-fixed: the `wp_font_face`/`wp_font_family` DATABASE posts core's own Font
-Library UI creates — no module migrates those (deliberate, YAGNI; Etch itself
-never uses them). The issue's detection half is now a WARNING, not a refusal —
-`graft_migrate_options` logs (never blocks) when a migrated OPTION's value still
-appears to reference A's domain, widened after review to catch a case/scheme-
-different or protocol-relative host, or one buried in a JSON blob stored as a
-string (the pilot's own `etch_global_stylesheets` shape, proven with a real
-`php json_encode()` fixture) — but this covers option values only, is a
-heuristic substring search, and does not touch post content (`#88` below is a
-different mechanism, still open). See `docs/todo.md`'s own "Done" entry for the
-full detail.
+side, not hardcoded) the same way media is synced. The ssh-remote pull took two
+review rounds: an absent-directory abort (round 1), then a fail-OPEN existence
+probe that silently skipped the sync and reported success on a real ssh
+connection/auth failure (round 2, now a three-valued, mutation-tested probe
+shared with `inventory_check_path_topology` so `SITE_<ALIAS>_SSH_KEY` handling
+cannot drift between the two). Not fixed: the `wp_font_face`/`wp_font_family`
+DATABASE posts core's own Font Library UI creates — no module migrates those
+(deliberate, YAGNI; Etch itself never uses them). The issue's detection half
+is now a WARNING, not a refusal — `graft_migrate_options` logs (never blocks)
+when a migrated OPTION's value still appears to reference A's domain, widened
+after review to catch a case/scheme-different or protocol-relative host, or
+one buried in a JSON blob stored as a string (the pilot's own
+`etch_global_stylesheets` shape, proven with a real `php json_encode()`
+fixture — remeasured by review across 6 realistic forms, 6/6 caught, none
+refused), and no longer false-positives on the apex/www shape (A's host a
+substring of B's own) after a second review round found it firing on every
+single correctly-rewritten key. Covers option values only, is a heuristic
+substring search, and does not touch post content (`#88` below is a different
+mechanism, still open). See `docs/todo.md`'s own "Done" entry for the full
+detail, including the precise (non-overclaimed) percent-encoding scope note.
 
 ### Done by hand on the pilot target, outside the tool
 

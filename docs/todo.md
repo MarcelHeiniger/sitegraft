@@ -33,6 +33,16 @@
       blocks carrying id references.
 - [ ] Consider making the HTTP smoke marker configurable per profile — it
       currently looks for "Home" and false-fails on any non-English site.
+- [ ] **Every `ssh` call in this repo is missing `-o BatchMode=yes -o
+      ConnectTimeout=<n>`.** Pre-existing, not introduced by #83's fix-pack —
+      noted while adding `ssh_test_dir_rc` (`lib/inventory.sh`), which is a
+      probe run mid-graft and inherits the same gap: without `BatchMode=yes`,
+      a host whose key auth fails can fall back to an interactive password
+      prompt, which blocks a run this tool otherwise treats as fully
+      unattended; without a `ConnectTimeout`, an unreachable host hangs on
+      the OS's own TCP timeout instead of failing promptly. Worth fixing
+      once, for every `ssh` invocation in the codebase, not piecemeal per
+      call site.
 
 ## Backlog
 
@@ -98,13 +108,28 @@
       FILTERS the path; it does not CREATE the directory (that only
       happens on WordPress's own first real font upload), so a non-empty
       path with nothing on disk yet is the ORDINARY case for any A that
-      has simply never used the Font Library — handled as a no-op on both
-      the local AND ssh-remote pull branches (review fix-pack: the
-      ssh-remote branch had no equivalent check at first, and aborted the
-      entire graft on the routine rsync-against-absent-source exit 23;
-      fixed and mutation-tested). A having fonts while B cannot resolve a
-      Font Library directory of its own at all is a hard failure, not a
-      silent drop.
+      has simply never used the Font Library.
+
+      The ssh-remote pull branch went through TWO review rounds to get
+      this right. Round 1: the branch had no existence check at all and
+      aborted the whole graft on the routine rsync-against-absent-source
+      exit 23. Round 2, on the fix for round 1: the existence probe
+      (`graft_ssh_path_exists`) collapsed EVERY non-zero ssh exit into
+      "absent, nothing to pull" — including ssh's own connection/auth
+      failure code (255), which meant a dedicated `SITE_A_SSH_KEY` profile
+      whose ssh connection genuinely failed skipped the sync SILENTLY,
+      marked the step done, and reported the graft a success, never
+      retrying on resume (before issue #83 existed at all, that same
+      profile failed LOUDLY at rsync instead — round 1's own fix had
+      turned a noisy failure into a silent false success). Fixed by making
+      the probe three-valued (exists / confirmed absent / could not
+      determine) via a shared `ssh_test_dir_rc` helper
+      (`lib/inventory.sh`, factored out of `inventory_check_path_topology`'s
+      own pre-existing probe so `SITE_<ALIAS>_SSH_KEY` handling, issue
+      #75, cannot drift between the two again) — "could not determine" is
+      now a hard failure, never a no-op. Both rounds mutation-tested. A
+      having fonts while B cannot resolve a Font Library directory of its
+      own at all is, separately, also a hard failure, not a silent drop.
 
       Known, deliberate gap, not built here: this syncs the FILES only.
       Core WordPress 6.5's Font Library also registers
@@ -127,22 +152,42 @@
       AS A STRING, double-escaped by `wp option get --format=json` in a
       way the rewrite's exact-substring match cannot parse; proven with a
       real `php json_encode()` fixture in `tests/unit/test_graft_options.bats`,
-      not a fabricated string `--format=json` never produces). Downgraded
-      from an earlier hard refusal: no flag anywhere in this CLI can skip
-      a single option key, this step runs AFTER the WXR import, so a
-      refusal abandons a half-migrated B and every resume repeats the
-      identical refusal — not a practicable remedy mid-migration.
+      not a fabricated string `--format=json` never produces; remeasured
+      by review against all 6 realistic forms — case, scheme,
+      protocol-relative, the JSON-blob-in-a-string shape, and two more —
+      6/6 caught, none refused). Downgraded from an earlier hard refusal:
+      no flag anywhere in this CLI can skip a single option key, this step
+      runs AFTER the WXR import, so a refusal abandons a half-migrated B
+      and every resume repeats the identical refusal — not a practicable
+      remedy mid-migration.
+
+      Second review round also found the widened check false-positiving
+      SYSTEMATICALLY (every key, every run, not occasionally) on the
+      apex/www migration shape ("example.com" -> "www.example.com"),
+      where A's host is a literal substring of B's own — a value the
+      rewrite corrected perfectly still triggered the warning, because
+      B's own new host still contains A's old one. Fixed by stripping
+      every occurrence of B's own (scheme-stripped) host from the value
+      before searching for A's; verified both directions (a clean rewrite
+      of that shape no longer warns, a genuine leftover reference still
+      does).
 
       Scope, stated precisely so this is not overclaimed: OPTION VALUES
-      only, a heuristic substring search (can still miss a form it does
-      not cover, and can occasionally flag a coincidental match on
-      unrelated text), and does not touch post CONTENT at all — #88's own
-      class below (block-attribute id rewrites inside WXR-imported post
-      content matching only the compact JSON form) is a completely
-      separate mechanism and remains open, unaffected by this fix.
-      `verify_domain_absent` (`lib/verify.sh`) remains the second,
+      only, a heuristic substring search, and does not touch post CONTENT
+      at all — #88's own class below (block-attribute id rewrites inside
+      WXR-imported post content matching only the compact JSON form) is a
+      completely separate mechanism and remains open, unaffected by this
+      fix. `verify_domain_absent` (`lib/verify.sh`) remains the second,
       independent check, covering both options and post content, via a
-      separate `sitegraft verify` run.
+      separate `sitegraft verify` run. What this check still cannot see:
+      a deliberately over-encoded value (percent-encoding/HTML entities
+      CAN alter any byte, including a hostname's own letters — measured;
+      an earlier draft of this same entry overclaimed that they could
+      not) — what IS true is that no conventional WordPress/PHP encoder
+      (`rawurlencode()`, `esc_url()`, `htmlspecialchars()`) touches an
+      unreserved character, so the forms those actually produce are still
+      caught; a hand-crafted, non-conventionally-encoded value is not, and
+      was never this check's claimed scope.
 - [x] **`modules/acss.sh` (Automatic.css) — shipped.** The
       `TODO_VERIFY_LEGACY_ACSS_SLUG` blocker (the pre-4.0 plugin folder name) is
       closed: both folder names have now been observed on real installs on

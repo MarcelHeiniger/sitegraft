@@ -121,7 +121,12 @@ setup() {
   run_or_echo() { echo "RAN: $*"; return 0; }
   run graft_fonts_sync "$BATS_TEST_TMPDIR/run"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"CHECKED: host-a.example.com /site-a/wp-content/fonts"* ]] || false
+  # Called with the ALIAS ("a"), not the raw host -- graft_ssh_path_exists
+  # resolves both SITE_A_SSH_HOST and SITE_A_SSH_KEY internally now
+  # (review fix-pack, BLOCKER: a raw-host signature is exactly what let the
+  # first draft lose SITE_*_SSH_KEY when it built its own ssh call instead
+  # of reusing the shared probe -- see graft_ssh_path_exists' own header).
+  [[ "$output" == *"CHECKED: a /site-a/wp-content/fonts"* ]] || false
   [[ "$output" == *"RAN: rsync -avz host-a.example.com:/site-a/wp-content/fonts/"* ]] || false
   [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }
@@ -158,6 +163,39 @@ setup() {
   [[ "$output" == *"PUSHED"* ]] || false
 }
 
+# --- BLOCKER (second review round): the case above (rc 1, confirmed
+# absent) and THIS case (rc 2, could not determine — ssh itself failed:
+# unreachable host, refused auth, wrong/missing SITE_A_SSH_KEY) must not
+# collapse into the same outcome. The first fix-pack draft's
+# `graft_ssh_path_exists` returned a plain boolean, so `! graft_ssh_path_
+# exists ...` read BOTH as "absent, nothing to pull" — on a real ssh
+# failure this silently skipped the sync, marked graft.fonts_sync.done,
+# and reported the whole graft a SUCCESS, having synced nothing and never
+# retrying on resume. Before issue #83's fix-pack existed at all, that
+# same profile failed LOUDLY at rsync instead — the bug turned a noisy
+# failure into a silent false success, exactly backwards.
+@test "graft_fonts_sync's ssh pull is a HARD FAILURE (never a silent skip) when the ssh probe itself cannot determine existence (rc 2 -- unreachable host, refused auth, or a wrong SSH key) (BLOCKER, issue #83 second review round)" {
+  graft_font_dir() {
+    if [ "$1" = "a" ]; then echo "/site-a/wp-content/fonts"; else echo "/site-b/wp-content/fonts"; fi
+  }
+  graft_pull_dir() { echo "SHOULD NOT BE CALLED FOR A REMOTE"; return 1; }
+  graft_push_dir() { echo "SHOULD NOT BE CALLED -- the step must abort before ever reaching the push"; return 0; }
+  graft_ssh_path_exists() { return 2; }
+  SITE_A_SSH_HOST="host-a.example.com"
+  run_or_echo() { echo "RAN: $*"; return 0; }
+  run graft_fonts_sync "$BATS_TEST_TMPDIR/run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"could not determine"* ]] || false
+  [[ "$output" != *"RAN: rsync"* ]] || false
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+  # Never takes the "confirmed absent" no-op path (its own distinct log
+  # line, checked verbatim -- not a bare "does not exist" substring, which
+  # this branch's OWN honest wording ("not the ordinary 'directory does
+  # not exist yet' case") legitimately contains too) for a question that
+  # was never actually answered.
+  [[ "$output" != *"source directory does not exist on a yet"* ]] || false
+}
+
 @test "graft_fonts_sync's ssh pull skips the real existence check under --dry-run and previews the rsync anyway (mirrors graft_pull_dir's own non-ssh dry-run behavior)" {
   graft_font_dir() {
     if [ "$1" = "a" ]; then echo "/site-a/wp-content/fonts"; else echo "/site-b/wp-content/fonts"; fi
@@ -175,17 +213,78 @@ setup() {
 }
 
 # --- graft_ssh_path_exists ---------------------------------------------
+#
+# Signature is now <alias> <path>, not <host> <path> (second review round):
+# resolving SITE_<ALIAS>_SSH_HOST *and* SITE_<ALIAS>_SSH_KEY internally,
+# from the alias, is what makes losing the dedicated key structurally
+# impossible for a future caller -- a raw-host parameter lets a caller
+# forget to also pass/resolve the key (which is exactly how the first
+# draft of this function lost it, and exactly what inventory.sh's own
+# sibling probe, inventory_check_path_topology, never lost). Every test
+# below sets SITE_A_SSH_HOST (and, where relevant, SITE_A_SSH_KEY) the way
+# a real profile would, then calls with alias "a".
 
-@test "graft_ssh_path_exists returns success when the remote test -d succeeds" {
+@test "graft_ssh_path_exists returns 0 when the remote test -d succeeds" {
+  SITE_A_SSH_HOST="host-a.example.com"
   ssh() { echo "ssh called: $*" >&2; return 0; }
-  run graft_ssh_path_exists "host-a.example.com" "/site-a/wp-content/fonts"
+  run graft_ssh_path_exists a "/site-a/wp-content/fonts"
   [ "$status" -eq 0 ]
 }
 
-@test "graft_ssh_path_exists returns failure when the remote test -d fails (directory absent, or unreachable -- either way, nothing safe to pull)" {
+@test "graft_ssh_path_exists returns 1 (confirmed absent) when the remote test -d itself reports absence" {
+  SITE_A_SSH_HOST="host-a.example.com"
   ssh() { return 1; }
-  run graft_ssh_path_exists "host-a.example.com" "/site-a/wp-content/fonts"
-  [ "$status" -ne 0 ]
+  run graft_ssh_path_exists a "/site-a/wp-content/fonts"
+  [ "$status" -eq 1 ]
+}
+
+# --- BLOCKER (second review round): the three-way distinction ------------
+#
+# 0 (exists), 1 (`test -d` itself says absent) and "ssh could not even ask
+# the question" are three DIFFERENT facts, and only the first two used to
+# be tested. rc 255 is ssh's own real connection/authentication failure
+# code (measured against real OpenSSH) -- a wrong password, a host key
+# mismatch, a firewalled port, or (below) a wrong/missing dedicated key
+# ALL produce it, and none of them mean "the directory is absent". This is
+# the mutation-tested regression guard for the fix: graft_ssh_path_exists
+# must not return the SAME thing for "no" as for "I don't know".
+@test "graft_ssh_path_exists returns 2 (could not determine -- NOT 'confirmed absent') when ssh itself fails to connect (BLOCKER, issue #83 second review round)" {
+  SITE_A_SSH_HOST="host-a.example.com"
+  ssh() { return 255; }
+  run graft_ssh_path_exists a "/site-a/wp-content/fonts"
+  [ "$status" -eq 2 ]
+  [ "$status" -ne 1 ]
+}
+
+@test "graft_ssh_path_exists returns 2 for an ARBITRARY non-0/1 ssh exit status, not just 255 -- the check is 'not 0, not 1', never a fixed allowlist" {
+  SITE_A_SSH_HOST="host-a.example.com"
+  ssh() { return 42; }
+  run graft_ssh_path_exists a "/site-a/wp-content/fonts"
+  [ "$status" -eq 2 ]
+}
+
+# ssh_test_dir_rc (lib/inventory.sh) redirects the real ssh call's own
+# stdout/stderr to /dev/null (it is a probe, not user-visible output), so
+# a stub that merely echoes what it received is invisible to bats' own
+# $output -- these two tests instead have the stub RECORD its argv to a
+# file, read back after `run` returns.
+@test "graft_ssh_path_exists passes SITE_A_SSH_KEY to ssh as -i, the same way inventory_check_path_topology already does (issue #75)" {
+  SITE_A_SSH_HOST="host-a.example.com"
+  SITE_A_SSH_KEY="/home/op/.ssh/deploy_key"
+  local call_log="$BATS_TEST_TMPDIR/ssh-call.log"
+  ssh() { printf '%s\n' "$*" > "$call_log"; return 0; }
+  run graft_ssh_path_exists a "/site-a/wp-content/fonts"
+  [ "$status" -eq 0 ]
+  [[ "$(cat "$call_log")" == *"-i /home/op/.ssh/deploy_key -- host-a.example.com"* ]] || false
+}
+
+@test "graft_ssh_path_exists omits -i entirely when no dedicated SSH key is configured (the ordinary case)" {
+  SITE_A_SSH_HOST="host-a.example.com"
+  unset SITE_A_SSH_KEY
+  local call_log="$BATS_TEST_TMPDIR/ssh-call.log"
+  ssh() { printf '%s\n' "$*" > "$call_log"; return 0; }
+  run graft_ssh_path_exists a "/site-a/wp-content/fonts"
+  [[ "$(cat "$call_log")" != *" -i "* ]] || false
 }
 
 # Behavioral, not string-matching: the stub below actually EXECUTES the
@@ -200,17 +299,19 @@ setup() {
 # Proves the round trip end to end instead of asserting on brittle,
 # hand-computed escaped-string output.
 @test "graft_ssh_path_exists's remote command survives a real directory whose name contains a single quote" {
+  SITE_A_SSH_HOST="host-a.example.com"
   ssh() { shift 2; bash -c "$1"; }
   local d="$BATS_TEST_TMPDIR/it's-fonts"
   mkdir -p "$d"
-  run graft_ssh_path_exists "host-a.example.com" "$d"
+  run graft_ssh_path_exists a "$d"
   [ "$status" -eq 0 ]
 }
 
 @test "graft_ssh_path_exists correctly reports absence too, for the same quoted-path shape" {
+  SITE_A_SSH_HOST="host-a.example.com"
   ssh() { shift 2; bash -c "$1"; }
-  run graft_ssh_path_exists "host-a.example.com" "$BATS_TEST_TMPDIR/it's-fonts-never-created"
-  [ "$status" -ne 0 ]
+  run graft_ssh_path_exists a "$BATS_TEST_TMPDIR/it's-fonts-never-created"
+  [ "$status" -eq 1 ]
 }
 
 # --- graft_fonts_sync guards its own exit status (same shape as

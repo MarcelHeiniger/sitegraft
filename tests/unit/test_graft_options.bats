@@ -430,6 +430,50 @@ setup() {
   [[ "$output" != *"WARNING, not a refusal"* ]] || false
 }
 
+# Review, second round: measured as a SYSTEMATIC false positive, not an
+# occasional one -- domain_from's host being a literal substring of
+# domain_to's host is the ordinary apex/www migration shape ("example.com"
+# -> "www.example.com"), and before this fix the check fired on it for
+# EVERY key, every time, regardless of whether the rewrite actually
+# missed anything. A warning that always fires is a warning nobody reads
+# -- the exact opposite of what widening the check (BLOCKER 2) was for.
+@test "graft_migrate_options does NOT warn when A's host is a substring of B's own host and the value was correctly rewritten (apex -> www, review fix-pack)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_global_stylesheets"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  local fixture
+  fixture=$(php -r 'echo json_encode(["css" => "body{src:url(https://www.example.com/wp-content/fonts/heading-sans.woff2)}"]);')
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then printf '%s' "$fixture"; else echo "[dry-run] wp_remote b $*"; fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest" "https://example.com" "https://www.example.com"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"WARNING, not a refusal"* ]] || false
+}
+
+# The other half of the same fix, verified in the same shape: stripping
+# B's own host from the value before searching must not also hide a
+# GENUINE leftover reference to A that happens to sit in that exact
+# apex/www pair -- only an actual occurrence of B's host is removed, an
+# unrelated bare reference to A's host survives and is still caught.
+@test "graft_migrate_options still WARNS on a genuine leftover reference to A even when A's host is a substring of B's own host (apex -> www, review fix-pack)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_global_stylesheets"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  local fixture
+  fixture=$(php -r 'echo json_encode(["css" => "body{src:url(//example.com/wp-content/fonts/heading-sans.woff2)}"]);')
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then printf '%s' "$fixture"; else echo "[dry-run] wp_remote b $*"; fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest" "https://example.com" "https://www.example.com"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARNING, not a refusal"* ]] || false
+}
+
 # Fix-pack bug found live (DDEV harness, MAJOR-B's new graft --dry-run
 # assertion, running end to end for the first time): every other test in
 # this file stubs wp_remote WITHOUT checking is_dry_run at all, so it

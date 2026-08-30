@@ -60,27 +60,54 @@ graft_ssh_host() {
   printf '%s' "${!host_var:-}"
 }
 
-# graft_ssh_path_exists <host> <path> — true (exit 0) iff <path> is a
-# directory on <host>, reachable over ssh. Same "any non-zero means
-# absent" posture graft_pull_dir's own local existence check already uses
-# (its own header/body just below) — a permission error and a genuinely
-# missing directory are not distinguished here either, on purpose: either
-# way there is nothing this run can safely pull.
+# graft_ssh_path_exists <alias> <path> — THREE-valued, not a boolean:
+#   0 = <path> is confirmed a directory on <alias>'s ssh host
+#   1 = confirmed ABSENT (a genuine `test -d` failure)
+#   2 = COULD NOT DETERMINE (ssh itself failed — unreachable host, refused
+#       auth, wrong/missing key — rc 255 most commonly, but any rc other
+#       than 0/1 lands here)
+# Case 2 is NOT case 1. Review fix-pack (issue #83): the first draft of
+# this function collapsed "any non-zero" into "absent", which is exactly
+# CLAUDE.md's own "condition of the form X-is-correct-or-X-was-never-
+# configured is not a check" trap — on a profile with a real ssh problem,
+# graft_fonts_sync read case 2 as "nothing to pull", skipped the sync,
+# marked its step done, and phase_graft reported the graft a SUCCESS,
+# having never synced anything and never retrying it on resume. Measured:
+# before this issue's OWN fix-pack, that same profile failed LOUDLY at
+# rsync instead — this function had turned a noisy failure into a silent
+# false success, the opposite of what it exists to fix.
 #
-# Added for issue #83's ssh-remote gap: graft_fonts_sync's ssh branch used
-# to rsync A's font directory unconditionally, with no equivalent to
-# graft_pull_dir's own "source directory does not exist yet" no-op. On any
-# ssh-remote A running WordPress 6.5+ that has never actually used the
-# Font Library — the ORDINARY case, not an edge case — wp_get_font_dir()
-# still returns a real, non-empty path (it computes/filters the path; it
-# does not create the directory, which is only ever created by WordPress
-# itself on the first real font upload). Measured: rsync against that
-# absent path exits 23, graft_fonts_sync's own `|| return $?` propagates
-# it, and phase_graft aborts the entire graft over a directory that was
-# never supposed to exist yet.
+# Routed through the shared ssh_test_dir_rc (lib/inventory.sh), not a
+# second hand-rolled ssh call: that is what makes SITE_<ALIAS>_SSH_KEY
+# (issue #75) impossible to lose here again — the first draft of this
+# function re-implemented the probe from scratch instead of reusing
+# inventory_check_path_topology's own, and silently dropped the `-i
+# "$ssh_key"` that probe already had.
+#
+# Added for issue #83's ssh-remote gap in the first place: graft_fonts_sync's
+# ssh branch used to rsync A's font directory unconditionally, with no
+# equivalent to graft_pull_dir's own "source directory does not exist yet"
+# no-op. On any ssh-remote A running WordPress 6.5+ that has never actually
+# used the Font Library — the ORDINARY case, not an edge case —
+# wp_get_font_dir() still returns a real, non-empty path (it computes/
+# filters the path; it does not create the directory, which is only ever
+# created by WordPress itself on the first real font upload). Measured:
+# rsync against that absent path exits 23, graft_fonts_sync's own
+# `|| return $?` propagates it, and phase_graft aborts the entire graft
+# over a directory that was never supposed to exist yet.
 graft_ssh_path_exists() {
-  local host="$1" path="$2"
-  ssh -- "$host" "test -d $(sq "$path")" >/dev/null 2>&1
+  local alias_lc="$1" path="$2"
+  local host; host=$(graft_ssh_host "$alias_lc")
+  local alias_uc; alias_uc=$(printf '%s' "$alias_lc" | tr '[:lower:]' '[:upper:]')
+  local key_var="SITE_${alias_uc}_SSH_KEY"
+  local ssh_key="${!key_var:-}"
+  local rc=0
+  ssh_test_dir_rc "$host" "$path" "$ssh_key" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
 }
 
 # graft_pull_dir <alias> <src_dir_on_alias> <host_dest_dir> — pull a whole
@@ -656,10 +683,28 @@ graft_fonts_sync() {
     # fix: rsync against that absent source exits 23, this function's own
     # `|| return $?` propagates it, and phase_graft aborted the entire graft
     # over a directory that was never supposed to exist yet.
-    if ! is_dry_run && ! graft_ssh_path_exists "$SITE_A_SSH_HOST" "$font_dir_a"; then
-      log_info "source directory does not exist on a yet (nothing to pull): ${font_dir_a}"
-    else
+    #
+    # Second review round: the check above used to read `! graft_ssh_path_
+    # exists "$SITE_A_SSH_HOST" "$font_dir_a"` and treat ANY non-zero as
+    # "absent, nothing to pull" -- which also swallowed a genuine ssh
+    # connection/auth failure (rc 255, most commonly a dedicated
+    # SITE_A_SSH_KEY the probe never even read, since it built its own ssh
+    # call instead of reusing the one that does). That silently skipped the
+    # sync, marked the step done, and reported success. graft_ssh_path_exists
+    # is THREE-valued now (its own header comment) precisely so this call
+    # site can no longer make that mistake: only rc 1 (confirmed absent) is
+    # a no-op; rc 2 (could not determine) is refused, exactly like a real
+    # rsync failure would have been before this whole fix existed.
+    if is_dry_run; then
       run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${font_dir_a%/}/" "${staging}/" || return $?
+    else
+      local exists_rc=0
+      graft_ssh_path_exists a "$font_dir_a" || exists_rc=$?
+      case "$exists_rc" in
+        0) run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${font_dir_a%/}/" "${staging}/" || return $? ;;
+        1) log_info "source directory does not exist on a yet (nothing to pull): ${font_dir_a}" ;;
+        *) log_error "graft: could not determine whether A's font directory (${font_dir_a}) exists on ${SITE_A_SSH_HOST} -- the ssh probe itself failed (host unreachable, authentication refused, or a wrong/missing SSH key), not the ordinary 'directory does not exist yet' case. Refusing to treat an unanswered question as a safe no-op. Check that ${SITE_A_SSH_HOST} is reachable and, if SITE_A_SSH_KEY is set, that it is correct, then re-run 'sitegraft graft --run ${run_dir}' -- this step will retry." ; return 1 ;;
+      esac
     fi
   else
     graft_pull_dir a "$font_dir_a" "$staging" || return $?
@@ -2325,11 +2370,22 @@ _graft_migrate_one_option_key() {
     # two-form discipline, lib/php/content-remap-functions.php), since
     # escaping only ever touches `/`, `"`, `\` and control characters —
     # never the alphanumeric/hyphen/dot characters an ordinary hostname is
-    # made of. Because escaping never touches those characters either,
-    # URL-encoding and HTML-entity-encoding a plain hostname is a non-issue
-    # for this same reason: an ordinary domain contains no character that
-    # either encoding would ever alter, so both are already covered here
-    # at no extra cost -- deliberately not built as separate cases.
+    # made of.
+    #
+    # What it does NOT catch, stated precisely rather than overclaimed
+    # (review, second round): percent-encoding and HTML-entity encoding
+    # CAN alter any byte, including the alphanumeric/hyphen/dot characters
+    # a hostname is made of (measured: `https://%61.example.com/f.woff2`
+    # is not detected) — an earlier draft of this comment claimed neither
+    # encoding could ever touch those characters, which is false in
+    # general. What IS true, and is what actually matters here: no
+    # CONVENTIONAL encoder a real WordPress/PHP codepath would apply to a
+    # URL — `rawurlencode()`, `esc_url()`, `htmlspecialchars()` — encodes
+    # an unreserved character (letters, digits, `-._~`) at all, so the
+    # forms those encoders actually produce are still caught. A value
+    # deliberately hand-crafted with non-conventional over-encoding is
+    # not, and is not a scope this check claims.
+    #
     # `grep -F` (fixed string, no regex) so a domain containing regex
     # metacharacters (a literal `.`, most commonly) is matched literally,
     # not as a pattern.
@@ -2350,9 +2406,39 @@ _graft_migrate_one_option_key() {
     esac
     if [ -n "$domain_no_scheme" ]; then
       local domain_no_scheme_escaped="${domain_no_scheme//\//\\/}"
-      if printf '%s' "$value" | grep -qiF -- "$domain_no_scheme" \
-        || printf '%s' "$value" | grep -qiF -- "$domain_no_scheme_escaped"; then
-        log_warn "graft: option '${key}' may still reference A's domain ('${domain_from}') after the domain rewrite — pushing it to B anyway (this is a WARNING, not a refusal — see issue #83). Review '${key}' on B by hand once this graft finishes: a case/scheme-different or protocol-relative form of A's domain, or one embedded inside a JSON blob stored as a string, is exactly what this check exists to surface but the automatic rewrite above could not reach. This check is intentionally wide (a plain, case-insensitive substring search for '${domain_no_scheme}') and can occasionally flag a coincidental match that is not actually a broken reference — treat it as a lead to check by hand, not a certainty."
+      # Review, second round: a systematic false positive, not an
+      # occasional one -- whenever A's host is a literal SUBSTRING of B's
+      # (the ordinary apex/www shape: "example.com" -> "www.example.com"),
+      # a value the rewrite pass corrected PERFECTLY still contains B's
+      # own new host, and B's host still contains A's host as a
+      # substring -- so the plain check above fires on every single
+      # correctly-migrated key, every time, unconditionally. A warning
+      # that fires unconditionally is a warning nobody reads, which
+      # destroys exactly the visibility this issue exists to add. Fixed
+      # by removing every occurrence of B's own (scheme-stripped, both
+      # plain and escaped) host from the value FIRST, then searching what
+      # remains: a genuine leftover reference to A (e.g. a bare
+      # "//example.com" nobody rewrote) has no reason to sit next to or
+      # inside an instance of B's host, so it survives this removal and
+      # is still caught; an instance of B's host that merely happens to
+      # CONTAIN A's host as a substring does not survive it, and so no
+      # longer matches. Verified both directions (this function's own
+      # tests): the false positive on a clean www-prefixed rewrite is
+      # gone, and a real leftover "//example.com" is still flagged.
+      local value_for_domain_check="$value"
+      local domain_to_no_scheme="$domain_to"
+      case "$domain_to_no_scheme" in
+        [Hh][Tt][Tt][Pp][Ss]://*) domain_to_no_scheme="${domain_to_no_scheme#????????}" ;;
+        [Hh][Tt][Tt][Pp]://*) domain_to_no_scheme="${domain_to_no_scheme#???????}" ;;
+      esac
+      if [ -n "$domain_to_no_scheme" ]; then
+        local domain_to_no_scheme_escaped="${domain_to_no_scheme//\//\\/}"
+        value_for_domain_check="${value_for_domain_check//$domain_to_no_scheme/}"
+        value_for_domain_check="${value_for_domain_check//$domain_to_no_scheme_escaped/}"
+      fi
+      if printf '%s' "$value_for_domain_check" | grep -qiF -- "$domain_no_scheme" \
+        || printf '%s' "$value_for_domain_check" | grep -qiF -- "$domain_no_scheme_escaped"; then
+        log_warn "graft: option '${key}' may still reference A's domain ('${domain_from}') after the domain rewrite — pushing it to B anyway (this is a WARNING, not a refusal — see issue #83). Review '${key}' on B by hand once this graft finishes: a case/scheme-different or protocol-relative form of A's domain, or one embedded inside a JSON blob stored as a string, is exactly what this check exists to surface but the automatic rewrite above could not reach. This check is intentionally wide (a plain, case-insensitive substring search for '${domain_no_scheme}', with every occurrence of B's own host already removed from the value first) and can still occasionally flag a coincidental match that is not actually a broken reference — treat it as a lead to check by hand, not a certainty."
       fi
     fi
   fi
