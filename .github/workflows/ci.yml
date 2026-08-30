@@ -103,7 +103,19 @@ jobs:
         # shape as php: ubuntu-latest ships git (actions/checkout needs
         # it), a bare image does not. That test is the 43rd failure above,
         # and is fixed by the same measured re-run.
-        run: sudo apt-get update && sudo apt-get install -y bats jq rsync perl openssh-client curl git php-cli php-xml
+        #
+        # sqlite3 (issue #106 sweep, Marcel's call): NOT one of the 43
+        # measured failures above -- the 3 tests in test_backup.bats that
+        # need a real `sqlite3` binary (backup_verify_db_export against a
+        # genuine `sqlite3 .dump`) already guard themselves with
+        # `_require_sqlite3`, which `skip`s cleanly when it's absent, so
+        # this was never a silent-luck defect the way php/git were: a
+        # missing sqlite3 shows up as a visible skip, not a false green.
+        # Declared anyway, on Marcel's explicit call rather than the
+        # issue's own acceptance criteria: it's a one-word, no-cost change
+        # that turns those 3 tests from "never actually run in CI" into
+        # "run for real," which is the same spirit #106 closes for php.
+        run: sudo apt-get update && sudo apt-get install -y bats jq rsync perl openssh-client curl git php-cli php-xml sqlite3
 
       - name: bats tests/unit/
         # Canonical run command per CLAUDE.md. Integration tests
@@ -151,9 +163,9 @@ jobs:
       # identical tests/unit/ suite, just under a stdin that never reaches
       # EOF instead of ubuntu-latest's default /dev/null. See that job's
       # own comment for why each package is here (issue #106: git,
-      # php-cli, php-xml).
+      # php-cli, php-xml, sqlite3).
       - name: Install bats and sitegraft's runtime dependencies
-        run: sudo apt-get update && sudo apt-get install -y bats jq rsync perl openssh-client curl git php-cli php-xml
+        run: sudo apt-get update && sudo apt-get install -y bats jq rsync perl openssh-client curl git php-cli php-xml sqlite3
 
       - name: tests/lint/no-blocking-stdin-reads.sh
         # CI's stdin is already /dev/null, which is exactly why this repo

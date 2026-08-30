@@ -186,7 +186,7 @@ a: three" ]
 a: two" ]
 }
 
-# --- Durcissement (Step 6), tracked from Viktor's Step 2 review: EOF on
+# --- Hardening (Step 6), tracked from Viktor's Step 2 review: EOF on
 # stdin (no TTY / unattended invocation, stdin exhausted or /dev/null) is
 # NOT the same signal as a real operator pressing Enter on the [Y/n]
 # default — before this fix, `${ans:-y}` could not tell them apart and
@@ -257,11 +257,15 @@ a: two" ]
 # it or closes it, so a `read` against it blocks forever; `[ -t 0 ]`
 # against it is false immediately, since a FIFO is never a TTY, so the
 # guard fires without ever reaching a `read` at all. Wrapped in `timeout`
-# (skipped, not failed, where the coreutil is absent -- e.g. a bare macOS
-# dev machine -- matching test_no_blocking_stdin_reads.bats's own
-# fallback) purely as a safety net for THIS test file, in case the guard
-# itself ever regresses: without it, a broken guard would hang this test
-# rather than fail it.
+# where the coreutil is present -- CI always has it -- as a safety net:
+# if the guard ever regresses, `timeout 10` fails this test in ~10s
+# instead of letting it hang. That net is NOT equivalent to the fallback
+# below (a bare macOS dev machine, which typically lacks GNU `timeout`):
+# without it, a regressed guard hangs this test with nothing to bound it
+# except an externally-set BATS_TEST_TIMEOUT (e.g.
+# tests/lint/no-blocking-stdin-reads.sh sets one; a plain local `bats`
+# invocation does not). Not a gap CI can hit -- it has `timeout` -- but
+# said plainly rather than implied as a like-for-like fallback.
 setup_never_eof_fifo() {
   local fifo="$BATS_TEST_TMPDIR/never-eof-$$"
   mkfifo "$fifo"
@@ -278,7 +282,6 @@ setup_never_eof_fifo() {
   fi
   exec 9<&-
   [ "$status" -eq 1 ]
-  [ "$status" -ne 124 ]
   [[ "$stderr" == *"needs a real interactive terminal"* ]] || false
 }
 
@@ -291,7 +294,6 @@ setup_never_eof_fifo() {
   fi
   exec 9<&-
   [ "$status" -eq 1 ]
-  [ "$status" -ne 124 ]
   [[ "$stderr" == *"needs a real interactive terminal"* ]] || false
 }
 
@@ -312,7 +314,50 @@ setup_never_eof_fifo() {
   fi
   exec 9<&-
   [ "$status" -eq 1 ]
-  [ "$status" -ne 124 ]
   [ -z "$output" ]
   [[ "$stderr" == *"needs a real interactive terminal"* ]] || false
+}
+
+# --- issue #103 fix-pack (review round 2): the two sections above prove
+# two separate properties -- _plan_confirm_plain/_plan_confirm_strong_plain/
+# _plan_prompt_items_plain prove the y/n/YES/EOF PARSING logic, and the
+# never-EOF FIFO tests prove the GUARD itself fires. Neither proves that
+# the guarded, real entry points (_plan_confirm/_plan_confirm_strong/
+# _plan_prompt_items -- what phase_plan actually calls) dispatch to the
+# RIGHT plain function. That gap is real, not hypothetical: measured by
+# mutating _plan_confirm_strong to call _plan_confirm_plain instead of
+# _plan_confirm_strong_plain (i.e. degrading plan's one hard-blocking gate,
+# design doc §14's custom-code acknowledgment, from "type YES" to a bare
+# "y") -- the full suite stayed 1068/1068 green, because every existing
+# test either calls a `_plain` function directly (bypassing the dispatch
+# entirely) or hits the guard before any dispatch is reached (empty/never-
+# EOF stdin). CLAUDE.md's first rule, "prove the check can fail," taken
+# at its word: the three tests below exercise the SAME functions
+# phase_plan calls, through their real dispatch logic, with the guard
+# neutralized (not bypassed by calling a different function) so a fed
+# stdin can reach the actual read.
+@test "_plan_confirm answers correctly through the guarded entry point (guard neutralized, not the function)" {
+  run env PATH=/usr/bin:/bin bash -c 'source lib/core.sh; source lib/plan.sh; _plan_require_tty() { return 0; }; _plan_confirm "ok?" <<< "y"'
+  [ "$status" -eq 0 ]
+  run env PATH=/usr/bin:/bin bash -c 'source lib/core.sh; source lib/plan.sh; _plan_require_tty() { return 0; }; _plan_confirm "ok?" <<< "n"'
+  [ "$status" -eq 1 ]
+}
+
+@test "_plan_confirm_strong requires the literal YES through the guarded entry point (guard neutralized, not the function)" {
+  run env PATH=/usr/bin:/bin bash -c 'source lib/core.sh; source lib/plan.sh; _plan_require_tty() { return 0; }; _plan_confirm_strong "ok?" <<< "y"'
+  [ "$status" -eq 1 ]
+  run env PATH=/usr/bin:/bin bash -c 'source lib/core.sh; source lib/plan.sh; _plan_require_tty() { return 0; }; _plan_confirm_strong "ok?" <<< "YES"'
+  [ "$status" -eq 0 ]
+}
+
+@test "_plan_prompt_items filters items correctly through the guarded entry point (guard neutralized, not the function)" {
+  run --separate-stderr env PATH=/usr/bin:/bin bash -c '
+    source lib/core.sh; source lib/plan.sh
+    _plan_require_tty() { return 0; }
+    items=$(printf "a: one\na: two\na: three")
+    _plan_prompt_items "$items"
+  ' <<< $'y\nn\ny'
+  [ "$status" -eq 0 ]
+  [ "$output" = "a: one
+a: three" ]
 }

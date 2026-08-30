@@ -565,7 +565,7 @@ _plan_prompt_items() {
 # directly by feeding it answers on a redirected (non-TTY) stdin in tests
 # — _plan_prompt_items's own [ -t 0 ] guard would otherwise refuse before
 # any of the logic below (including the MAJOR fd-collision fix and the EOF
-# durcissement, both documented below) ever ran.
+# hardening, both documented below) ever ran.
 _plan_prompt_items_plain() {
   local items="$1"
   # MAJOR bug fixed here (found live, reproduced before this fix): `done <<<
@@ -583,7 +583,7 @@ _plan_prompt_items_plain() {
   local line ans kept_buf=""
   while IFS= read -r line <&3; do
     [ -n "$line" ] || continue
-    # Durcissement (Step 6, tracked from Viktor's Step 2 review, non-
+    # Hardening (Step 6, tracked from Viktor's Step 2 review, non-
     # blocking at the time): checking `read`'s own exit status here,
     # not just `${ans:-y}`, is the fix. A real operator pressing Enter on
     # this [Y/n] prompt returns 0 with ans="" — that IS a genuine answer
@@ -697,7 +697,7 @@ plan_select_interactive() {
   # comment and multiple other spots for why bare reliance on `set -e`
   # propagating out of a `var=$(...)` assignment is not trusted here).
   # Needed for real, not just defensive: this is the propagation path for
-  # _plan_prompt_items' EOF durcissement fix above — an aborted selection
+  # _plan_prompt_items' EOF hardening fix above — an aborted selection
   # (gum/fzf cancelled, or the plain-fallback EOF case) must stop
   # plan_select_interactive from ever handing a guessed/partial `kept` list
   # to _plan_apply_selection, and must stop phase_plan from freezing a
@@ -929,7 +929,7 @@ _phase_plan_build() {
       return 1
     }
     manifest=$(plan_custom_code_gate "$manifest" "$(cat "${run_dir}/scan-b.json")") || return 1
-    # `|| return 1` added to both calls below (Step 6 durcissement pass) for
+    # `|| return 1` added to both calls below (Step 6 hardening pass) for
     # the same reason plan_custom_code_gate already has it just above —
     # consistency, and the real fix for plan_select_interactive: without
     # this, an aborted selection (see _plan_prompt_items' EOF handling)
