@@ -734,8 +734,6 @@ EOF
   [[ "$output" != *"WILL retry"* ]] || false
 }
 
-# --- foreign-file message clarity (review — the DDEV harness's OWN bug,
-
 # issue #109 fix-pack, reviewer-mandated correction: a failed
 # sitegraft_mktemp_dir inside graft_verify_import_completeness used to
 # return 1 -- the SAME code phase_graft's rc=1 branch treats as "issue
@@ -792,6 +790,50 @@ EOF
   [[ "$output" == *"ENVIRONMENT"* ]] || false
   [[ "$output" != *"WILL retry"* ]] || false
   [[ "$output" != *"is missing its staged WXR export"* ]] || false
+}
+
+# issue #109 fix-pack, second review round (reviewer-mandated): closes the
+# fallthrough itself, not just the two known failure modes above.
+# graft_verify_import_completeness's real return values are exactly
+# {0, 1, 2, 3} today, so this scenario cannot happen through the real
+# function -- it is stubbed here specifically to simulate a FUTURE return
+# code phase_graft's own if/elif chain does not recognize yet, proving
+# that an unrecognized code is refused rather than silently treated as
+# rc=1's "safe to retry" case.
+@test "issue #109 fix-pack: an unrecognized graft_verify_import_completeness return code fails closed, without clearing markers or invoking prune" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "${run_dir}/export"
+  touch "${run_dir}/backup.complete"
+  cat > "${run_dir}/manifest.json" <<'EOF'
+{"migrate":{"core-wp":{"post_types":["page"],"option_keys":[]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}
+EOF
+  local step
+  for step in stack_sync media_sync mu_plugin prune import_attachments importer_setup export import fetch_id_map; do
+    touch "${run_dir}/graft.${step}.done"
+  done
+  printf '101\t5001\tpage\n' > "${run_dir}/id-map.tsv"
+
+  _major4_stub_everything_but_the_marker_block
+  # A code this chain does not know about -- deliberately not 0/1/2/3.
+  graft_verify_import_completeness() { return 4; }
+
+  unset SITEGRAFT_DRY_RUN
+  run phase_graft --profile demo --run "$run_dir"
+  [ "$status" -eq 1 ]
+
+  # The acceptance criterion: NONE of the four retry markers were
+  # cleared, and prune was NEVER invoked -- an unknown code must not
+  # default to the destructive rc=1 handling.
+  [ -f "${run_dir}/graft.media_sync.done" ]
+  [ -f "${run_dir}/graft.import_attachments.done" ]
+  [ -f "${run_dir}/graft.import.done" ]
+  [ -f "${run_dir}/graft.fetch_id_map.done" ]
+  [[ "$output" != *"STUB: graft_prune_previous_run"* ]] || false
+
+  # The message names the unrecognized code and refuses to guess --
+  # never implies a retry will fix it (the rc=1 wording).
+  [[ "$output" == *"unexpected status (4)"* ]] || false
+  [[ "$output" != *"WILL retry"* ]] || false
 }
 
 # --- foreign-file message clarity (review — the DDEV harness's OWN bug,

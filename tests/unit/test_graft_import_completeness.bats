@@ -66,7 +66,7 @@ _write_wxr() {
   # Same mechanism as lib/graft.sh's other sitegraft_mktemp_dir caller
   # (graft_integrity_gate, see tests/unit/test_graft_integrity_gate.bats'
   # sibling test): this function's own only production caller,
-  # phase_graft (lib/graft.sh:3095), calls it as
+  # phase_graft (lib/graft.sh), calls it as
   # `if graft_verify_import_completeness ...; then :; else ...; fi` --
   # not `|| return` (an earlier draft of this comment claimed that, and a
   # `sitegraft verify` caller that does not exist; corrected). Bash

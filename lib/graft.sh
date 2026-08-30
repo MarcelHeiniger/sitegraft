@@ -1424,7 +1424,7 @@ graft_verify_import_completeness() {
   #
   # issue #109: checked explicitly, same reasoning as
   # graft_integrity_gate's identical call above — its own only production
-  # caller, phase_graft (lib/graft.sh:3095), calls this function as
+  # caller, phase_graft (lib/graft.sh), calls this function as
   # `if graft_verify_import_completeness ...; then :; else ...; fi`, NOT
   # `|| return`. Corrected here (an earlier draft of this comment claimed
   # `... || return 1/2`, and invented a `sitegraft verify` caller that
@@ -3169,7 +3169,7 @@ phase_graft() {
       # not even attempt the check, because sitegraft_mktemp_dir failed
       # (TMPDIR full, read-only, or missing — see the error printed
       # above this one for the actual cause). Kept as its own code
-      # rather than folded into rc=2: rc=2's own message below points an
+      # rather than folded into rc=2: rc=2's own message above points an
       # operator at ${run_dir}/export — actively misleading for an
       # environment problem that has nothing to do with the staged WXR
       # export, which was never even reached. Same safe handling as
@@ -3181,6 +3181,29 @@ phase_graft() {
       # it is the only one where the staged WXR itself was confirmed
       # readable.
       log_error "could not verify this run's WXR import completeness against B: a temporary directory could not be created (see the error above for the cause — typically TMPDIR full, read-only, or missing). This is an ENVIRONMENT problem, not a sign that anything is wrong with what this run already did to B or with its staged WXR export. No resumability marker was touched. Fix the environment issue and re-run 'sitegraft graft' (or 'sitegraft verify') against this same run directory — it will re-check from where it left off."
+      return 1
+    elif [ "$verify_rc" -ne 1 ]; then
+      # issue #109 fix-pack (second review round, reviewer-mandated): the
+      # chain above used to end at rc=3's own `fi`, so every value that
+      # was neither 2 nor 3 — including a value that does not exist
+      # today — fell through unconditionally into the rc=1 branch below,
+      # which clears four resumability markers and arms
+      # graft_prune_previous_run. That fallthrough is harmless right now
+      # only because graft_verify_import_completeness's own return
+      # values are exactly {0, 1, 2, 3} (read every `return` in that
+      # function to confirm — its own header comment enumerates them),
+      # so "not 2, not 3" and "confirmed 1" happen to coincide today. A
+      # future rc=4 would not: it would silently take the SAME
+      # destructive path as a confirmed, readable "wordpress-importer
+      # skipped an item" failure, on nothing more than the absence of a
+      # branch that recognized it — an unverified guess treated as a
+      # known-safe case, the exact class of defect the rest of this PR
+      # closes one layer down (#107's own `.tables: []`, #109's own
+      # silent empty tmp_dir). Closed at the chain itself: an
+      # unrecognized code now gets the same no-marker-touched treatment
+      # as rc=2/rc=3 — refuse to guess, never default "unknown" to
+      # "known safe".
+      log_error "graft_verify_import_completeness returned an unexpected status (${verify_rc}) while verifying this run's WXR import completeness against B. phase_graft does not know how to interpret this return code safely, so it is refusing to guess — no resumability marker was touched, and 'sitegraft graft' will NOT automatically retry. Check the output above for the real cause before re-running against this run directory; if this is not a transient environment issue, this may be a bug in sitegraft itself — please report it along with that output."
       return 1
     fi
 
