@@ -1551,10 +1551,127 @@ backup_prefix_tables_csv() {
 # or any post_type/option_key-only module) is skipped, not sent as an empty
 # --tables= (not a meaningful export request) — plan bug fix already present
 # before this extraction, kept as-is.
+#
+# issue #97 — three states per table, not two. A `wp db export` that fails
+# (a locked table, a permissions error, a table this run's manifest names
+# but this particular install does not actually have) used to fall through
+# an internal `|| echo ""` and get checksummed as though its content were
+# the empty string — indistinguishable from a table that really is empty.
+# The worst case (measured, not hypothetical): the SAME table fails to
+# export before the graft and after it. sha256("") matches itself, and the
+# report ends up asserting protected data is unchanged for a table it never
+# actually read, either time.
+#
+# Fixed by checking wp_remote's own exit status instead of discarding it,
+# and then splitting on which of the two buckets above (declared vs.
+# `_unclaimed`) the failing table belongs to — the same split this
+# function's docblock already draws for a table that CHANGED, extended here
+# to a table that could not be READ, for the identical reason:
+#
+#   - A DECLARED module's table failing to export is a hard failure of this
+#     whole function (non-zero return, nothing printed). An operator named
+#     that table as something to protect; if it cannot be read, the
+#     function does not know whether it is untouched, and has no scope
+#     narrower than "protected data cannot be confirmed" to report that in.
+#     Both of this function's callers already treat a non-zero return as a
+#     hard failure — `phase_backup`, below, refuses to declare the backup
+#     good, and `phase_verify`'s recompute (lib/verify.sh) already hard-
+#     fails the same way for issue #33 (a total recompute failure). One
+#     failure mode, inherited by both phases for free, rather than a new,
+#     second one that could drift from #33's.
+#
+#   - An `_unclaimed:<table>` failing to export is NOT treated as a reason
+#     to abort the whole computation. These tables are, by definition,
+#     outside anything the operator declared protected — often several
+#     dozen of them on a real site. Aborting backup (which blocks the
+#     operator on the very command meant to protect them, before the graft
+#     has even started) over ONE such table having a transient permission
+#     quirk or a lock held by an unrelated process would be exactly the
+#     "legitimate case a hardening wrongly refuses" this issue warns
+#     against — the same argument already made, for CHANGES rather than
+#     read failures, in the hard/soft split above. Instead, the table's
+#     checksum value is the literal string "unreadable" — never a valid
+#     "sha256:..." value — so it can never again silently pass as either a
+#     match or a no-op empty read. `verify_compare_checksums` (lib/
+#     verify.sh) treats that sentinel as its own third outcome: NOT
+#     VERIFIED, neither a confirmed match nor a confirmed change — closing
+#     the exact "unreadable-vs-unreadable still matches itself" case this
+#     issue measured, one level below where #33 already closed it for a
+#     total recompute failure.
+#
+# Measured, not assumed (corrected, review of PR #105 — the first version of
+# this comment guessed wrong): a DECLARED module's table that does not
+# actually exist on B (a static `_tables` function, per lib/plan.sh's own
+# comment on `owns_tables`, is never filtered against a live scan the way a
+# `_tables_dynamic` selection is — so this is a real, reachable shape, not a
+# hypothetical one; modules/motopress.sh.example, shipped in this repo,
+# declares exactly one such static table) is treated as a hard failure too,
+# same as any other unreadable declared table — and it turns out that isn't
+# a shortcut around a harder distinction, it's the only reading the data
+# supports. Verified live against a real MariaDB 11: `wp db export
+# --tables=<name>` (mysqldump underneath) exits 6 with `Couldn't find
+# table: "wp_x"` BOTH for a table that genuinely does not exist AND for one
+# that exists but this wp-cli user has no privilege on — same exit code,
+# same message text, in both cases. MySQL/MariaDB does this ON PURPOSE (an
+# unprivileged user should not be able to learn a hidden table's existence
+# from mysqldump's own error) — there is nothing in wp_remote's exit status
+# OR mysqldump's stderr that tells "absent" apart from "exists, but you may
+# not see it". Treating them identically isn't settling for less; there is
+# no more to read.
+#
+# What CAN be told apart, from data already on disk: whether THIS RUN'S OWN
+# manifest even claims to know the table exists. `phase_backup`/
+# `phase_verify` (below) pass scan-b.json's own `.tables` list — the live,
+# already-prefixed table names `sitegraft scan` actually saw on B, the
+# exact same string space `backup_prefix_tables_csv` resolves a module's
+# suffix into — as this function's OPTIONAL third argument. When present, a
+# declared table absent from THAT list gets a message that says so
+# specifically ("module X declares table Y, which B's last scan never
+# saw — a module/site mismatch"), instead of the generic unreadable-table
+# message. It changes nothing about the OUTCOME (still a hard failure
+# either way — unreadable is unreadable, per the paragraph above) — only
+# the message, which is the actual point: an operator staring at "could not
+# export" needs to know whether to go check permissions on B or to go fix
+# the module. `manifest_compute_unclaimed` (lib/manifest.sh) already
+# resolves table names against this exact scan-b.json list, for the
+# identical reason; this reuses the same data, not a second lookup of it.
+#
+# An absent third argument (every 2-arg call site, including every existing
+# unit test) means "no scan-b.json list available to cross-check against",
+# never "B has zero tables" — only a real, NON-EMPTY JSON array turns the
+# mismatch message on. An omitted argument, an unparseable one, AND a
+# genuinely empty array `[]` all fall through to the generic message
+# instead — `[]` is what a scan that saw nothing at all looks like
+# (including a failed `wp db tables` swallowed by lib/inventory.sh:302's
+# unguarded pipe), and "the scan saw nothing" must read as "unknown",
+# never as "confirmed this table doesn't exist".
 backup_compute_protected_checksums() {
-  local alias_lc="$1" manifest="$2"
+  local alias_lc="$1" manifest="$2" scan_b_tables_json="${3:-}"
   local prefix
   prefix=$(inventory_table_prefix "$alias_lc") || return 1
+  # issue #97 review fix-pack: "" (the default above) means "no scan-b.json
+  # table list available" — NOT "B has zero tables". Only a genuine,
+  # NON-EMPTY JSON array turns the mismatch message in the declared-table
+  # branch below on; an empty string, a value that fails to parse as an
+  # array, OR a genuinely empty array `[]`, all fall through to the generic
+  # message instead.
+  #
+  # `and length > 0` (review, PR #105 round 2): a bare `[]` used to pass
+  # `type == "array"` and set have_scan_tables=1, which then reported EVERY
+  # declared table as a module/site mismatch — accusing the module for a
+  # scan that saw nothing at all. Reachable through the exact default this
+  # issue is about, one layer up: lib/inventory.sh:302 builds scan-b.json's
+  # `.tables` via `wp_remote ... db tables | jq -R -s -c ...`, with no
+  # `pipefail` and no `||` — a failing `wp db tables` (permissions,
+  # connectivity) is swallowed by the pipe into an empty array rather than
+  # aborting the scan. An empty scan result means "unknown whether B has
+  # this table", the identical "empty vs. unread" conflation this whole
+  # issue exists to close, not "confirmed absent" — so it must not be
+  # allowed to accuse a module of a mismatch it cannot actually see.
+  local have_scan_tables=0
+  if [ -n "$scan_b_tables_json" ] && echo "$scan_b_tables_json" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+    have_scan_tables=1
+  fi
   local checksums='{}' mod
   for mod in $(echo "$manifest" | jq -r '.protect | keys[]'); do
     local tables_csv
@@ -1596,17 +1713,94 @@ backup_compute_protected_checksums() {
         # FULL table names as scan read them off the site, where a module's
         # `_tables` holds bare suffixes for sitegraft to prefix. Prefixing
         # these a second time would ask for `wpfn_wpfn_...`.
-        local one_content one_sum
-        one_content=$(wp_remote "$alias_lc" db export - --tables="$tbl" 2>/dev/null || echo "")
-        one_sum=$(backup_checksum "$one_content")
-        checksums=$(echo "$checksums" | jq --arg m "_unclaimed:${tbl}" --arg s "sha256:${one_sum}" '.[$m] = $s')
+        #
+        # issue #97: `wp_remote`'s own exit status is checked, not discarded
+        # — a failed export is recorded as the sentinel "unreadable" (see
+        # this function's own header comment), never checksummed as though
+        # its content were empty. Out-of-scope by definition, so this one
+        # table's failure does not abort the sweep — the loop continues to
+        # the next table either way.
+        local one_content
+        if one_content=$(wp_remote "$alias_lc" db export - --tables="$tbl" 2>/dev/null); then
+          local one_sum
+          one_sum=$(backup_checksum "$one_content")
+          checksums=$(echo "$checksums" | jq --arg m "_unclaimed:${tbl}" --arg s "sha256:${one_sum}" '.[$m] = $s')
+        else
+          log_warn "could not export unclaimed table '${tbl}' on ${alias_lc} for its protected-data checksum — recorded as unreadable rather than checksummed as empty. Out of the declared protect scope, so this table alone does not abort the run; see verify's report for what an unreadable table means for this run's result."
+          checksums=$(echo "$checksums" | jq --arg m "_unclaimed:${tbl}" '.[$m] = "unreadable"')
+        fi
       done 3<<< "$(echo "$manifest" | jq -r --arg m "$mod" '.protect[$m].tables // [] | .[]')"
       continue
     fi
 
     local prefixed_tables_csv tables_content sum
     prefixed_tables_csv=$(backup_prefix_tables_csv "$prefix" "$tables_csv")
-    tables_content=$(wp_remote "$alias_lc" db export - --tables="$prefixed_tables_csv" 2>/dev/null || echo "")
+    # issue #97: same exit-status check as the `_unclaimed` branch above,
+    # but this table WAS named by an operator as protected — no "out of
+    # scope" reading is available here, so a failed export is a hard
+    # failure of the whole computation (see this function's own header
+    # comment for why both callers already do the right thing with that).
+    #
+    # Review fix-pack (PR #105, mineur 5): stderr is now captured, not
+    # discarded — a module can declare several tables at once
+    # (`prefixed_tables_csv` is a CSV, one wp_remote call for the lot), so
+    # without this the error named the whole list and never which one
+    # actually failed. mysqldump already names it in its own stderr; this
+    # surfaces that text instead of re-deriving it. sitegraft_mktemp_dir
+    # (lib/core.sh) is the established capture-stderr-to-a-file pattern
+    # this codebase already uses for exactly this reason (lib/graft.sh's
+    # WXR helpers, lib/verify.sh's content-remap CLI) — its directory is
+    # registered for cleanup on exit, not removed here.
+    #
+    # tmp_dir's OWN result is verified before use (review, PR #105 round
+    # 2): sitegraft_mktemp_dir's `mktemp -d` is not itself guarded (lib/
+    # core.sh), so a full/read-only TMPDIR makes it echo an empty string
+    # rather than fail loudly. Measured: an unverified `stderr_file` in
+    # that case becomes the bare path "/stderr" — the redirect itself then
+    # fails to open (a real, unrelated error, since "/" is not writable),
+    # so `wp_remote` never even runs, and a table that would have exported
+    # PERFECTLY gets reported as unreadable, with a raw shell redirection
+    # error leaking a filesystem path into the message on top. Falls back
+    # to /dev/null (the exact behavior every call site had before this
+    # fix-pack introduced stderr capture at all) whenever tmp_dir does not
+    # come back as a real, existing directory — this failure mode is about
+    # losing the improved diagnostic, never about losing correctness: the
+    # export itself still runs (or still fails) on its own merits.
+    local tmp_dir stderr_file="" err_text=""
+    tmp_dir=$(sitegraft_mktemp_dir)
+    if [ -n "$tmp_dir" ] && [ -d "$tmp_dir" ]; then
+      stderr_file="${tmp_dir}/stderr"
+    fi
+    if ! tables_content=$(wp_remote "$alias_lc" db export - --tables="$prefixed_tables_csv" 2>"${stderr_file:-/dev/null}"); then
+      [ -n "$stderr_file" ] && [ -s "$stderr_file" ] && err_text=$(cat "$stderr_file")
+      # Review fix-pack (PR #105, design ask): when scan-b.json's own table
+      # list is available (see this function's own header comment), a
+      # declared table absent from it gets a message that names the actual
+      # mismatch — module vs. site — rather than the generic unreadable-
+      # table message below. Still a hard failure either way; only the
+      # wording changes.
+      if [ "$have_scan_tables" = "1" ]; then
+        local missing
+        # `as $t | select(($scan | index($t)) | not) | $t`, NOT
+        # `select(($scan | index(.)) | not)` — lib/manifest.sh's own
+        # manifest_compute_unclaimed carries a comment on this exact jq
+        # pitfall (found there via TDD, reproduced here the same way while
+        # writing this fix-pack's tests): piping INTO `index(.)` rebinds
+        # `.` to whatever was piped in ($scan itself), not to the outer
+        # $wanted[] element under select — silently searching $scan for
+        # $scan, which is never found, so `missing` never named anything.
+        # `as $t` binds the element explicitly, immune to the rebind.
+        missing=$(jq -n --argjson scan "$scan_b_tables_json" --arg csv "$prefixed_tables_csv" \
+          '($csv | split(",") | map(select(length > 0))) as $wanted
+           | [$wanted[] as $t | select(($scan | index($t)) | not) | $t]')
+        if [ "$(echo "$missing" | jq 'length')" != "0" ]; then
+          log_error "module '${mod}' declares table(s) $(echo "$missing" | jq -r 'join(", ")') that ${alias_lc}'s last scan (scan-b.json) never saw — a module/site mismatch, not (necessarily) a permission or lock problem. Re-run 'sitegraft scan' if B has genuinely changed since, or fix/remove this module's declared table name(s).${err_text:+ (mysqldump also reported: ${err_text})}"
+          return 1
+        fi
+      fi
+      log_error "could not export table(s) [${prefixed_tables_csv}] declared by protected module '${mod}' — a table this run was asked to protect could not be read, so it cannot be confirmed unchanged. Never checksummed as empty.${err_text:+ (${err_text})}"
+      return 1
+    fi
     sum=$(backup_checksum "$tables_content")
     checksums=$(echo "$checksums" | jq --arg m "$mod" --arg s "sha256:${sum}" '.[$m] = $s')
   done
@@ -1833,8 +2027,23 @@ phase_backup() {
     # (Step 5) will later reuse via backup_compute_protected_checksums —
     # see that function's own comment for why this must never be a second,
     # independent implementation.
+    #
+    # issue #97 review fix-pack (PR #105): scan-b.json's own `.tables` list
+    # is read here, if the file exists and parses, and handed to
+    # backup_compute_protected_checksums as its optional third argument —
+    # see that function's own header comment for what it does with it (an
+    # actionable module/site-mismatch message for a declared table absent
+    # from B's last scan, rather than a generic unreadable-table one). Left
+    # unset (empty string) on any read/parse failure — a missing or broken
+    # scan-b.json is not itself a backup failure, it only means this one
+    # message stays generic, exactly like every 2-arg call this function
+    # already had before this fix-pack.
+    local scan_b_tables=""
+    if [ -f "${run_dir}/scan-b.json" ]; then
+      scan_b_tables=$(jq -c '.tables // empty' "${run_dir}/scan-b.json" 2>/dev/null) || scan_b_tables=""
+    fi
     local checksums
-    checksums=$(backup_compute_protected_checksums b "$manifest") || { log_error "could not compute protected-data checksums — aborting before declaring the backup good"; return 1; }
+    checksums=$(backup_compute_protected_checksums b "$manifest" "$scan_b_tables") || { log_error "could not compute protected-data checksums — aborting before declaring the backup good"; return 1; }
     manifest=$(echo "$manifest" | jq --argjson c "$checksums" '.checksums_protected_pre_graft = $c')
 
     # issue #52 / ADR 0008's "Required regardless" list: the pre-graft

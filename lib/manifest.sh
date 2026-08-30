@@ -11,7 +11,22 @@
 # previous release, or a hand-inspecting operator) couldn't parse correctly
 # — new optional keys with safe defaults (like `profile`/aliases/
 # `options.search_replace`, added in this fix-pack) don't need a bump; a
-# renamed or restructured key would. Currently 1, unbumped since Task 2.1.
+# renamed or restructured key would.
+#
+# Bumped 1 -> 2 for issue #97 (review, PR #105): not a new/renamed key, but
+# an existing one's VALUE SPACE changed in a way that matters for exactly
+# the reason this field exists. `checksums_protected_pre_graft`'s per-entry
+# values used to be ALWAYS "sha256:<hex>"; as of this bump a value can also
+# be the literal string "unreadable" (lib/backup.sh's
+# backup_compute_protected_checksums, lib/verify.sh's
+# verify_compare_checksums). A manifest whose `checksums_protected_pre_graft`
+# was written by a version older than this one was produced by code that
+# could not tell an unreadable table from a genuinely empty one — silently
+# checksumming the former as the latter is issue #97's own defect. Bumping
+# the version does not repair an already-written older manifest (there is
+# nothing left in it to recover the missing information from) — it only
+# DECLARES the incompatibility, for whichever future reader chooses to act
+# on it. Currently 2.
 
 # manifest_new <site_a_url> <site_b_url> [profile] [alias_a] [alias_b] — the
 # three bracketed args are new in this fix-pack (MINOR, PR #2 review:
@@ -32,7 +47,7 @@ manifest_new() {
     --arg profile "$profile" --arg alias_a "$alias_a" --arg alias_b "$alias_b" \
     --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{
-      sitegraft_manifest_version: 1,
+      sitegraft_manifest_version: 2,
       profile: $profile,
       frozen: false,
       created_at: $now,
@@ -223,6 +238,13 @@ manifest_freeze() {
 # happen first) — not from inside plan_defaults, where it would only ever
 # see the module defaults and go stale the moment the operator adjusts a
 # selection.
+#
+# STALE, kept for history — SUPERSEDED by the "Tables." block further down
+# in this function (search for "Tables. This list used to be left empty"),
+# which extends and fills `tables` for real. Flagged, not rewritten, during
+# the issue #97 review (PR #105): this paragraph still reads as though
+# `tables` stays `[]` unconditionally, which stopped being true once the
+# later block landed — a reader who stops here gets the wrong idea.
 #
 # `tables` is deliberately left `[]` here — a MINOR review finding on PR #2
 # (Viktor) flagged this as a design/impl gap (§3.6 says "post_type, table, OR

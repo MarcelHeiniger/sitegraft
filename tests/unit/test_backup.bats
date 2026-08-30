@@ -1,3 +1,5 @@
+bats_require_minimum_version 1.5.0
+
 # tests/unit/test_backup.bats — pure/near-pure functions in lib/backup.sh:
 # backup_checksum (design doc §6.3, review finding A5), backup_wp_cmd_literal
 # (used only decoratively in restore.sh's header comment), and the two
@@ -543,6 +545,165 @@ INSERT INTO `wp_users` VALUES (1,"admin");
   inventory_table_prefix() { return 1; }
   run backup_compute_protected_checksums b "$manifest"
   [ "$status" -eq 1 ]
+}
+
+# --- issue #97: a per-table export failure was swallowed by an internal
+# `|| echo ""`, checksumming the failed table as though its content were
+# empty — indistinguishable from a table that really is empty. Three states,
+# not two: read-and-non-empty, read-and-legitimately-empty, unreadable. The
+# third must never collapse into the second. See this function's own header
+# comment (updated alongside this fix-pack) for the declared/`_unclaimed`
+# split in what each state does next.
+@test "backup_compute_protected_checksums fails when a DECLARED module's table export itself fails, rather than checksumming it as empty (issue #97)" {
+  local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  wp_remote() { return 1; }
+  run backup_compute_protected_checksums b "$manifest"
+  [ "$status" -eq 1 ]
+  # never a checksum of empty content standing in for the read that failed
+  [[ "$output" != *"sha256:"* ]] || false
+}
+
+@test "backup_compute_protected_checksums still succeeds, with a real checksum, when a declared module's table genuinely exports empty (issue #97 — empty is not the same as unreadable)" {
+  local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  wp_remote() { echo ""; }   # rc 0, empty content -- a genuinely empty table
+  run backup_compute_protected_checksums b "$manifest"
+  [ "$status" -eq 0 ]
+  run jq -e '.fakebooking | startswith("sha256:")' <<< "$output"
+  [ "$status" -eq 0 ]
+}
+
+@test "backup_compute_protected_checksums records an unclaimed table's export failure as 'unreadable', not empty, and does not abort the run over an out-of-scope table (issue #97)" {
+  local manifest='{"protect":{"_unclaimed":{"tables":["wp_actionscheduler_actions","wp_usermeta"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  wp_remote() {
+    shift
+    for a in "$@"; do
+      case "$a" in
+        --tables=wp_actionscheduler_actions) return 1 ;;
+      esac
+    done
+    echo "INSERT INTO t VALUES (1);"
+  }
+  # --separate-stderr (bats >= 1.5.0): this path also calls log_warn on the
+  # table that failed to export (stderr), which would otherwise get merged
+  # into $output ahead of the JSON and break the jq parse below.
+  run --separate-stderr backup_compute_protected_checksums b "$manifest"
+  [ "$status" -eq 0 ]
+  local checksums_json="$output"
+  run jq -e '.["_unclaimed:wp_actionscheduler_actions"] == "unreadable"' <<< "$checksums_json"
+  [ "$status" -eq 0 ]
+  # the OTHER unclaimed table, which read fine, still gets a real checksum —
+  # one bad table does not poison the rest of the sweep
+  run jq -e '.["_unclaimed:wp_usermeta"] | startswith("sha256:")' <<< "$checksums_json"
+  [ "$status" -eq 0 ]
+}
+
+# --- issue #97 review fix-pack (PR #105): a DECLARED table's export failure
+# used to name only the CSV of every table the module declares, never which
+# one actually failed, and never distinguished "this table does not exist on
+# B at all" (a module/site mismatch) from "it exists but could not be read
+# right now". Measured live against a real MariaDB 11 (see
+# backup_compute_protected_checksums' own header comment): mysqldump exits 6
+# with "Couldn't find table: ..." identically for an ABSENT table and for one
+# that exists but this wp-cli user has no privilege on — the two are
+# genuinely indistinguishable from wp_remote's exit status or stderr text
+# alone. What CAN be told apart, from data already on disk, is whether the
+# table appears at all in scan-b.json's own `.tables` list — passed in here
+# as an OPTIONAL third argument.
+@test "backup_compute_protected_checksums names the mismatch when the declared table is absent from scan-b.json's own table list (issue #97 review)" {
+  local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  wp_remote() { echo "mysqldump: Couldn't find table: \"wp_fakebooking_reservations\"" >&2; return 1; }
+  # scan-b.json saw OTHER tables, but never this one
+  local scan_b_tables='["wp_options","wp_posts","wp_users"]'
+  run --separate-stderr backup_compute_protected_checksums b "$manifest" "$scan_b_tables"
+  [ "$status" -eq 1 ]
+  [[ "$stderr" == *"module/site mismatch"* ]] || false
+  [[ "$stderr" == *"wp_fakebooking_reservations"* ]] || false
+  [[ "$stderr" == *"fakebooking"* ]] || false
+}
+
+@test "backup_compute_protected_checksums does NOT claim a mismatch when scan-b.json's table list DOES contain the declared table (something else is wrong)" {
+  local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  wp_remote() { echo "mysqldump: Couldn't find table: \"wp_fakebooking_reservations\"" >&2; return 1; }
+  # scan-b.json DID see this exact table -- read failure is something else
+  # (permissions, a lock), not an absent table
+  local scan_b_tables='["wp_options","wp_posts","wp_fakebooking_reservations"]'
+  run --separate-stderr backup_compute_protected_checksums b "$manifest" "$scan_b_tables"
+  [ "$status" -eq 1 ]
+  [[ "$stderr" != *"module/site mismatch"* ]] || false
+  [[ "$stderr" == *"wp_fakebooking_reservations"* ]] || false
+}
+
+@test "backup_compute_protected_checksums never claims a mismatch when scan-b.json's table list was not supplied at all (unknown, not confirmed absent)" {
+  local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  wp_remote() { return 1; }
+  # no third argument at all -- same call shape every pre-existing 2-arg
+  # call site (including phase_backup's callers before this fix-pack) uses
+  run --separate-stderr backup_compute_protected_checksums b "$manifest"
+  [ "$status" -eq 1 ]
+  [[ "$stderr" != *"module/site mismatch"* ]] || false
+}
+
+@test "backup_compute_protected_checksums never claims a mismatch when scan-b.json's table list is a genuinely EMPTY array (review: [] must not accuse every declared table)" {
+  local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  wp_remote() { return 1; }
+  # scan-b.json's own .tables is [] -- reachable via the same default this
+  # PR fixes one layer up: lib/inventory.sh:302 builds .tables through a
+  # pipe with no pipefail/||, so a failed `wp db tables` is swallowed into
+  # an empty array rather than aborting scan. An empty scan result must
+  # read as "unknown whether B has this table", not "confirmed absent" --
+  # the exact same "empty vs unread" conflation this whole issue exists to
+  # close, one level up.
+  local scan_b_tables='[]'
+  run --separate-stderr backup_compute_protected_checksums b "$manifest" "$scan_b_tables"
+  [ "$status" -eq 1 ]
+  [[ "$stderr" != *"module/site mismatch"* ]] || false
+}
+
+@test "backup_compute_protected_checksums's declared-table error includes mysqldump's own stderr, naming the specific table (issue #97 review, mysqldump names it, log_error used to not)" {
+  local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  wp_remote() { echo "mysqldump: Got error: 1045: Access denied for user" >&2; return 1; }
+  run --separate-stderr backup_compute_protected_checksums b "$manifest"
+  [ "$status" -eq 1 ]
+  [[ "$stderr" == *"Access denied for user"* ]] || false
+}
+
+@test "backup_compute_protected_checksums does not falsely report a successfully-exported table as unreadable when sitegraft_mktemp_dir fails (review round 2)" {
+  local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  # simulates a genuine sitegraft_mktemp_dir failure (a full/read-only
+  # TMPDIR): mktemp -d errors, and the real function's own unguarded
+  # `echo "$dir"` then echoes an empty string -- reproduced here directly,
+  # since forcing the real mktemp to fail portably in a test is not
+  # practical.
+  sitegraft_mktemp_dir() { echo ""; }
+  # this table's export genuinely SUCCEEDS -- the only failure in this run
+  # is the broken tmp_dir, which must never surface as a false read failure
+  # on a table that read fine.
+  wp_remote() { echo "INSERT INTO t VALUES (1);"; }
+  run --separate-stderr backup_compute_protected_checksums b "$manifest"
+  [ "$status" -eq 0 ]
+  run jq -e '.fakebooking | startswith("sha256:")' <<< "$output"
+  [ "$status" -eq 0 ]
+}
+
+@test "backup_compute_protected_checksums's error never leaks a bare unverified stderr-capture path when sitegraft_mktemp_dir fails (review round 2)" {
+  local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  sitegraft_mktemp_dir() { echo ""; }
+  wp_remote() { return 1; }
+  run --separate-stderr backup_compute_protected_checksums b "$manifest"
+  [ "$status" -eq 1 ]
+  [[ "$stderr" != *"/stderr"* ]] || false
+  [[ "$stderr" != *"Read-only"* ]] || false
+  [[ "$stderr" != *"No such file"* ]] || false
 }
 
 # --- issue #14: exact-state restore on a wrapped-local target ---------------
