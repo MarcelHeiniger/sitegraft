@@ -446,6 +446,18 @@ STUB
 # unrelated one is added to keep the total looking right. That combination
 # still turns C1-C4 (each drops or blanks a real argv entry) red, while
 # surviving a reordering that changes nothing observable.
+#
+# It compares the WRITTEN FORM of each argument, not its meaning: gum
+# accepts `--affirmative "x"` as well as `--affirmative=x`, and `fzf
+# --multi` as well as `fzf -m`, and switching to either spelling will
+# fail these assertions. That is deliberate. Normalising the two forms
+# would mean re-joining adjacent argv lines, which destroys the
+# one-argument-per-line property the stub exists for -- once joined,
+# `--affirmative=Yes, I understand` is indistinguishable from two
+# separate arguments -- and doing it correctly needs a parser that knows
+# which options take a value. The failure this leaves open is loud and
+# one line to fix here, never silent, so update the expectation rather
+# than hunting for a bug.
 assert_argv() {
   local got="$1" want_count="$2"
   shift 2
