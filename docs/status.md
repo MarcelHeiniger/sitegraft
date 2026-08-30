@@ -62,17 +62,25 @@ bolted on outside the sentinel discipline that could point an image at a
 ### Known gaps, none blocking the pilot site
 
 `#82` (Etch taxonomies never migrated — and silent, since the gate counts items),
-`#83` (`wp-content/fonts/` never synced, WP 6.5+ Font Library lost), `#88` (spaced
-JSON unmatched by the rewrite passes), `#79` (the harness fixture does not cover
-the shapes where these defects live — it went green on three broken builds this
-session).
+`#88` (spaced JSON unmatched by the rewrite passes), `#79` (the harness fixture
+does not cover the shapes where these defects live — it went green on three
+broken builds this session).
+
+`#83` (`wp-content/fonts/` never synced) is fixed: `graft_fonts_sync` now syncs
+the Font Library directory (read live via `wp_get_font_dir()` on each side, not
+hardcoded) the same way media is synced, and `graft_migrate_options` now refuses
+a migrated option whose value still names A's domain after the rewrite pass —
+exactly the `etch_global_stylesheets` shape the pilot needed fixed by hand (see
+"Done by hand" below, now automated, not a standing workaround). See
+`docs/todo.md`'s own "Done" entry for the detail.
 
 ### Done by hand on the pilot target, outside the tool
 
 Copying `wp-content/fonts/` and rewriting the source host inside
-`etch_global_stylesheets` (#83). Two items left to Marcel's judgement: Etch's AI
-API key was copied to the target along with the rest of its settings, and the HTTP
-smoke check fails on a false positive (it looks for "Home" in a German page).
+`etch_global_stylesheets` (#83, now fixed — see above). Two items left to
+Marcel's judgement: Etch's AI API key was copied to the target along with the
+rest of its settings, and the HTTP smoke check fails on a false positive (it
+looks for "Home" in a German page).
 
 ## Done
 

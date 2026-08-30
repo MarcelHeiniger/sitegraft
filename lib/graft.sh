@@ -477,6 +477,116 @@ graft_media_sync() {
   graft_push_dir b "$staging" "${SITE_B_WP_PATH}/wp-content/uploads" --keep-existing || return $?
 }
 
+# graft_font_dir <alias: a|b> — the absolute filesystem path of <alias>'s
+# WordPress Font Library directory (issue #83: WordPress 6.5+ writes
+# uploaded font files to `wp-content/fonts/` by default, but that path is
+# filterable via the `font_dir` filter — `wp_get_font_dir()` is the ONLY
+# thing that resolves it correctly, so this never hardcodes the default).
+#
+# Routed through `wp_remote`, not a raw `wp` call, for the exact reason
+# every other path-sensitive read in this file is: `wp_remote` already
+# resolves the correct execution context for all three site shapes this
+# tool supports (lib/inventory.sh) —
+#   - ssh-remote: runs wp-cli ON the SSH host, so the path `wp_get_font_dir()`
+#     returns is already meaningful to the `rsync` this function's caller
+#     runs against that same host.
+#   - wrapped-local (e.g. DDEV): runs wp-cli THROUGH the wrapper, so the
+#     path returned is the CONTAINER-INTERNAL path — exactly the shape
+#     graft_pull_dir/graft_push_dir already expect (the same shape
+#     SITE_*_WP_PATH itself is for a wrapped-local site; see this file's
+#     own top-of-file header comment).
+#   - bare-local: runs plain `wp`, so the path is already a real path on
+#     the orchestrator's own filesystem.
+# A hardcoded "${SITE_*_WP_PATH}/wp-content/fonts" would be wrong for any
+# site whose `font_dir` filter changes it, and would still be RIGHT for
+# every other site purely by accident — reading it live is the only way
+# this is reliable across an install this tool does not control.
+#
+# `SITEGRAFT_DRY_RUN=0` prefixed onto this one call, same technique (and
+# same reasoning) as `_graft_migrate_one_option_key`'s own A-side read
+# below: a read needed to compute a correct dry-run PREVIEW must run for
+# real (wp_remote wraps every call in run_or_echo, which under --dry-run
+# returns the literal text "[dry-run] wp_remote ... eval ..." instead of a
+# real path) — only the WRITE side (graft_push_dir, inside graft_fonts_sync
+# below) stays simulated.
+#
+# `wp_get_font_dir()` does not exist before WordPress 6.5 — checked with
+# `function_exists()` inside the eval itself (not by trying to read WP's
+# version number some other way, which this codebase has no existing
+# helper for) so a pre-6.5 site — the ordinary case for most of the
+# installs this tool will ever see — returns an EMPTY string here, read by
+# graft_fonts_sync as "no Font Library, nothing to sync", never as an
+# error. A genuine failure to even ask the question (wp-cli unreachable, a
+# fatal in the eval) is different from that and is NOT swallowed: this
+# function's own exit status still reports it, exactly like every other
+# `wp_remote ... eval` call in this file.
+graft_font_dir() {
+  local alias_lc="$1"
+  local result rc=0
+  result=$(SITEGRAFT_DRY_RUN=0 wp_remote "$alias_lc" eval '
+    if ( function_exists( "wp_get_font_dir" ) ) {
+      $d = wp_get_font_dir();
+      echo isset( $d["path"] ) ? $d["path"] : "";
+    }
+  ' 2>/dev/null) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log_error "graft: could not determine ${alias_lc}'s font directory (wp eval failed) — refusing to guess a path for wp-content/fonts"
+    return 1
+  fi
+  printf '%s' "$result"
+}
+
+# graft_fonts_sync <run_dir> — issue #83: WordPress 6.5+'s Font Library
+# writes uploaded font files to a directory that is a SIBLING of
+# `wp-content/uploads/` (not a subdirectory of it), so graft_media_sync
+# above never reaches it. Same shape, same safety properties, same
+# `--keep-existing` (never overwrite a file already on B) as media_sync —
+# deliberately not a copy-paste of it, though, because the source AND
+# destination directories here are two INDEPENDENT reads (graft_font_dir a
+# / graft_font_dir b), not one hardcoded relative path reused on both
+# sides the way `wp-content/uploads` is. A and B can each have their own
+# `font_dir` filter.
+#
+# Every step below guards its own exit status with `|| return $?`, same
+# reasoning as graft_media_sync's own header comment: phase_graft puts this
+# function on the LHS of a `||`, which disables `set -e` for this entire
+# function body, so a silent mid-body failure here would fall through
+# exactly the way issue #36's original media bug did.
+#
+# A site with no Font Library in use at all (the ordinary case: no plugin/
+# theme ever called the font-upload UI, or WordPress itself predates 6.5)
+# is not an error — graft_font_dir returns "" for it, and this function
+# logs and returns 0, same as graft_pull_dir's own "source directory does
+# not exist yet" no-op. B lacking Font Library support entirely (a
+# pre-6.5 target) WHILE A has real font files to migrate is treated
+# differently: refusing loudly rather than silently dropping A's fonts a
+# second time, which is the exact defect this issue exists to close.
+graft_fonts_sync() {
+  local run_dir="$1"
+  local font_dir_a; font_dir_a=$(graft_font_dir a) || return $?
+  if [ -z "$font_dir_a" ]; then
+    log_info "A has no WordPress Font Library directory (pre-6.5 core, or the Font Library was never used) — nothing to sync for wp-content/fonts"
+    return 0
+  fi
+  local font_dir_b; font_dir_b=$(graft_font_dir b) || return $?
+  if [ -z "$font_dir_b" ]; then
+    log_error "A has a font directory (${font_dir_a}) but B's own WordPress Font Library directory could not be resolved (pre-6.5 core, or wp_get_font_dir() is unavailable) — refusing to push font files to a destination this tool cannot confirm B will actually serve them from"
+    return 1
+  fi
+  local staging="${run_dir}/fonts-staging"
+  mkdir -p "$staging" || return $?
+  log_info "pulling A's fonts to the orchestrator..."
+  if [ -n "${SITE_A_SSH_HOST:-}" ]; then
+    run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${font_dir_a%/}/" "${staging}/" || return $?
+  else
+    graft_pull_dir a "$font_dir_a" "$staging" || return $?
+  fi
+  log_info "pushing fonts to B (never overwriting existing files)..."
+  # graft_push_dir itself now handles all three shapes (ssh-remote,
+  # wrapped-local, bare-local) — see its own header comment.
+  graft_push_dir b "$staging" "$font_dir_b" --keep-existing || return $?
+}
+
 graft_deploy_mu_plugin() {
   local mu_dir="${SITE_B_WP_PATH}/wp-content/mu-plugins"
   local src="${SITEGRAFT_ROOT}/mu-plugins/sitegraft-id-mapper.php"
@@ -2090,6 +2200,51 @@ _graft_migrate_one_option_key() {
     rewritten=$(printf '%s' "$value" | jq -c --arg from "$domain_from" --arg to "$domain_to" \
       'def replace_domain: if type == "string" then split($from) | join($to) else . end; walk(replace_domain)' 2>/dev/null)
     [ -n "$rewritten" ] && value="$rewritten"
+    # Issue #83's own detection half, not just its sync half: a value that
+    # STILL contains A's raw domain string after the rewrite pass just
+    # above is exactly the silent-loss shape the issue describes — the
+    # measured real-site case (docs/status.md) needed
+    # `etch_global_stylesheets` fixed BY HAND after a graft that reported
+    # success, because this rewrite did not reach it (the jq walk above
+    # only ever rewrites a value that parsed as JSON in the first place —
+    # `rewritten` comes back empty, and `value` keeps A's ORIGINAL,
+    # unrewritten bytes, for a value `option get --format=json` could not
+    # decode; a differently-cased or differently-schemed host, documented
+    # as verify_domain_absent's own known scope limit — lib/verify.sh —
+    # slips through it identically). Checked here with a plain substring
+    # test, not jq: `value` is the exact text this function is about to
+    # push to B with `wp option update`, so the question is simply "does
+    # the raw byte sequence still contain A's domain", the same question
+    # `sitegraft_domain_present()` (lib/php/content-remap-functions.php)
+    # answers for verify_domain_absent's own scope, just answered here,
+    # inside `graft` itself, before the value ever reaches B — no separate
+    # `sitegraft verify` invocation required to notice it.
+    #
+    # Both the plain form AND its JSON-escaped form (`https:\/\/...`) are
+    # checked, same two-form discipline sitegraft_domain_present already
+    # uses (its own header comment explains why a value can legitimately
+    # carry either byte sequence). The escaped variant is built with
+    # bash's own `${var//pattern/replacement}`, NOT the hand-rolled
+    # "plain + escaped" double-pass this file's own comment three lines
+    # above warns broke silently — that bug was about MATCHING a literal
+    # backslash already present in the pattern; this is the opposite
+    # direction (INSERTING one into a freshly-built string with no
+    # existing backslash in it to be misread as glob-escape syntax), which
+    # is not the same trap — verified directly: `${s//\//\\/}` on
+    # "https://a.example.com" produces the literal 21-byte string
+    # "https:\/\/a.example.com", matched correctly by the `case` below.
+    #
+    # Fails the whole step (never a warning-and-continue): pushing a value
+    # known to still name A would report success while B's live option
+    # keeps pointing at A, exactly the "run is green, the defect is
+    # silent" failure mode CLAUDE.md's first rule exists to stop.
+    local domain_from_escaped="${domain_from//\//\\/}"
+    case "$value" in
+      *"$domain_from"*|*"$domain_from_escaped"*)
+        log_error "graft: option '${key}' still references A's domain ('${domain_from}') after the domain rewrite — refusing to push it to B as migrated. This is issue #83's own failure class: a value that LOOKS migrated but keeps pointing at A (a font/asset URL the rewrite could not parse or match is the case that was measured live). Inspect '${key}' on A by hand for the exact reference this misses before re-running — a differently-cased host, a scheme this manifest's domain_from does not spell the same way, or a value shape 'wp option get --format=json' did not return as parseable JSON are the known causes."
+        return 1
+        ;;
+    esac
   fi
   # issue #63, case 2 — investigated, LEFT UNGUARDED on purpose (unlike
   # graft_ensure_importer's own state_file, case 1, which the same issue
@@ -3054,6 +3209,25 @@ phase_graft() {
       return 1
     }
     graft_mark_step "$run_dir" media_sync
+  }
+  # Issue #83: fonts_sync, plain `graft_step_done`, NOT gated on
+  # `prune_will_rerun` the way media_sync's own gate just above is. That
+  # gating exists because `graft_prune_previous_run`'s `wp post delete
+  # --force` deletes an attachment's underlying FILE as a side effect of
+  # deleting its `attachment` post (issue #36) — font files uploaded
+  # through WordPress 6.5's Font Library are NOT attachment posts at all
+  # (they're `wp_font_face`/`wp_font_family` posts, a deliberately separate
+  # WordPress core post type — see wp_get_font_dir()'s own introduction in
+  # WP 6.5), and `post_types_csv` (prune's own deletion scope) never
+  # includes either. Prune cannot delete a font file this step already
+  # placed, so there is nothing here for prune_will_rerun to protect a
+  # dry-run preview against.
+  graft_step_done "$run_dir" fonts_sync || {
+    graft_fonts_sync "$run_dir" || {
+      log_error "font sync failed. This is independent of B's post content and media -- nothing already on B was touched by this step. Rerun the same command with --run ${run_dir} and this step will run again."
+      return 1
+    }
+    graft_mark_step "$run_dir" fonts_sync
   }
   # NIT (issue #36 fix-pack, second review round): the SAME `rm -f` above
   # clears FOUR markers, not just media_sync.done — import_attachments.done,

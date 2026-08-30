@@ -21,10 +21,6 @@
       Same defect as #16 one level up, and **worse**: the completeness gate counts
       items, so a post whose terms were dropped still lands and the gate passes.
       Not triggered on the pilot site (the option does not exist there).
-- [ ] **#83 — `wp-content/fonts/` is never synced.** Media sync covers only
-      `wp-content/uploads/`; WordPress 6.5+ writes the Font Library to a sibling
-      directory. The page renders with a fallback font and nothing reports it.
-      Worked around by hand on the pilot.
 - [ ] **#88 — spaced JSON.** Every rewrite pass matches the compact form only; a
       spaced call site is left untouched, by two independent causes. Pre-existing
       (#84/#85 miss it identically), never emitted by WordPress's serializer.
@@ -94,6 +90,21 @@
 
 ## Done
 
+- [x] **#83 — `wp-content/fonts/` is never synced.** `graft_fonts_sync`
+      (`lib/graft.sh`) now syncs it alongside `graft_media_sync`, reading the
+      real font directory from `wp_get_font_dir()` on both A and B (never
+      hardcoded — the path is filterable via `font_dir`), same
+      `--keep-existing` safety as media. A pre-6.5 A with no Font Library is
+      a no-op, not an error; A having fonts while B cannot resolve one at all
+      is a hard failure, not a silent drop. Also closes the issue's own
+      detection half: `_graft_migrate_one_option_key` (shared by
+      `graft_migrate_options`/`graft_migrate_post_type_defining_options`) now
+      refuses to push a migrated option's value to B if it still contains
+      A's raw domain string after the rewrite pass — the exact shape
+      `etch_global_stylesheets` took on the pilot (see "Done by hand on the
+      pilot target" in `docs/status.md`), caught inside `graft` itself
+      rather than only by a separate `sitegraft verify` an operator might
+      not run.
 - [x] **`modules/acss.sh` (Automatic.css) — shipped.** The
       `TODO_VERIFY_LEGACY_ACSS_SLUG` blocker (the pre-4.0 plugin folder name) is
       closed: both folder names have now been observed on real installs on

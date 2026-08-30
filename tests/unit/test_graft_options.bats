@@ -284,6 +284,67 @@ setup() {
   [[ "$stored" != *"a.example.com"* ]] || false
 }
 
+# Issue #83's own detection half, not just its sync half (docs/status.md's
+# own record of the real pilot: `etch_global_stylesheets` had to be fixed
+# BY HAND after a graft that reported success, because the jq rewrite pass
+# above never reached it). Simulated here the same way the real defect
+# actually happens: A's value is not something the rewrite's `jq -c ...`
+# can parse (this stub returns plain, non-JSON text — no `--format=json`
+# ever produces this for real, but it exercises the exact code path a
+# genuinely un-rewritable value takes: `rewritten` comes back empty, so
+# `value` keeps A's ORIGINAL, unrewritten bytes) — and that original text
+# still names A's domain, exactly what a URL the rewrite could not parse
+# or match would look like once it reaches this point.
+@test "graft_migrate_options refuses (never pushes to B) when a migrated option's value still names A's domain after the rewrite pass — issue #83's own detection half" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_global_stylesheets"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then
+      printf 'not valid json, still names https://a.example.com/wp-content/fonts/heading-sans.woff2'
+    else
+      echo "SHOULD NOT BE CALLED -- refusing must happen before any write reaches B"
+    fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest" "https://a.example.com" "https://b.example.com"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"etch_global_stylesheets"* ]] || false
+  [[ "$output" == *"still references A's domain"* ]] || false
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+  # Never even wrote the cached value file core_wp_post_import's own
+  # --dry-run preview reads (§9.3) -- a refused key leaves nothing for a
+  # later step to mistake for a real, pushed value.
+  [ ! -f "${run_dir}/option-etch_global_stylesheets.value" ]
+}
+
+# Companion to the refusal above: the SAME residue check must stay quiet
+# when the rewrite genuinely reached every occurrence — proven by mutation
+# (see this repo's own CLAUDE.md convention), not merely asserted. Removing
+# the residue check's `return 1` (i.e. reverting to pre-#83 behavior)
+# leaves this test green and the refusal test above red; keeping the
+# residue check leaves both green — the two tests together are what
+# demonstrate the check discriminates rather than always firing.
+@test "graft_migrate_options does NOT refuse a key whose value the rewrite pass fully corrected (residue check does not fire on a clean rewrite)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"migrate":{"etch":{"option_keys":["etch_global_stylesheets"]}}}'
+  SITEGRAFT_DRY_RUN=1
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then
+      echo '"https://a.example.com/wp-content/fonts/heading-sans.woff2"'
+    else
+      echo "[dry-run] wp_remote b $*"
+    fi
+  }
+  run graft_migrate_options "$run_dir" "$manifest" "https://a.example.com" "https://b.example.com"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"still references A's domain"* ]] || false
+  [ -f "${run_dir}/option-etch_global_stylesheets.value" ]
+}
+
 # Fix-pack bug found live (DDEV harness, MAJOR-B's new graft --dry-run
 # assertion, running end to end for the first time): every other test in
 # this file stubs wp_remote WITHOUT checking is_dry_run at all, so it

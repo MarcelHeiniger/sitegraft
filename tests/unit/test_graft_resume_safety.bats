@@ -663,6 +663,12 @@ _issue36_stub_everything_but_prune_media_sync_import_attachments() {
   graft_check_stack_precondition() { return 0; }
   graft_deploy_mu_plugin() { :; }
   graft_migrate_post_type_defining_options() { :; }
+  # Not part of this test's own subject (issue #36 is about media/
+  # attachments, not fonts) -- stubbed out so this test's own `wp_remote`
+  # stub (below, keyed only on `eval`/`post`, not on WHICH eval was sent)
+  # is never asked to answer graft_font_dir's font_dir query with data
+  # shaped for something else entirely.
+  graft_fonts_sync() { :; }
   graft_ensure_importer() { :; }
   graft_export_wxr() { :; }
   graft_integrity_gate() { return 0; }
