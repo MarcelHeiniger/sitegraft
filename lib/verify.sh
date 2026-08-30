@@ -21,9 +21,37 @@
 # harness) can never drift on HOW a checksum is computed, only on WHEN.
 verify_compare_checksums() {
   local manifest="$1" recomputed="$2"
+  local pre post
+  pre=$(echo "$manifest" | jq '.checksums_protected_pre_graft')
+  post="$recomputed"
+
+  # issue #97: backup_compute_protected_checksums (lib/backup.sh) records a
+  # table it could not export as the literal string "unreadable" — never a
+  # valid "sha256:..." value — rather than silently checksumming it as
+  # though its content were empty. By construction this can only ever
+  # appear under an "_unclaimed:<table>" key here: a DECLARED module's
+  # table failing to export makes that function return non-zero, which
+  # phase_verify's own pre-existing #33 HARD FAIL already catches before
+  # this function is ever called (see backup_compute_protected_checksums'
+  # own header comment for the full split).
+  #
+  # Split out FIRST, before the plain string-diff below ever runs. Compared
+  # straight through it, "unreadable" vs "unreadable" would silently read
+  # as a MATCH — the issue's own measured worst case, sha256("") matching
+  # itself because the table was never actually read either time, one level
+  # below where #33 already closed the identical shape for a total
+  # recompute failure. "unreadable" vs a real checksum would, just as
+  # wrongly, read as a content CHANGE it never actually observed. Neither
+  # is right: a table this run could not read on at least one side is its
+  # own third outcome, NOT VERIFIED — not a confirmed match, not a
+  # confirmed change.
+  local unread
+  unread=$(jq -n --argjson pre "$pre" --argjson post "$post" \
+    '[$pre | keys[] as $k | select($pre[$k] == "unreadable" or $post[$k] == "unreadable") | $k]')
+
   local diffs
-  diffs=$(jq -n --argjson pre "$(echo "$manifest" | jq '.checksums_protected_pre_graft')" --argjson post "$recomputed" \
-    '[$pre | keys[] as $k | select($pre[$k] != $post[$k]) | $k]')
+  diffs=$(jq -n --argjson pre "$pre" --argjson post "$post" --argjson unread "$unread" \
+    '[$pre | keys[] as $k | select(($unread | index($k)) == null) | select($pre[$k] != $post[$k]) | $k]')
 
   # Two regimes, on purpose.
   #
@@ -44,6 +72,11 @@ verify_compare_checksums() {
   hard=$(echo "$diffs" | jq -c '[.[] | select(startswith("_unclaimed:") | not)]')
   soft=$(echo "$diffs" | jq -c '[.[] | select(startswith("_unclaimed:"))] | map(sub("^_unclaimed:"; ""))')
 
+  local unread_count; unread_count=$(echo "$unread" | jq 'length')
+  if [ "$unread_count" != "0" ]; then
+    log_warn "table(s) could not be read on at least one side of this run and were excluded from the changed/unchanged comparison — not verified this run, neither confirmed unchanged nor flagged as changed: $(echo "$unread" | jq -r 'map(sub("^_unclaimed:"; "")) | join(", ")')"
+  fi
+
   if [ "$(echo "$soft" | jq 'length')" != "0" ]; then
     log_warn "unclaimed table(s) on B changed during this run: $(echo "$soft" | jq -r 'join(", ")') — no module declares them, so this is reported rather than failed. Expected for tables WordPress writes on its own (the action scheduler, sessions, usermeta after a login). If any of these hold data that must be guaranteed untouched, write a module declaring them."
   fi
@@ -53,6 +86,15 @@ verify_compare_checksums() {
     echo "$hard"
     return 1
   fi
+
+  # Consumed by phase_verify, below, to move the report's "protected data
+  # unchanged" line into its own INCOMPLETE bucket instead of the plain PASS
+  # tick when this is non-zero — the same parseable-suffix convention
+  # verify_options_match already uses (OPTIONS_COMPARED:) for the identical
+  # reason: a caller downstream of a `run`/`$(...)` capture needs a count
+  # this function alone can produce, without a second, independently-
+  # drifting recount in phase_verify.
+  echo "UNREADABLE_COUNT:${unread_count}"
 }
 
 # verify_options_match <run_dir> <manifest_json> — design doc §6.5, review
@@ -2093,7 +2135,25 @@ phase_verify() {
       else
         local checksum_diff
         if checksum_diff=$(verify_compare_checksums "$manifest" "$recomputed" 2>>"$report"); then
-          echo "- [x] protected data unchanged (${pre_graft_count} protected set(s) compared)" >> "$report"
+          # issue #97: verify_compare_checksums' own UNREADABLE_COUNT: line
+          # (see its header comment) — an `_unclaimed` table that could not
+          # be read on at least one side of this run. A declared module's
+          # own read failure never reaches here at all (it already hard-
+          # fails the recompute above, #33's path) — so this can only ever
+          # be an out-of-scope table, and is reported through the SAME
+          # three-valued INCOMPLETE bucket every other "could not verify"
+          # finding in this phase already uses, never folded into the plain
+          # "[x] ... compared" tick, which is exactly the false-green shape
+          # this issue exists to close.
+          local unread_count="${checksum_diff##*UNREADABLE_COUNT:}"
+          case "$unread_count" in ''|*[!0-9]*) unread_count=0 ;; esac
+          if [ "$unread_count" -gt 0 ]; then
+            echo "- [ ] protected data unchanged: **UNVERIFIED for ${unread_count} of ${pre_graft_count} protected set(s)** — could not be read on at least one side of this run (see warning(s) above); the rest matched" >> "$report"
+            incomplete=$((incomplete + 1))
+            incomplete_names="${incomplete_names}protected-data-checksums(unreadable) "
+          else
+            echo "- [x] protected data unchanged (${pre_graft_count} protected set(s) compared)" >> "$report"
+          fi
         else
           echo "- [ ] **HARD FAIL: protected data changed** — ${checksum_diff}" >> "$report"
           hard_fail=1

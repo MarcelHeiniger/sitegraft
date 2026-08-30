@@ -1,3 +1,5 @@
+bats_require_minimum_version 1.5.0
+
 # tests/unit/test_backup.bats — pure/near-pure functions in lib/backup.sh:
 # backup_checksum (design doc §6.3, review finding A5), backup_wp_cmd_literal
 # (used only decoratively in restore.sh's header comment), and the two
@@ -543,6 +545,59 @@ INSERT INTO `wp_users` VALUES (1,"admin");
   inventory_table_prefix() { return 1; }
   run backup_compute_protected_checksums b "$manifest"
   [ "$status" -eq 1 ]
+}
+
+# --- issue #97: a per-table export failure was swallowed by an internal
+# `|| echo ""`, checksumming the failed table as though its content were
+# empty — indistinguishable from a table that really is empty. Three states,
+# not two: read-and-non-empty, read-and-legitimately-empty, unreadable. The
+# third must never collapse into the second. See this function's own header
+# comment (updated alongside this fix-pack) for the declared/`_unclaimed`
+# split in what each state does next.
+@test "backup_compute_protected_checksums fails when a DECLARED module's table export itself fails, rather than checksumming it as empty (issue #97)" {
+  local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  wp_remote() { return 1; }
+  run backup_compute_protected_checksums b "$manifest"
+  [ "$status" -eq 1 ]
+  # never a checksum of empty content standing in for the read that failed
+  [[ "$output" != *"sha256:"* ]] || false
+}
+
+@test "backup_compute_protected_checksums still succeeds, with a real checksum, when a declared module's table genuinely exports empty (issue #97 — empty is not the same as unreadable)" {
+  local manifest='{"protect":{"fakebooking":{"tables":["fakebooking_reservations"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  wp_remote() { echo ""; }   # rc 0, empty content -- a genuinely empty table
+  run backup_compute_protected_checksums b "$manifest"
+  [ "$status" -eq 0 ]
+  run jq -e '.fakebooking | startswith("sha256:")' <<< "$output"
+  [ "$status" -eq 0 ]
+}
+
+@test "backup_compute_protected_checksums records an unclaimed table's export failure as 'unreadable', not empty, and does not abort the run over an out-of-scope table (issue #97)" {
+  local manifest='{"protect":{"_unclaimed":{"tables":["wp_actionscheduler_actions","wp_usermeta"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  wp_remote() {
+    shift
+    for a in "$@"; do
+      case "$a" in
+        --tables=wp_actionscheduler_actions) return 1 ;;
+      esac
+    done
+    echo "INSERT INTO t VALUES (1);"
+  }
+  # --separate-stderr (bats >= 1.5.0): this path also calls log_warn on the
+  # table that failed to export (stderr), which would otherwise get merged
+  # into $output ahead of the JSON and break the jq parse below.
+  run --separate-stderr backup_compute_protected_checksums b "$manifest"
+  [ "$status" -eq 0 ]
+  local checksums_json="$output"
+  run jq -e '.["_unclaimed:wp_actionscheduler_actions"] == "unreadable"' <<< "$checksums_json"
+  [ "$status" -eq 0 ]
+  # the OTHER unclaimed table, which read fine, still gets a real checksum —
+  # one bad table does not poison the rest of the sweep
+  run jq -e '.["_unclaimed:wp_usermeta"] | startswith("sha256:")' <<< "$checksums_json"
+  [ "$status" -eq 0 ]
 }
 
 # --- issue #14: exact-state restore on a wrapped-local target ---------------

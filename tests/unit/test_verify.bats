@@ -42,6 +42,42 @@ setup() {
   [ "$status" -eq 0 ]
 }
 
+# --- issue #97: backup_compute_protected_checksums (lib/backup.sh) now
+# records a table it could not export as the literal string "unreadable",
+# never a valid "sha256:..." value (see that function's own header
+# comment). Compared straight through the plain string-diff above,
+# "unreadable" would either silently MATCH itself (the exact defect this
+# issue exists to close, one level below where #33 already closed it for a
+# total recompute failure) or read as a content CHANGE it never actually
+# observed. Neither is right: it must come out as its own third outcome —
+# not verified — reported via the UNREADABLE_COUNT: line on stdout, which
+# phase_verify (below) turns into the report's own INCOMPLETE bucket.
+@test "verify_compare_checksums treats an 'unreadable' table as NOT VERIFIED — neither a match nor a hard/soft change (issue #97)" {
+  local manifest='{"checksums_protected_pre_graft":{"_unclaimed:wp_actionscheduler_actions":"unreadable"}}'
+  local recomputed='{"_unclaimed:wp_actionscheduler_actions":"sha256:abc"}'
+  run verify_compare_checksums "$manifest" "$recomputed"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"UNREADABLE_COUNT:1"* ]] || false
+  # must not be reported as a confirmed "changed" table -- it was never read
+  [[ "$output" != *"unclaimed table(s) on B changed"* ]] || false
+}
+
+@test "verify_compare_checksums's UNREADABLE_COUNT catches the issue's own worst case: unreadable BOTH before and after graft (sha256(\"\") would have matched itself)" {
+  local manifest='{"checksums_protected_pre_graft":{"_unclaimed:wp_actionscheduler_actions":"unreadable"}}'
+  local recomputed='{"_unclaimed:wp_actionscheduler_actions":"unreadable"}'
+  run verify_compare_checksums "$manifest" "$recomputed"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"UNREADABLE_COUNT:1"* ]] || false
+}
+
+@test "verify_compare_checksums's UNREADABLE_COUNT is 0 when every protected table was read on both sides" {
+  local manifest='{"checksums_protected_pre_graft":{"plugin-x":"sha256:abc"}}'
+  local recomputed='{"plugin-x":"sha256:abc"}'
+  run verify_compare_checksums "$manifest" "$recomputed"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"UNREADABLE_COUNT:0"* ]] || false
+}
+
 # --- verify_options_match ----------------------------------------------------
 
 @test "verify_options_match fails when B's live value differs from the file graft wrote" {
@@ -2025,6 +2061,87 @@ EOF
   grep -qF -- "no pre-graft protected-data snapshot exists in this manifest" "${RUN_DIR}/verify-report.md"
   ! grep -qF -- "protected data unchanged (not applicable" "${RUN_DIR}/verify-report.md"
   ! grep -qF -- "protected set(s) compared" "${RUN_DIR}/verify-report.md"
+}
+
+# --- Issue #97: a per-table export failure one level below #33's own fix
+# (see backup_compute_protected_checksums' and verify_compare_checksums'
+# own header comments). A DECLARED module's table failing to export makes
+# the recompute itself fail (backup_compute_protected_checksums now returns
+# non-zero for that case) -- inherited for free by the ALREADY-EXISTING #33
+# hard-fail path below, proving the issue's own worst case (the same table
+# unreadable before AND after the graft, sha256("") matching itself) can no
+# longer happen for a declared table: no empty checksum is ever computed
+# for it to match against, on either side.
+@test "phase_verify HARD FAILs when a DECLARED protected table's export itself fails, both pre- and post-graft (issue #97's own worst case, closed for declared tables)" {
+  setup_phase_verify_fixture
+  jq '.protect = {"fakebooking": {"tables": ["fakebooking_reservations"]}}' "${RUN_DIR}/manifest.json" > "${RUN_DIR}/manifest.json.tmp" && mv "${RUN_DIR}/manifest.json.tmp" "${RUN_DIR}/manifest.json"
+  wp_remote() {
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
+    local alias_lc="$1"; shift
+    case "$1" in
+      eval) echo "wp_" ;;       # inventory_table_prefix succeeds
+      db) return 1 ;;           # THIS table's export fails on the recompute
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 1 ]
+  grep -q "HARD FAIL: could not recompute protected data checksums" "${RUN_DIR}/verify-report.md"
+  ! grep -q "protected data unchanged" "${RUN_DIR}/verify-report.md"
+}
+
+# --- Issue #97, the `_unclaimed` (out-of-scope) half: unlike a declared
+# table, this one does NOT abort the recompute (see
+# backup_compute_protected_checksums' header comment on why) -- it must
+# still never be silently folded into "protected data unchanged", and must
+# never read as confirmed either way just because it was equally unreadable
+# pre- and post-graft. Reported via the report's existing three-valued
+# INCOMPLETE bucket, never a plain PASS tick.
+@test "phase_verify reports INCOMPLETE, not PASS, when an unclaimed table could not be read on either side of the run (issue #97, worst case for an out-of-scope table)" {
+  setup_phase_verify_fixture
+  jq '.checksums_protected_pre_graft = {"_unclaimed:wp_actionscheduler_actions": "unreadable"} | .protect = {"_unclaimed": {"tables": ["wp_actionscheduler_actions"]}}' "${RUN_DIR}/manifest.json" > "${RUN_DIR}/manifest.json.tmp" && mv "${RUN_DIR}/manifest.json.tmp" "${RUN_DIR}/manifest.json"
+  wp_remote() {
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
+    local alias_lc="$1"; shift
+    case "$1" in
+      eval) echo "wp_" ;;
+      db) return 1 ;;   # the recompute cannot read this table either -- pre AND post both unreadable
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 2 ]
+  grep -q "Result: INCOMPLETE" "${RUN_DIR}/verify-report.md"
+  grep -qF -- "UNVERIFIED for 1 of 1 protected set(s)" "${RUN_DIR}/verify-report.md"
+  ! grep -q "HARD FAIL" "${RUN_DIR}/verify-report.md"
+  ! grep -qF -- "protected data unchanged (1 protected set(s) compared)" "${RUN_DIR}/verify-report.md"
+}
+
+@test "phase_verify still ticks a plain PASS for protected data when every table reads cleanly (no unreadable tables, no false INCOMPLETE)" {
+  setup_phase_verify_fixture
+  local pre_sum; pre_sum=$(backup_checksum "IDENTICAL PROTECTED CONTENT")
+  jq --arg s "sha256:${pre_sum}" '.checksums_protected_pre_graft = {"fakebooking": $s} | .protect = {"fakebooking": {"tables": ["fakebooking_reservations"]}}' "${RUN_DIR}/manifest.json" > "${RUN_DIR}/manifest.json.tmp" && mv "${RUN_DIR}/manifest.json.tmp" "${RUN_DIR}/manifest.json"
+  wp_remote() {
+  for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
+    local alias_lc="$1"; shift
+    case "$1" in
+      eval) echo "wp_" ;;
+      db) echo "IDENTICAL PROTECTED CONTENT" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  grep -qF -- "protected data unchanged (1 protected set(s) compared)" "${RUN_DIR}/verify-report.md"
 }
 
 # --- phase_verify: domain check wiring (scoped, fail-closed) ----------------

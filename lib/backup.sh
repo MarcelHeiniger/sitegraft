@@ -1551,6 +1551,72 @@ backup_prefix_tables_csv() {
 # or any post_type/option_key-only module) is skipped, not sent as an empty
 # --tables= (not a meaningful export request) — plan bug fix already present
 # before this extraction, kept as-is.
+#
+# issue #97 — three states per table, not two. A `wp db export` that fails
+# (a locked table, a permissions error, a table this run's manifest names
+# but this particular install does not actually have) used to fall through
+# an internal `|| echo ""` and get checksummed as though its content were
+# the empty string — indistinguishable from a table that really is empty.
+# The worst case (measured, not hypothetical): the SAME table fails to
+# export before the graft and after it. sha256("") matches itself, and the
+# report ends up asserting protected data is unchanged for a table it never
+# actually read, either time.
+#
+# Fixed by checking wp_remote's own exit status instead of discarding it,
+# and then splitting on which of the two buckets above (declared vs.
+# `_unclaimed`) the failing table belongs to — the same split this
+# function's docblock already draws for a table that CHANGED, extended here
+# to a table that could not be READ, for the identical reason:
+#
+#   - A DECLARED module's table failing to export is a hard failure of this
+#     whole function (non-zero return, nothing printed). An operator named
+#     that table as something to protect; if it cannot be read, the
+#     function does not know whether it is untouched, and has no scope
+#     narrower than "protected data cannot be confirmed" to report that in.
+#     Both of this function's callers already treat a non-zero return as a
+#     hard failure — `phase_backup`, below, refuses to declare the backup
+#     good, and `phase_verify`'s recompute (lib/verify.sh) already hard-
+#     fails the same way for issue #33 (a total recompute failure). One
+#     failure mode, inherited by both phases for free, rather than a new,
+#     second one that could drift from #33's.
+#
+#   - An `_unclaimed:<table>` failing to export is NOT treated as a reason
+#     to abort the whole computation. These tables are, by definition,
+#     outside anything the operator declared protected — often several
+#     dozen of them on a real site. Aborting backup (which blocks the
+#     operator on the very command meant to protect them, before the graft
+#     has even started) over ONE such table having a transient permission
+#     quirk or a lock held by an unrelated process would be exactly the
+#     "legitimate case a hardening wrongly refuses" this issue warns
+#     against — the same argument already made, for CHANGES rather than
+#     read failures, in the hard/soft split above. Instead, the table's
+#     checksum value is the literal string "unreadable" — never a valid
+#     "sha256:..." value — so it can never again silently pass as either a
+#     match or a no-op empty read. `verify_compare_checksums` (lib/
+#     verify.sh) treats that sentinel as its own third outcome: NOT
+#     VERIFIED, neither a confirmed match nor a confirmed change — closing
+#     the exact "unreadable-vs-unreadable still matches itself" case this
+#     issue measured, one level below where #33 already closed it for a
+#     total recompute failure.
+#
+# Measured, not assumed: a DECLARED module's table that does not actually
+# exist on B (a static `_tables` function, per lib/plan.sh's own comment on
+# `owns_tables`, is never filtered against a live scan the way a
+# `_tables_dynamic` selection is — so this is a real, reachable shape, not a
+# hypothetical one). `wp db export --tables=<name>` shells out to
+# mysqldump, and mysqldump errors — not "0 rows", a real non-zero exit —
+# when a named table does not exist. From wp_remote's exit status alone
+# there is no reliable way to tell "this table is absent" apart from "this
+# table exists but could not be read" (permissions, a lock, a transient
+# connection drop): the distinction lives in mysqldump's stderr TEXT, whose
+# exact wording is not a contract this function can depend on across
+# versions/locales. Both are therefore treated identically — a hard failure
+# for a declared module, same as any other read failure of a table an
+# operator named. If a module's protected-table set is expected to vary
+# per-install, the existing, already-scan-aware escape hatch is
+# `_tables_dynamic` (resolved against scan_b_json, lib/plan.sh) — a static
+# `_tables` list is a claim that this table exists, and an install where it
+# does not is a module/site mismatch worth surfacing, not silently passing.
 backup_compute_protected_checksums() {
   local alias_lc="$1" manifest="$2"
   local prefix
@@ -1596,17 +1662,37 @@ backup_compute_protected_checksums() {
         # FULL table names as scan read them off the site, where a module's
         # `_tables` holds bare suffixes for sitegraft to prefix. Prefixing
         # these a second time would ask for `wpfn_wpfn_...`.
-        local one_content one_sum
-        one_content=$(wp_remote "$alias_lc" db export - --tables="$tbl" 2>/dev/null || echo "")
-        one_sum=$(backup_checksum "$one_content")
-        checksums=$(echo "$checksums" | jq --arg m "_unclaimed:${tbl}" --arg s "sha256:${one_sum}" '.[$m] = $s')
+        #
+        # issue #97: `wp_remote`'s own exit status is checked, not discarded
+        # — a failed export is recorded as the sentinel "unreadable" (see
+        # this function's own header comment), never checksummed as though
+        # its content were empty. Out-of-scope by definition, so this one
+        # table's failure does not abort the sweep — the loop continues to
+        # the next table either way.
+        local one_content
+        if one_content=$(wp_remote "$alias_lc" db export - --tables="$tbl" 2>/dev/null); then
+          local one_sum
+          one_sum=$(backup_checksum "$one_content")
+          checksums=$(echo "$checksums" | jq --arg m "_unclaimed:${tbl}" --arg s "sha256:${one_sum}" '.[$m] = $s')
+        else
+          log_warn "could not export unclaimed table '${tbl}' on ${alias_lc} for its protected-data checksum — recorded as unreadable rather than checksummed as empty. Out of the declared protect scope, so this table alone does not abort the run; see verify's report for what an unreadable table means for this run's result."
+          checksums=$(echo "$checksums" | jq --arg m "_unclaimed:${tbl}" '.[$m] = "unreadable"')
+        fi
       done 3<<< "$(echo "$manifest" | jq -r --arg m "$mod" '.protect[$m].tables // [] | .[]')"
       continue
     fi
 
     local prefixed_tables_csv tables_content sum
     prefixed_tables_csv=$(backup_prefix_tables_csv "$prefix" "$tables_csv")
-    tables_content=$(wp_remote "$alias_lc" db export - --tables="$prefixed_tables_csv" 2>/dev/null || echo "")
+    # issue #97: same exit-status check as the `_unclaimed` branch above,
+    # but this table WAS named by an operator as protected — no "out of
+    # scope" reading is available here, so a failed export is a hard
+    # failure of the whole computation (see this function's own header
+    # comment for why both callers already do the right thing with that).
+    if ! tables_content=$(wp_remote "$alias_lc" db export - --tables="$prefixed_tables_csv" 2>/dev/null); then
+      log_error "could not export table(s) [${prefixed_tables_csv}] declared by protected module '${mod}' — a table this run was asked to protect could not be read, so it cannot be confirmed unchanged. Never checksummed as empty."
+      return 1
+    fi
     sum=$(backup_checksum "$tables_content")
     checksums=$(echo "$checksums" | jq --arg m "$mod" --arg s "sha256:${sum}" '.[$m] = $s')
   done

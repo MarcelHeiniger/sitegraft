@@ -229,6 +229,45 @@ EOF
   [ "$status" -eq 0 ]
 }
 
+# --- issue #97: backup_compute_protected_checksums's own internal
+# `|| echo ""` used to swallow a per-table export failure and checksum it as
+# empty content — indistinguishable from a table that really is empty. See
+# that function's own header comment (lib/backup.sh) for the declared vs.
+# `_unclaimed` split these two tests exercise.
+@test "phase_backup FAILS, and writes no completion marker or checksum, when a DECLARED protect module's table export fails (issue #97)" {
+  wp_remote() {
+    return 1   # every wp-cli call fails, including the fakebooking db export
+  }
+  run phase_backup --profile t --run "$RUN_DIR"
+  [ "$status" -eq 1 ]
+  [ ! -f "${RUN_DIR}/backup.complete" ]
+  [[ "$output" == *"could not compute protected-data checksums"* ]] || false
+  # never wrote an empty-content checksum standing in for the read that failed
+  run jq -e 'has("checksums_protected_pre_graft")' "${RUN_DIR}/manifest.json"
+  [ "$status" -eq 1 ]
+}
+
+@test "phase_backup SUCCEEDS when only an UNCLAIMED (out-of-scope) table's export fails, recording it as unreadable rather than blocking the backup (issue #97)" {
+  jq '.protect._unclaimed.tables = ["wp_actionscheduler_actions"]' "${RUN_DIR}/manifest.json" > "${RUN_DIR}/manifest.json.tmp" && mv "${RUN_DIR}/manifest.json.tmp" "${RUN_DIR}/manifest.json"
+  wp_remote() {
+    local alias_lc="$1"; shift
+    for a in "$@"; do
+      case "$a" in
+        --tables=wp_actionscheduler_actions) return 1 ;;
+      esac
+    done
+    echo "INSERT INTO wp_fakebooking_reservations VALUES (1);"
+  }
+  run phase_backup --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  [ -f "${RUN_DIR}/backup.complete" ]
+  run jq -e '.checksums_protected_pre_graft["_unclaimed:wp_actionscheduler_actions"] == "unreadable"' "${RUN_DIR}/manifest.json"
+  [ "$status" -eq 0 ]
+  # the unrelated DECLARED module, whose table read fine, still gets a real checksum
+  run jq -e '.checksums_protected_pre_graft.fakebooking | startswith("sha256:")' "${RUN_DIR}/manifest.json"
+  [ "$status" -eq 0 ]
+}
+
 @test "phase_backup writes the backup dir/files and manifest.json as owner-only" {
   phase_backup --profile t --run "$RUN_DIR"
   local dir_mode db_mode manifest_mode complete_mode
