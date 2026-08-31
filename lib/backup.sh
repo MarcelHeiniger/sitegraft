@@ -2037,6 +2037,11 @@ phase_backup() {
     log_error "manifest at ${run_dir}/manifest.json is not frozen — re-run 'sitegraft plan' to freeze it"
     return 1
   }
+  # Issue #108, second entry point (see lib/manifest.sh's own comment on
+  # manifest_check_version_supported): backup is its own separate
+  # invocation, potentially against a manifest a NEWER sitegraft froze —
+  # manifest_validate's gate at freeze time does not run again here.
+  manifest_check_version_supported "$(cat "${run_dir}/manifest.json")" || return 1
 
   # design doc §0 (--dry-run global contract) / mission clarification: backup
   # never reads B destructively in the first place (db export and rsync pull

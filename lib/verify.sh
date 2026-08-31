@@ -2249,6 +2249,15 @@ phase_verify() {
     return 1
   }
   local manifest; manifest=$(cat "${run_dir}/manifest.json")
+  # Issue #108, second entry point (see lib/manifest.sh's own comment on
+  # manifest_check_version_supported): same "validate once, up front, refuse
+  # the whole phase" reasoning as the JSON-validity check just above — a
+  # manifest this build's format understanding does not cover makes every
+  # check below just as unreliable as malformed JSON would, and verify is
+  # routinely a separate, later invocation against a manifest a NEWER
+  # sitegraft froze (backup and verify, sometimes days apart — see design
+  # doc / issue #108).
+  manifest_check_version_supported "$manifest" || return 1
   local id_map_tsv="${run_dir}/id-map.tsv"
   local report="${run_dir}/verify-report.md"
   local hard_fail=0

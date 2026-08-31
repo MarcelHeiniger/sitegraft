@@ -27,6 +27,74 @@
 # nothing left in it to recover the missing information from) — it only
 # DECLARES the incompatibility, for whichever future reader chooses to act
 # on it. Currently 2.
+#
+# THE RULE (issue #108 — #105's bump was purely declarative; nothing read
+# the field, so nothing enforced it): bump `sitegraft_manifest_version`
+# exactly when a change here would make an OLDER reader's existing parsing
+# logic draw a WRONG conclusion from a manifest this version writes, not
+# merely a blank one. A new optional key with a safe absent/default reading
+# (an older `jq -r '.foo // "x"'` degrades cleanly) does not need a bump. A
+# renamed/restructured key, or — #105's own case — an existing key whose
+# value space grows a new member that changes what an existing comparison
+# means (old code treats the new member as whatever member it already knew,
+# rather than failing to recognize it) DOES need one. When in doubt: would
+# code written for the OLD version silently misinterpret data written by
+# the NEW one, rather than just ignore what it doesn't recognize? If yes,
+# bump. Bump `SITEGRAFT_MANIFEST_VERSION_SUPPORTED` below in the SAME
+# commit, for the SAME reason stated on that constant — the two must never
+# drift apart.
+
+# SITEGRAFT_MANIFEST_VERSION_SUPPORTED — the highest sitegraft_manifest_version
+# THIS code (not SITEGRAFT_VERSION, bin/sitegraft's own release number) knows
+# how to read. manifest_check_version_supported (below) refuses a manifest
+# whose written version exceeds it — issue #108's fix. Before this, nothing
+# read the field at all: an older sitegraft hitting a newer manifest just
+# parsed it as though it were its own format, which for #97/#105's own case
+# meant reintroducing #97's false PASS on a version skew alone (backup and
+# verify are separate invocations, sometimes days apart, so "the sitegraft
+# that wrote this manifest" and "the sitegraft reading it now" are not
+# guaranteed to be the same build). A version <= this constant is accepted
+# outright; lib/verify.sh's five "written by an older sitegraft version"
+# guards already cover whatever narrower vocabulary an old WRITER produced
+# within that range — this constant is the other direction, a newer WRITER
+# and an old READER.
+SITEGRAFT_MANIFEST_VERSION_SUPPORTED=2
+
+# manifest_check_version_supported <manifest_json> — pure. Returns 1 (and
+# logs why) if the manifest's sitegraft_manifest_version is not a plain
+# non-negative integer, or exceeds SITEGRAFT_MANIFEST_VERSION_SUPPORTED.
+# A missing field is treated as version 1 (every manifest predating the
+# field's own introduction, before #105's bump to 2 — no manifest this old
+# can ever exceed a SUPPORTED constant this repo will ship).
+manifest_check_version_supported() {
+  local manifest="$1"
+  local version
+  version=$(echo "$manifest" | jq -r '.sitegraft_manifest_version // 1')
+  case "$version" in
+    *[!0-9]*|'')
+      log_error "manifest field sitegraft_manifest_version ('${version}') is not a plain non-negative integer — refusing to guess whether this manifest's format is understood. Rebuild it with 'sitegraft plan', or, if this is a hand-edited/prefilled manifest, fix the field by hand."
+      return 1
+      ;;
+  esac
+  # Viktor's review, issue #108: a digit string long enough to overflow
+  # bash's signed 64-bit `[ -gt ]` comparison below degrades that
+  # comparison to neither true nor false (it throws "integer expression
+  # expected" to stderr and the `if` treats the failed test as false),
+  # which would silently let an absurd/adversarial version number through
+  # as though it were understood — exactly the fail-open CLAUDE.md warns
+  # against. SITEGRAFT_MANIFEST_VERSION_SUPPORTED will never plausibly
+  # reach even 3 digits, so any version 10+ digits long is unambiguously
+  # "newer than supported" without needing the arithmetic comparison at
+  # all; reject it here, before -gt ever sees it.
+  if [ "${#version}" -gt 9 ]; then
+    log_error "manifest field sitegraft_manifest_version ('${version}') is too large to be a real format version — refusing to read it as though it were understood. Rebuild it with 'sitegraft plan', or, if this is a hand-edited/prefilled manifest, fix the field by hand."
+    return 1
+  fi
+  if [ "$version" -gt "$SITEGRAFT_MANIFEST_VERSION_SUPPORTED" ]; then
+    log_error "manifest format version ${version} is newer than this sitegraft understands (this build supports up to version ${SITEGRAFT_MANIFEST_VERSION_SUPPORTED}) — refusing to read it as though it were its own format. This run directory was produced by a newer sitegraft; update this installation before continuing, or run this phase with the sitegraft version that wrote the manifest. Treating an unrecognized manifest format as understood is exactly how issue #97's false PASS came back on a version skew alone — see this file's own sitegraft_manifest_version comment."
+    return 1
+  fi
+}
 
 # manifest_new <site_a_url> <site_b_url> [profile] [alias_a] [alias_b] — the
 # three bracketed args are new in this fix-pack (MINOR, PR #2 review:
@@ -83,6 +151,18 @@ manifest_validate() {
   local manifest="$1"
   local migrate_pt protect_pt migrate_ok protect_ok migrate_tb protect_tb
   local overlap_pt overlap_ok overlap_tb
+
+  # Issue #108, first entry point: a SITEGRAFT_MANIFEST_PREFILLED or
+  # hand-edited manifest (both documented workflows) can carry a version
+  # field this build never wrote — freeze must refuse it here, same as
+  # every other unusable-manifest shape this function already checks.
+  # manifest_check_version_supported is also called directly at each later
+  # phase's own manifest-load site (backup, graft, verify) — this function
+  # is only ever invoked from manifest_freeze (at plan time), so a manifest
+  # frozen elsewhere and read by an older sitegraft in a SEPARATE, later
+  # invocation would not reach this gate at all otherwise. Same "one
+  # enforcement point is elegant and fragile" reasoning as B4/#73 below.
+  manifest_check_version_supported "$manifest" || return 1
 
   migrate_pt=$(echo "$manifest" | jq -c '[.migrate[]?.post_types[]?] | sort')
   protect_pt=$(echo "$manifest" | jq -c '[.protect[]?.post_types[]?] | sort')

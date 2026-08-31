@@ -9,6 +9,7 @@ setup() {
   load '../../lib/core.sh'
   load '../../lib/profile.sh'
   load '../../lib/inventory.sh'
+  load '../../lib/manifest.sh'
   load '../../lib/backup.sh'
 
   export SITEGRAFT_PROFILES_DIR="$BATS_TEST_TMPDIR/profiles"
@@ -116,6 +117,19 @@ EOF
   run phase_backup --profile t --run "$RUN_DIR"
   [ "$status" -eq 1 ]
   [[ "$output" == *"not frozen"* ]]
+}
+
+# --- issue #108: a manifest whose sitegraft_manifest_version exceeds what
+# THIS binary knows how to read must refuse the whole phase, exactly like
+# the "no manifest"/"not frozen" guards just above — backup is routinely a
+# separate, later invocation than whatever sitegraft wrote/froze this
+# manifest.
+@test "phase_backup refuses a manifest whose format version is newer than this sitegraft understands (issue #108)" {
+  jq '.sitegraft_manifest_version = 999' "${RUN_DIR}/manifest.json" > "${RUN_DIR}/manifest.json.tmp" && mv "${RUN_DIR}/manifest.json.tmp" "${RUN_DIR}/manifest.json"
+  run phase_backup --profile t --run "$RUN_DIR"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"newer than this sitegraft understands"* ]]
+  [ ! -f "${RUN_DIR}/backup.complete" ]
 }
 
 # --- issue #94 / ADR 0010: phase_backup's own phase-start rsync

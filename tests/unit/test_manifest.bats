@@ -263,3 +263,71 @@ setup() {
   [[ "$output" == *"hand-edit"* ]] || false
   [[ "$output" == *"ddev.site"* ]] || false
 }
+
+# --- issue #108: nothing previously read sitegraft_manifest_version at all
+# — #105's bump from 1 to 2 was purely declarative. manifest_check_version_
+# supported is the guard that finally listens: a manifest whose declared
+# format version exceeds SITEGRAFT_MANIFEST_VERSION_SUPPORTED must be
+# refused, not silently read as though it were this build's own format
+# (that silent path is exactly how #97's false PASS came back on a version
+# skew alone). manifest_validate calls it too, so plan/freeze also refuses
+# a too-new SITEGRAFT_MANIFEST_PREFILLED or hand-edited manifest.
+
+@test "manifest_check_version_supported accepts the current version (2)" {
+  run manifest_check_version_supported '{"sitegraft_manifest_version":2}'
+  [ "$status" -eq 0 ]
+}
+
+@test "manifest_check_version_supported accepts an older, still-known version (1, the pre-#105 format)" {
+  run manifest_check_version_supported '{"sitegraft_manifest_version":1}'
+  [ "$status" -eq 0 ]
+}
+
+@test "manifest_check_version_supported accepts a manifest with no version field at all as version 1 (predates the field's own introduction)" {
+  run manifest_check_version_supported '{}'
+  [ "$status" -eq 0 ]
+}
+
+@test "manifest_check_version_supported REFUSES a version newer than this build supports — the missing NEW->OLD guard issue #108 is about" {
+  run manifest_check_version_supported '{"sitegraft_manifest_version":999}'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"999"* ]] || false
+  [[ "$output" == *"newer than this sitegraft understands"* ]] || false
+}
+
+@test "manifest_check_version_supported refuses a non-numeric version rather than guessing" {
+  run manifest_check_version_supported '{"sitegraft_manifest_version":"future"}'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"not a plain non-negative integer"* ]] || false
+}
+
+@test "manifest_check_version_supported refuses a version too large for bash's [ -gt ] to compare safely, rather than silently passing it (Viktor's review, issue #108)" {
+  # A digit string this long would overflow bash's signed 64-bit integer
+  # comparison inside `[ "$version" -gt "$SITEGRAFT_MANIFEST_VERSION_SUPPORTED" ]`,
+  # which throws to stderr and degrades to a false test -- letting an
+  # absurd version number through as though it were understood. Reject it
+  # before that comparison ever runs.
+  run manifest_check_version_supported '{"sitegraft_manifest_version":99999999999999999999}'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"too large to be a real format version"* ]] || false
+}
+
+@test "manifest_validate rejects a manifest whose format version is newer than this build supports (issue #108, plan/freeze-time entry point)" {
+  local m='{"sitegraft_manifest_version":999,"migrate":{},"protect":{}}'
+  run manifest_validate "$m"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"newer than this sitegraft understands"* ]] || false
+}
+
+@test "manifest_freeze refuses to freeze a manifest whose format version is newer than this build supports (issue #108)" {
+  local m='{"sitegraft_manifest_version":999,"migrate":{},"protect":{}}'
+  run manifest_freeze "$m"
+  [ "$status" -eq 1 ]
+  [[ "$output" != *'"frozen":true'* ]] || false
+}
+
+@test "manifest_validate still accepts a manifest at exactly the current version (issue #108 does not break the currently-supported format)" {
+  local m='{"sitegraft_manifest_version":2,"migrate":{"core-wp":{"post_types":["page"]}},"protect":{"x":{"post_types":["booking"]}}}'
+  run manifest_validate "$m"
+  [ "$status" -eq 0 ]
+}
