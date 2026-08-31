@@ -163,6 +163,187 @@ EOF
   [ "$output" = "CALLED --path=/var/www/html option get siteurl" ]
 }
 
+# --- issue #75/#94: ssh_key_for / ssh_remote_run / rsync_pull_remote /
+# sitegraft_require_rsync_arg_escaping (lib/inventory.sh). These are the
+# shared choke points every ssh/rsync consumer in lib/backup.sh and
+# lib/graft.sh now goes through, so SITE_<ALIAS>_SSH_KEY (issue #75) and
+# rsync's default arg-escaping (issue #94) cannot drift between call sites
+# the way SITE_*_SSH_KEY already had once (wp_remote/ssh_test_dir_rc only).
+
+@test "ssh_key_for returns SITE_<ALIAS>_SSH_KEY for the given alias, uppercased" {
+  SITE_A_SSH_KEY="/home/op/.ssh/a-key"
+  SITE_B_SSH_KEY="/home/op/.ssh/b-key"
+  run ssh_key_for a
+  [ "$output" = "/home/op/.ssh/a-key" ]
+  run ssh_key_for b
+  [ "$output" = "/home/op/.ssh/b-key" ]
+}
+
+@test "ssh_key_for returns empty when the alias's SSH key is unset" {
+  unset SITE_A_SSH_KEY
+  run ssh_key_for a
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "ssh_remote_run passes -i <key> before -- when SITE_<ALIAS>_SSH_KEY is set" {
+  SITE_B_SSH_KEY="/home/op/.ssh/b-key"
+  ssh() { echo "ssh called with: $*"; }
+  run ssh_remote_run b "host-b.example.com" "rm -f '/site-b/wp-content/x.php'"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ssh called with: -i /home/op/.ssh/b-key -- host-b.example.com rm -f '/site-b/wp-content/x.php'"* ]] || false
+}
+
+@test "ssh_remote_run omits -i entirely when the alias has no dedicated SSH key" {
+  unset SITE_B_SSH_KEY
+  ssh() { echo "ssh called with: $*"; }
+  run ssh_remote_run b "host-b.example.com" "rm -f '/site-b/wp-content/x.php'"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ssh called with: -- host-b.example.com rm -f"* ]] || false
+  [[ "$output" != *"-i"* ]] || false
+}
+
+@test "ssh_remote_run's whole invocation is simulated (not run) under --dry-run, like every other write-side call" {
+  SITE_B_SSH_KEY="/home/op/.ssh/b-key"
+  SITEGRAFT_DRY_RUN=1
+  ssh() { echo "SHOULD NOT BE CALLED"; return 1; }
+  run ssh_remote_run b "host-b.example.com" "rm -f '/x'"
+  [ "$status" -eq 0 ]
+  [[ "$output" == "[dry-run]"* ]] || false
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
+@test "rsync_pull_remote forces --no-old-args and omits -e when no SSH key is set (issue #94)" {
+  unset SITE_A_SSH_KEY
+  rsync() { echo "rsync called with: $*"; }
+  run rsync_pull_remote a "host-a.example.com" "/site-a/wp-content/uploads/" "/staging/"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"rsync called with: -avz --no-old-args host-a.example.com:/site-a/wp-content/uploads/ /staging/"* ]] || false
+  [[ "$output" != *"-e"* ]] || false
+  [[ "$output" != *"--protect-args"* ]] || false
+  [[ "$output" != *" -s "* ]] || false
+}
+
+@test "rsync_pull_remote carries the SSH key via -e \"ssh -i <key>\" (double-quoted, not sq()'s single-quoted literal) when SITE_<ALIAS>_SSH_KEY is set (issue #75)" {
+  SITE_A_SSH_KEY="/home/op/.ssh/a-key"
+  rsync() { echo "rsync called with: $*"; }
+  run rsync_pull_remote a "host-a.example.com" "/site-a/wp-content/uploads/" "/staging/"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'rsync called with: -avz --no-old-args -e ssh -i "/home/op/.ssh/a-key" host-a.example.com:/site-a/wp-content/uploads/ /staging/'* ]] || false
+}
+
+@test "rsync_pull_remote's SSH key path survives a space, one rsync -e argv element not two (issue #75/#94)" {
+  SITE_A_SSH_KEY="/home/op/.ssh/a deploy key"
+  rsync() { echo "rsync called with: $*"; }
+  run rsync_pull_remote a "host-a.example.com" "/site-a/wp-content/uploads/" "/staging/"
+  [ "$status" -eq 0 ]
+  # One rsync -e argv element, not two -- the space in the key path must
+  # not have been split into a second, bogus argument.
+  [[ "$output" == *'-e ssh -i "/home/op/.ssh/a deploy key" host-a.example.com:'* ]] || false
+}
+
+# Review found this codebase's FIRST attempt at this (sq() applied twice,
+# single-quoting the -e value) claimed "quote-safe" while only actually
+# being space-safe: rsync's own -e argument parser is not a real shell and
+# gives no meaning to sq()'s '\'' encoding, so a key path containing an
+# APOSTROPHE broke the connection outright ("Missing trailing-' in
+# remote-shell command", measured live, GNU rsync 3.4.4) -- and the
+# earlier version of the test just above, despite being titled
+# "quote-safe", only ever exercised a space, never an apostrophe. This is
+# the test that closes the actual gap: a real, unremarkable key path (this
+# repo's own restore.sh fixtures elsewhere use "/var/www/d'artagnan/html"
+# as exactly this kind of realistic apostrophe'd example).
+@test "rsync_pull_remote's SSH key path survives an embedded apostrophe (issue #75/#94, the case sq() applied twice actually got wrong)" {
+  SITE_A_SSH_KEY="/home/op/.ssh/d'artagnan-key"
+  rsync() { echo "rsync called with: $*"; }
+  run rsync_pull_remote a "host-a.example.com" "/site-a/wp-content/uploads/" "/staging/"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'-e ssh -i "/home/op/.ssh/d'"'"'artagnan-key" host-a.example.com:'* ]] || false
+}
+
+@test "rsync_pull_remote refuses (rather than silently corrupt the -e argument) when the SSH key path contains a literal double-quote character" {
+  SITE_A_SSH_KEY='"'"'/home/op/.ssh/my "quoted" key'"'"'
+  rsync() { echo "SHOULD NOT BE CALLED -- refuse before ever building the command"; return 1; }
+  run rsync_pull_remote a "host-a.example.com" "/site-a/wp-content/uploads/" "/staging/"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+  [[ "$output" == *"literal double-quote"* ]] || false
+}
+
+@test "rsync_pull_remote's whole invocation is simulated (not run) under --dry-run" {
+  SITEGRAFT_DRY_RUN=1
+  rsync() { echo "SHOULD NOT BE CALLED"; return 1; }
+  run rsync_pull_remote a "host-a.example.com" "/src/" "/dst/"
+  [ "$status" -eq 0 ]
+  [[ "$output" == "[dry-run]"* ]] || false
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
+# --- sitegraft_require_rsync_arg_escaping (issue #94's phase-start probe,
+# promoted from restore.sh's own generated, script-local check) ---
+
+@test "sitegraft_require_rsync_arg_escaping passes when the local rsync supports --no-old-args (default-escapes)" {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/rsync" <<'EOS'
+#!/usr/bin/env bash
+exit 0
+EOS
+  chmod +x "$BATS_TEST_TMPDIR/bin/rsync"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+  run sitegraft_require_rsync_arg_escaping
+  [ "$status" -eq 0 ]
+}
+
+@test "sitegraft_require_rsync_arg_escaping refuses, with a clear reason, when the local rsync does not support --no-old-args (openrsync-shaped) -- probes the actual flag the invocation carries, not its --old-args opt-out sibling (review nit)" {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/rsync" <<'EOS'
+#!/usr/bin/env bash
+case " $* " in
+  *" --no-old-args "*) echo "rsync: unrecognized option \`--no-old-args'" >&2; exit 1 ;;
+esac
+exit 0
+EOS
+  chmod +x "$BATS_TEST_TMPDIR/bin/rsync"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+  run sitegraft_require_rsync_arg_escaping
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"openrsync"* ]] || false
+  [[ "$output" == *"3.2.4"* ]] || false
+  [[ "$output" != *"--protect-args"* ]] || false
+}
+
+@test "sitegraft_require_rsync_arg_escaping does NOT accept a rsync that only recognizes --old-args but not --no-old-args (proves the probe tests the flag actually used, not its sibling)" {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/rsync" <<'EOS'
+#!/usr/bin/env bash
+case " $* " in
+  *" --no-old-args "*) exit 1 ;;
+  *" --old-args "*) exit 0 ;;
+esac
+exit 0
+EOS
+  chmod +x "$BATS_TEST_TMPDIR/bin/rsync"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+  run sitegraft_require_rsync_arg_escaping
+  [ "$status" -ne 0 ]
+}
+
+@test "sitegraft_require_rsync_arg_escaping gives a DISTINCT message when rsync is not on PATH at all" {
+  mkdir -p "$BATS_TEST_TMPDIR/bin-norsync"
+  for cmd in bash cat grep; do
+    p=$(command -v "$cmd" 2>/dev/null) || continue
+    ln -sf "$p" "$BATS_TEST_TMPDIR/bin-norsync/$cmd"
+  done
+  # PATH is reassigned only for this one `run` (prefix-assignment scoping),
+  # not for the rest of the test process — an earlier draft assigned it as
+  # a separate statement instead, which persisted past this test into
+  # bats' own teardown (its `rm -rf "$BATS_TEST_TMPDIR"`) and broke the
+  # NEXT test with "rm: command not found".
+  PATH="$BATS_TEST_TMPDIR/bin-norsync" run sitegraft_require_rsync_arg_escaping
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not found on PATH"* ]] || false
+}
+
 @test "inventory_resolve_slug returns the first candidate actually present, never an absent one" {
   local scan="$BATS_TEST_TMPDIR/scan.json"
   echo '{"plugins":[{"name":"acss-legacy-slug","version":"3.9"}]}' > "$scan"

@@ -72,6 +72,29 @@ setup() {
   [[ "$output" != *"ssh"* ]] || false
 }
 
+@test "graft_push_file carries SITE_B_SSH_KEY on both the mkdir ssh call and the rsync -e clause when it is set (issue #75)" {
+  SITE_B_SSH_HOST="b.example.com"
+  SITE_B_SSH_KEY="/home/op/.ssh/b-key"
+  unset SITE_B_WP_CMD
+  ssh() { echo "ssh called with: $*"; }
+  rsync() { echo "rsync called with: $*"; }
+  run graft_push_file b "/local/src/lib.php" "/remote/site-b/wp-content" "sitegraft-lib.php"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ssh called with: -i /home/op/.ssh/b-key -- b.example.com mkdir -p '/remote/site-b/wp-content'"* ]] || false
+  [[ "$output" == *"rsync called with: -avz -s -e ssh -i \"/home/op/.ssh/b-key\" /local/src/lib.php b.example.com:/remote/site-b/wp-content/sitegraft-lib.php"* ]] || false
+}
+
+@test "graft_push_file refuses BEFORE creating the remote directory when SITE_B_SSH_KEY contains a literal double-quote (review round 3, same ordering fix as graft_push_dir)" {
+  SITE_B_SSH_HOST="b.example.com"
+  SITE_B_SSH_KEY='/home/op/.ssh/my "quoted" key'
+  ssh() { echo "SHOULD NOT BE CALLED -- refuse before ever touching B"; return 1; }
+  rsync() { echo "SHOULD NOT BE CALLED"; return 1; }
+  run graft_push_file b "/local/src/lib.php" "/remote/site-b/wp-content" "sitegraft-lib.php"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+  [[ "$output" == *"literal double-quote"* ]] || false
+}
+
 @test "graft_push_file falls back to plain mkdir+rsync for a genuinely bare-local site (no SSH_HOST, no wrapper) — regression, unchanged by this fix" {
   unset SITE_B_SSH_HOST SITE_B_WP_CMD
   local dest="$BATS_TEST_TMPDIR/site-b/wp-content"
@@ -104,6 +127,38 @@ setup() {
   [[ "$output" == *"rsync called with: -avz -s --ignore-existing /local/staging/ b.example.com:/remote/site-b/wp-content/uploads/"* ]] || false
 }
 
+@test "graft_push_dir carries SITE_B_SSH_KEY on both the mkdir ssh call and the rsync -e clause when it is set (issue #75)" {
+  SITE_B_SSH_HOST="b.example.com"
+  SITE_B_SSH_KEY="/home/op/.ssh/b-key"
+  ssh() { echo "ssh called with: $*"; }
+  rsync() { echo "rsync called with: $*"; }
+  run graft_push_dir b "/local/staging" "/remote/site-b/wp-content/plugins/foo"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ssh called with: -i /home/op/.ssh/b-key -- b.example.com mkdir -p '/remote/site-b/wp-content/plugins/foo'"* ]] || false
+  [[ "$output" == *"rsync called with: -avz -s -e ssh -i \"/home/op/.ssh/b-key\" /local/staging/ b.example.com:/remote/site-b/wp-content/plugins/foo/"* ]] || false
+}
+
+@test "graft_push_dir refuses BEFORE creating the remote directory when SITE_B_SSH_KEY contains a literal double-quote (review round 3: mkdir used to run first, leaving a pointless mkdir on B before the refusal)" {
+  SITE_B_SSH_HOST="b.example.com"
+  SITE_B_SSH_KEY='/home/op/.ssh/my "quoted" key'
+  ssh() { echo "SHOULD NOT BE CALLED -- refuse before ever touching B"; return 1; }
+  rsync() { echo "SHOULD NOT BE CALLED"; return 1; }
+  run graft_push_dir b "/local/staging" "/remote/site-b/wp-content/plugins/foo"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+  [[ "$output" == *"literal double-quote"* ]] || false
+}
+
+@test "graft_push_dir --keep-existing also carries SITE_B_SSH_KEY (issue #75)" {
+  SITE_B_SSH_HOST="b.example.com"
+  SITE_B_SSH_KEY="/home/op/.ssh/b-key"
+  ssh() { :; }
+  rsync() { echo "rsync called with: $*"; }
+  run graft_push_dir b "/local/staging" "/remote/site-b/wp-content/uploads" --keep-existing
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"rsync called with: -avz -s --ignore-existing -e ssh -i \"/home/op/.ssh/b-key\" /local/staging/ b.example.com:/remote/site-b/wp-content/uploads/"* ]] || false
+}
+
 @test "graft_push_dir still uses the wrapped-local tar-through-the-wrapper path when no SSH_HOST is set but a container wrapper is (regression)" {
   unset SITE_B_SSH_HOST
   SITE_B_WP_CMD="ddev exec --raw -p sitegraft-test-b -- wp"
@@ -125,6 +180,15 @@ setup() {
   run graft_remove_file b "/remote/site-b/wp-content/sitegraft-content-remap-functions.php"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ssh called with: -- b.example.com rm -f '/remote/site-b/wp-content/sitegraft-content-remap-functions.php'"* ]] || false
+}
+
+@test "graft_remove_file carries SITE_B_SSH_KEY when it is set (issue #75)" {
+  SITE_B_SSH_HOST="b.example.com"
+  SITE_B_SSH_KEY="/home/op/.ssh/b-key"
+  ssh() { echo "ssh called with: $*"; }
+  run graft_remove_file b "/remote/site-b/wp-content/sitegraft-content-remap-functions.php"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ssh called with: -i /home/op/.ssh/b-key -- b.example.com rm -f '/remote/site-b/wp-content/sitegraft-content-remap-functions.php'"* ]] || false
 }
 
 @test "graft_remove_file falls back to a local rm for a bare-local site (regression, unchanged by this fix)" {

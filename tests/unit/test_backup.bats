@@ -73,6 +73,30 @@ setup() {
   [[ "$output" != *"wp_remote"* ]]
 }
 
+# issue #75 (review round 3): this line is decorative (this function's own
+# header comment) -- but the first version of this fix's test coverage
+# never set SITE_B_SSH_KEY at all, so a mutation removing the `-i` this
+# function bakes in went undetected across all 1127 tests. Found by
+# review, mutation-per-site, not self-discovered.
+@test "backup_wp_cmd_literal includes -i <key> when SITE_B_SSH_KEY is set (issue #75)" {
+  SITE_B_SSH_HOST="user@host-b.example.com"
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="wp"
+  SITE_B_SSH_KEY="/home/op/.ssh/b-key"
+  run backup_wp_cmd_literal b
+  [ "$output" = 'ssh -i /home/op/.ssh/b-key user@host-b.example.com "wp --path=/var/www/site-b"' ]
+}
+
+@test "backup_wp_cmd_literal omits -i entirely when SITE_B_SSH_KEY is unset (regression, unchanged by this fix)" {
+  SITE_B_SSH_HOST="user@host-b.example.com"
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="wp"
+  unset SITE_B_SSH_KEY
+  run backup_wp_cmd_literal b
+  [[ "$output" != *" -i "* ]] || false
+  [ "$output" = 'ssh user@host-b.example.com "wp --path=/var/www/site-b"' ]
+}
+
 @test "backup_wp_cmd_literal builds a plain local command with no ssh for a local site" {
   unset SITE_B_SSH_HOST
   SITE_B_WP_PATH="/var/www/site-b"
@@ -89,6 +113,126 @@ setup() {
   run backup_wp_cmd_literal b
   [ "$status" -eq 1 ]
   [[ "$output" == *"SITE_B_WP_PATH"* ]]
+}
+
+# --- issue #75: SITE_*_SSH_KEY reaching every ssh/rsync consumer in this
+# file, not only wp_remote (lib/inventory.sh) — backup_db_export,
+# backup_wp_content and backup_list_b_wp_content all built a bare `ssh`/
+# `rsync` with no `-i`, found on a real migration where B needed a
+# dedicated key: `scan` (wp_remote) succeeded, `backup` (none of these
+# three) failed immediately with "Permission denied". backup_wp_content
+# also carries issue #94's --no-old-args (ADR 0010) since its rsync hands
+# B a `host:path` SOURCE that rsync itself re-parses on the far end.
+#
+# backup_db_export's ssh call happens inside a CHILD `bash -c` (needed so
+# the pipe to gzip runs locally, not on B — see that function's own
+# comment), so a bash function named `ssh` in THIS process is not visible
+# there; these tests stub `ssh` as a real PATH executable instead, the
+# same technique tests/unit/test_backup_pipefail.bats already uses for
+# this exact function's ssh branch.
+
+@test "backup_db_export's ssh call carries -i <key> when SITE_B_SSH_KEY is set (issue #75)" {
+  SITE_B_SSH_HOST="b.example.com"
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="wp"
+  SITE_B_SSH_KEY="/home/op/.ssh/b-key"
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  local captured="$BATS_TEST_TMPDIR/ssh-argv"
+  cat > "$BATS_TEST_TMPDIR/bin/ssh" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" > "${captured}"
+# \${!#}: the LAST positional argument (the remote command string), whether
+# ssh was called with 2 args (no -i) or 4 (-i <key> host cmd) -- portable
+# indirect expansion, not a negative offset (bash 3.2 target, this repo's
+# own convention).
+bash -c "\${!#}"
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/ssh"
+  cat > "$BATS_TEST_TMPDIR/bin/wp" <<'STUB'
+#!/usr/bin/env bash
+printf -- '-- MySQL dump\n-- Dump completed on 2026-08-19 10:00:00\n'
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/wp"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+
+  run backup_db_export "$BATS_TEST_TMPDIR/backup"
+  [ "$status" -eq 0 ]
+  run cat "$captured"
+  [[ "$output" == "-i /home/op/.ssh/b-key b.example.com "* ]] || false
+}
+
+@test "backup_db_export's ssh call omits -i entirely when SITE_B_SSH_KEY is unset (regression, unchanged by this fix)" {
+  SITE_B_SSH_HOST="b.example.com"
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="wp"
+  unset SITE_B_SSH_KEY
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  local captured="$BATS_TEST_TMPDIR/ssh-argv"
+  cat > "$BATS_TEST_TMPDIR/bin/ssh" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" > "${captured}"
+# \${!#}: the LAST positional argument (the remote command string), whether
+# ssh was called with 2 args (no -i) or 4 (-i <key> host cmd) -- portable
+# indirect expansion, not a negative offset (bash 3.2 target, this repo's
+# own convention).
+bash -c "\${!#}"
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/ssh"
+  cat > "$BATS_TEST_TMPDIR/bin/wp" <<'STUB'
+#!/usr/bin/env bash
+printf -- '-- MySQL dump\n-- Dump completed on 2026-08-19 10:00:00\n'
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/wp"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+
+  run backup_db_export "$BATS_TEST_TMPDIR/backup"
+  [ "$status" -eq 0 ]
+  run cat "$captured"
+  [[ "$output" == "b.example.com "* ]] || false
+  [[ "$output" != *"-i"* ]] || false
+}
+
+@test "backup_wp_content pulls B's wp-content over ssh with --no-old-args and carries SITE_B_SSH_KEY when set (issues #75/#94)" {
+  SITE_B_SSH_HOST="b.example.com"
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_SSH_KEY="/home/op/.ssh/b-key"
+  rsync() { echo "rsync called with: $*"; }
+  run backup_wp_content "$BATS_TEST_TMPDIR/backup/b-wp-content"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"rsync called with: -avz --no-old-args -e ssh -i \"/home/op/.ssh/b-key\" b.example.com:/var/www/site-b/wp-content/ ${BATS_TEST_TMPDIR}/backup/b-wp-content/"* ]] || false
+}
+
+@test "backup_wp_content omits -i/-e entirely when SITE_B_SSH_KEY is unset (regression, unchanged by this fix)" {
+  SITE_B_SSH_HOST="b.example.com"
+  SITE_B_WP_PATH="/var/www/site-b"
+  unset SITE_B_SSH_KEY
+  rsync() { echo "rsync called with: $*"; }
+  run backup_wp_content "$BATS_TEST_TMPDIR/backup/b-wp-content"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"rsync called with: -avz --no-old-args b.example.com:/var/www/site-b/wp-content/"* ]] || false
+  [[ "$output" != *" -i "* ]] || false
+  [[ "$output" != *"-e ssh"* ]] || false
+}
+
+@test "backup_list_b_wp_content's ssh call carries -i <key> when SITE_B_SSH_KEY is set (issue #75)" {
+  SITE_B_SSH_HOST="b.example.com"
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_SSH_KEY="/home/op/.ssh/b-key"
+  ssh() { echo "ssh called with: $*"; }
+  run backup_list_b_wp_content
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ssh called with: -i /home/op/.ssh/b-key -- b.example.com find"* ]] || false
+}
+
+@test "backup_list_b_wp_content omits -i entirely when SITE_B_SSH_KEY is unset (regression, unchanged by this fix)" {
+  SITE_B_SSH_HOST="b.example.com"
+  SITE_B_WP_PATH="/var/www/site-b"
+  unset SITE_B_SSH_KEY
+  ssh() { echo "ssh called with: $*"; }
+  run backup_list_b_wp_content
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ssh called with: -- b.example.com find"* ]] || false
+  [[ "$output" != *"-i"* ]] || false
 }
 
 # --- _backup_local_exec_prefix ---
@@ -969,6 +1113,86 @@ _manifest_fixture() {
   # mentions "rsync --delete" in its own descriptive text).
   run grep -c "if ! { ssh .* && rsync .*--delete" "${run_dir}/restore.sh"
   [ "$output" = "1" ]
+}
+
+# --- issue #75: SITE_B_SSH_KEY baked into the generated restore.sh. This
+# is the site #75's own issue text names explicitly: "the generated
+# restore.sh, which bakes those same key-less commands into the recovery
+# script" -- a site that couldn't be backed up for want of its dedicated
+# key also couldn't have been restored by the script this tool writes.
+# restore.sh runs standalone (no sitegraft function, no profile in scope —
+# this function's own header comment), so the key has to be resolved and
+# baked in at GENERATION time, same as every other operator-supplied value
+# here.
+
+@test "the generated ssh-remote restore.sh bakes in -i <key> on both ssh calls, and -e \"ssh -i <key>\" on the rsync call, when SITE_B_SSH_KEY is set (issue #75)" {
+  SITE_B_SSH_HOST="user@host-b.example.com"
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="wp"
+  SITE_B_SSH_KEY="/home/op/.ssh/b-key"
+  local run_dir="$BATS_TEST_TMPDIR/run-ssh-key-baked"
+  mkdir -p "$run_dir"
+  backup_generate_restore_script "$run_dir"
+  # Both `ssh` invocations (mkdir, and the piped db import) carry -i.
+  run grep -c -- "ssh -i '/home/op/.ssh/b-key' 'user@host-b.example.com'" "${run_dir}/restore.sh"
+  [ "$output" = "2" ]
+  # The rsync invocation carries the key via -e, not -i (rsync has no -i of
+  # its own -- it invokes ssh itself).
+  run grep -c -- "rsync -avz --no-old-args --delete -e 'ssh -i \"/home/op/.ssh/b-key\"'" "${run_dir}/restore.sh"
+  [ "$output" = "1" ]
+}
+
+@test "the generated ssh-remote restore.sh omits -i/-e entirely when SITE_B_SSH_KEY is unset (regression, unchanged by this fix)" {
+  SITE_B_SSH_HOST="user@host-b.example.com"
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="wp"
+  unset SITE_B_SSH_KEY
+  local run_dir="$BATS_TEST_TMPDIR/run-ssh-key-unset"
+  mkdir -p "$run_dir"
+  backup_generate_restore_script "$run_dir"
+  # Scoped to the ssh/rsync command line itself, not the whole script --
+  # restore.sh's own generic boilerplate legitimately contains ` -e ` (a
+  # `[ -e "$FILE" ]` existence test) and would false-positive an unscoped
+  # grep.
+  run grep -c "if ! { ssh .*-i.* && rsync" "${run_dir}/restore.sh"
+  [ "$output" = "0" ]
+  run grep -c "if ! { ssh .* && rsync .*-e " "${run_dir}/restore.sh"
+  [ "$output" = "0" ]
+}
+
+# Behavioral, not just textual: the SAME loopback-shim technique the
+# mkdir/db-import injection tests below use, proving -i actually reaches
+# BOTH ssh invocations when a real (fake) ssh executes them, and that the
+# script still runs cleanly with a key path containing no metacharacters
+# (a key path WITH one is covered by rsync_pull_remote's own unit test in
+# tests/unit/test_inventory.bats, which measures rsync's own -e quote-aware
+# split live rather than re-deriving it here).
+@test "the generated ssh-remote restore.sh's mkdir ssh call actually receives -i <key> on real (shimmed) execution (issue #75)" {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  local captured="$BATS_TEST_TMPDIR/ssh-argv"
+  cat > "$BATS_TEST_TMPDIR/bin/ssh" <<EOS
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "${captured}"
+if [ "\$1" = "-i" ]; then shift 2; fi
+shift # drop the host argument; this stand-in never actually connects
+exec sh -c "\$*"
+EOS
+  chmod +x "$BATS_TEST_TMPDIR/bin/ssh"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+
+  SITE_B_SSH_HOST="fakehost"
+  SITE_B_WP_PATH="$BATS_TEST_TMPDIR/b-target"
+  SITE_B_WP_CMD="wp"
+  SITE_B_SSH_KEY="/home/op/.ssh/b-key"
+  local run_dir="$BATS_TEST_TMPDIR/run-ssh-key-real-mkdir"
+  mkdir -p "${run_dir}/backup"
+  backup_generate_restore_script "$run_dir"
+  local chain; chain=$(_extract_if_body "${run_dir}/restore.sh" '^if ! { ssh')
+  local mkdir_part="${chain%% && rsync*}"
+  eval "$mkdir_part" || true
+  [ -d "$BATS_TEST_TMPDIR/b-target" ]
+  run cat "$captured"
+  [[ "$output" == "-i /home/op/.ssh/b-key fakehost "* ]] || false
 }
 
 # --- issue #44: the ssh-remote rsync destination is a SECOND shell's problem

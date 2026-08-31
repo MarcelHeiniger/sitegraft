@@ -66,6 +66,228 @@ ssh_test_dir_rc() {
   fi
 }
 
+# ssh_key_for <alias: a|b> — resolves SITE_<ALIAS>_SSH_KEY, or prints
+# nothing if it is unset. Issue #75: SITE_*_SSH_KEY used to be read in
+# exactly two places (both in this file — wp_remote below and, via
+# ssh_test_dir_rc above, inventory_check_path_topology/
+# graft_ssh_path_exists). Every OTHER ssh/rsync consumer in lib/backup.sh
+# and lib/graft.sh built its own command line and never read this
+# variable at all, so a dedicated per-site key never reached backup,
+# graft, verify, or the generated restore.sh. Found on a real migration:
+# `scan` (routed through wp_remote) succeeded; `backup` (none of whose
+# ssh/rsync calls went through wp_remote) failed immediately with
+# "Permission denied", against a B that `ssh -i <key> <B>` reached fine.
+#
+# Every ssh/rsync consumer THIS ISSUE ADDED or TOUCHED (ssh_remote_run and
+# rsync_pull_remote below, and every graft_push_dir/graft_push_file/
+# graft_import_wxr site that builds its own rsync -e) resolves the key
+# through this one function, so it cannot drift between THOSE call sites
+# the way it already had once. Not a claim that every consumer in the
+# codebase does: wp_remote (below) and ssh_test_dir_rc's two callers
+# (inventory_check_path_topology, graft_ssh_path_exists) still derive
+# SITE_${alias_uc}_SSH_KEY by hand, unchanged — they predate this
+# function, already have their own established test coverage for exactly
+# this resolution, and folding them in was judged out of scope for this
+# fix (touching well-tested, working code with no bug to fix in it, purely
+# for uniformity). SITE_*_SSH_KEY was parsed and whitelisted by
+# lib/profile.sh and wired into wp_remote by a Step 6 self-review — on the
+# wp_remote path only; see this repo's issue #75 for the full list of call
+# sites that were never revisited before this fix.
+ssh_key_for() {
+  local alias_lc="$1"
+  local alias_uc; alias_uc=$(printf '%s' "$alias_lc" | tr '[:lower:]' '[:upper:]')
+  local key_var="SITE_${alias_uc}_SSH_KEY"
+  printf '%s' "${!key_var:-}"
+}
+
+# ssh_remote_run <alias> <host> <remote_cmd> — `ssh [-i <key>] -- <host>
+# <remote_cmd>` via run_or_echo, with the key resolved through
+# ssh_key_for (issue #75). <remote_cmd> is ONE string, already quoted for
+# the remote shell by the caller (sq(), same convention wp_remote and
+# every other ssh call site in this codebase already use) — this function
+# does no quoting of its own beyond the key path itself.
+#
+# The one ssh-invocation shape repeated across every WRITE-side ssh call
+# in lib/graft.sh (mkdir/rm on A or B) and lib/backup.sh
+# (backup_list_b_wp_content, which does NOT go through run_or_echo — see
+# its own comment for why, and calls ssh directly instead of through this
+# function for that reason).
+ssh_remote_run() {
+  local alias_lc="$1" host="$2" remote_cmd="$3"
+  local ssh_key; ssh_key=$(ssh_key_for "$alias_lc")
+  if [ -n "$ssh_key" ]; then
+    run_or_echo ssh -i "$ssh_key" -- "$host" "$remote_cmd"
+  else
+    run_or_echo ssh -- "$host" "$remote_cmd"
+  fi
+}
+
+# rsync_ssh_e_arg <ssh_key> — builds the value rsync's own `-e` flag
+# expects to carry a dedicated SSH key for the one hop rsync itself
+# invokes ssh for (issue #75). <ssh_key> must be non-empty; callers skip
+# `-e` entirely (no dedicated key configured) rather than call this with
+# an empty value.
+#
+# DOUBLE-QUOTED, not sq()'s single-quoted literal — this was reviewed and
+# measured wrong in an earlier version of this fix. sq() protects a value
+# for a shell that re-parses quote syntax; rsync's `-e` argument is NOT
+# reparsed by a shell — rsync has its own small, non-shell tokenizer for
+# it, and that tokenizer's handling of a quoted span differs from bash's
+# in a way that matters here. Measured live, GNU rsync 3.4.4, a loopback
+# `ssh` stand-in that logs its own argv:
+#   - `-e "ssh -i '<value>'"` (single-quoted, the first version of this
+#     fix): a key path containing a SPACE round-trips as one argument —
+#     but a key path containing an APOSTROPHE (a real, unremarkable case:
+#     this repo's own restore.sh test fixtures use paths like
+#     "/var/www/d'artagnan/html") breaks the connection outright — "Missing
+#     trailing-' in remote-shell command", exit code 1. sq()'s `'\''`
+#     encoding, which is what makes it safe for a REAL shell, means
+#     nothing to rsync's tokenizer.
+#   - `-e "ssh -i \"<value>\""` (double-quoted): the identical
+#     apostrophe'd key path round-trips correctly as one argument.
+#
+# Residual, deliberately not covered: a key path containing a literal `"`
+# character. `man rsync`, under `--rsh=COMMAND, -e`, DOES document an
+# escape for exactly this: "you can use single- and/or double-quotes to
+# preserve spaces in an argument (but not backslashes)... doubling a
+# single-quote inside a single-quoted string gives you a single-quote;
+# likewise for double-quotes." Round-trip byte-exact, measured live on
+# BOTH implementations this codebase cares about: GNU rsync 3.4.4
+# (`-e 'ssh -i "a""b"'` -> the argument `a"b`) and openrsync, the actual
+# `/usr/bin/rsync` macOS ships (identical: `a"b`) — an earlier version of
+# this comment claimed the doubling escape was undocumented and unverified
+# on openrsync; both halves of that claim were themselves measured wrong,
+# by review, and are corrected here (round 4 of the same lesson this
+# function's whole history is made of: verify the claim, not just the
+# code). The SAME man page paragraph is also, independently, why the
+# round-1 version of this fix (sq()'s `'''` single-quote escaping) could
+# never have worked here: rsync's own tokenizer does not escape
+# backslashes at all ("but not backslashes") — sq()'s encoding is
+# backslash-based, so it was never going to mean anything to this parser,
+# whatever quote style wrapped it.
+#
+# So the escape exists and works. Refused anyway, on purpose: nobody has
+# asked this codebase to support a literal `"` inside an SSH private key's
+# own file path — an already-obscure shape one order of magnitude rarer
+# than the apostrophe case this function DOES close — and a second,
+# doubling-based quoting mode on this one hot path costs more to keep
+# correct and reviewable than the case it would ever unblock is worth.
+# What refusing avoids, and what IS measured: the NAIVE, unencoded
+# embedding this function used to consider — a bare `"` inside the
+# double-quoted span, no doubling — is silently DROPPED from the
+# resulting argument, not rejected: `-i "/…/say "hi"/id"` reaches rsync's
+# remote command as `/…/say hi/id`, a DIFFERENT path, with no error
+# anywhere. That silent, wrong-destination corruption is the actual
+# failure mode a refusal here closes. See
+# docs/decisions/0010-ssh-remote-rsync-protect-args.md's Extension section
+# for the fuller measurement writeup.
+rsync_ssh_e_arg() {
+  local ssh_key="$1"
+  case "$ssh_key" in
+    *'"'*)
+      log_error "SITE_*_SSH_KEY (${ssh_key}) contains a literal double-quote character. rsync's -e tokenizer does support a doubled-quote escape for this (documented in 'man rsync' under --rsh; measured live on both GNU rsync and openrsync), but this codebase deliberately does not use it -- nobody has asked to support a literal \" in an SSH key's own file path, and a second quoting mode on this hot path costs more to keep correct than that case is worth. Embedding it unencoded instead would silently corrupt the path (an unencoded \" is dropped, not rejected -- e.g. '/x/say \"hi\"/id' would silently become '/x/say hi/id', a DIFFERENT path, with no error anywhere), so this refuses instead. Rename the key file/path to avoid a literal \" and re-run."
+      return 1
+      ;;
+  esac
+  printf 'ssh -i "%s"' "$ssh_key"
+}
+
+# rsync_pull_remote <alias> <host> <remote_src> <local_dst>
+#
+# Pull FROM <host> (SITE_<ALIAS>_SSH_HOST) INTO the orchestrator — the one
+# rsync shape shared, verbatim, by every ssh-remote PULL in this codebase:
+# backup_wp_content, graft_copy_wp_content_dir, graft_media_sync,
+# graft_fonts_sync (both its dry-run and real branches — two separate call
+# sites, not one), graft_export_wxr's pull, graft_fetch_id_map. Seven call
+# sites total. A real, repeated shape (unlike the push side, where all but
+# one call site already funnel through graft_push_dir/graft_push_file, and
+# the shapes there differ enough — --ignore-existing, -s — that one
+# wrapper would just re-expose those as more parameters; see issue #94's
+# own PR notes on why push stays untouched here). No variadic opts
+# parameter: every one of the seven callers passes exactly these four
+# arguments, so there is nothing to make room for.
+#
+# Closes issue #75 (SITE_<ALIAS>_SSH_KEY, via ssh_key_for + rsync_ssh_e_arg
+# above -- carried to rsync via `-e`/`--rsh`, since rsync invokes ssh
+# itself rather than being invoked through it) and issue #94 (a
+# `host:path` argument handed to rsync makes rsync build its OWN remote
+# command line on the far end, which sq()'s local quoting cannot reach) at
+# every pull site at once, rather than as N separate patches that could
+# drift from each other exactly the way #75 already did once.
+#
+# --no-old-args is unconditional here, never `--protect-args`/`-s` — see
+# docs/decisions/0010-ssh-remote-rsync-protect-args.md for why: `-s`
+# measured live to break a real GNU-rsync-client-vs-openrsync-SERVER
+# connection (a restricted-shell/rrsync B, a standard backup-account
+# hardening, not an edge case), while `--no-old-args` closes the same gap
+# without that regression. Every caller reaching this function is, by
+# construction, pulling from a real ssh-remote host — exactly the shape
+# that ADR requires it for (a host:path SOURCE rsync re-parses on the far
+# end). Requires a GNU-rsync-compatible local rsync >= 3.2.4; callers must
+# have already run sitegraft_require_rsync_arg_escaping once, at phase
+# start, before reaching here — this function does not re-probe per call
+# (see that function's own comment for why a phase-start check was chosen
+# over a per-call probe).
+rsync_pull_remote() {
+  local alias_lc="$1" host="$2" remote_src="$3" local_dst="$4"
+  local ssh_key; ssh_key=$(ssh_key_for "$alias_lc")
+  if [ -n "$ssh_key" ]; then
+    local e_arg; e_arg=$(rsync_ssh_e_arg "$ssh_key") || return 1
+    run_or_echo rsync -avz --no-old-args -e "$e_arg" "${host}:${remote_src}" "$local_dst"
+  else
+    run_or_echo rsync -avz --no-old-args "${host}:${remote_src}" "$local_dst"
+  fi
+}
+
+# sitegraft_require_rsync_arg_escaping — issue #94 / ADR 0010's own
+# capability probe (originally embedded only in the generated restore.sh,
+# for its one ssh-remote wp-content step), promoted to a live function so
+# `backup`/`graft` can run the identical check against a LOCAL rsync
+# they're about to reuse across several pull sites in the same phase.
+#
+# Called ONCE per phase invocation (phase_backup, phase_graft), before
+# that phase's first ssh-remote pull — never re-probed per rsync_pull_remote
+# call. Considered and rejected: a per-call probe. The answer ("is the
+# local rsync on PATH capable of --no-old-args") cannot change mid-run —
+# it is a property of the one local binary every pull in the phase
+# resolves via the same PATH — so re-running it before every one of
+# potentially half a dozen pulls (stack sync, media, fonts, WXR export,
+# id-map fetch) buys nothing a single check at phase start doesn't already
+# give, while making a slow/flaky probe (a subprocess exec) a repeated
+# tax. A phase-start check also fails BEFORE any real work has been done
+# (no partial stack sync, no partial media pull) — a per-call probe could
+# only ever fail partway through, mid-phase, in the middle of the same
+# situation this whole fix exists to make loud and early instead of
+# confusing.
+#
+# Skipped entirely under --dry-run for the same reason restore.sh's own
+# probe is (its own comment): a dry run never actually calls rsync
+# (run_or_echo intercepts every real invocation), so requiring a real
+# GNU-rsync-compatible binary to be on PATH just to PREVIEW a run would
+# defeat the one thing --dry-run exists for. Callers must guard this
+# themselves with `is_dry_run ||` (same convention as every other
+# read-that-must-run-for-real check in this codebase) rather than have it
+# baked in here, so a caller that genuinely needs the check to run even
+# under --dry-run (none exist today) is not structurally prevented from
+# doing so.
+sitegraft_require_rsync_arg_escaping() {
+  if ! command -v rsync >/dev/null 2>&1; then
+    log_error "rsync is required for this phase's ssh-remote pull step(s) and was not found on PATH. Install a GNU-rsync-compatible build (e.g. 'brew install rsync' on macOS; already the default via apt on Debian/Ubuntu) and re-run."
+    return 1
+  fi
+  # Probes the exact flag every pull invocation actually carries
+  # (--no-old-args), not its opt-out sibling --old-args (which restore.sh's
+  # OWN generated probe uses, and which this one used to mirror without
+  # re-justifying it -- review nit). The two are adjacent entries of the
+  # same option table since rsync 3.2.4 and openrsync rejects both
+  # identically, so this is not a behavior change, only a probe that
+  # checks what it claims to check.
+  if ! rsync --no-old-args --version >/dev/null 2>&1; then
+    log_error "this phase pulls over ssh and forces rsync to escape the remote path (--no-old-args, issue #94) so the far end's shell never gets a chance to interpret it, and the rsync resolved on PATH here does not support that option at all. This is most often macOS's own /usr/bin/rsync (openrsync, a different implementation from GNU rsync, which never escapes anything): put a GNU rsync >= 3.2.4 first on PATH (e.g. 'brew install rsync' on macOS; already the default via apt on Debian/Ubuntu) and re-run. (This is a requirement on the LOCAL rsync only — nothing is required of A's/B's.)"
+    return 1
+  fi
+}
+
 # wp_remote <alias: a|b> <wp-cli args...>
 # Dispatches to SSH+wp-cli if SITE_<ALIAS>_SSH_HOST is set, else runs the local
 # wp command (plain `wp`, or a wrapper like `ddev exec --raw -p <project> --

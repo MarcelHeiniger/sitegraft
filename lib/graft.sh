@@ -47,12 +47,14 @@ graft_local_prefix() { _backup_local_exec_prefix "$1"; }
 # unconverted deliberately (out of scope for this fix-pack — see the PR's
 # own "flagged, not addressed" section), not by oversight.
 #
-# Deliberately does NOT also resolve SITE_<ALIAS>_SSH_KEY — that is issue
-# #75 (a dedicated key only ever reaches wp_remote, lib/inventory.sh), a
-# real but separate gap. This is nonetheless the right place for that fix
-# to land later: whatever ssh/rsync invocation it needs to add (-i/
-# IdentityFile) belongs here, once, rather than re-diverging across every
-# caller a second time.
+# Deliberately does NOT also resolve SITE_<ALIAS>_SSH_KEY itself — that is
+# ssh_key_for's job now (lib/inventory.sh, issue #75 fix), called
+# separately by graft_push_dir/graft_push_file/graft_remove_file right
+# where they build their own ssh/rsync invocations. Keeping host and key
+# resolution as two small, separately-testable functions rather than
+# merging them into one avoids the same trap this comment used to warn
+# about for a merged step (a caller that reaches for the host alone should
+# not have to know a key resolution comes bundled with it, or vice versa).
 graft_ssh_host() {
   local alias_lc="$1"
   local alias_uc; alias_uc=$(printf '%s' "$alias_lc" | tr '[:lower:]' '[:upper:]')
@@ -160,11 +162,37 @@ graft_push_dir() {
   local alias_lc="$1" host_src_dir="$2" dest_dir="$3" mode="${4:-}"
   local ssh_host; ssh_host=$(graft_ssh_host "$alias_lc")
   if [ -n "$ssh_host" ]; then
-    run_or_echo ssh -- "$ssh_host" "mkdir -p $(sq "$dest_dir")"
+    # issue #75: `-e "ssh -i <key>"` when SITE_<ALIAS>_SSH_KEY is set — via
+    # the same rsync_ssh_e_arg every pull site uses (lib/inventory.sh), so
+    # the double-quoting it settled on (not sq(), which breaks on a key
+    # path containing an apostrophe — see that function's own comment)
+    # cannot drift between push and pull. `-s` is unchanged (out of scope
+    # for issue #94, which is pull-side only — see that issue and ADR 0010
+    # for why `-s` itself is a separate, flagged-not-fixed concern here).
+    #
+    # Computed and possibly REFUSED (rsync_ssh_e_arg's own double-quote
+    # guard) before the mkdir below, not after — review round 3, found by
+    # mutation: the earlier ordering ran `ssh_remote_run ... mkdir -p`
+    # first, so a key path this function was about to refuse over still
+    # left a real, pointless `mkdir -p` on B before the refusal fired.
+    local ssh_key; ssh_key=$(ssh_key_for "$alias_lc")
+    local e_arg=""
+    if [ -n "$ssh_key" ]; then
+      e_arg=$(rsync_ssh_e_arg "$ssh_key") || return 1
+    fi
+    ssh_remote_run "$alias_lc" "$ssh_host" "mkdir -p $(sq "$dest_dir")"
     if [ "$mode" = "--keep-existing" ]; then
-      run_or_echo rsync -avz -s --ignore-existing "${host_src_dir%/}/" "${ssh_host}:${dest_dir%/}/"
+      if [ -n "$e_arg" ]; then
+        run_or_echo rsync -avz -s --ignore-existing -e "$e_arg" "${host_src_dir%/}/" "${ssh_host}:${dest_dir%/}/"
+      else
+        run_or_echo rsync -avz -s --ignore-existing "${host_src_dir%/}/" "${ssh_host}:${dest_dir%/}/"
+      fi
     else
-      run_or_echo rsync -avz -s "${host_src_dir%/}/" "${ssh_host}:${dest_dir%/}/"
+      if [ -n "$e_arg" ]; then
+        run_or_echo rsync -avz -s -e "$e_arg" "${host_src_dir%/}/" "${ssh_host}:${dest_dir%/}/"
+      else
+        run_or_echo rsync -avz -s "${host_src_dir%/}/" "${ssh_host}:${dest_dir%/}/"
+      fi
     fi
     return
   fi
@@ -248,8 +276,21 @@ graft_push_file() {
   local alias_lc="$1" host_file="$2" dest_dir="$3" dest_name="$4"
   local ssh_host; ssh_host=$(graft_ssh_host "$alias_lc")
   if [ -n "$ssh_host" ]; then
-    run_or_echo ssh -- "$ssh_host" "mkdir -p $(sq "$dest_dir")"
-    run_or_echo rsync -avz -s "$host_file" "${ssh_host}:${dest_dir}/${dest_name}"
+    # issue #75: `-e "ssh -i <key>"` when SITE_<ALIAS>_SSH_KEY is set —
+    # same reasoning as graft_push_dir's own comment just above. Computed
+    # (and possibly refused) BEFORE the mkdir, same ordering fix as
+    # graft_push_dir — see that function's own comment for why.
+    local ssh_key; ssh_key=$(ssh_key_for "$alias_lc")
+    local e_arg=""
+    if [ -n "$ssh_key" ]; then
+      e_arg=$(rsync_ssh_e_arg "$ssh_key") || return 1
+    fi
+    ssh_remote_run "$alias_lc" "$ssh_host" "mkdir -p $(sq "$dest_dir")"
+    if [ -n "$e_arg" ]; then
+      run_or_echo rsync -avz -s -e "$e_arg" "$host_file" "${ssh_host}:${dest_dir}/${dest_name}"
+    else
+      run_or_echo rsync -avz -s "$host_file" "${ssh_host}:${dest_dir}/${dest_name}"
+    fi
     return
   fi
   local prefix; prefix=$(graft_local_prefix "$alias_lc")
@@ -269,7 +310,7 @@ graft_remove_file() {
   local alias_lc="$1" path="$2"
   local ssh_host; ssh_host=$(graft_ssh_host "$alias_lc")
   if [ -n "$ssh_host" ]; then
-    run_or_echo ssh -- "$ssh_host" "rm -f $(sq "$path")"
+    ssh_remote_run "$alias_lc" "$ssh_host" "rm -f $(sq "$path")"
     return
   fi
   local prefix; prefix=$(graft_local_prefix "$alias_lc")
@@ -352,7 +393,9 @@ graft_copy_wp_content_dir() {
 
   if [ -n "${SITE_A_SSH_HOST:-}" ]; then
     # shellcheck disable=SC2153 # not a typo: SITE_A_WP_PATH is assigned in bin/sitegraft or a sourced profile, not in this file (cross-file, same blind spot as this file's SC2034 disables)
-    run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${SITE_A_WP_PATH}/${rel_dir}/" "${staging}/"
+    # issues #75/#94: rsync_pull_remote (lib/inventory.sh) carries A's
+    # dedicated SSH key and forces rsync's default arg-escaping.
+    rsync_pull_remote a "$SITE_A_SSH_HOST" "${SITE_A_WP_PATH}/${rel_dir}/" "${staging}/"
   elif [ -n "$(graft_local_prefix a)" ]; then
     graft_pull_dir a "${SITE_A_WP_PATH}/${rel_dir}" "$staging"
   else
@@ -534,7 +577,9 @@ graft_media_sync() {
   mkdir -p "$staging" || return $?
   log_info "pulling A's media to the orchestrator..."
   if [ -n "${SITE_A_SSH_HOST:-}" ]; then
-    run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${SITE_A_WP_PATH}/wp-content/uploads/" "${staging}/" || return $?
+    # issues #75/#94: rsync_pull_remote (lib/inventory.sh) carries A's
+    # dedicated SSH key and forces rsync's default arg-escaping.
+    rsync_pull_remote a "$SITE_A_SSH_HOST" "${SITE_A_WP_PATH}/wp-content/uploads/" "${staging}/" || return $?
   else
     graft_pull_dir a "${SITE_A_WP_PATH}/wp-content/uploads" "$staging" || return $?
   fi
@@ -695,13 +740,15 @@ graft_fonts_sync() {
     # site can no longer make that mistake: only rc 1 (confirmed absent) is
     # a no-op; rc 2 (could not determine) is refused, exactly like a real
     # rsync failure would have been before this whole fix existed.
+    # issues #75/#94: rsync_pull_remote (lib/inventory.sh) carries A's
+    # dedicated SSH key and forces rsync's default arg-escaping.
     if is_dry_run; then
-      run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${font_dir_a%/}/" "${staging}/" || return $?
+      rsync_pull_remote a "$SITE_A_SSH_HOST" "${font_dir_a%/}/" "${staging}/" || return $?
     else
       local exists_rc=0
       graft_ssh_path_exists a "$font_dir_a" || exists_rc=$?
       case "$exists_rc" in
-        0) run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${font_dir_a%/}/" "${staging}/" || return $? ;;
+        0) rsync_pull_remote a "$SITE_A_SSH_HOST" "${font_dir_a%/}/" "${staging}/" || return $? ;;
         1) log_info "source directory does not exist on a yet (nothing to pull): ${font_dir_a}" ;;
         *) log_error "graft: could not determine whether A's font directory (${font_dir_a}) exists on ${SITE_A_SSH_HOST} -- the ssh probe itself failed (host unreachable, authentication refused, or a wrong/missing SSH key), not the ordinary 'directory does not exist yet' case. Refusing to treat an unanswered question as a safe no-op. Check that ${SITE_A_SSH_HOST} is reachable and, if SITE_A_SSH_KEY is set, that it is correct, then re-run 'sitegraft graft --run ${run_dir}' -- this step will retry." ; return 1 ;;
       esac
@@ -1263,10 +1310,14 @@ graft_export_wxr() {
   mkdir -p "$staging"
   if [ -n "${SITE_A_SSH_HOST:-}" ]; then
     local remote_dir="/tmp/sitegraft-export-$$"
-    run_or_echo ssh -- "$SITE_A_SSH_HOST" "mkdir -p $(sq "$remote_dir")"
+    # issues #75/#94: ssh_remote_run/rsync_pull_remote (lib/inventory.sh)
+    # carry A's dedicated SSH key; rsync_pull_remote also forces rsync's
+    # default arg-escaping for the one call here whose remote_dir goes to
+    # rsync as a `host:path` source.
+    ssh_remote_run a "$SITE_A_SSH_HOST" "mkdir -p $(sq "$remote_dir")"
     run_or_echo wp_remote a export --post_type="$post_types_csv" --dir="$remote_dir"
-    run_or_echo rsync -avz "${SITE_A_SSH_HOST}:${remote_dir}/" "${staging}/"
-    run_or_echo ssh -- "$SITE_A_SSH_HOST" "rm -rf $(sq "$remote_dir")"
+    rsync_pull_remote a "$SITE_A_SSH_HOST" "${remote_dir}/" "${staging}/"
+    ssh_remote_run a "$SITE_A_SSH_HOST" "rm -rf $(sq "$remote_dir")"
   else
     local prefix; prefix=$(graft_local_prefix a)
     if [ -n "$prefix" ]; then
@@ -1303,14 +1354,31 @@ graft_import_wxr() {
   local f base
   if [ -n "${SITE_B_SSH_HOST:-}" ]; then
     local remote_dir="/tmp/sitegraft-import-$$"
-    run_or_echo ssh -- "$SITE_B_SSH_HOST" "mkdir -p $(sq "$remote_dir")"
-    run_or_echo rsync -avz "${staging}/" "${SITE_B_SSH_HOST}:${remote_dir}/"
+    # issue #75: `-e "ssh -i <key>"` when SITE_B_SSH_KEY is set — same
+    # reasoning as graft_push_dir/graft_push_file's own comments,
+    # including computing (and possibly refusing) it BEFORE the mkdir.
+    # This is a PUSH (staging -> B), out of scope for issue #94 (pull-side
+    # only — see that issue and ADR 0010); it is also, pre-existing and
+    # unchanged here, the one push-side rsync call in this file that does
+    # not carry `-s` at all, unlike graft_push_dir/graft_push_file's own —
+    # flagged, not fixed, in the PR that closed issue #44.
+    local ssh_key; ssh_key=$(ssh_key_for b)
+    local e_arg=""
+    if [ -n "$ssh_key" ]; then
+      e_arg=$(rsync_ssh_e_arg "$ssh_key") || return 1
+    fi
+    ssh_remote_run b "$SITE_B_SSH_HOST" "mkdir -p $(sq "$remote_dir")"
+    if [ -n "$e_arg" ]; then
+      run_or_echo rsync -avz -e "$e_arg" "${staging}/" "${SITE_B_SSH_HOST}:${remote_dir}/"
+    else
+      run_or_echo rsync -avz "${staging}/" "${SITE_B_SSH_HOST}:${remote_dir}/"
+    fi
     for f in "${staging}"/*.xml; do
       [ -e "$f" ] || continue
       base=$(basename "$f")
       run_or_echo wp_remote b import "${remote_dir}/${base}" --authors=skip --skip=attachment
     done
-    run_or_echo ssh -- "$SITE_B_SSH_HOST" "rm -rf $(sq "$remote_dir")"
+    ssh_remote_run b "$SITE_B_SSH_HOST" "rm -rf $(sq "$remote_dir")"
   else
     local prefix; prefix=$(graft_local_prefix b)
     if [ -n "$prefix" ]; then
@@ -1445,7 +1513,9 @@ graft_fetch_id_map() {
   local dest="${run_dir}/id-map.tsv"
   local tmp="${run_dir}/.id-map-fetch.tmp"
   if [ -n "${SITE_B_SSH_HOST:-}" ]; then
-    run_or_echo rsync -avz "${SITE_B_SSH_HOST}:${src}" "$tmp"
+    # issues #75/#94: rsync_pull_remote (lib/inventory.sh) carries B's
+    # dedicated SSH key and forces rsync's default arg-escaping.
+    rsync_pull_remote b "$SITE_B_SSH_HOST" "$src" "$tmp"
   else
     local prefix; prefix=$(graft_local_prefix b)
     if [ -n "$prefix" ]; then
@@ -3197,6 +3267,20 @@ phase_graft() {
   done
   [ -n "$profile" ] || { log_error "graft requires --profile <name>"; return 1; }
   profile_load "$profile" || return 1
+
+  # issue #94 / ADR 0010: one check, at phase start, not re-probed before
+  # each of this phase's several ssh-remote pulls (stack sync, media,
+  # fonts, WXR export all pull from A; the id-map fetch pulls from B) —
+  # see sitegraft_require_rsync_arg_escaping's own comment for why a
+  # phase-start check was chosen over a per-call probe. Either alias being
+  # ssh-remote is enough to trigger it: the answer ("is the local rsync
+  # capable of --no-old-args") does not depend on which alias a given pull
+  # targets. Skipped entirely under --dry-run (never calls rsync for
+  # real).
+  if [ -n "${SITE_A_SSH_HOST:-}" ] || [ -n "${SITE_B_SSH_HOST:-}" ]; then
+    is_dry_run || sitegraft_require_rsync_arg_escaping || return 1
+  fi
+
   [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1 || true)
   [ -n "$run_dir" ] || { log_error "no scan/plan run found for profile ${profile} — run 'sitegraft scan' and 'sitegraft plan' first"; return 1; }
   [ -f "${run_dir}/backup.complete" ] || {

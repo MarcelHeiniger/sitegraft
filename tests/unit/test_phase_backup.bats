@@ -118,6 +118,98 @@ EOF
   [[ "$output" == *"not frozen"* ]]
 }
 
+# --- issue #94 / ADR 0010: phase_backup's own phase-start rsync
+# arg-escaping check (sitegraft_require_rsync_arg_escaping,
+# lib/inventory.sh), run once here — before backup_db_export/
+# backup_wp_content ever touch B — when SITE_B_SSH_HOST is ssh-remote.
+# Uses its own profile/run dir (SITE_B_SSH_HOST unset in `t.conf`, the
+# setup() default, so these three tests would otherwise never exercise
+# this guard at all).
+
+_ssh_remote_profile_and_run_dir() {
+  cat > "${SITEGRAFT_PROFILES_DIR}/t-ssh.conf" <<EOF
+SITE_A_ALIAS="a"
+SITE_A_WP_PATH="/var/www/a"
+SITE_B_ALIAS="b"
+SITE_B_SSH_HOST="b.example.com"
+SITE_B_WP_PATH="/var/www/site-b"
+SITE_B_WP_CMD="wp"
+SITEGRAFT_STATE_DIR="${SITEGRAFT_STATE_DIR}"
+EOF
+  local d="${SITEGRAFT_STATE_DIR}/t-ssh-20260101T000000"
+  mkdir -p "$d"
+  cp "${RUN_DIR}/manifest.json" "${d}/manifest.json"
+  printf '%s' "$d"
+}
+
+@test "phase_backup refuses before touching B when SITE_B_SSH_HOST is set and the local rsync cannot do --no-old-args (issue #94)" {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/rsync" <<'EOS'
+#!/usr/bin/env bash
+case " $* " in
+  *" --no-old-args "*) exit 1 ;;
+esac
+exit 0
+EOS
+  chmod +x "$BATS_TEST_TMPDIR/bin/rsync"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+  local d; d=$(_ssh_remote_profile_and_run_dir)
+  run phase_backup --profile t-ssh --run "$d"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"openrsync"* || "$output" == *"3.2.4"* ]] || false
+  # Never reached the actual pull/export — no backup dir was created.
+  [ ! -d "${d}/backup" ]
+}
+
+@test "phase_backup's --dry-run does NOT run the rsync arg-escaping check at all (never requires a real GNU rsync just to preview)" {
+  # Same incapable-rsync stand-in as the previous test (would refuse this
+  # profile for real) -- proves the check is genuinely SKIPPED under
+  # --dry-run, not merely that a capable rsync happened to be on PATH.
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/rsync" <<'EOS'
+#!/usr/bin/env bash
+case " $* " in
+  *" --no-old-args "*) exit 1 ;;
+esac
+exit 0
+EOS
+  chmod +x "$BATS_TEST_TMPDIR/bin/rsync"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+  local d; d=$(_ssh_remote_profile_and_run_dir)
+  run phase_backup --profile t-ssh --run "$d" --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"openrsync"* ]] || false
+}
+
+@test "phase_backup does not require the rsync arg-escaping check at all when SITE_B_SSH_HOST is unset (nothing here needs it)" {
+  # Discriminating, not just a smoke check (review nit -- the first
+  # version of this test ran with no rsync stand-in at all, so it would
+  # have stayed green even if the `[ -n "${SITE_B_SSH_HOST:-}" ]` guard
+  # were removed and the check ran unconditionally, as long as this dev
+  # machine's own rsync happened to be capable): an INCAPABLE rsync is on
+  # PATH, exactly like the "refuses" test above -- if the alias guard were
+  # ever removed, this run would start failing with the openrsync message
+  # instead of completing, on profile "t" (setup()'s default, no
+  # SITE_B_SSH_HOST at all). backup_db_export/backup_wp_content are
+  # stubbed by this file's own setup() (bash functions, not real rsync
+  # invocations), so this incapable rsync is never actually EXECUTED by a
+  # real transfer either way -- it is here purely to prove the guard's own
+  # condition, not to re-prove backup_wp_content's plumbing.
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/rsync" <<'EOS'
+#!/usr/bin/env bash
+case " $* " in
+  *" --no-old-args "*) exit 1 ;;
+esac
+exit 0
+EOS
+  chmod +x "$BATS_TEST_TMPDIR/bin/rsync"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+  run phase_backup --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"openrsync"* ]] || false
+}
+
 @test "phase_backup produces a verified backup, checksums, restore.sh, and a completion marker" {
   run phase_backup --profile t --run "$RUN_DIR"
   [ "$status" -eq 0 ]
