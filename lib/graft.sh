@@ -3114,8 +3114,20 @@ graft_prune_previous_run() {
       mv "${run_dir}/id-map.tsv.tmp" "${run_dir}/id-map.tsv"
     }
   fi
+  # Issue #76: this read must run for real even under --dry-run, same
+  # technique (and same reasoning) as graft_font_dir's A-side read and
+  # _graft_migrate_one_option_key's A-side read above, which themselves
+  # mirror scan's own M6 fix and verify's own MAJOR-A fix. wp_remote wraps
+  # every call in run_or_echo, which under SITEGRAFT_DRY_RUN=1 returns the
+  # literal text "[dry-run] wp_remote b post list ..." instead of B's real
+  # IDs. Left unguarded, that placeholder text was read as a single real
+  # post ID — so a dry run against a B with ZERO matching posts still
+  # warned "pruning 1 post(s)" and printed a delete command whose argument
+  # was the whole placeholder string. `SITEGRAFT_DRY_RUN=0` here only
+  # covers this one read; the actual deletion below (`run_or_echo
+  # wp_remote b post delete ...`) stays correctly simulated.
   local ids
-  ids=$(wp_remote b post list --post_type="$post_types_csv" --meta_key=_sitegraft_source_id --field=ID)
+  ids=$(SITEGRAFT_DRY_RUN=0 wp_remote b post list --post_type="$post_types_csv" --meta_key=_sitegraft_source_id --field=ID)
   [ -n "$ids" ] || return 0
   log_warn "pruning $(echo "$ids" | wc -l | tr -d ' ') post(s) left by a previous sitegraft run before re-importing"
   # Same fd0-collision class as graft_remap_attachment_ids's own fix above
