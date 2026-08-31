@@ -638,18 +638,71 @@ etch_post_import() {
   # against the exact scenario BLOCKER 2 exploited (see this file's own
   # test suite).
   #
+  # ISSUE #88: every pattern below that matches a JSON key/value pair
+  # (`"ref":<n>`, `"mediaId":<n>`/`"mediaId":"<n>"`, the component-prop
+  # discovery regex, and the component-prop call-site rewrite) used to
+  # match ONLY the exact compact byte sequence -- zero whitespace either
+  # side of the colon. Real WordPress/Etch content never emits the spaced
+  # form (json_encode() default has no whitespace), so this was never
+  # observed live -- but a hand-edited or differently-serialized call site
+  # would have been silently left with A's old id, the exact "total
+  # invisibility" #88 itself is about: no error, no warning, just a
+  # reference that quietly never got rewritten. Every one of those
+  # patterns now tolerates `\s*` around the colon (`mediaId=".."`'s `=` on
+  # the HTML-attribute form gets the same tolerance). The bare-digit CSS
+  # class form graft's OWN generic remap uses (`wp-image-<n>`,
+  # lib/php/content-remap-functions.php) has no colon and no legitimate
+  # whitespace variant, so it is unaffected.
+  #
+  # Whitespace tolerance narrows the gap but does not close it to zero --
+  # a form this fix did not anticipate (a line break inside the key, a
+  # different quote character) would still be missed silently. Per this
+  # issue's own recommendation, closing that completely means decoding
+  # each block's JSON and re-encoding it rather than matching its raw
+  # bytes at all -- a materially larger change than this fix-pack, left
+  # for a follow-up. In the interim, the loop below adds the guard the
+  # issue itself calls out as cheap regardless: this hook already knows,
+  # for every (post, old id) pair it is looking at, whether it DECIDED
+  # that id might need remapping (it is iterating $map/$media_map, which
+  # is built from exactly the ids this run migrated) -- so if that old id
+  # is still textually present, digit-bounded, in the post's content AFTER
+  # every sentinel pass has run, that is a case this hook tried to fix and
+  # apparently did not. Reported as `UNMATCHED_ID_REF:<pid>:<old>:<kind>`
+  # (handled below, alongside NESTED_COMPONENT/MALFORMED_COMPONENT_BLOCK)
+  # rather than left to the same silence #88 itself reports.
+  #
+  # ASYMMETRY BETWEEN THIS HOOK AND lib/verify.sh's matching guard (issue
+  # #88, documented rather than changed -- it is a deliberate split, not a
+  # bug): the `MALFORMED_COMPONENT_BLOCK:<pid>` warning below is emitted
+  # from INSIDE the `if ( ! empty( $component_prop_map ) )` branch, so it
+  # only fires on a site that has at least one component with an
+  # id-carrying prop to remap. A site with a malformed
+  # `<!-- wp:etch/component -->` call site but NO id-carrying prop on any
+  # component never enters that branch, so this hook says nothing at all
+  # about it -- while `verify_component_prop_references_resolve` decodes
+  # every citing post independently of whether any prop map is non-empty,
+  # and HARD FAILS on that same malformed block. The result an operator can
+  # see is a green graft next to a red verify with no trace, on the graft
+  # side, of why. That split follows this repo's own convention (graft
+  # repairs what it can and warns about what it cannot; verify refuses to
+  # vouch for what it cannot confirm) and is not being changed here -- but
+  # it means a HARD FAIL from verify's component-prop guard is always worth
+  # reading graft's own log for, even when graft's log looks clean.
 
 #
-# NOTE ON WHY THE PHP BELOW STAYS COMMENT-FREE: an inline "//" PHP
-  # comment holding an UNBALANCED parenthesis on its own line (an opening
-  # "(" on one line, its matching ")" only on a later line) breaks this
-  # bash 3.2's own here-doc-inside-command-substitution parser --
-  # execution-proven while writing this fix-pack (a "syntax error near
-  # unexpected token" pointing at the PHP comment line itself, gone the
-  # moment the same explanation moved up here instead). Keeping the
-  # heredoc body itself free of prose comments, exactly as it already was
-  # before this change, sidesteps the whole class of bug rather than
-  # hunting for which single parenthesis broke it.
+# NOTE ON WHY THE PHP BELOW STAYS COMMENT-FREE: an inline "//" PHP comment
+  # holding an UNMATCHED parenthesis breaks this bash 3.2's own
+  # here-doc-inside-command-substitution parser -- execution-proven while
+  # writing this fix-pack (a "syntax error near unexpected token" pointing
+  # at the PHP comment line itself, gone the moment the same explanation
+  # moved up here instead). Corrected per issue #88: a matched PAIR split
+  # across two lines (an opening "(" on one line, its own closing ")" on a
+  # later line) was verified NOT to trigger this -- the actual trigger is a
+  # single parenthesis with no partner in the same heredoc at all (a lone
+  # ")" reads as a syntax error, a lone "(" reads as unexpected EOF).
+  # Keeping the heredoc body itself free of prose comments, exactly as it
+  # already was before this change, sidesteps the whole class of bug
+  # rather than hunting for which single parenthesis broke it.
   local php
   php=$(cat <<PHP
 function sitegraft_json_span( \$text, \$start ) {
@@ -716,10 +769,13 @@ function sitegraft_find_component_blocks( \$content ) {
 	return \$blocks;
 }
 function sitegraft_attributes_span( \$content, \$block_start, \$block_end ) {
-	\$needle = '"attributes":';
+	\$needle = '"attributes"';
 	\$pos = strpos( \$content, \$needle, \$block_start );
 	if ( false === \$pos || \$pos >= \$block_end ) { return null; }
 	\$val_start = \$pos + strlen( \$needle );
+	while ( \$val_start < \$block_end && ' ' === \$content[ \$val_start ] ) { \$val_start++; }
+	if ( \$val_start >= \$block_end || ':' !== \$content[ \$val_start ] ) { return null; }
+	\$val_start++;
 	while ( \$val_start < \$block_end && ' ' === \$content[ \$val_start ] ) { \$val_start++; }
 	if ( \$val_start >= \$block_end || '{' !== \$content[ \$val_start ] ) { return null; }
 	\$span = sitegraft_json_span( \$content, \$val_start );
@@ -738,7 +794,7 @@ foreach ( \$component_map as \$old_cid => \$new_cid ) {
 	\$new_cid = (int) \$new_cid;
 	\$cbody = get_post_field( 'post_content', \$new_cid );
 	if ( is_string( \$cbody ) && '' !== \$cbody ) {
-		if ( preg_match_all( '/"(mediaId|ref|parentPageID)":"\{props\.([A-Za-z0-9_]+)\}"/', \$cbody, \$pm, PREG_SET_ORDER ) ) {
+		if ( preg_match_all( '/"(mediaId|ref|parentPageID)"\s*:\s*"\{props\.([A-Za-z0-9_]+)\}"/', \$cbody, \$pm, PREG_SET_ORDER ) ) {
 			foreach ( \$pm as \$prow ) {
 				\$component_prop_map[ (string) \$old_cid ][ \$prow[2] ] = \$prow[1];
 			}
@@ -794,9 +850,10 @@ foreach ( \$ids as \$pid ) {
 				\$new_val = \$submap[ \$old_val ];
 				\$seq++;
 				\$token = '@@CPROP_' . \$pid . '_' . \$seq . '@@';
-				\$search = \$quoted ? ( '"' . \$propname . '":"' . \$old_val . '"' ) : ( '"' . \$propname . '":' . \$old_val );
+				\$prop_quoted_for_regex = preg_quote( \$propname, '/' );
+				\$pattern = \$quoted ? ( '/"' . \$prop_quoted_for_regex . '"\s*:\s*"' . \$old_val . '"/' ) : ( '/"' . \$prop_quoted_for_regex . '"\s*:\s*' . \$old_val . '(?!\d)/' );
 				\$replace = \$quoted ? ( '"' . \$propname . '":"' . \$token . '"' ) : ( '"' . \$propname . '":' . \$token );
-				\$attrs_text = str_replace( \$search, \$replace, \$attrs_text );
+				\$attrs_text = preg_replace( \$pattern, \$replace, \$attrs_text );
 				\$cprop_tokens[ \$token ] = \$new_val;
 			}
 			if ( \$attrs_text !== \$attrs_before ) {
@@ -811,15 +868,15 @@ foreach ( \$ids as \$pid ) {
 		}
 	}
 	foreach ( \$map as \$old => \$new ) {
-		\$content = preg_replace( '/"ref":' . \$old . '(?!\d)/', '"ref":@@' . \$old . '@@', \$content );
+		\$content = preg_replace( '/"ref"\s*:\s*' . \$old . '(?!\d)/', '"ref":@@' . \$old . '@@', \$content );
 	}
 	foreach ( \$map as \$old => \$new ) {
 		\$content = str_replace( '"ref":@@' . \$old . '@@', '"ref":' . \$new, \$content );
 	}
 	foreach ( \$media_map as \$old => \$new ) {
-		\$content = preg_replace( '/"mediaId":"' . \$old . '"/', '"mediaId":"@@MEDIA_' . \$old . '@@"', \$content );
-		\$content = preg_replace( '/"mediaId":' . \$old . '(?!\d)/', '"mediaId":@@MEDIA_' . \$old . '@@', \$content );
-		\$content = preg_replace( '/mediaId="' . \$old . '"/', 'mediaId="@@MEDIA_' . \$old . '@@"', \$content );
+		\$content = preg_replace( '/"mediaId"\s*:\s*"' . \$old . '"/', '"mediaId":"@@MEDIA_' . \$old . '@@"', \$content );
+		\$content = preg_replace( '/"mediaId"\s*:\s*' . \$old . '(?!\d)/', '"mediaId":@@MEDIA_' . \$old . '@@', \$content );
+		\$content = preg_replace( '/mediaId\s*=\s*"' . \$old . '"/', 'mediaId="@@MEDIA_' . \$old . '@@"', \$content );
 	}
 	foreach ( \$media_map as \$old => \$new ) {
 		\$content = str_replace( '@@MEDIA_' . \$old . '@@', \$new, \$content );
@@ -827,6 +884,14 @@ foreach ( \$ids as \$pid ) {
 	if ( ! empty( \$cprop_tokens ) ) {
 		foreach ( \$cprop_tokens as \$token => \$new_val ) {
 			\$content = str_replace( \$token, \$new_val, \$content );
+		}
+	}
+	foreach ( array( 'ref' => \$map, 'mediaId' => \$media_map ) as \$kind => \$submap ) {
+		foreach ( \$submap as \$old => \$new ) {
+			\$digit_bounded = '/(?<!\d)' . \$old . '(?!\d)/';
+			if ( preg_match( \$digit_bounded, \$before ) && preg_match( \$digit_bounded, \$content ) ) {
+				echo 'UNMATCHED_ID_REF:' . \$pid . ':' . \$old . ':' . \$kind . "\n";
+			}
 		}
 	}
 	if ( \$content !== \$before ) {
@@ -888,6 +953,25 @@ PHP
           # those. Surfaced by name so an operator can inspect the post
           # directly rather than trusting a scan that quietly gave up.
           log_warn "etch post_import: post ${pid#MALFORMED_COMPONENT_BLOCK:} has a wp:etch/component block whose JSON did not parse as balanced (issue #86 fix-pack) — that occurrence's props were left unremapped; every other occurrence on the same post was still processed."
+          ;;
+        UNMATCHED_ID_REF:*)
+          # Issue #88's own cheap interim guard: this hook's PHP already
+          # KNOWS which old id it was looking for in this post (it is
+          # iterating $map/$media_map, the exact ids this run decided need
+          # remapping) — reporting when a digit-bounded occurrence of that
+          # id survives in the post's content, unchanged, after every
+          # sentinel pass ran, turns a silent miss (a JSON form none of the
+          # \s*-tolerant patterns above happens to cover — different
+          # quoting, a line break inside the key, anything not yet
+          # anticipated) into a named post id and a named old id, rather
+          # than nothing at all. A false positive is possible (the digit
+          # sequence could coincidentally appear elsewhere in the post for
+          # an unrelated reason) — deliberately accepted: CLAUDE.md's own
+          # rule is "report unknown, never OK," and a warning an operator
+          # can dismiss after a two-second look is strictly better than the
+          # silence issue #88 itself reports.
+          IFS=':' read -r _ _pid _old_id _kind <<< "$pid"
+          log_warn "etch post_import: post ${_pid} still textually references old ${_kind} id ${_old_id} after the remap pass ran — the remap decided this id needed rewriting but the content is unchanged (possible unrecognized JSON formatting, issue #88)"
           ;;
         *)
           graft_record_module_content_rewrite "$run_dir" "$pid"
