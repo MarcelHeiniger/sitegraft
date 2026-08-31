@@ -51,6 +51,21 @@ etch: etch_settings"
   echo "$output" | jq -e '.migrate.etch.post_types == [] and .migrate.etch.option_keys == []' >/dev/null
 }
 
+@test "_plan_apply_selection treats a module name containing a space as ONE module, not two word-split fragments (issue #40)" {
+  local manifest='{"migrate":{"my module":{"post_types":["cfs","cpts"],"option_keys":["settings"]}}}'
+  local kept="my module: cfs"
+  run _plan_apply_selection "$manifest" "$kept"
+  [ "$status" -eq 0 ]
+  # Issue #40: the loop used to be `for mod in $(jq ... .migrate | keys[])` —
+  # UNQUOTED command substitution, so the shell word-split "my module" into
+  # "my" and "module". Neither matches the "my module: " prefix `kept`
+  # actually carries, so "my module" itself was never filtered at all (its
+  # original, UNfiltered post_types would survive), while two bogus new
+  # keys ("my", "module") were fabricated in .migrate with empty lists.
+  echo "$output" | jq -e '.migrate["my module"].post_types == ["cfs"]' >/dev/null
+  echo "$output" | jq -e '(.migrate | has("my")) or (.migrate | has("module")) | not' >/dev/null
+}
+
 @test "_plan_apply_selection leaves other modules' selections untouched by one module's kept list" {
   local manifest='{"migrate":{"etch":{"post_types":["etch_cfs"],"option_keys":[]},"core_wp":{"post_types":["page","post"],"option_keys":[]}}}'
   local kept="etch: etch_cfs

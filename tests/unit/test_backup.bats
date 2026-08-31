@@ -673,6 +673,28 @@ INSERT INTO `wp_users` VALUES (1,"admin");
   [ "$status" -eq 0 ]
 }
 
+@test "backup_compute_protected_checksums checksums a module name containing a space as ONE module, not two word-split fragments (issue #40)" {
+  local manifest='{"protect":{"my module":{"tables":["fakebooking_reservations"]}}}'
+  inventory_table_prefix() { echo "wp_"; }
+  wp_remote() { echo "INSERT INTO t VALUES (1);"; }
+  run backup_compute_protected_checksums b "$manifest"
+  [ "$status" -eq 0 ]
+  # Issue #40: the loop used to be `for mod in $(jq ... .protect | keys[])` —
+  # UNQUOTED command substitution, so the shell word-split "my module" into
+  # "my" and "module". Neither is a real key of .protect, so
+  # `.protect[$m].tables` resolved to null for each fragment, `tables_csv`
+  # came back empty, and the `[ -n "$tables_csv" ] || continue` guard
+  # silently skipped both — the module was never checksummed at all, and
+  # nothing about the run's own output said so.
+  local checksums_json="$output"
+  run jq -e 'has("my module")' <<< "$checksums_json"
+  [ "$status" -eq 0 ]
+  run jq -e '.["my module"] | startswith("sha256:")' <<< "$checksums_json"
+  [ "$status" -eq 0 ]
+  run jq -e 'has("my") or has("module")' <<< "$checksums_json"
+  [ "$status" -eq 1 ]
+}
+
 @test "backup_compute_protected_checksums skips a module with no tables (empty --tables= is not a meaningful export)" {
   local manifest='{"protect":{"_unclaimed":{"tables":[]}}}'
   inventory_table_prefix() { echo "wp_"; }

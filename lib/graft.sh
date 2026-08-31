@@ -361,8 +361,19 @@ graft_remove_dir() {
 # case, matching the exact command shape the plan's own unit tests assert.
 graft_sync_stack() {
   local run_dir="$1" manifest="$2"
-  local component
-  for component in $(echo "$manifest" | jq -r '.stack // {} | to_entries[] | select(.value.resolution == "copy") | .key'); do
+  local component components
+  components=$(echo "$manifest" | jq -r '.stack // {} | to_entries[] | select(.value.resolution == "copy") | .key')
+  # A read loop over fd 3, not `for component in $(...)` (issue #40) — same
+  # fix, same reason, as graft_migrate_options/verify_options_match:
+  # unquoted command substitution word-splits, so a component name
+  # containing whitespace becomes two names, neither of which is a real key
+  # of manifest.stack, silently skipping the component this run was meant to
+  # sync onto B. fd 3 rather than stdin also matters here, same as
+  # verify_options_match: the loop body's graft_copy_wp_content_dir shells
+  # out to rsync/ssh, which drains stdin — a stdin-fed loop would have the
+  # first component's transfer swallow the remaining component names.
+  while IFS= read -r component <&3; do
+    [ -n "$component" ] || continue
     local slug rel_dir
     slug=$(echo "$manifest" | jq -r --arg c "$component" '.stack[$c].slug_a')
     if [ "$component" = "theme" ]; then
@@ -379,7 +390,7 @@ graft_sync_stack() {
     else
       run_or_echo wp_remote b plugin activate "$slug"
     fi
-  done
+  done 3<<< "$components"
 }
 
 # graft_copy_wp_content_dir <rel_dir> <staging> — copy one wp-content

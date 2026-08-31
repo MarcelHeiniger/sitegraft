@@ -645,8 +645,15 @@ _plan_prompt_items_plain() {
 # be one accidental keystroke).
 _plan_apply_selection() {
   local manifest="$1" kept="$2"
-  local mod
-  for mod in $(echo "$manifest" | jq -r '.migrate | keys[]'); do
+  local mod mods
+  mods=$(echo "$manifest" | jq -r '.migrate | keys[]')
+  # A read loop over fd 3, not `for mod in $(...)` (issue #40) — same fix,
+  # same reason, as graft_migrate_options/verify_options_match: unquoted
+  # command substitution word-splits, so a module name containing whitespace
+  # becomes two names, neither of which matches the "$mod: " prefix `kept`
+  # actually uses, silently dropping that module's whole selection.
+  while IFS= read -r mod <&3; do
+    [ -n "$mod" ] || continue
     local mod_pt_list mod_re mod_kept_raw kept_pt kept_ok
     mod_pt_list=$(echo "$manifest" | jq -c --arg m "$mod" '.migrate[$m].post_types')
     # $mod is filename-derived (lib/modules.sh: hyphens -> underscores from
@@ -671,7 +678,7 @@ _plan_apply_selection() {
       'split("\n") | map(select(length > 0)) | map(select(. as $x | ($pt | index($x)) | not))')
     manifest=$(echo "$manifest" | jq --arg m "$mod" --argjson pt "$kept_pt" --argjson ok "$kept_ok" \
       '.migrate[$m].post_types = $pt | .migrate[$m].option_keys = $ok')
-  done
+  done 3<<< "$mods"
   echo "$manifest"
 }
 
@@ -720,8 +727,19 @@ plan_select_interactive() {
 plan_resolve_stack() {
   local manifest="$1" scan_a_json="$2" scan_b_json="$3"
   local diff; diff=$(inventory_stack_diff "$scan_a_json" "$scan_b_json")
-  local component
-  for component in $(echo "$diff" | jq -r 'keys[]'); do
+  local component components
+  components=$(echo "$diff" | jq -r 'keys[]')
+  # A read loop over fd 3, not `for component in $(...)` (issue #40) — same
+  # fix, same reason, as graft_migrate_options/verify_options_match:
+  # unquoted command substitution word-splits, so a component name
+  # containing whitespace becomes two names, neither of which is a real key
+  # of $diff, silently skipping the component this run was meant to resolve.
+  # fd 3 rather than stdin also matters here, same as verify_options_match:
+  # the loop body calls _plan_confirm/_plan_confirm_strong, which `read`
+  # the operator's answer from stdin — a stdin-fed loop would have the first
+  # prompt's answer also consume the remaining component names.
+  while IFS= read -r component <&3; do
+    [ -n "$component" ] || continue
     local slug_a slug_b ver_a ver_b resolution
     slug_a=$(echo "$diff" | jq -r --arg c "$component" '.[$c].slug_a')
     slug_b=$(echo "$diff" | jq -r --arg c "$component" '.[$c].slug_b')
@@ -750,7 +768,7 @@ plan_resolve_stack() {
         version_a: $va, version_b: $vb,
         resolution: $r
       }')
-  done
+  done 3<<< "$components"
   echo "$manifest"
 }
 
