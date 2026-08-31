@@ -56,6 +56,26 @@ setup() {
   [[ "$output" == *"theme activate etch-theme"* ]]
 }
 
+@test "graft_sync_stack treats a component name containing a space as ONE component, not two word-split fragments (issue #40)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"stack":{"my component":{"slug_a":"real-slug","slug_b":null,"version_a":"1.0","version_b":null,"resolution":"copy"}}}'
+  SITE_A_WP_PATH="/site-a"; SITE_B_WP_PATH="/site-b"; SITEGRAFT_DRY_RUN=1
+  run graft_sync_stack "$run_dir" "$manifest"
+  [ "$status" -eq 0 ]
+  # Issue #40: the loop used to be `for component in $(echo "$manifest" | jq
+  # -r '.stack ... .key')` — UNQUOTED command substitution, so the shell
+  # word-split "my component" into "my" and "component". Neither is a real
+  # key of .stack, so both resolved slug_a to a literal "null" and would
+  # have synced/activated a plugin folder named "null" from A onto B — while
+  # "my component" itself, the one component actually marked resolution=copy,
+  # was never synced at all.
+  [[ "$output" == *"wp-content/plugins/real-slug"* ]] || false
+  [[ "$output" == *"plugin activate real-slug"* ]] || false
+  [[ "$output" != *"wp-content/plugins/null"* ]] || false
+  [[ "$output" != *"plugin activate null"* ]] || false
+}
+
 @test "graft_sync_stack does nothing when the manifest has no stack key" {
   local run_dir="$BATS_TEST_TMPDIR/run"
   mkdir -p "$run_dir"

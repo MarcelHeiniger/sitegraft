@@ -84,6 +84,27 @@ EOF
   echo "$output" | jq -e '.stack.acss.resolution == "skip"' >/dev/null
 }
 
+@test "plan_resolve_stack treats a component name containing a space as ONE component, not two word-split fragments (issue #40)" {
+  # inventory_stack_diff is stubbed directly: its own keys come from
+  # modules_discover's filename-derived module names (plan.sh's own comment
+  # on _plan_apply_selection documents nothing stops an author picking a
+  # filename with a space in it) — stubbing it is the simplest way to feed
+  # plan_resolve_stack a spaced key without wiring up a whole fixture module.
+  inventory_stack_diff() { echo '{"my component":{"slug_a":"a-slug","slug_b":null,"version_a":"1.0","version_b":null}}'; }
+  _plan_confirm() { return 0; } # simulate the operator accepting
+  local manifest; manifest=$(manifest_new "https://a.example.com" "https://b.example.com")
+  run --separate-stderr plan_resolve_stack "$manifest" "/dev/null" "/dev/null"
+  [ "$status" -eq 0 ]
+  # Issue #40: the loop used to be `for component in $(echo "$diff" | jq -r
+  # 'keys[]')` — UNQUOTED command substitution, so the shell word-split "my
+  # component" into "my" and "component". Neither is a real key of $diff, so
+  # both resolved every field to null and got recorded as bogus new stack
+  # entries — while "my component" itself, the one component this run was
+  # actually meant to resolve, was never looked at.
+  echo "$output" | jq -e '.stack["my component"].resolution == "copy" and .stack["my component"].slug_a == "a-slug"' >/dev/null
+  echo "$output" | jq -e '(.stack | has("my")) or (.stack | has("component")) | not' >/dev/null
+}
+
 @test "plan_resolve_stack records a theme mismatch the same way as a module component" {
   local a="$BATS_TEST_TMPDIR/a.json" b="$BATS_TEST_TMPDIR/b.json"
   echo '{"active_theme":{"stylesheet":"etch-theme","version":"1.0"},"plugins":[]}' > "$a"

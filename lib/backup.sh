@@ -1741,7 +1741,19 @@ backup_compute_protected_checksums() {
     have_scan_tables=1
   fi
   local checksums='{}' mod
-  for mod in $(echo "$manifest" | jq -r '.protect | keys[]'); do
+  local mods
+  mods=$(echo "$manifest" | jq -r '.protect | keys[]')
+  # A read loop over fd 3, not `for mod in $(...)` (issue #40) — same fix,
+  # same reason, as graft_migrate_options/verify_options_match: unquoted
+  # command substitution word-splits, so a module name containing whitespace
+  # becomes two names, one of which matches nothing in .protect and is
+  # silently skipped rather than checksummed. Module names are read from
+  # `modules/*.sh` filenames (lib/modules.sh) with nothing stopping an author
+  # from picking one with a space in it. fd 3 rather than stdin also matters
+  # here: the `_unclaimed` branch below runs wp_remote (ssh) inside a NESTED
+  # read loop of its own, which already uses fd 3 for the same reason.
+  while IFS= read -r mod <&3; do
+    [ -n "$mod" ] || continue
     local tables_csv
     tables_csv=$(echo "$manifest" | jq -r --arg m "$mod" '.protect[$m].tables // [] | join(",")')
     [ -n "$tables_csv" ] || continue
@@ -1879,7 +1891,7 @@ backup_compute_protected_checksums() {
     fi
     sum=$(backup_checksum "$tables_content")
     checksums=$(echo "$checksums" | jq --arg m "$mod" --arg s "sha256:${sum}" '.[$m] = $s')
-  done
+  done 3<<< "$mods"
   printf '%s' "$checksums"
 }
 
