@@ -163,20 +163,27 @@ graft_push_dir() {
   local ssh_host; ssh_host=$(graft_ssh_host "$alias_lc")
   if [ -n "$ssh_host" ]; then
     ssh_remote_run "$alias_lc" "$ssh_host" "mkdir -p $(sq "$dest_dir")"
-    # issue #75: `-e "ssh -i <key>"` when SITE_<ALIAS>_SSH_KEY is set — see
-    # ssh_key_for's own header comment. `-s` is unchanged (out of scope for
-    # issue #94, which is pull-side only — see that issue and ADR 0010 for
-    # why `-s` itself is a separate, flagged-not-fixed concern here).
+    # issue #75: `-e "ssh -i <key>"` when SITE_<ALIAS>_SSH_KEY is set — via
+    # the same rsync_ssh_e_arg every pull site uses (lib/inventory.sh), so
+    # the double-quoting it settled on (not sq(), which breaks on a key
+    # path containing an apostrophe — see that function's own comment)
+    # cannot drift between push and pull. `-s` is unchanged (out of scope
+    # for issue #94, which is pull-side only — see that issue and ADR 0010
+    # for why `-s` itself is a separate, flagged-not-fixed concern here).
     local ssh_key; ssh_key=$(ssh_key_for "$alias_lc")
+    local e_arg=""
+    if [ -n "$ssh_key" ]; then
+      e_arg=$(rsync_ssh_e_arg "$ssh_key") || return 1
+    fi
     if [ "$mode" = "--keep-existing" ]; then
-      if [ -n "$ssh_key" ]; then
-        run_or_echo rsync -avz -s --ignore-existing -e "ssh -i $(sq "$ssh_key")" "${host_src_dir%/}/" "${ssh_host}:${dest_dir%/}/"
+      if [ -n "$e_arg" ]; then
+        run_or_echo rsync -avz -s --ignore-existing -e "$e_arg" "${host_src_dir%/}/" "${ssh_host}:${dest_dir%/}/"
       else
         run_or_echo rsync -avz -s --ignore-existing "${host_src_dir%/}/" "${ssh_host}:${dest_dir%/}/"
       fi
     else
-      if [ -n "$ssh_key" ]; then
-        run_or_echo rsync -avz -s -e "ssh -i $(sq "$ssh_key")" "${host_src_dir%/}/" "${ssh_host}:${dest_dir%/}/"
+      if [ -n "$e_arg" ]; then
+        run_or_echo rsync -avz -s -e "$e_arg" "${host_src_dir%/}/" "${ssh_host}:${dest_dir%/}/"
       else
         run_or_echo rsync -avz -s "${host_src_dir%/}/" "${ssh_host}:${dest_dir%/}/"
       fi
@@ -268,7 +275,8 @@ graft_push_file() {
     # same reasoning as graft_push_dir's own comment just above.
     local ssh_key; ssh_key=$(ssh_key_for "$alias_lc")
     if [ -n "$ssh_key" ]; then
-      run_or_echo rsync -avz -s -e "ssh -i $(sq "$ssh_key")" "$host_file" "${ssh_host}:${dest_dir}/${dest_name}"
+      local e_arg; e_arg=$(rsync_ssh_e_arg "$ssh_key") || return 1
+      run_or_echo rsync -avz -s -e "$e_arg" "$host_file" "${ssh_host}:${dest_dir}/${dest_name}"
     else
       run_or_echo rsync -avz -s "$host_file" "${ssh_host}:${dest_dir}/${dest_name}"
     fi
@@ -1345,7 +1353,8 @@ graft_import_wxr() {
     # not fixed, in the PR that closed issue #44.
     local ssh_key; ssh_key=$(ssh_key_for b)
     if [ -n "$ssh_key" ]; then
-      run_or_echo rsync -avz -e "ssh -i $(sq "$ssh_key")" "${staging}/" "${SITE_B_SSH_HOST}:${remote_dir}/"
+      local e_arg; e_arg=$(rsync_ssh_e_arg "$ssh_key") || return 1
+      run_or_echo rsync -avz -e "$e_arg" "${staging}/" "${SITE_B_SSH_HOST}:${remote_dir}/"
     else
       run_or_echo rsync -avz "${staging}/" "${SITE_B_SSH_HOST}:${remote_dir}/"
     fi

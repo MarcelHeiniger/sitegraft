@@ -33,7 +33,7 @@ _incapable_rsync_stub() {
   cat > "$BATS_TEST_TMPDIR/bin/rsync" <<'EOS'
 #!/usr/bin/env bash
 case " $* " in
-  *" --old-args "*) exit 1 ;;
+  *" --no-old-args "*) exit 1 ;;
 esac
 exit 0
 EOS

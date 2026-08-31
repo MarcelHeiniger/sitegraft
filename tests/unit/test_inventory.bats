@@ -224,30 +224,50 @@ EOF
   [[ "$output" != *" -s "* ]] || false
 }
 
-@test "rsync_pull_remote carries the SSH key via -e \"ssh -i <key>\" when SITE_<ALIAS>_SSH_KEY is set (issue #75)" {
+@test "rsync_pull_remote carries the SSH key via -e \"ssh -i <key>\" (double-quoted, not sq()'s single-quoted literal) when SITE_<ALIAS>_SSH_KEY is set (issue #75)" {
   SITE_A_SSH_KEY="/home/op/.ssh/a-key"
   rsync() { echo "rsync called with: $*"; }
   run rsync_pull_remote a "host-a.example.com" "/site-a/wp-content/uploads/" "/staging/"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"rsync called with: -avz --no-old-args -e ssh -i '/home/op/.ssh/a-key' host-a.example.com:/site-a/wp-content/uploads/ /staging/"* ]] || false
+  [[ "$output" == *'rsync called with: -avz --no-old-args -e ssh -i "/home/op/.ssh/a-key" host-a.example.com:/site-a/wp-content/uploads/ /staging/'* ]] || false
 }
 
-@test "rsync_pull_remote's SSH key path survives a space, quote-safe via sq() applied twice (issue #75/#94, mirrors backup_generate_restore_script's own reasoning)" {
+@test "rsync_pull_remote's SSH key path survives a space, one rsync -e argv element not two (issue #75/#94)" {
   SITE_A_SSH_KEY="/home/op/.ssh/a deploy key"
   rsync() { echo "rsync called with: $*"; }
   run rsync_pull_remote a "host-a.example.com" "/site-a/wp-content/uploads/" "/staging/"
   [ "$status" -eq 0 ]
   # One rsync -e argv element, not two -- the space in the key path must
   # not have been split into a second, bogus argument.
-  [[ "$output" == *"-e ssh -i '/home/op/.ssh/a deploy key' host-a.example.com:"* ]] || false
+  [[ "$output" == *'-e ssh -i "/home/op/.ssh/a deploy key" host-a.example.com:'* ]] || false
 }
 
-@test "rsync_pull_remote passes extra opts through before the source/dest pair" {
-  unset SITE_A_SSH_KEY
+# Review found this codebase's FIRST attempt at this (sq() applied twice,
+# single-quoting the -e value) claimed "quote-safe" while only actually
+# being space-safe: rsync's own -e argument parser is not a real shell and
+# gives no meaning to sq()'s '\'' encoding, so a key path containing an
+# APOSTROPHE broke the connection outright ("Missing trailing-' in
+# remote-shell command", measured live, GNU rsync 3.4.4) -- and the
+# earlier version of the test just above, despite being titled
+# "quote-safe", only ever exercised a space, never an apostrophe. This is
+# the test that closes the actual gap: a real, unremarkable key path (this
+# repo's own restore.sh fixtures elsewhere use "/var/www/d'artagnan/html"
+# as exactly this kind of realistic apostrophe'd example).
+@test "rsync_pull_remote's SSH key path survives an embedded apostrophe (issue #75/#94, the case sq() applied twice actually got wrong)" {
+  SITE_A_SSH_KEY="/home/op/.ssh/d'artagnan-key"
   rsync() { echo "rsync called with: $*"; }
-  run rsync_pull_remote a "host-a.example.com" "/src/" "/dst/" --ignore-existing
+  run rsync_pull_remote a "host-a.example.com" "/site-a/wp-content/uploads/" "/staging/"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"rsync called with: -avz --no-old-args --ignore-existing host-a.example.com:/src/ /dst/"* ]] || false
+  [[ "$output" == *'-e ssh -i "/home/op/.ssh/d'"'"'artagnan-key" host-a.example.com:'* ]] || false
+}
+
+@test "rsync_pull_remote refuses (rather than silently corrupt the -e argument) when the SSH key path contains a literal double-quote character" {
+  SITE_A_SSH_KEY='"'"'/home/op/.ssh/my "quoted" key'"'"'
+  rsync() { echo "SHOULD NOT BE CALLED -- refuse before ever building the command"; return 1; }
+  run rsync_pull_remote a "host-a.example.com" "/site-a/wp-content/uploads/" "/staging/"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+  [[ "$output" == *"literal double-quote"* ]] || false
 }
 
 @test "rsync_pull_remote's whole invocation is simulated (not run) under --dry-run" {
@@ -262,7 +282,7 @@ EOF
 # --- sitegraft_require_rsync_arg_escaping (issue #94's phase-start probe,
 # promoted from restore.sh's own generated, script-local check) ---
 
-@test "sitegraft_require_rsync_arg_escaping passes when the local rsync supports --old-args (default-escapes)" {
+@test "sitegraft_require_rsync_arg_escaping passes when the local rsync supports --no-old-args (default-escapes)" {
   mkdir -p "$BATS_TEST_TMPDIR/bin"
   cat > "$BATS_TEST_TMPDIR/bin/rsync" <<'EOS'
 #!/usr/bin/env bash
@@ -274,12 +294,12 @@ EOS
   [ "$status" -eq 0 ]
 }
 
-@test "sitegraft_require_rsync_arg_escaping refuses, with a clear reason, when the local rsync does not support --old-args (openrsync-shaped)" {
+@test "sitegraft_require_rsync_arg_escaping refuses, with a clear reason, when the local rsync does not support --no-old-args (openrsync-shaped) -- probes the actual flag the invocation carries, not its --old-args opt-out sibling (review nit)" {
   mkdir -p "$BATS_TEST_TMPDIR/bin"
   cat > "$BATS_TEST_TMPDIR/bin/rsync" <<'EOS'
 #!/usr/bin/env bash
 case " $* " in
-  *" --old-args "*) echo "rsync: unrecognized option \`--old-args'" >&2; exit 1 ;;
+  *" --no-old-args "*) echo "rsync: unrecognized option \`--no-old-args'" >&2; exit 1 ;;
 esac
 exit 0
 EOS
@@ -290,6 +310,22 @@ EOS
   [[ "$output" == *"openrsync"* ]] || false
   [[ "$output" == *"3.2.4"* ]] || false
   [[ "$output" != *"--protect-args"* ]] || false
+}
+
+@test "sitegraft_require_rsync_arg_escaping does NOT accept a rsync that only recognizes --old-args but not --no-old-args (proves the probe tests the flag actually used, not its sibling)" {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/rsync" <<'EOS'
+#!/usr/bin/env bash
+case " $* " in
+  *" --no-old-args "*) exit 1 ;;
+  *" --old-args "*) exit 0 ;;
+esac
+exit 0
+EOS
+  chmod +x "$BATS_TEST_TMPDIR/bin/rsync"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+  run sitegraft_require_rsync_arg_escaping
+  [ "$status" -ne 0 ]
 }
 
 @test "sitegraft_require_rsync_arg_escaping gives a DISTINCT message when rsync is not on PATH at all" {

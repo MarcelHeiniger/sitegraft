@@ -53,7 +53,7 @@ setup() {
   }
   run graft_copy_wp_content_dir "wp-content/plugins/foo" "$BATS_TEST_TMPDIR/staging"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"PULL rsync: -avz --no-old-args -e ssh -i '/home/op/.ssh/a-key' a.example.com:/site-a/wp-content/plugins/foo/"* ]] || false
+  [[ "$output" == *"PULL rsync: -avz --no-old-args -e ssh -i \"/home/op/.ssh/a-key\" a.example.com:/site-a/wp-content/plugins/foo/"* ]] || false
 }
 
 # --- graft_media_sync (pull half — the push half is already covered in
@@ -71,7 +71,7 @@ setup() {
   graft_push_dir() { echo "PUSHED"; return 0; }
   run graft_media_sync "$BATS_TEST_TMPDIR/run"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"PULL rsync: -avz --no-old-args -e ssh -i '/home/op/.ssh/a-key' a.example.com:/site-a/wp-content/uploads/ ${BATS_TEST_TMPDIR}/run/media-staging/"* ]] || false
+  [[ "$output" == *"PULL rsync: -avz --no-old-args -e ssh -i \"/home/op/.ssh/a-key\" a.example.com:/site-a/wp-content/uploads/ ${BATS_TEST_TMPDIR}/run/media-staging/"* ]] || false
 }
 
 # --- graft_export_wxr --------------------------------------------------
@@ -89,7 +89,7 @@ setup() {
   run cat "$calls"
   [[ "$output" == *"ssh called with: -i /home/op/.ssh/a-key -- a.example.com mkdir -p"* ]] || false
   # issue #94: --no-old-args, since remote_dir is a `host:path` SOURCE.
-  [[ "$output" == *"rsync called with: -avz --no-old-args -e ssh -i '/home/op/.ssh/a-key' a.example.com:"* ]] || false
+  [[ "$output" == *"rsync called with: -avz --no-old-args -e ssh -i \"/home/op/.ssh/a-key\" a.example.com:"* ]] || false
   [[ "$output" == *"ssh called with: -i /home/op/.ssh/a-key -- a.example.com rm -rf"* ]] || false
 }
 
@@ -125,7 +125,7 @@ setup() {
   # No --no-old-args here: this is the PUSH side, out of scope for #94 (and
   # pre-existing, unchanged: this call never carried -s either — see this
   # file's own header comment).
-  [[ "$output" == *"rsync called with: -avz -e ssh -i '/home/op/.ssh/b-key' ${BATS_TEST_TMPDIR}/run/export/ b.example.com:"* ]] || false
+  [[ "$output" == *"rsync called with: -avz -e ssh -i \"/home/op/.ssh/b-key\" ${BATS_TEST_TMPDIR}/run/export/ b.example.com:"* ]] || false
   [[ "$output" == *"ssh called with: -i /home/op/.ssh/b-key -- b.example.com rm -rf"* ]] || false
 }
 
@@ -139,7 +139,7 @@ setup() {
   rsync() { echo "rsync called with: $*"; }
   run graft_fetch_id_map "$BATS_TEST_TMPDIR/run"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"rsync called with: -avz --no-old-args -e ssh -i '/home/op/.ssh/b-key' b.example.com:/site-b/wp-content/sitegraft-id-map.log ${BATS_TEST_TMPDIR}/run/.id-map-fetch.tmp"* ]] || false
+  [[ "$output" == *"rsync called with: -avz --no-old-args -e ssh -i \"/home/op/.ssh/b-key\" b.example.com:/site-b/wp-content/sitegraft-id-map.log ${BATS_TEST_TMPDIR}/run/.id-map-fetch.tmp"* ]] || false
 }
 
 @test "graft_fetch_id_map omits -i/-e entirely when SITE_B_SSH_KEY is unset (regression, unchanged by this fix)" {

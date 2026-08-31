@@ -81,7 +81,7 @@ setup() {
   run graft_push_file b "/local/src/lib.php" "/remote/site-b/wp-content" "sitegraft-lib.php"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ssh called with: -i /home/op/.ssh/b-key -- b.example.com mkdir -p '/remote/site-b/wp-content'"* ]] || false
-  [[ "$output" == *"rsync called with: -avz -s -e ssh -i '/home/op/.ssh/b-key' /local/src/lib.php b.example.com:/remote/site-b/wp-content/sitegraft-lib.php"* ]] || false
+  [[ "$output" == *"rsync called with: -avz -s -e ssh -i \"/home/op/.ssh/b-key\" /local/src/lib.php b.example.com:/remote/site-b/wp-content/sitegraft-lib.php"* ]] || false
 }
 
 @test "graft_push_file falls back to plain mkdir+rsync for a genuinely bare-local site (no SSH_HOST, no wrapper) — regression, unchanged by this fix" {
@@ -124,7 +124,7 @@ setup() {
   run graft_push_dir b "/local/staging" "/remote/site-b/wp-content/plugins/foo"
   [ "$status" -eq 0 ]
   [[ "$output" == *"ssh called with: -i /home/op/.ssh/b-key -- b.example.com mkdir -p '/remote/site-b/wp-content/plugins/foo'"* ]] || false
-  [[ "$output" == *"rsync called with: -avz -s -e ssh -i '/home/op/.ssh/b-key' /local/staging/ b.example.com:/remote/site-b/wp-content/plugins/foo/"* ]] || false
+  [[ "$output" == *"rsync called with: -avz -s -e ssh -i \"/home/op/.ssh/b-key\" /local/staging/ b.example.com:/remote/site-b/wp-content/plugins/foo/"* ]] || false
 }
 
 @test "graft_push_dir --keep-existing also carries SITE_B_SSH_KEY (issue #75)" {
@@ -134,7 +134,7 @@ setup() {
   rsync() { echo "rsync called with: $*"; }
   run graft_push_dir b "/local/staging" "/remote/site-b/wp-content/uploads" --keep-existing
   [ "$status" -eq 0 ]
-  [[ "$output" == *"rsync called with: -avz -s --ignore-existing -e ssh -i '/home/op/.ssh/b-key' /local/staging/ b.example.com:/remote/site-b/wp-content/uploads/"* ]] || false
+  [[ "$output" == *"rsync called with: -avz -s --ignore-existing -e ssh -i \"/home/op/.ssh/b-key\" /local/staging/ b.example.com:/remote/site-b/wp-content/uploads/"* ]] || false
 }
 
 @test "graft_push_dir still uses the wrapped-local tar-through-the-wrapper path when no SSH_HOST is set but a container wrapper is (regression)" {

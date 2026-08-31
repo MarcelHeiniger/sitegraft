@@ -175,7 +175,7 @@ STUB
   rsync() { echo "rsync called with: $*"; }
   run backup_wp_content "$BATS_TEST_TMPDIR/backup/b-wp-content"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"rsync called with: -avz --no-old-args -e ssh -i '/home/op/.ssh/b-key' b.example.com:/var/www/site-b/wp-content/ ${BATS_TEST_TMPDIR}/backup/b-wp-content/"* ]] || false
+  [[ "$output" == *"rsync called with: -avz --no-old-args -e ssh -i \"/home/op/.ssh/b-key\" b.example.com:/var/www/site-b/wp-content/ ${BATS_TEST_TMPDIR}/backup/b-wp-content/"* ]] || false
 }
 
 @test "backup_wp_content omits -i/-e entirely when SITE_B_SSH_KEY is unset (regression, unchanged by this fix)" {
@@ -1114,7 +1114,7 @@ _manifest_fixture() {
   [ "$output" = "2" ]
   # The rsync invocation carries the key via -e, not -i (rsync has no -i of
   # its own -- it invokes ssh itself).
-  run grep -c -- "rsync -avz --no-old-args --delete -e 'ssh -i '\\\\''/home/op/.ssh/b-key'\\\\'''" "${run_dir}/restore.sh"
+  run grep -c -- "rsync -avz --no-old-args --delete -e 'ssh -i \"/home/op/.ssh/b-key\"'" "${run_dir}/restore.sh"
   [ "$output" = "1" ]
 }
 

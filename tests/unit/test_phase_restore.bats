@@ -66,6 +66,103 @@ EOF
   }
 }
 
+# --- BLOCKER (found by review, mutation-per-site rather than a whole-file
+# revert): phase_restore's pre-restore safety snapshot reuses
+# backup_wp_content unmodified (this file's own header comment), which now
+# REQUIRES sitegraft_require_rsync_arg_escaping to have already run --
+# phase_backup and phase_graft both got that guard; phase_restore did not.
+# Reproduced live before this fix, against an openrsync-shaped rsync
+# stand-in: an ssh-remote restore got past --yes, past backup_db_export
+# (which had already written a real, partial b-db.sql.gz snapshot), and
+# only then failed inside backup_wp_content with "unknown option
+# '--no-old-args'" -- exactly the "fail partway through, after real work"
+# shape ADR 0010's Extension section claims this whole fix eliminates.
+# backup_db_export/backup_wp_content are stubbed by this file's own
+# setup() (bash functions, not real rsync invocations) -- the incapable
+# rsync stand-in below exists purely to prove the GUARD's own condition,
+# the same technique tests/unit/test_phase_backup.bats already established
+# for phase_backup's identical guard.
+
+_ssh_remote_restore_profile_and_run_dir() {
+  cat > "${SITEGRAFT_PROFILES_DIR}/t-ssh.conf" <<EOF
+SITE_A_ALIAS="a"
+SITE_A_WP_PATH="/var/www/a"
+SITE_B_ALIAS="b"
+SITE_B_SSH_HOST="b.example.com"
+SITE_B_WP_PATH="${B_ROOT}"
+SITE_B_WP_CMD="wp"
+SITEGRAFT_STATE_DIR="${SITEGRAFT_STATE_DIR}"
+EOF
+  local d="${SITEGRAFT_STATE_DIR}/t-ssh-20260101T000000"
+  mkdir -p "$d"
+  cat > "${d}/restore.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "REAL RESTORE.SH RAN -- SHOULD NEVER HAPPEN IN THIS TEST"
+EOF
+  chmod +x "${d}/restore.sh"
+  printf '%s' "$d"
+}
+
+@test "phase_restore refuses right after profile_load when SITE_B_SSH_HOST is set and the local rsync cannot do --no-old-args (issue #94 -- BLOCKER, phase_restore was the one phase missing this guard)" {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/rsync" <<'EOS'
+#!/usr/bin/env bash
+case " $* " in
+  *" --no-old-args "*) exit 1 ;;
+esac
+exit 0
+EOS
+  chmod +x "$BATS_TEST_TMPDIR/bin/rsync"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+  local d; d=$(_ssh_remote_restore_profile_and_run_dir)
+  run phase_restore --profile t-ssh --run "$d" --yes
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"openrsync"* || "$output" == *"3.2.4"* ]] || false
+  # Never reached the confirmation prompt, the pre-restore snapshot, or
+  # restore.sh itself -- no partial artifact left behind anywhere.
+  [[ "$output" != *"REAL RESTORE.SH RAN"* ]] || false
+  run bash -c "ls -d '${d}'/pre-restore-* 2>/dev/null"
+  [ -z "$output" ]
+}
+
+@test "phase_restore's --dry-run does NOT run the rsync arg-escaping check (falls through to the next guard instead)" {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/rsync" <<'EOS'
+#!/usr/bin/env bash
+case " $* " in
+  *" --no-old-args "*) exit 1 ;;
+esac
+exit 0
+EOS
+  chmod +x "$BATS_TEST_TMPDIR/bin/rsync"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+  local d; d=$(_ssh_remote_restore_profile_and_run_dir)
+  SITEGRAFT_DRY_RUN=1 run phase_restore --profile t-ssh --run "$d" --yes
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"openrsync"* ]] || false
+}
+
+@test "phase_restore does not require the rsync arg-escaping check at all when SITE_B_SSH_HOST is unset (nothing here needs it)" {
+  # Discriminating: an INCAPABLE rsync is on PATH -- if phase_restore's
+  # alias-scoped `if [ -n "${SITE_B_SSH_HOST:-}" ]` guard were ever
+  # removed (the check running unconditionally), this run (profile "t",
+  # setup()'s default, no SITE_B_SSH_HOST) would start failing with the
+  # openrsync message instead of completing normally.
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/rsync" <<'EOS'
+#!/usr/bin/env bash
+case " $* " in
+  *" --no-old-args "*) exit 1 ;;
+esac
+exit 0
+EOS
+  chmod +x "$BATS_TEST_TMPDIR/bin/rsync"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+  run phase_restore --profile t --run "$RUN_DIR" --yes
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"openrsync"* ]] || false
+}
+
 @test "phase_restore requires both --profile and --run" {
   run phase_restore --profile t
   [ "$status" -eq 1 ]

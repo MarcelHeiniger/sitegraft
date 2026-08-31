@@ -262,11 +262,17 @@ This ADR's original scope was the ONE rsync line inside the generated
 PR, named the same defect at every OTHER ssh-remote PULL in this codebase —
 calls that run live, not from a generated script: `backup_wp_content`
 (`lib/backup.sh`), and `graft_copy_wp_content_dir`/`graft_media_sync`/
-`graft_fonts_sync`/`graft_export_wxr`/`graft_fetch_id_map` (`lib/graft.sh`).
-Each hands rsync a `host:path` SOURCE, which is exactly the shape this
-ADR's Measurement 1/2/3 describe — rsync builds its own second, remote
-command line out of that string, on the far end, after this process's own
-quoting (`sq()`) has already had its only chance to matter.
+`graft_export_wxr`/`graft_fetch_id_map` (`lib/graft.sh`), plus
+`graft_fonts_sync`, which is TWO separate call sites (its `is_dry_run`
+branch and its real, `graft_ssh_path_exists`-gated branch each build their
+own `rsync_pull_remote` call) — **seven** call sites total, corrected here
+after review found the first pass of this section undercounted it as six
+by treating `graft_fonts_sync` as one site rather than two; the miscount
+had already let its dry-run branch's fix go untested (see below). Each
+hands rsync a `host:path` SOURCE, which is exactly the shape this ADR's
+Measurement 1/2/3 describe — rsync builds its own second, remote command
+line out of that string, on the far end, after this process's own quoting
+(`sq()`) has already had its only chance to matter.
 
 **Decision: apply this ADR's existing conclusion (`--no-old-args`, never
 `--protect-args`/`-s`) to every one of those call sites, unchanged.** No new
@@ -278,7 +284,7 @@ explicitly asked to be checked, rather than assumed by symmetry with #44,
 was answered per call site, not once for all of them (issue #35 is the
 cautionary precedent named in that issue for exactly this failure mode):
 
-- Every one of the six sites above hands rsync a `host:path` **source**
+- Every one of the seven sites above hands rsync a `host:path` **source**
   (a pull) — verified individually, not inferred. None of them is a
   restricted-shell-server scenario this ADR's Measurement 2 warns
   `--protect-args` breaks, because `--protect-args` was never reconsidered
@@ -286,7 +292,7 @@ cautionary precedent named in that issue for exactly this failure mode):
   it out for identical reasons.
 - The **push** side (`graft_push_dir`/`graft_push_file`, and
   `graft_import_wxr`'s own rsync) is explicitly OUT of this issue's scope
-  (its own text: "côté tirage" — pull side). Those call sites' pre-existing
+  (issue #94 itself is scoped to the pull side only). Those call sites' pre-existing
   `-s`/`--protect-args` usage (and, on `graft_import_wxr` specifically, the
   pre-existing absence of even that) is a real, separate inconsistency with
   this ADR's own conclusion — flagged, not fixed, in the PR that closed
@@ -294,13 +300,25 @@ cautionary precedent named in that issue for exactly this failure mode):
   should replace `-s` with `--no-old-args` there too, not add `-s` to the
   one call site that currently lacks it.
 
-**A shared helper, not six independent patches**: `rsync_pull_remote`
+**A shared helper, not seven independent patches**: `rsync_pull_remote`
 (`lib/inventory.sh`) is the one place that now builds `-avz --no-old-args
 [-e "ssh -i <key>"] host:path dst` for every pull site above — chosen
-because, unlike the push side, all six pull sites share this exact shape
+because, unlike the push side, all seven pull sites share this exact shape
 verbatim (verified by reading each one, not assumed). It also carries
 `SITE_<ALIAS>_SSH_KEY` (issue #75) via `-e`/`--rsh`, since rsync invokes
-ssh itself for this hop rather than being invoked through it.
+ssh itself for this hop rather than being invoked through it — via a
+double-quoted value (`rsync_ssh_e_arg`, same file), not `sq()`'s
+single-quoted one. That, too, was a review-found correction: `sq()`
+applied twice made a key path containing a SPACE round-trip correctly
+through rsync's own `-e` tokenizer (measured live), but the identical
+construction breaks outright on a key path containing an APOSTROPHE —
+"Missing trailing-' in remote-shell command" — because rsync's tokenizer,
+unlike a real shell, gives no meaning to `'\''`. A double-quoted value
+closes the apostrophe case (also measured live) at the cost of a narrower,
+explicitly refused residual gap: a key path containing a literal `"`,
+which rsync's tokenizer silently drops rather than escapes. See
+`rsync_ssh_e_arg`'s own comment in `lib/inventory.sh` for the full
+measurement.
 
 **The capability probe becomes a phase-start check, not a per-call
 probe.** This ADR's original probe (`_sg_check_rsync_arg_escaping`) lives
@@ -316,10 +334,28 @@ subprocess-exec tax and, worse, a failure mode where the checked-and-passed
 first pull already did real (partial) work before a LATER pull's redundant
 probe could ever fail — the opposite of failing loudly before touching
 anything. `sitegraft_require_rsync_arg_escaping` (`lib/inventory.sh`) is
-that check, called once at the top of `phase_backup`/`phase_graft`, guarded
-by `is_dry_run ||` (same reasoning as the generated script's own `--dry-run`
-exemption: a dry run never actually calls rsync, so it must never require a
-real GNU rsync just to preview) and by whichever alias(es) that phase
-actually needs it for (`SITE_B_SSH_HOST` for `backup`; either alias for
-`graft`, since stack/media/fonts/WXR pull from A while the id-map fetch
-pulls from B).
+that check, called once at the top of `phase_backup`/`phase_graft`/
+`phase_restore`, guarded by `is_dry_run ||` (same reasoning as the
+generated script's own `--dry-run` exemption: a dry run never actually
+calls rsync, so it must never require a real GNU rsync just to preview)
+and by whichever alias(es) that phase actually needs it for
+(`SITE_B_SSH_HOST` for `backup` and `restore`; either alias for `graft`,
+since stack/media/fonts/WXR pull from A while the id-map fetch pulls from
+B).
+
+**`phase_restore` was the one call site missed in the first pass of this
+Extension, found by review, not self-discovered.** `phase_restore`'s
+pre-restore safety snapshot (design doc §6.7, "even a restore has to stay
+reversible") calls `backup_db_export`/`backup_wp_content` unmodified — the
+exact same two functions `phase_backup` calls — which means it needed the
+identical guard `phase_backup` got, and did not have it. Reproduced live
+against an openrsync-shaped rsync stand-in before the fix: an ssh-remote
+`sitegraft restore` got past `--yes`, past `backup_db_export` (which had
+already written a real, partial `b-db.sql.gz`), and only then failed
+inside `backup_wp_content` with `unknown option '--no-old-args'` — a
+partial artifact on disk, and a generic error pointing at the transfer
+tool's own output, in place of the loud, before-anything-happens refusal
+this whole Extension's own opening paragraph claims. Fixed the same way,
+in the same place relative to `profile_load` (`lib/backup.sh`'s
+`phase_restore`), with its own test coverage
+(`tests/unit/test_phase_restore.bats`).

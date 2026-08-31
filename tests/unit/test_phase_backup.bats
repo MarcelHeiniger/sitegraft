@@ -147,7 +147,7 @@ EOF
   cat > "$BATS_TEST_TMPDIR/bin/rsync" <<'EOS'
 #!/usr/bin/env bash
 case " $* " in
-  *" --old-args "*) exit 1 ;;
+  *" --no-old-args "*) exit 1 ;;
 esac
 exit 0
 EOS
@@ -169,7 +169,7 @@ EOS
   cat > "$BATS_TEST_TMPDIR/bin/rsync" <<'EOS'
 #!/usr/bin/env bash
 case " $* " in
-  *" --old-args "*) exit 1 ;;
+  *" --no-old-args "*) exit 1 ;;
 esac
 exit 0
 EOS
@@ -182,11 +182,32 @@ EOS
 }
 
 @test "phase_backup does not require the rsync arg-escaping check at all when SITE_B_SSH_HOST is unset (nothing here needs it)" {
-  # profile "t" (setup()'s default) has no SITE_B_SSH_HOST -- the guard's
-  # own `[ -n "${SITE_B_SSH_HOST:-}" ]` condition must not fire here, so
-  # this run must succeed exactly as it already does without the guard.
+  # Discriminating, not just a smoke check (review nit -- the first
+  # version of this test ran with no rsync stand-in at all, so it would
+  # have stayed green even if the `[ -n "${SITE_B_SSH_HOST:-}" ]` guard
+  # were removed and the check ran unconditionally, as long as this dev
+  # machine's own rsync happened to be capable): an INCAPABLE rsync is on
+  # PATH, exactly like the "refuses" test above -- if the alias guard were
+  # ever removed, this run would start failing with the openrsync message
+  # instead of completing, on profile "t" (setup()'s default, no
+  # SITE_B_SSH_HOST at all). backup_db_export/backup_wp_content are
+  # stubbed by this file's own setup() (bash functions, not real rsync
+  # invocations), so this incapable rsync is never actually EXECUTED by a
+  # real transfer either way -- it is here purely to prove the guard's own
+  # condition, not to re-prove backup_wp_content's plumbing.
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cat > "$BATS_TEST_TMPDIR/bin/rsync" <<'EOS'
+#!/usr/bin/env bash
+case " $* " in
+  *" --no-old-args "*) exit 1 ;;
+esac
+exit 0
+EOS
+  chmod +x "$BATS_TEST_TMPDIR/bin/rsync"
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH"
   run phase_backup --profile t --run "$RUN_DIR"
   [ "$status" -eq 0 ]
+  [[ "$output" != *"openrsync"* ]] || false
 }
 
 @test "phase_backup produces a verified backup, checksums, restore.sh, and a completion marker" {

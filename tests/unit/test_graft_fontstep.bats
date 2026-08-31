@@ -147,7 +147,7 @@ setup() {
   run_or_echo() { echo "RAN: $*"; return 0; }
   run graft_fonts_sync "$BATS_TEST_TMPDIR/run"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"RAN: rsync -avz --no-old-args -e ssh -i '/home/op/.ssh/site-a-deploy-key' host-a.example.com:/site-a/wp-content/fonts/"* ]] || false
+  [[ "$output" == *'RAN: rsync -avz --no-old-args -e ssh -i "/home/op/.ssh/site-a-deploy-key" host-a.example.com:/site-a/wp-content/fonts/'* ]] || false
 }
 
 # --- BLOCKER 1 (review fix-pack): wp_get_font_dir() COMPUTES/FILTERS a
@@ -229,6 +229,30 @@ setup() {
   [ "$status" -eq 0 ]
   [ -z "$stderr" ]
   [[ "$output" == *"[dry-run] rsync"* ]] || false
+  # issue #94: this branch (is_dry_run, lib/graft.sh) is a SEPARATE call
+  # site from the real (exists_rc==0) branch tested above -- it is its own
+  # `rsync_pull_remote` call, not shared code, so it needs its own
+  # assertion. Found missing in review: without it, reverting JUST this
+  # branch back to a bare `rsync -avz` (dropping --no-old-args) left every
+  # one of the 1121 other tests green.
+  [[ "$output" == *"[dry-run] rsync -avz --no-old-args host-a.example.com:/site-a/wp-content/fonts/"* ]] || false
+}
+
+@test "graft_fonts_sync's ssh pull under --dry-run also carries SITE_A_SSH_KEY via rsync -e when it is set (issue #75, same gap as the --no-old-args test above)" {
+  graft_font_dir() {
+    if [ "$1" = "a" ]; then echo "/site-a/wp-content/fonts"; else echo "/site-b/wp-content/fonts"; fi
+  }
+  graft_pull_dir() { echo "SHOULD NOT BE CALLED FOR A REMOTE"; return 1; }
+  graft_push_dir() { echo "[dry-run] PUSHED"; return 0; }
+  graft_ssh_path_exists() { echo "SHOULD NOT BE CALLED UNDER DRY-RUN" >&2; return 1; }
+  SITE_A_SSH_HOST="host-a.example.com"
+  SITE_A_SSH_KEY="/home/op/.ssh/a-key"
+  SITEGRAFT_DRY_RUN=1
+  run_or_echo() { echo "[dry-run] $*"; return 0; }
+  run --separate-stderr graft_fonts_sync "$BATS_TEST_TMPDIR/run"
+  [ "$status" -eq 0 ]
+  [ -z "$stderr" ]
+  [[ "$output" == *'[dry-run] rsync -avz --no-old-args -e ssh -i "/home/op/.ssh/a-key" host-a.example.com:/site-a/wp-content/fonts/'* ]] || false
 }
 
 # --- graft_ssh_path_exists ---------------------------------------------

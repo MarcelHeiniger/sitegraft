@@ -54,7 +54,17 @@ backup_wp_cmd_literal() {
   local wp_cmd="${!cmd_var:-wp}"
 
   if [ -n "$host" ]; then
-    printf 'ssh %s "%s --path=%s"' "$host" "$wp_cmd" "$path"
+    # issue #75 (review nit): this line is decorative (this function's own
+    # header comment) -- but an operator who copies it BECAUSE it looked
+    # like a working command, on a profile whose dedicated key this line
+    # silently dropped, would land on the exact "Permission denied" issue
+    # #75 was filed over. Carries -i too now, purely so the copy is honest.
+    local ssh_key; ssh_key=$(ssh_key_for "$alias_lc")
+    if [ -n "$ssh_key" ]; then
+      printf 'ssh -i %s %s "%s --path=%s"' "$ssh_key" "$host" "$wp_cmd" "$path"
+    else
+      printf 'ssh %s "%s --path=%s"' "$host" "$wp_cmd" "$path"
+    fi
   else
     printf '%s --path=%s' "$wp_cmd" "$path"
   fi
@@ -88,8 +98,15 @@ backup_db_export() {
     # operator-supplied value in this string -- goes through sq() before
     # being spliced in, not a bare interpolation.
     local ssh_key; ssh_key=$(ssh_key_for b)
+    # review nit: an `&&`-as-statement here is harmless TODAY (it is not
+    # this function's last statement), but this codebase has been bitten
+    # three times by exactly this shape silently swallowing a real failure
+    # under `set -e` when it ends up last in a function -- an explicit
+    # if/then costs one line and can never become that trap later.
     local ssh_key_opt=""
-    [ -n "$ssh_key" ] && ssh_key_opt="-i $(sq "$ssh_key") "
+    if [ -n "$ssh_key" ]; then
+      ssh_key_opt="-i $(sq "$ssh_key") "
+    fi
     run_or_echo bash -c "set -o pipefail; ssh ${ssh_key_opt}'${SITE_B_SSH_HOST}' \"${SITE_B_WP_CMD} --path='${SITE_B_WP_PATH}' db export - --add-drop-table\" | gzip > '${dest_dir}/b-db.sql.gz'"
   else
     run_or_echo bash -c "set -o pipefail; ${SITE_B_WP_CMD} --path='${SITE_B_WP_PATH}' db export - --add-drop-table | gzip > '${dest_dir}/b-db.sql.gz'"
@@ -795,19 +812,22 @@ _sg_delete_from_stdin() { echo 'internal error: this restore.sh does not use a w
     # value this function bakes in via sq(). Both `ssh` invocations get a
     # plain `-i $(sq "$ssh_key")` (same shape as ssh_key_for's every other
     # consumer). The `rsync` invocation cannot take `-i` directly — it
-    # invokes ssh itself, and rsync's own flag for that is `-e`/`--rsh` — so
-    # the key is carried there via `-e "ssh -i '<key>'"`, sq()'d TWICE for
-    # the same two-shell reason as the rest of this function's own header
-    # comment: the inner sq() quotes the key for rsync's own quote-aware
-    # split of its `-e` argument (measured live: GNU rsync 3.4.4 respects a
-    # single-quoted token there, so a key path containing a space survives
-    # as one argument), the outer sq() quotes the resulting string as ONE
-    # shell word in restore.sh's own source.
+    # invokes ssh itself, and rsync's own flag for that is `-e`/`--rsh` —
+    # built by the SAME rsync_ssh_e_arg (lib/inventory.sh) every live pull
+    # site uses now, computed here (this function runs in the live
+    # process, at generation time) and then sq()'d ONCE more to bake the
+    # resulting string in as a literal in restore.sh's own source — see
+    # rsync_ssh_e_arg's own comment for why it double-quotes rather than
+    # single-quotes the key (review-found correction: a single-quoted
+    # value here broke outright, live, on a key path containing an
+    # apostrophe, which rsync's own `-e` tokenizer gives no meaning to
+    # sq()'s `'''` encoding).
     local ssh_key="${SITE_B_SSH_KEY:-}"
     local ssh_i_opt="" rsync_e_opt=""
     if [ -n "$ssh_key" ]; then
+      local e_arg; e_arg=$(rsync_ssh_e_arg "$ssh_key") || return 1
       ssh_i_opt="-i $(sq "$ssh_key") "
-      rsync_e_opt=" -e $(sq "ssh -i $(sq "$ssh_key")")"
+      rsync_e_opt=" -e $(sq "$e_arg")"
     fi
     restore_wp_content_cmd="ssh ${ssh_i_opt}$(sq "$SITE_B_SSH_HOST") $(sq "mkdir -p $(sq "${SITE_B_WP_PATH}/wp-content")") && rsync -avz --no-old-args --delete${rsync_e_opt} $(sq "${run_dir}/backup/b-wp-content/") $(sq "${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/wp-content/")"
     restore_db_cmd="gunzip -c $(sq "${run_dir}/backup/b-db.sql.gz") | ssh ${ssh_i_opt}$(sq "$SITE_B_SSH_HOST") $(sq "${SITE_B_WP_CMD} --path=$(sq "${SITE_B_WP_PATH}") db import -")"
@@ -2173,6 +2193,24 @@ phase_restore() {
     return 1
   fi
   profile_load "$profile" || return 1
+
+  # issue #94 / ADR 0010: same guard as phase_backup's own (see that
+  # function's comment for the full reasoning) -- restore's pre-restore
+  # safety snapshot below reuses backup_wp_content unmodified, which now
+  # requires this exact check to have already run. Missing here was a real
+  # regression, not just an omission: reproduced live against an
+  # openrsync-shaped stand-in, an ssh-remote restore got past the
+  # confirmation prompt, past backup_db_export (which had already written a
+  # real b-db.sql.gz), and only then failed inside backup_wp_content with
+  # "unknown option '--no-old-args'" -- a partial pre-restore snapshot on
+  # disk and a generic error pointing at the transfer tool's own output,
+  # instead of refusing loudly before touching anything. Checked here,
+  # before the confirmation prompt too, for the same reason: no point
+  # asking an operator to confirm a restore this phase cannot actually run.
+  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
+    is_dry_run || sitegraft_require_rsync_arg_escaping || return 1
+  fi
+
   [ -x "${run_dir}/restore.sh" ] || { log_error "no restore.sh found for run: ${run_dir}"; return 1; }
 
   if is_dry_run; then
