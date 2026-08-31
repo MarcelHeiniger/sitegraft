@@ -1613,6 +1613,37 @@ graft_fetch_id_map() {
 # here. This function keeps failing loudly, on purpose, until step 2 exists
 # to consume the pairing instead.
 #
+# COMPLETENESS, not just availability (issue #58's own follow-up, after
+# issue #61 found the analogous gap for terms): before step 2 writes
+# anything to id-map.tsv from this filter, the same question #61 asked of
+# `wp_import_term_meta` applies here too — is the resulting map genuinely
+# COMPLETE, or only plausible (see mu-plugins/sitegraft-id-mapper.php's own
+# comment for the full term-side account). The two cases differ.
+# `wp_import_term_meta` fires only when process_categories()/
+# process_tags()/process_terms() set `created === true` — i.e. only for a
+# term this import actually CREATED — so a map built from it silently
+# OMITS every term that already existed on B, exactly the population a
+# completion map exists to cover. `wp_import_existing_post` has no
+# equivalent gate: process_posts() applies it to `$post_exists`
+# UNCONDITIONALLY, for every item it reaches, immediately before — and
+# using the same two now-filtered values as — the skip decision itself,
+# `if ( $post_exists && get_post_type( $post_exists ) == $post['post_type']
+# )` (quoted in full in issue #58). A hook recomputing that identical
+# condition from the filter's own two arguments cannot diverge from
+# process_posts()'s own decision — it is not a plausible proxy for the
+# skip population, it is that decision's own trigger condition, read one
+# statement early. The create side of the same import is already covered
+# by the wp_import_insert_post hook this mu-plugin wires today, so the two
+# events together would be complete in the way $this->processed_posts
+# alone cannot deliver as a hook target (public, and wp-cli does read it —
+# see above — but never exposed per item to anything outside
+# class-wp-import.php's own instance). This is analysis, not a claim
+# already exercised against a real import: per this repo's own discipline
+# for exactly this kind of claim (issue #53's "verify against the shipped
+# version before anything depends on it"), step 2's implementation must
+# re-confirm this reading against the shipped 0.9.5 source before any code
+# relies on it, the same way #53/#55/#61 each did before shipping theirs.
+#
 # What this checks, and deliberately NOT via wp-cli's own log text: WP-CLI's
 # import-command DOES hook wp_import_post_data_raw to print a per-item
 # "Processing post #<id> (...)" progress line (Import_Command::
