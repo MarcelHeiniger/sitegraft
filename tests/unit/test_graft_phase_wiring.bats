@@ -12,6 +12,7 @@ setup() {
   # same as every other test file that exercises a wrapped-local path
   # (e.g. tests/unit/test_graft_ssh_file_transfer.bats's own setup).
   load '../../lib/backup.sh'
+  load '../../lib/manifest.sh'
   load '../../lib/graft.sh'
 }
 

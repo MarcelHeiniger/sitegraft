@@ -13,6 +13,7 @@ bats_require_minimum_version 1.5.0
 setup() {
   load '../../lib/core.sh'
   load '../../lib/inventory.sh'
+  load '../../lib/manifest.sh'
   load '../../lib/backup.sh'
   load '../../lib/graft.sh'
   load '../../lib/verify.sh'
@@ -1919,6 +1920,23 @@ EOF
   [ "$status" -eq 0 ]
   [ -f "${RUN_DIR}/verify-report.md" ]
   grep -q "protected data unchanged" "${RUN_DIR}/verify-report.md"
+}
+
+# --- issue #108: verify is routinely a SEPARATE, later invocation than
+# whatever sitegraft wrote/froze this manifest (backup and verify, sometimes
+# days apart per the issue). A manifest whose declared format version this
+# binary was never taught must refuse the whole phase up front, the same
+# "validate once, refuse the whole phase" reasoning phase_verify already
+# applies to malformed JSON, rather than let every check below read a
+# schema it does not actually understand.
+@test "phase_verify refuses a manifest whose format version is newer than this sitegraft understands (issue #108)" {
+  setup_phase_verify_fixture
+  jq '.sitegraft_manifest_version = 999' "${RUN_DIR}/manifest.json" > "${RUN_DIR}/manifest.json.tmp" && mv "${RUN_DIR}/manifest.json.tmp" "${RUN_DIR}/manifest.json"
+  wp_remote() { echo "SHOULD NOT BE CALLED"; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"newer than this sitegraft understands"* ]]
+  [ ! -f "${RUN_DIR}/verify-report.md" ]
 }
 
 # --- MAJOR-A (review fix-pack): phase_verify used to set

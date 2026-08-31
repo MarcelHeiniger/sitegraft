@@ -14,6 +14,7 @@
 setup() {
   load '../../lib/core.sh'
   load '../../lib/inventory.sh'
+  load '../../lib/manifest.sh'
   load '../../lib/backup.sh'
   load '../../lib/graft.sh'
 }
@@ -878,4 +879,28 @@ _issue36_stub_everything_but_prune_media_sync_import_attachments() {
   # reproduces exactly that (mutation-tested for this fix-pack).
   [ -f "$probe_on_b" ]
   [[ "$output" == *"1 newly imported"* ]] || false
+}
+
+# --- issue #108: graft is its own separate invocation too — it may run
+# against a manifest a NEWER sitegraft froze during an earlier plan/backup,
+# potentially with THIS binary being the older one. phase_graft is exercised
+# directly here (not via bin/sitegraft), same convention as the rest of this
+# file — modules_discover is stubbed for the same reason
+# _issue36_stub_everything_but_prune_media_sync_import_attachments stubs it
+# above (lib/modules.sh is not loaded by this file's setup()).
+@test "phase_graft refuses a manifest whose format version is newer than this sitegraft understands (issue #108)" {
+  modules_discover() { SITEGRAFT_MODULES=""; }
+  profile_load() {
+    SITE_A_ALIAS=a; SITE_B_ALIAS=b
+    SITE_A_WP_PATH="$BATS_TEST_TMPDIR/site-a"; SITE_B_WP_PATH="$BATS_TEST_TMPDIR/site-b"
+    unset SITE_A_SSH_HOST SITE_B_SSH_HOST SITE_A_WP_CMD SITE_B_WP_CMD
+    return 0
+  }
+  local run_dir="$BATS_TEST_TMPDIR/run-108"
+  mkdir -p "$run_dir"
+  touch "${run_dir}/backup.complete"
+  printf '%s' '{"sitegraft_manifest_version":999,"migrate":{},"protect":{},"options":{"search_replace":{"from":"","to":""}}}' > "${run_dir}/manifest.json"
+  run phase_graft --profile demo --run "$run_dir"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"newer than this sitegraft understands"* ]]
 }

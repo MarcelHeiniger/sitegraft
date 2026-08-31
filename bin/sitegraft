@@ -16,7 +16,7 @@ SITEGRAFT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # invisible, not merely unclear.
 trap sitegraft_cleanup EXIT
 
-SITEGRAFT_VERSION="1.0.0-rc33"
+SITEGRAFT_VERSION="1.0.0-rc34"
 
 usage() {
   cat <<EOF
@@ -133,6 +133,9 @@ main() {
       require_cmd shasum || exit 1
       require_lib profile 1 || exit 1
       require_lib inventory 1 || exit 1
+      # issue #108: phase_backup calls manifest_check_version_supported
+      # (lib/manifest.sh) at its own manifest-load gate.
+      require_lib manifest 2 || exit 1
       require_lib backup 3 || exit 1
       phase_backup "$@"
       ;;
@@ -155,6 +158,9 @@ main() {
       # (non-ssh) transfer that touches a wrapped-local site (e.g. DDEV) — see
       # lib/graft.sh's own header comment for why.
       require_lib backup 3 || exit 1
+      # issue #108: phase_graft calls manifest_check_version_supported
+      # (lib/manifest.sh) at its own manifest-load gate.
+      require_lib manifest 2 || exit 1
       require_lib graft 4 || exit 1
       modules_discover
       phase_graft "$@"
@@ -169,6 +175,9 @@ main() {
       require_lib inventory 1 || exit 1
       require_lib backup 3 || exit 1
       require_lib graft 4 || exit 1
+      # issue #108: phase_verify calls manifest_check_version_supported
+      # (lib/manifest.sh) at its own manifest-load gate.
+      require_lib manifest 2 || exit 1
       require_lib verify 5 || exit 1
       phase_verify "$@"
       ;;

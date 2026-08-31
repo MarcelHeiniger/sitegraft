@@ -3470,6 +3470,11 @@ phase_graft() {
 
   modules_discover
   local manifest; manifest=$(cat "${run_dir}/manifest.json")
+  # Issue #108, second entry point (see lib/manifest.sh's own comment on
+  # manifest_check_version_supported): graft is its own separate invocation
+  # too — it may run against a manifest a NEWER sitegraft froze, and
+  # manifest_validate's freeze-time gate does not run again here.
+  manifest_check_version_supported "$manifest" || return 1
   local post_types_csv; post_types_csv=$(echo "$manifest" | jq -r '[.migrate[].post_types[]?] | join(",")')
   # attachment is deliberately excluded from the WXR export's own post_type
   # filter — graft_import_attachments handles attachments itself (see its
