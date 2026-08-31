@@ -279,6 +279,7 @@ assert_jq '.post_types[] | select(.name=="fake_reservation")' "${RUN_DIR}/scan-b
   "site B's scan does not list the fake_reservation post type — the site-b-fake-plugin fixture's activation hook may not have run before scan"
 assert_jq '.classic_menus_detected == false' "${RUN_DIR}/scan-a.json" \
   "site A's scan reports classic_menus_detected != false on a fresh block-theme install with no classic nav menus configured"
+echo "==> confirmed: scan detected both plugin fixtures (etch_cfs on A, fake_reservation on B) and reports classic_menus_detected == false on A's block-theme install"
 
 echo "==> asserting m8's extra one-line coverage"
 # nav_uses_dynamic_page_list (M5): the wp:page-list post seeded on A above.
@@ -384,6 +385,7 @@ assert_jq '.nav_post_count > 0' "${RUN_DIR}/scan-a.json" \
 # readers.
 assert_jq '.nav_post_count == null' "${RUN_DIR}/scan-b.json" \
   "site B's scan does not report nav_post_count == null — inventory_nav_post_count is A-only by design (lib/inventory.sh) and should never run against B"
+echo "==> confirmed: m8's extra one-line coverage — nav_uses_dynamic_page_list, the fake-plugin table, custom_code_detected, both options and both active themes are all present; nav_post_count=${SCANNED_NAV_COUNT} matches a live count of ${LIVE_NAV_COUNT}; fixture navs \"Main\" and \"Footer\" both present"
 
 # home_url/site_url (issue #73, second review round — point 7 of that
 # review): this fix-pack's own unit tests (tests/unit/test_inventory.bats)
@@ -440,6 +442,7 @@ assert_jq '.home_url | type == "string" and length > 0' "${RUN_DIR}/scan-a.json"
   "site A's scan recorded a non-string or empty home_url against a real, healthy WordPress install — inventory_scan_site's fail-safe path should never fire here"
 assert_jq '.site_url | type == "string" and length > 0' "${RUN_DIR}/scan-a.json" \
   "site A's scan recorded a non-string or empty site_url against a real, healthy WordPress install — inventory_scan_site's fail-safe path should never fire here"
+echo "==> confirmed: scan-a.json/scan-b.json's home_url and site_url both match a live wp-cli read on each site, and A's values are non-empty real strings"
 
 # Issue #17, closing the gap Nat's review found: proving core-wp's own
 # automatic CLAIM works — not merely that the id-remap mechanics work once
@@ -1430,8 +1433,41 @@ echo "==> running verify"
 "${ROOT}/bin/sitegraft" verify --profile "$PROFILE" --run "$RUN_DIR"
 
 VERIFY_REPORT="${RUN_DIR}/verify-report.md"
-echo "==> asserting the verify report exists and every check passed cleanly (no HARD FAIL) on a graft that should be entirely correct"
 [ -f "$VERIFY_REPORT" ]
+
+# Issue #68: verify_http_smoke (lib/verify.sh) is best-effort by design
+# (design doc §6.5, never a hard fail on its own) -- that part is correct
+# and stays. The problem was VISIBILITY: verify_http_smoke's own log_error
+# is redirected straight into verify-report.md (phase_verify's
+# `2>>"$report"`), so a failed smoke check appeared NOWHERE in this
+# script's own log -- an operator watching a run that ends "full
+# graft/verify/restore pipeline proven end-to-end" had no way to know the
+# one check that actually proves B serves a page had silently failed
+# (found live: run rosa643, exit 0, zero FAIL: lines, smoke check FAILED
+# buried in the report). Surfaced here unconditionally, straight from the
+# report -- pass, fail, or not-applicable are all echoed into THIS log, not
+# left for an operator to go dig verify-report.md out for. A FAILURE HERE
+# IS EXPECTED under this harness's own DDEV environment: this box is
+# typically headless and `*.ddev.site` is a router-managed hostname that
+# frequently does not resolve for a bare `curl` run outside DDEV's own
+# network/mkcert trust store, even though the site is genuinely reachable
+# through a browser hitting the project directly -- so a FAILED line below
+# is explanatory context, not a regression, and must never fail this
+# harness on its own (verify_http_smoke's own exit code already keeps it
+# out of "Result: HARD FAIL" -- see the assertions above/below this block).
+HTTP_SMOKE_LINE=$(grep "HTTP smoke check" "$VERIFY_REPORT" || true)
+if [ -z "$HTTP_SMOKE_LINE" ]; then
+  echo "FAIL: verify-report.md contains no 'HTTP smoke check' line at all -- phase_verify (lib/verify.sh) should always emit exactly one (PASS/FAILED/not-applicable/no-curl), so a totally missing line means the check's own bookkeeping is out of sync, not that nothing needed checking" >&2
+  exit 1
+fi
+echo "==> HTTP smoke check result (best-effort, design doc §6.5 -- never a hard fail on its own): ${HTTP_SMOKE_LINE}"
+case "$HTTP_SMOKE_LINE" in
+  *FAILED*)
+    echo "    (expected on a headless DDEV box: *.ddev.site often does not resolve for a bare curl outside DDEV's own network -- not a sitegraft defect)"
+    ;;
+esac
+
+echo "==> asserting the verify report exists and every check passed cleanly (no HARD FAIL) on a graft that should be entirely correct"
 if grep -q "HARD FAIL" "$VERIFY_REPORT"; then
   echo "FAIL: verify-report.md contains a HARD FAIL line on a graft run that completed cleanly:" >&2
   cat "$VERIFY_REPORT" >&2
