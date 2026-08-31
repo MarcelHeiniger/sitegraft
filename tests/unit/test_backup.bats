@@ -73,6 +73,30 @@ setup() {
   [[ "$output" != *"wp_remote"* ]]
 }
 
+# issue #75 (review round 3): this line is decorative (this function's own
+# header comment) -- but the first version of this fix's test coverage
+# never set SITE_B_SSH_KEY at all, so a mutation removing the `-i` this
+# function bakes in went undetected across all 1127 tests. Found by
+# review, mutation-per-site, not self-discovered.
+@test "backup_wp_cmd_literal includes -i <key> when SITE_B_SSH_KEY is set (issue #75)" {
+  SITE_B_SSH_HOST="user@host-b.example.com"
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="wp"
+  SITE_B_SSH_KEY="/home/op/.ssh/b-key"
+  run backup_wp_cmd_literal b
+  [ "$output" = 'ssh -i /home/op/.ssh/b-key user@host-b.example.com "wp --path=/var/www/site-b"' ]
+}
+
+@test "backup_wp_cmd_literal omits -i entirely when SITE_B_SSH_KEY is unset (regression, unchanged by this fix)" {
+  SITE_B_SSH_HOST="user@host-b.example.com"
+  SITE_B_WP_PATH="/var/www/site-b"
+  SITE_B_WP_CMD="wp"
+  unset SITE_B_SSH_KEY
+  run backup_wp_cmd_literal b
+  [[ "$output" != *" -i "* ]] || false
+  [ "$output" = 'ssh user@host-b.example.com "wp --path=/var/www/site-b"' ]
+}
+
 @test "backup_wp_cmd_literal builds a plain local command with no ssh for a local site" {
   unset SITE_B_SSH_HOST
   SITE_B_WP_PATH="/var/www/site-b"

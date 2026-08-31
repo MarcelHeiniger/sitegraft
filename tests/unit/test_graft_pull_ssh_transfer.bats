@@ -129,6 +129,19 @@ setup() {
   [[ "$output" == *"ssh called with: -i /home/op/.ssh/b-key -- b.example.com rm -rf"* ]] || false
 }
 
+@test "graft_import_wxr refuses BEFORE creating the remote directory when SITE_B_SSH_KEY contains a literal double-quote (review round 3, same ordering fix as graft_push_dir/graft_push_file)" {
+  SITE_B_SSH_HOST="b.example.com"
+  SITE_B_SSH_KEY='/home/op/.ssh/my "quoted" key'
+  mkdir -p "$BATS_TEST_TMPDIR/run/export"
+  ssh() { echo "SHOULD NOT BE CALLED -- refuse before ever touching B"; return 1; }
+  rsync() { echo "SHOULD NOT BE CALLED"; return 1; }
+  wp_remote() { echo "SHOULD NOT BE CALLED"; return 1; }
+  run graft_import_wxr "$BATS_TEST_TMPDIR/run"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+  [[ "$output" == *"literal double-quote"* ]] || false
+}
+
 # --- graft_fetch_id_map -------------------------------------------------
 
 @test "graft_fetch_id_map pulls B's id-map.log over ssh with --no-old-args and carries SITE_B_SSH_KEY when set (issues #75/#94)" {

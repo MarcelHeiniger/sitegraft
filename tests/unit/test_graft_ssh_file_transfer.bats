@@ -84,6 +84,17 @@ setup() {
   [[ "$output" == *"rsync called with: -avz -s -e ssh -i \"/home/op/.ssh/b-key\" /local/src/lib.php b.example.com:/remote/site-b/wp-content/sitegraft-lib.php"* ]] || false
 }
 
+@test "graft_push_file refuses BEFORE creating the remote directory when SITE_B_SSH_KEY contains a literal double-quote (review round 3, same ordering fix as graft_push_dir)" {
+  SITE_B_SSH_HOST="b.example.com"
+  SITE_B_SSH_KEY='/home/op/.ssh/my "quoted" key'
+  ssh() { echo "SHOULD NOT BE CALLED -- refuse before ever touching B"; return 1; }
+  rsync() { echo "SHOULD NOT BE CALLED"; return 1; }
+  run graft_push_file b "/local/src/lib.php" "/remote/site-b/wp-content" "sitegraft-lib.php"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+  [[ "$output" == *"literal double-quote"* ]] || false
+}
+
 @test "graft_push_file falls back to plain mkdir+rsync for a genuinely bare-local site (no SSH_HOST, no wrapper) — regression, unchanged by this fix" {
   unset SITE_B_SSH_HOST SITE_B_WP_CMD
   local dest="$BATS_TEST_TMPDIR/site-b/wp-content"
@@ -125,6 +136,17 @@ setup() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"ssh called with: -i /home/op/.ssh/b-key -- b.example.com mkdir -p '/remote/site-b/wp-content/plugins/foo'"* ]] || false
   [[ "$output" == *"rsync called with: -avz -s -e ssh -i \"/home/op/.ssh/b-key\" /local/staging/ b.example.com:/remote/site-b/wp-content/plugins/foo/"* ]] || false
+}
+
+@test "graft_push_dir refuses BEFORE creating the remote directory when SITE_B_SSH_KEY contains a literal double-quote (review round 3: mkdir used to run first, leaving a pointless mkdir on B before the refusal)" {
+  SITE_B_SSH_HOST="b.example.com"
+  SITE_B_SSH_KEY='/home/op/.ssh/my "quoted" key'
+  ssh() { echo "SHOULD NOT BE CALLED -- refuse before ever touching B"; return 1; }
+  rsync() { echo "SHOULD NOT BE CALLED"; return 1; }
+  run graft_push_dir b "/local/staging" "/remote/site-b/wp-content/plugins/foo"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+  [[ "$output" == *"literal double-quote"* ]] || false
 }
 
 @test "graft_push_dir --keep-existing also carries SITE_B_SSH_KEY (issue #75)" {
