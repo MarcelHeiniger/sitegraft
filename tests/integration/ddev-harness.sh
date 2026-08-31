@@ -1235,6 +1235,61 @@ esac
 # on size at all, regardless of why the old form happened not to fail.
 grep -q "${PROJECT_B}.ddev.site" <<< "$IMAGE_BLOCK_CONTENT"
 
+echo "==> (c2) issue #51: asserting site-a-seed.sh's 'Escaped URL CFS' post -- the one fixture in this repo whose block attributes carry a URL in the JSON-ESCAPED form (\"src\":\"https:\\/\\/...\") Etch's own json_encode() actually produces -- survived graft's domain remap AND write-back, both byte-for-byte AND as something parse_blocks() still decodes correctly. #43 was wp_update_post()'s array form silently eating every backslash in post_content on write-back; #50 fixed and unit-tested that against a stub; nothing above this line in this file has ever put a backslash anywhere near a real WordPress write, so the regression this guards against has never actually been exercised end-to-end until now."
+ESCAPED_URL_ID=$(ddev exec --raw -p "$PROJECT_B" -- wp post list --post_type=etch_cfs --title="Escaped URL CFS" --field=ID)
+[ -n "$ESCAPED_URL_ID" ]
+ESCAPED_URL_CONTENT=$(ddev exec --raw -p "$PROJECT_B" -- wp post get "$ESCAPED_URL_ID" --field=post_content)
+
+# Byte check first. Verified directly (php -r against json_decode()) while
+# building this fixture: for a URL whose ONLY escaped character is "/",
+# stripping the backslash still leaves syntactically valid JSON that
+# DECODES to the exact same string -- json_decode() treats "\/" and "/" as
+# equivalent inside a string. That means the decode check further below,
+# taken alone, would NOT go red if #43 regressed on exactly this fixture:
+# it would decode the de-escaped bytes to the same correct URL either way.
+# This byte check is therefore not a redundant "cheaper, weaker" extra --
+# for this specific escape, it is the check that actually distinguishes
+# the fixed write path from the regressed one.
+case "$ESCAPED_URL_CONTENT" in
+  *"\"src\":\"https:\/\/${PROJECT_B}"*) : ;;
+  *) echo "FAIL: B's escaped-URL block content lost its backslash-escaped domain form (expected \"src\":\"https:\/\/${PROJECT_B}...) -- either wp_update_post()'s array-form unslash bug (#43) regressed, or the domain remap never ran against the escaped form. content: ${ESCAPED_URL_CONTENT}" >&2; exit 1 ;;
+esac
+case "$ESCAPED_URL_CONTENT" in
+  *"\"src\":\"https://${PROJECT_B}"*) echo "FAIL: B's escaped-URL block content was de-escaped (found unescaped https://${PROJECT_B} where the JSON-escaped https:\/\/ form should be) -- #43's backslash-eating regressed" >&2; exit 1 ;;
+  *) : ;;
+esac
+case "$ESCAPED_URL_CONTENT" in
+  *"${PROJECT_A}.ddev.site"*) echo "FAIL: B's escaped-URL block content still references A's own domain (${PROJECT_A}.ddev.site) -- the domain remap did not run against the escaped form at all" >&2; exit 1 ;;
+  *) : ;;
+esac
+
+# Decode check: resolve through the SAME function a real page render uses
+# -- parse_blocks() -- rather than re-deriving the JSON boundary by hand in
+# bash, so this is a proof that the block still RENDERS (the property that
+# actually matters to a site visitor), not just that some expected
+# substring happens to be present. Complements the byte check above rather
+# than replacing it: it is what would catch a BROADER corruption than pure
+# "/" de-escaping -- e.g. a stray backslash surviving before a quote
+# elsewhere in the same content and breaking json_decode() outright, which
+# would leave 'attrs' missing/empty without necessarily changing this
+# fixture's own "src" substring.
+A_ATTACH_URL=$(ddev exec --raw -p "$PROJECT_A" -- wp post get "$OLD_ATTACH_ID" --field=guid)
+EXPECTED_DECODED_URL="${A_ATTACH_URL/${PROJECT_A}.ddev.site/${PROJECT_B}.ddev.site}"
+DECODED_SRC=$(ddev exec --raw -p "$PROJECT_B" -- wp eval "
+\$post = get_post( ${ESCAPED_URL_ID} );
+\$blocks = parse_blocks( \$post->post_content );
+\$src = '';
+foreach ( \$blocks as \$block ) {
+  if ( isset( \$block['attrs']['src'] ) ) { \$src = \$block['attrs']['src']; break; }
+}
+echo \$src;
+")
+if [ "$DECODED_SRC" != "$EXPECTED_DECODED_URL" ]; then
+  echo "FAIL: parse_blocks() on B did not decode the escaped-URL block's 'src' attribute to the expected URL (${EXPECTED_DECODED_URL}) -- got '${DECODED_SRC}'. Either the escaped bytes survived but no longer decode to the right value, or parse_blocks() failed to decode the attrs JSON at all (empty/missing 'attrs')." >&2
+  exit 1
+fi
+echo "==> confirmed: the escaped URL block attribute survived graft's domain remap byte-for-byte (\"src\":\"https:\/\/${PROJECT_B}...\") AND parse_blocks() decodes it on B to the correct plain URL (${EXPECTED_DECODED_URL})"
+
 echo "==> (d) asserting page_on_front resolves to the correctly remapped page on B (design doc §9.3)"
 B_FRONT_ID=$(ddev exec --raw -p "$PROJECT_B" -- wp option get page_on_front)
 [ -n "$B_FRONT_ID" ] && [ "$B_FRONT_ID" != "0" ]

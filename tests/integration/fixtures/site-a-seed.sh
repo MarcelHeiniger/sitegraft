@@ -54,6 +54,27 @@ ATTACH_URL=$(ddev exec --raw -p "$DDEV_PROJECT" -- wp post get "$ATTACH_ID" --fi
 ddev exec --raw -p "$DDEV_PROJECT" -- wp post create --post_type=etch_cfs --post_title="Image Block CFS" --post_status=publish \
   --post_content="<!-- wp:etch/image {\"id\":${ATTACH_ID}} --><img class=\"wp-image-${ATTACH_ID}\" src=\"${ATTACH_URL}\" /><!-- /wp:etch/image -->"
 
+# Issue #51 fixture: a THIRD etch_cfs post whose block attributes carry a
+# URL in the JSON-ESCAPED form -- "src":"https:\/\/..." -- that Etch's own
+# block attribute JSON actually stores on disk (PHP's json_encode() escapes
+# "/" to "\/" by default). Every other fixture in this repo, including the
+# "Image Block CFS" one right above, only ever puts a PLAIN URL inside an
+# <img src="..."> attribute -- never inside the JSON block-comment
+# attributes themselves -- so there was, before this, no backslash anywhere
+# in any fixture. #43 (wp_update_post()'s array form silently eating every
+# backslash in post_content on write-back) was fixed and unit-tested
+# against a stub (#50), but structurally invisible to this DDEV harness,
+# because nothing here ever exercised the escaped byte sequence the bug
+# actually eats. Kept as its OWN single-key-JSON post (`{"src":"..."}`,
+# deliberately no "id" key) rather than added onto "Image Block CFS" above,
+# so this fixture stays decoupled from that post's own id-remap assertions
+# and their hand-tuned `"id":<N>` terminator matching (ddev-harness.sh's
+# own N1/F3 comments) -- adding a second JSON key there would change "id"'s
+# terminator from `}` to `,` and silently break those.
+ESCAPED_ATTACH_URL="${ATTACH_URL//\//\\/}"
+ddev exec --raw -p "$DDEV_PROJECT" -- wp post create --post_type=etch_cfs --post_title="Escaped URL CFS" --post_status=publish \
+  --post_content="<!-- wp:etch/image {\"src\":\"${ESCAPED_ATTACH_URL}\"} --><!-- /wp:etch/image -->"
+
 # MAJOR-1 fixture (review, Viktor): a migrated page carrying A's own
 # attachment as its WordPress-core featured image (_thumbnail_id) — the
 # reference wordpress-importer would normally remap natively during a WXR
