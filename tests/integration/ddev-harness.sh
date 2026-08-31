@@ -1255,36 +1255,39 @@ FAKEBOOKING_SETTINGS_AFTER=$(ddev exec --raw -p "$PROJECT_B" -- wp option get fa
 # #64 fix-pack: the ORIGINAL version of this check tested
 # `*"${NEW_ATTACH_ID}"*` — an UNANCHORED substring match of a short bare
 # numeral against the ENTIRE fakebooking_settings JSON blob, not against
-# the specific "decoy" field it claims to be checking. With
-# SITEGRAFT_HARNESS_ID set, B's own domain string
-# (sitegraft-test-b-<id>.ddev.site, embedded in this SAME blob's "note"
-# field, entirely unrelated to any id-remap) can coincidentally CONTAIN
-# NEW_ATTACH_ID's digits — reproduced live: run id "rosa64" contains the
-# digit "6", and this run's NEW_ATTACH_ID was "6", so the single most
+# any specific field it claims to be checking. With SITEGRAFT_HARNESS_ID
+# set, B's own domain string (sitegraft-test-b-<id>.ddev.site, embedded in
+# this SAME blob's "note" field, entirely unrelated to any id-remap) can
+# coincidentally CONTAIN NEW_ATTACH_ID's digits, or collide with the
+# fixture's own "tax_rate":3.7 — reproduced live: run id "rosa64" contains
+# the digit "6", and that run's NEW_ATTACH_ID was "6", so the single most
 # consequential assertion in this harness ("a third party's protected data
-# was not touched") failed on a graft that had done nothing wrong. The
-# domain half of the same case arm had an identical, if less likely,
-# exposure: matching bare "${PROJECT_B}.ddev.site" without regard for
-# WHICH field it appeared in.
+# was not touched") failed on a graft that had done nothing wrong.
 #
-# Fixed by reading the actual "decoy" and "note" fields through jq instead
-# of grep-shaped substring matching against the raw blob — comparing
-# parsed JSON values leaves no digit-boundary question to get wrong,
-# because there is no substring search left to run at all.
-DECOY_AFTER=$(jq -r '.decoy' <<< "$FAKEBOOKING_SETTINGS_AFTER")
-if [ "$DECOY_AFTER" != "\"id\":${OLD_ATTACH_ID}" ]; then
-  echo "FAIL: fakebooking_settings.decoy no longer reads exactly \"id\":${OLD_ATTACH_ID} (got: ${DECOY_AFTER}) — protected option data was rewritten during graft even though the checksum matched — investigate immediately, this should never happen" >&2
+# Fixed (#64) by reading fields through jq instead of grep-shaped substring
+# matching against the raw blob. #67: that fix only compared "decoy" and
+# "note", the two fields the false-positive actually touched — "currency"
+# and "tax_rate" were left outside the check entirely (not a regression,
+# the old substring check only ever noticed those two by digit accident,
+# which was noise rather than detection, but not coverage either). Replaced
+# both field-by-field checks with ONE total-equality comparison against the
+# complete object seeded above (line ~968) — anchored (exact match, not
+# substring) AND total (every field, not just two), so no field's drift can
+# go unnoticed. Trade made deliberately: the old .note check separately
+# distinguished "B's domain leaked in" (real contamination) from "A's
+# domain missing entirely" (the fixture injection itself didn't survive,
+# making the assertion meaningless) via two different messages. This
+# single check collapses both into one generic mismatch -- an operator can
+# still tell them apart by reading the FAIL message's full "(got: ...)"
+# blob, just without the harness pre-classifying it. Judged worth it for
+# catching strictly more corruption (2 fields -> 4), not a loss anyone
+# should "fix" back without weighing that tradeoff again.
+if ! jq -e --arg da "$DOMAIN_A" --arg decoy "\"id\":${OLD_ATTACH_ID}" \
+    '. == {currency: "CHF", tax_rate: 3.7, note: ("see " + $da + "/booking for details"), decoy: $decoy}' \
+    <<< "$FAKEBOOKING_SETTINGS_AFTER" >/dev/null; then
+  echo "FAIL: fakebooking_settings no longer matches its exact seeded value (currency:\"CHF\", tax_rate:3.7, note:\"see ${DOMAIN_A}/booking for details\", decoy:\"\\\"id\\\":${OLD_ATTACH_ID}\") even though the checksum matched (got: ${FAKEBOOKING_SETTINGS_AFTER}) — protected option data was rewritten during graft — investigate immediately, this should never happen" >&2
   exit 1
 fi
-NOTE_AFTER=$(jq -r '.note' <<< "$FAKEBOOKING_SETTINGS_AFTER")
-case "$NOTE_AFTER" in
-  *"$DOMAIN_B"*)
-    echo "FAIL: fakebooking_settings.note now contains B's domain (${DOMAIN_B}) even though the checksum matched — the domain search-replace touched protected data it must never reach — investigate immediately" >&2
-    exit 1
-    ;;
-  *"$DOMAIN_A"*) : ;;
-  *) echo "FAIL: fakebooking_settings.note no longer contains A's domain string at all (got: ${NOTE_AFTER}) — the fixture injection itself didn't survive, this assertion would be meaningless" >&2; exit 1 ;;
-esac
 echo "==> confirmed: protected data (wp_options AND wp_posts) carrying a real domain-string + colliding-ID payload is untouched by graft"
 
 echo "==> (f) asserting the mapping mu-plugin was removed from B after graft"
