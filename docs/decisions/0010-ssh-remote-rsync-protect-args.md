@@ -1,6 +1,7 @@
 # ADR 0010 — the ssh-remote restore requires a LOCAL rsync that default-escapes its arguments; it does NOT use `--protect-args`
 
-**Date:** 2026-08-28 · **Status:** accepted (revised same day — see History)
+**Date:** 2026-08-28 · **Status:** accepted (revised same day — see History; extended
+2026-08-31 to the live `backup`/`graft` pull sites — see Extension)
 
 ## Context
 
@@ -253,3 +254,72 @@ become a supported way to run restore.sh — at that point the manual-
 escaping alternative above, or requiring the operator's `rsync-path` to
 point at a GNU-compatible binary explicitly, would need a real design pass
 rather than a silent fallback.
+
+## Extension (2026-08-31) — the live `backup`/`graft` pull sites (issue #94)
+
+This ADR's original scope was the ONE rsync line inside the generated
+`restore.sh` (issue #44). Issue #94, filed by Marcel while reviewing that
+PR, named the same defect at every OTHER ssh-remote PULL in this codebase —
+calls that run live, not from a generated script: `backup_wp_content`
+(`lib/backup.sh`), and `graft_copy_wp_content_dir`/`graft_media_sync`/
+`graft_fonts_sync`/`graft_export_wxr`/`graft_fetch_id_map` (`lib/graft.sh`).
+Each hands rsync a `host:path` SOURCE, which is exactly the shape this
+ADR's Measurement 1/2/3 describe — rsync builds its own second, remote
+command line out of that string, on the far end, after this process's own
+quoting (`sq()`) has already had its only chance to matter.
+
+**Decision: apply this ADR's existing conclusion (`--no-old-args`, never
+`--protect-args`/`-s`) to every one of those call sites, unchanged.** No new
+measurement was needed for the flag choice itself — the mechanism (a local
+rsync building a second, unescaped command line for a remote shell) is
+identical whether the invocation is baked into a generated script or run
+directly; ADR's own Measurements 1-3 do not depend on which. What issue #94
+explicitly asked to be checked, rather than assumed by symmetry with #44,
+was answered per call site, not once for all of them (issue #35 is the
+cautionary precedent named in that issue for exactly this failure mode):
+
+- Every one of the six sites above hands rsync a `host:path` **source**
+  (a pull) — verified individually, not inferred. None of them is a
+  restricted-shell-server scenario this ADR's Measurement 2 warns
+  `--protect-args` breaks, because `--protect-args` was never reconsidered
+  for these sites in the first place — the ADR's conclusion already rules
+  it out for identical reasons.
+- The **push** side (`graft_push_dir`/`graft_push_file`, and
+  `graft_import_wxr`'s own rsync) is explicitly OUT of this issue's scope
+  (its own text: "côté tirage" — pull side). Those call sites' pre-existing
+  `-s`/`--protect-args` usage (and, on `graft_import_wxr` specifically, the
+  pre-existing absence of even that) is a real, separate inconsistency with
+  this ADR's own conclusion — flagged, not fixed, in the PR that closed
+  issues #75/#94. A future pass that wants push-side parity with this ADR
+  should replace `-s` with `--no-old-args` there too, not add `-s` to the
+  one call site that currently lacks it.
+
+**A shared helper, not six independent patches**: `rsync_pull_remote`
+(`lib/inventory.sh`) is the one place that now builds `-avz --no-old-args
+[-e "ssh -i <key>"] host:path dst` for every pull site above — chosen
+because, unlike the push side, all six pull sites share this exact shape
+verbatim (verified by reading each one, not assumed). It also carries
+`SITE_<ALIAS>_SSH_KEY` (issue #75) via `-e`/`--rsh`, since rsync invokes
+ssh itself for this hop rather than being invoked through it.
+
+**The capability probe becomes a phase-start check, not a per-call
+probe.** This ADR's original probe (`_sg_check_rsync_arg_escaping`) lives
+inside the generated `restore.sh` and runs once, because that script only
+ever has ONE ssh-remote rsync step. `backup`/`graft` each have several. The
+question the probe answers — "can the local rsync on PATH parse
+`--no-old-args`" — is a property of the one local binary every pull in a
+given phase resolves via the same `PATH`; it cannot change between the
+first and the fifth pull of the same `sitegraft backup`/`sitegraft graft`
+invocation. Re-running the probe before every `rsync_pull_remote` call
+would therefore buy nothing over running it once, while adding a repeated
+subprocess-exec tax and, worse, a failure mode where the checked-and-passed
+first pull already did real (partial) work before a LATER pull's redundant
+probe could ever fail — the opposite of failing loudly before touching
+anything. `sitegraft_require_rsync_arg_escaping` (`lib/inventory.sh`) is
+that check, called once at the top of `phase_backup`/`phase_graft`, guarded
+by `is_dry_run ||` (same reasoning as the generated script's own `--dry-run`
+exemption: a dry run never actually calls rsync, so it must never require a
+real GNU rsync just to preview) and by whichever alias(es) that phase
+actually needs it for (`SITE_B_SSH_HOST` for `backup`; either alias for
+`graft`, since stack/media/fonts/WXR pull from A while the id-map fetch
+pulls from B).

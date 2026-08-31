@@ -82,7 +82,15 @@ backup_db_export() {
   # success. See lib/backup.sh's git history / issue #99 for the measured
   # reproduction.
   if [ -n "${SITE_B_SSH_HOST:-}" ]; then
-    run_or_echo bash -c "set -o pipefail; ssh '${SITE_B_SSH_HOST}' \"${SITE_B_WP_CMD} --path='${SITE_B_WP_PATH}' db export - --add-drop-table\" | gzip > '${dest_dir}/b-db.sql.gz'"
+    # issue #75: `-i <key>` when SITE_B_SSH_KEY is set. This whole command
+    # is a hand-built string that `bash -c` re-parses (needed so the pipe to
+    # `gzip` runs locally, not on B), so the key -- like every other
+    # operator-supplied value in this string -- goes through sq() before
+    # being spliced in, not a bare interpolation.
+    local ssh_key; ssh_key=$(ssh_key_for b)
+    local ssh_key_opt=""
+    [ -n "$ssh_key" ] && ssh_key_opt="-i $(sq "$ssh_key") "
+    run_or_echo bash -c "set -o pipefail; ssh ${ssh_key_opt}'${SITE_B_SSH_HOST}' \"${SITE_B_WP_CMD} --path='${SITE_B_WP_PATH}' db export - --add-drop-table\" | gzip > '${dest_dir}/b-db.sql.gz'"
   else
     run_or_echo bash -c "set -o pipefail; ${SITE_B_WP_CMD} --path='${SITE_B_WP_PATH}' db export - --add-drop-table | gzip > '${dest_dir}/b-db.sql.gz'"
   fi
@@ -189,7 +197,11 @@ backup_wp_content() {
   log_info "archiving B wp-content to ${dest_dir} ..."
   mkdir -p "$dest_dir"
   if [ -n "${SITE_B_SSH_HOST:-}" ]; then
-    run_or_echo rsync -avz "${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/wp-content/" "${dest_dir}/"
+    # issues #75/#94: rsync_pull_remote (lib/inventory.sh) carries B's
+    # dedicated SSH key and forces rsync's default arg-escaping -- see its
+    # own header comment for both. Requires sitegraft_require_rsync_arg_
+    # escaping to have already run once, at phase_backup's start.
+    rsync_pull_remote b "$SITE_B_SSH_HOST" "${SITE_B_WP_PATH}/wp-content/" "${dest_dir}/"
   else
     local prefix; prefix=$(_backup_local_exec_prefix b)
     if [ -n "$prefix" ]; then
@@ -231,7 +243,17 @@ backup_wp_content() {
 backup_list_b_wp_content() {
   local root="${SITE_B_WP_PATH}/wp-content"
   if [ -n "${SITE_B_SSH_HOST:-}" ]; then
-    ssh -- "$SITE_B_SSH_HOST" "find $(sq "$root") -mindepth 1 -print0"
+    # issue #75: `-i <key>` when SITE_B_SSH_KEY is set. Not routed through
+    # ssh_remote_run (lib/inventory.sh) -- that helper wraps run_or_echo,
+    # and this call must always run for real, dry-run or not (see this
+    # function's own header comment: its only caller already handles
+    # --dry-run itself, by returning early before ever reaching here).
+    local ssh_key; ssh_key=$(ssh_key_for b)
+    if [ -n "$ssh_key" ]; then
+      ssh -i "$ssh_key" -- "$SITE_B_SSH_HOST" "find $(sq "$root") -mindepth 1 -print0"
+    else
+      ssh -- "$SITE_B_SSH_HOST" "find $(sq "$root") -mindepth 1 -print0"
+    fi
   else
     local prefix; prefix=$(_backup_local_exec_prefix b)
     if [ -n "$prefix" ]; then
@@ -766,8 +788,29 @@ _sg_delete_from_stdin() { echo 'internal error: this restore.sh does not use a w
     # does not have the feature at all) rather than letting rsync itself
     # fail on an unrecognized option mid-restore.
     needs_rsync_arg_escaping=1
-    restore_wp_content_cmd="ssh $(sq "$SITE_B_SSH_HOST") $(sq "mkdir -p $(sq "${SITE_B_WP_PATH}/wp-content")") && rsync -avz --no-old-args --delete $(sq "${run_dir}/backup/b-wp-content/") $(sq "${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/wp-content/")"
-    restore_db_cmd="gunzip -c $(sq "${run_dir}/backup/b-db.sql.gz") | ssh $(sq "$SITE_B_SSH_HOST") $(sq "${SITE_B_WP_CMD} --path=$(sq "${SITE_B_WP_PATH}") db import -")"
+    # issue #75: restore.sh is generated ONCE, here, and then runs
+    # standalone with no sitegraft function or profile in scope (this
+    # function's own header comment) — so SITE_B_SSH_KEY, if set, has to be
+    # resolved and baked in now, exactly like every other operator-supplied
+    # value this function bakes in via sq(). Both `ssh` invocations get a
+    # plain `-i $(sq "$ssh_key")` (same shape as ssh_key_for's every other
+    # consumer). The `rsync` invocation cannot take `-i` directly — it
+    # invokes ssh itself, and rsync's own flag for that is `-e`/`--rsh` — so
+    # the key is carried there via `-e "ssh -i '<key>'"`, sq()'d TWICE for
+    # the same two-shell reason as the rest of this function's own header
+    # comment: the inner sq() quotes the key for rsync's own quote-aware
+    # split of its `-e` argument (measured live: GNU rsync 3.4.4 respects a
+    # single-quoted token there, so a key path containing a space survives
+    # as one argument), the outer sq() quotes the resulting string as ONE
+    # shell word in restore.sh's own source.
+    local ssh_key="${SITE_B_SSH_KEY:-}"
+    local ssh_i_opt="" rsync_e_opt=""
+    if [ -n "$ssh_key" ]; then
+      ssh_i_opt="-i $(sq "$ssh_key") "
+      rsync_e_opt=" -e $(sq "ssh -i $(sq "$ssh_key")")"
+    fi
+    restore_wp_content_cmd="ssh ${ssh_i_opt}$(sq "$SITE_B_SSH_HOST") $(sq "mkdir -p $(sq "${SITE_B_WP_PATH}/wp-content")") && rsync -avz --no-old-args --delete${rsync_e_opt} $(sq "${run_dir}/backup/b-wp-content/") $(sq "${SITE_B_SSH_HOST}:${SITE_B_WP_PATH}/wp-content/")"
+    restore_db_cmd="gunzip -c $(sq "${run_dir}/backup/b-db.sql.gz") | ssh ${ssh_i_opt}$(sq "$SITE_B_SSH_HOST") $(sq "${SITE_B_WP_CMD} --path=$(sq "${SITE_B_WP_PATH}") db import -")"
     restore_semantics="exact-state, via rsync --delete — wp-content is mirrored back to exactly what this backup contains, and any file added to it since is removed"
   else
     local prefix; prefix=$(_backup_local_exec_prefix b)
@@ -1936,6 +1979,18 @@ phase_backup() {
   done
   [ -n "$profile" ] || { log_error "backup requires --profile <name>"; return 1; }
   profile_load "$profile" || return 1
+
+  # issue #94 / ADR 0010: one check, at phase start, not re-probed before
+  # each of this phase's ssh-remote pulls (backup_wp_content is the only
+  # one today, but the check belongs at this level, not inside that
+  # function, so a future second pull site doesn't have to remember to add
+  # its own copy — see sitegraft_require_rsync_arg_escaping's own comment
+  # for why a phase-start check was chosen over a per-call probe). Skipped
+  # entirely under --dry-run (never calls rsync for real) and when B isn't
+  # ssh-remote at all (nothing here needs it).
+  if [ -n "${SITE_B_SSH_HOST:-}" ]; then
+    is_dry_run || sitegraft_require_rsync_arg_escaping || return 1
+  fi
 
   [ -n "$run_dir" ] || run_dir=$(ls -dt "${SITEGRAFT_STATE_DIR}/${profile}-"* 2>/dev/null | head -1 || true)
   [ -n "$run_dir" ] || {

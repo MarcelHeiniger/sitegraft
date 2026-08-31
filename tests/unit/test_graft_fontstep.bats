@@ -127,8 +127,27 @@ setup() {
   # first draft lose SITE_*_SSH_KEY when it built its own ssh call instead
   # of reusing the shared probe -- see graft_ssh_path_exists' own header).
   [[ "$output" == *"CHECKED: a /site-a/wp-content/fonts"* ]] || false
-  [[ "$output" == *"RAN: rsync -avz host-a.example.com:/site-a/wp-content/fonts/"* ]] || false
+  # issues #75/#94: routed through rsync_pull_remote now -- --no-old-args
+  # forces default arg-escaping (ADR 0010), and no `-i`/`-e` appears here
+  # because SITE_A_SSH_KEY is unset in this test (see the dedicated
+  # ssh-key test below for the case where it is set).
+  [[ "$output" == *"RAN: rsync -avz --no-old-args host-a.example.com:/site-a/wp-content/fonts/"* ]] || false
   [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
+@test "graft_fonts_sync's ssh pull carries SITE_A_SSH_KEY via rsync -e, and never contacts A without it, when the key is set (issue #75)" {
+  graft_font_dir() {
+    if [ "$1" = "a" ]; then echo "/site-a/wp-content/fonts"; else echo "/site-b/wp-content/fonts"; fi
+  }
+  graft_pull_dir() { echo "SHOULD NOT BE CALLED FOR A REMOTE"; return 1; }
+  graft_push_dir() { echo "PUSHED"; return 0; }
+  graft_ssh_path_exists() { return 0; }
+  SITE_A_SSH_HOST="host-a.example.com"
+  SITE_A_SSH_KEY="/home/op/.ssh/site-a-deploy-key"
+  run_or_echo() { echo "RAN: $*"; return 0; }
+  run graft_fonts_sync "$BATS_TEST_TMPDIR/run"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"RAN: rsync -avz --no-old-args -e ssh -i '/home/op/.ssh/site-a-deploy-key' host-a.example.com:/site-a/wp-content/fonts/"* ]] || false
 }
 
 # --- BLOCKER 1 (review fix-pack): wp_get_font_dir() COMPUTES/FILTERS a
