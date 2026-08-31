@@ -89,6 +89,30 @@
 # particular site's scan.
 # my_plugin_post_type_defining_option_keys() { printf 'my_plugin_cpts\n'; }
 
+# Optional: the exact same shape as `_post_type_defining_option_keys` just
+# above, one level down — names, among this module's OWN option_keys, that
+# DEFINE A TAXONOMY this module's plugin registers dynamically at runtime by
+# reading that option (e.g. Etch's `etch_taxonomies`, modules/etch.sh). A
+# SEPARATE hook from `_post_type_defining_option_keys`, not the same one
+# reused, because a taxonomy is not a post type: dropping every term (and
+# term relationship) that taxonomy defines is issue #82, the same ordering
+# bug as #16 just above, one level down — and it is WORSE than #16 in one
+# way worth knowing before you skip this: the POST each dropped term was
+# attached to still lands (its own post_type is unaffected), so a completion
+# gate that only counts items never notices. graft_migrate_taxonomy_defining_
+# options (lib/graft.sh) is this hook's own consumer, sharing the identical
+# guarded path graft_migrate_post_type_defining_options uses (see that
+# function's own header) — and lib/verify.sh's verify_taxonomy_terms_present
+# is the dedicated guard that checks term-level completeness directly
+# against the staged WXR, since an item-count gate structurally cannot.
+#
+# Same "every name here MUST also be returned by `_option_keys`" rule, and
+# no `_dynamic` counterpart, for the identical reason `_post_type_defining_
+# option_keys` has neither: WHICH option defines a taxonomy is fixed
+# knowledge about the plugin's own code, not something a site's scan can
+# tell you.
+# my_plugin_taxonomy_defining_option_keys() { printf 'my_plugin_taxonomies\n'; }
+
 # Optional: run after WXR import + generic remaps, for module-specific fixups.
 # Called unconditionally, including under `--dry-run` (design doc §3.2) — wrap
 # every write through $wp_cmd_b in lib/core.sh's run_or_echo (already sourced

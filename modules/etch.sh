@@ -243,6 +243,29 @@ etch_post_types_dynamic() {
 # express "whatever etch_cpts happens to declare". Closed by issue #16's
 # contract change: etch_post_types_dynamic above reads this option and claims
 # the types it declares.
+#
+# `etch_taxonomies` (issue #82, found by Viktor while reviewing #16's own
+# fix-pack): the exact same shape as `etch_cpts`, one level down.
+# Etch\Services\ContentTypeService::register_taxonomies() -- hooked on
+# `init`, priority 11, right alongside register_post_types()'s own
+# priority-5 hook that etch_post_types_dynamic's header already traces --
+# reads THIS option on every request and calls register_taxonomy() per
+# entry. `etch_option_keys` never named it before this fix: `grep -rn
+# etch_taxonomies` across the pre-#82 repo returned nothing, so a site
+# using this feature had its taxonomy DEFINITION migrated nowhere, not
+# even late -- worse than #16, whose etch_cpts at least reached B
+# eventually via graft_migrate_options. Unlike etch_cpts, nothing here
+# needs to PARSE this option's internal shape: no post-type-name-style
+# selection exists for taxonomies (a taxonomy's own terms travel inside
+# the WXR automatically, attached to whichever posts carry them -- see
+# lib/php/wxr-taxonomies-cli.php's own header), so the value only ever
+# needs to arrive on B intact, as an opaque blob, the same as every other
+# name in this list. That also means this fix carries none of
+# etch_post_types_dynamic's own shape risk: NOT independently re-verified
+# against a live site in this session (no such install was reachable from
+# it) -- but there is no parser here to be wrong about, only a value that
+# either arrives on B before `wp import` runs (etch_taxonomy_defining_
+# option_keys, below) or does not.
 etch_option_keys() {
   cat <<'EOF'
 etch_cfs
@@ -252,6 +275,7 @@ etch_global_stylesheets
 etch_loops
 etch_settings
 etch_styles
+etch_taxonomies
 EOF
 }
 
@@ -302,6 +326,40 @@ EOF
 etch_post_type_defining_option_keys() {
   cat <<'EOF'
 etch_cpts
+EOF
+}
+
+# Issue #82: `etch_taxonomies`' own sibling of the hook just above, one
+# level down -- a DIFFERENT module-contract hook, not etch_cpts's, because
+# a taxonomy is not a post type (Etch's own ContentTypeService::
+# register_taxonomies() is a separate `init`-priority-11 hook from
+# register_post_types()'s priority-5 one -- see etch_option_keys' own
+# comment on etch_taxonomies for the live trace), and conflating the two
+# under one name would make graft_migrate_post_type_defining_options'
+# own name a lie about what it migrates. graft_migrate_taxonomy_defining_
+# options (lib/graft.sh) is the exact sibling function this hook feeds --
+# same shared guarded path (_graft_migrate_options_named_by_hook), called
+# from phase_graft at the identical point, right after mu-plugin deploy
+# and before the WXR import: without this, `wp import` boots against a B
+# that has not yet seen etch_taxonomies, Etch never registers the
+# taxonomy in time, and wordpress-importer silently drops every term (and
+# term relationship) that taxonomy defines -- landing the POST it was
+# attached to regardless, since the post's own type is unaffected. That
+# is exactly why issue #53's own item-count completeness gate cannot see
+# this failure at all (its own header notes as much) and why this issue
+# adds a dedicated guard instead: lib/verify.sh's
+# verify_taxonomy_terms_present, fed by lib/php/wxr-taxonomies-cli.php,
+# checks term-level completeness directly against the staged WXR rather
+# than trusting anything read back out of this option.
+#
+# Same "MUST also appear in etch_option_keys above" and "no _dynamic
+# counterpart" rules as etch_post_type_defining_option_keys, for the
+# identical reason: WHICH option defines Etch's taxonomies is fixed
+# knowledge about the plugin's own code, not something that depends on
+# any particular site's scan.
+etch_taxonomy_defining_option_keys() {
+  cat <<'EOF'
+etch_taxonomies
 EOF
 }
 

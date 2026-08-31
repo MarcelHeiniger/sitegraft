@@ -1273,6 +1273,148 @@ PHP
   echo "COMPONENT_PROP_REFS:${checked}:0"
 }
 
+# verify_taxonomy_terms_present <run_dir> <manifest> — issue #82: #53's own
+# import-completeness gate (graft_verify_import_completeness, lib/graft.sh)
+# counts POSTS. A post whose taxonomy terms were silently dropped by
+# wordpress-importer -- because the taxonomy that defines them was not yet
+# registered on B when `wp import` ran, the identical ordering defect issue
+# #16 closed for POST TYPES one level up -- still lands, still counts as
+# expected == actual, and #53 reports PASS. This guard asks the TERM-level
+# question #53 structurally cannot: for every (taxonomy, slug) pair the
+# staged WXR itself declares (lib/php/wxr-taxonomies-cli.php, reading each
+# <wp:term>'s own wp:term_taxonomy/wp:term_slug -- NOT a plugin's own
+# option, e.g. Etch's etch_taxonomies, which keeps this guard module-
+# agnostic: it closes the gap for ANY future module with the identical
+# shape, not just Etch's), does a term with that EXACT taxonomy+slug exist
+# on B, right now, post-graft.
+#
+# Deliberately NOT "is the taxonomy registered on B" -- that would go GREEN
+# regardless of ordering, because graft_migrate_options' own later,
+# unconditional pass migrates a taxonomy-defining option (etch_taxonomies)
+# too, AFTER the WXR import, same as it always did for etch_cpts before
+# issue #16's fix. By the time `verify` runs, the option has reached B
+# either way -- checking registration alone would report PASS even when the
+# exact ordering bug this guard exists to catch reproduces, precisely the
+# "bookkeeping lies" trap CLAUDE.md's first rule warns against. And
+# deliberately NOT term COUNTS either: a taxonomy B already partly used
+# pre-graft (WordPress's own built-in "category", for one) makes a bare
+# count meaningless -- it would already be > 0 regardless of whether this
+# run added anything. Checking the EXACT declared slug is the one question
+# that stays correct in both directions.
+#
+# The (taxonomy, slug) payload travels to B inside a pushed JSON file (the
+# same graft_push_remap_payload/graft_remove_file pattern verify_domain_
+# absent above already uses, and for the identical reason: an operator-
+# supplied slug could in principle carry a character that would need
+# escaping if built into a `wp eval` string by direct bash interpolation --
+# json_decode(file_get_contents(...)) on B never has to escape anything).
+#
+# Two-valued like verify_id_references_resolve's own (no INCOMPLETE state):
+# an export with zero <wp:term> elements is a legitimate "nothing to check"
+# TAX_TERMS:0:0, not an unknown. The one genuine ambiguity (something WAS
+# selected for a WXR import, but the staged export itself is simply gone)
+# is resolved the same way graft_verify_import_completeness resolves the
+# identical ambiguity for item counts (lib/graft.sh, its own ${2}-argument
+# comment): only when the manifest shows nothing was ever selected for a
+# WXR import at all does a missing export read as "nothing to check";
+# otherwise it is UNVERIFIED (rc=2), never a silent pass.
+verify_taxonomy_terms_present() {
+  local run_dir="$1" manifest="$2"
+
+  local staging="${run_dir}/export"
+  local wxr_files=() f
+  for f in "${staging}"/*.xml; do
+    [ -e "$f" ] && wxr_files+=("$f")
+  done
+  if [ "${#wxr_files[@]}" -eq 0 ]; then
+    local selected_count
+    selected_count=$(echo "$manifest" | jq '[.migrate[].post_types[]? | select(. != "attachment")] | length')
+    if [ "${selected_count:-0}" -gt 0 ]; then
+      log_error "taxonomy-term completeness check: post type(s) were selected for migration but no WXR export was found under ${staging} to check taxonomy term completeness against — refusing to report success"
+      return 2
+    fi
+    echo "TAX_TERMS:0:0"
+    return 0
+  fi
+
+  local tmp_dir; tmp_dir=$(sitegraft_mktemp_dir) || return 1
+  local stderr_file="${tmp_dir}/stderr"
+  local ndjson rc
+  ndjson=$(php -d display_errors=stderr "${SITEGRAFT_ROOT}/lib/php/wxr-taxonomies-cli.php" "${wxr_files[@]}" 2>"$stderr_file") && rc=0 || rc=$?
+  local err_text=""
+  [ -s "$stderr_file" ] && err_text=$(cat "$stderr_file")
+  if [ "$rc" -ne 0 ]; then
+    log_error "could not parse the staged WXR export to check taxonomy term completeness: ${err_text} — refusing to report success"
+    return 1
+  fi
+  [ -n "$ndjson" ] || { echo "TAX_TERMS:0:0"; return 0; }
+
+  local result
+  result=$(printf '%s' "$ndjson" | jq -s -c '.' 2>/dev/null)
+  if [ -z "$result" ] || ! echo "$result" | jq -e . >/dev/null 2>&1; then
+    log_error "the taxonomy-term completeness driver did not return valid NDJSON: ${ndjson}"
+    return 1
+  fi
+
+  local pairs_json total
+  pairs_json=$(echo "$result" | jq -c '[.[] | select(.taxonomy != null and .taxonomy != "" and .slug != null and .slug != "") | {taxonomy, slug}] | unique')
+  total=$(echo "$pairs_json" | jq 'length')
+  if [ "$total" -eq 0 ]; then
+    echo "TAX_TERMS:0:0"
+    return 0
+  fi
+
+  local payload_json remote_path
+  payload_json=$(jq -n --argjson pairs "$pairs_json" '{pairs: $pairs}')
+  remote_path=$(graft_push_remap_payload "$run_dir" "$payload_json" "sitegraft-verify-taxonomy-terms-payload.json")
+
+  # `&&`/`||`, not a bare assignment -- same reasoning verify_domain_absent's
+  # own identical eval call gives (this file, above): a failing wp_remote
+  # call must be exempt from bin/sitegraft's `set -e` so $rc genuinely
+  # reflects the call's real exit status.
+  local out rc2
+  out=$(wp_remote b eval '
+    $payload_path = WP_CONTENT_DIR . "/sitegraft-verify-taxonomy-terms-payload.json";
+    $payload = json_decode( file_get_contents( $payload_path ), true );
+    if ( ! $payload || ! isset( $payload["pairs"] ) ) { echo "ERROR:unreadable-payload"; return; }
+    $missing = array();
+    foreach ( $payload["pairs"] as $pair ) {
+      $taxonomy = (string) $pair["taxonomy"];
+      $slug = (string) $pair["slug"];
+      $term = get_term_by( "slug", $slug, $taxonomy );
+      if ( false === $term ) {
+        $missing[] = $taxonomy . ":" . $slug;
+      }
+    }
+    echo empty( $missing ) ? "OK" : ( "MISSING:" . implode( ",", $missing ) );
+  ' 2>/dev/null) && rc2=0 || rc2=$?
+  graft_remove_file b "$remote_path" 2>/dev/null || true
+
+  if [ "$rc2" -ne 0 ]; then
+    log_error "could not confirm taxonomy term completeness on B (eval failed) — treated as UNKNOWN, never as a silent pass"
+    return 1
+  fi
+
+  case "$out" in
+    OK)
+      echo "TAX_TERMS:${total}:0"
+      return 0
+      ;;
+    MISSING:*)
+      local missing_list missing_count
+      missing_list="${out#MISSING:}"
+      missing_count=$(printf '%s' "$missing_list" | awk -F',' '{print NF}')
+      log_error "the staged WXR export declares ${missing_count} of ${total} taxonomy term(s) that do not exist on B under the same taxonomy+slug: ${missing_list} — if the taxonomy itself is not registered on B, wordpress-importer silently dropped these terms (and every relationship to them) during the WXR import: the same ordering defect issue #16 closed for post types, one level up (the option that defines the taxonomy must reach B before 'wp import' runs — see modules/etch.sh's etch_taxonomy_defining_option_keys, and lib/graft.sh's graft_migrate_taxonomy_defining_options). Refusing to report success."
+      echo "TAX_TERMS:${total}:${missing_count}"
+      return 1
+      ;;
+    *)
+      log_error "taxonomy-term completeness check on B returned an unrecognized result: ${out}"
+      return 1
+      ;;
+  esac
+}
+
 # _verify_wxr_items_remapped <run_dir> <id_map_tsv> <manifest_json> — issue
 # #52 shared helper behind both content-equality guards below. Parses A's
 # already-exported WXR file(s) (${run_dir}/export/*.xml, written by
@@ -2566,6 +2708,59 @@ phase_verify() {
         ;;
       *)
         echo "- [ ] **HARD FAIL: could not verify migrated content's component-prop id references against B (query failed, or a call site's JSON did not parse)** — see above" >> "$report"
+        ;;
+    esac
+    hard_fail=1
+  fi
+
+  # --- issue #82: taxonomy term completeness. #53's own item-count
+  # completeness gate (graft_verify_import_completeness, lib/graft.sh)
+  # cannot see a post whose taxonomy terms were silently dropped -- the
+  # post itself still lands, so the item count matches. This guard reads
+  # the staged WXR's own declared (taxonomy, slug) pairs and confirms each
+  # one exists on B, right now -- see verify_taxonomy_terms_present's own
+  # header for why this is the ONE question that stays correct regardless
+  # of ordering (checking registration alone would not). Three-valued: 0 =
+  # verified, 1 = HARD FAIL, 2 = UNVERIFIED (something was selected for a
+  # WXR import but the staged export itself is gone), same shape as
+  # verify_component_prop_references_resolve's own rc==0/rc==2/else just
+  # above. -------------------------------------------------------------------
+  local tax_terms_output="" tax_terms_rc=0
+  tax_terms_output=$(verify_taxonomy_terms_present "$run_dir" "$manifest" 2>>"$report") || tax_terms_rc=$?
+  if [ "$tax_terms_rc" -eq 0 ]; then
+    case "$tax_terms_output" in
+      *TAX_TERMS:*)
+        local tt_summary="${tax_terms_output##*TAX_TERMS:}"
+        local tt_checked tt_missing
+        tt_checked=$(echo "$tt_summary" | cut -d: -f1)
+        tt_missing=$(echo "$tt_summary" | cut -d: -f2)
+        if [ "$tt_checked" -eq 0 ]; then
+          echo "- [x] taxonomy terms (issue #82) declared by the staged WXR export exist on B (0 found to check)" >> "$report"
+        else
+          echo "- [x] taxonomy terms (issue #82) declared by the staged WXR export exist on B (${tt_checked} checked, ${tt_missing} missing)" >> "$report"
+        fi
+        ;;
+      *)
+        echo "- [ ] taxonomy terms present on B: **UNVERIFIED — the check reported success without saying which of its outcomes applied** (a success path added without its marker — see lib/verify.sh's verify_taxonomy_terms_present)" >> "$report"
+        incomplete=$((incomplete + 1))
+        incomplete_names="${incomplete_names}taxonomy-terms "
+        ;;
+    esac
+  elif [ "$tax_terms_rc" -eq 2 ]; then
+    echo "- [ ] taxonomy terms present on B: **UNVERIFIED — post type(s) were selected for migration but no staged WXR export exists to check taxonomy term completeness against** — see above" >> "$report"
+    incomplete=$((incomplete + 1))
+    incomplete_names="${incomplete_names}taxonomy-terms "
+  else
+    case "$tax_terms_output" in
+      *TAX_TERMS:*)
+        local ttf_summary="${tax_terms_output##*TAX_TERMS:}"
+        local ttf_checked ttf_missing
+        ttf_checked=$(echo "$ttf_summary" | cut -d: -f1)
+        ttf_missing=$(echo "$ttf_summary" | cut -d: -f2)
+        echo "- [ ] **HARD FAIL: the staged WXR export declares taxonomy term(s) that do not exist on B** (${ttf_checked} checked, ${ttf_missing} missing) — see above" >> "$report"
+        ;;
+      *)
+        echo "- [ ] **HARD FAIL: could not verify taxonomy term completeness against B (query failed, or the staged export could not be parsed)** — see above" >> "$report"
         ;;
     esac
     hard_fail=1
