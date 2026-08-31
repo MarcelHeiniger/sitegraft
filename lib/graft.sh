@@ -385,7 +385,13 @@ graft_sync_stack() {
     graft_copy_wp_content_dir "$rel_dir" "${run_dir}/stack-staging/${component}"
 
     if [ "$component" = "theme" ]; then
-      graft_sync_theme_parent "$slug" "$run_dir"
+      # Explicit `|| return 1`, not left to ambient `set -e`: this call sits
+      # inside a `while` loop body, and issue #20's audit made
+      # graft_sync_theme_parent capable of a real failure (it used to only
+      # ever return 0) — a caller that doesn't check it would activate the
+      # child theme below with its parent never copied, the exact defect
+      # this whole helper exists to prevent.
+      graft_sync_theme_parent "$slug" "$run_dir" || return 1
       run_or_echo wp_remote b theme activate "$slug"
     else
       run_or_echo wp_remote b plugin activate "$slug"
@@ -458,11 +464,23 @@ graft_sync_theme_parent() {
   # run_or_echo, as it must: that one is a write, and a dry run has to
   # simulate it.
   local saved_dry_run="${SITEGRAFT_DRY_RUN:-0}"
-  local parent b_themes
+  local parent b_themes parent_rc=0 b_themes_rc=0
   SITEGRAFT_DRY_RUN=0
-  parent=$(wp_remote a eval "echo wp_get_theme('${child_slug}')->get_template();" 2>/dev/null || true)
-  b_themes=$(wp_remote b theme list --field=name 2>/dev/null || true)
+  parent=$(wp_remote a eval "echo wp_get_theme('${child_slug}')->get_template();" 2>/dev/null) || parent_rc=$?
+  b_themes=$(wp_remote b theme list --field=name 2>/dev/null) || b_themes_rc=$?
   SITEGRAFT_DRY_RUN="$saved_dry_run"
+
+  # issue #20 audit: this used to be `... || true` on both reads, so a real
+  # failure (A unreachable mid-run, B's theme list erroring) came back as the
+  # same empty string as "this theme genuinely has no parent" below —
+  # silently skipping the parent-theme copy instead of refusing to guess.
+  # Same family as the front-page check's "or A never configured one":
+  # "could not determine" and "there is nothing to find" are different facts
+  # and must not collapse into one success path.
+  if [ "$parent_rc" -ne 0 ] || [ "$b_themes_rc" -ne 0 ]; then
+    log_error "graft: could not determine whether '${child_slug}' is a child theme (wp_get_theme() on A, or B's theme list, failed) -- refusing to guess whether a parent theme copy is needed. Check that A and B are reachable and re-run 'sitegraft graft --run ${run_dir}'."
+    return 1
+  fi
 
   parent=$(printf '%s' "$parent" | tr -d '\r' | tr -d '\n')
   b_themes=$(printf '%s' "$b_themes" | tr -d '\r')

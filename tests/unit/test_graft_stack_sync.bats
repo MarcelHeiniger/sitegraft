@@ -51,9 +51,66 @@ setup() {
   mkdir -p "$run_dir"
   local manifest='{"stack":{"theme":{"slug_a":"etch-theme","slug_b":null,"version_a":"1.0","version_b":null,"resolution":"copy"}}}'
   SITE_A_WP_PATH="/site-a"; SITE_B_WP_PATH="/site-b"; SITEGRAFT_DRY_RUN=1
+  # graft_sync_theme_parent (called for the "theme" component) makes real,
+  # non-dry-run reads regardless of SITEGRAFT_DRY_RUN — stub wp_get_theme()
+  # returning etch-theme's own slug, i.e. "not a child theme", the same
+  # convention test_graft_fontstep.bats uses for graft_font_dir.
+  wp_remote() {
+    local alias_lc="$1"; shift
+    case "$alias_lc:$1" in
+      a:eval) echo "etch-theme" ;;
+      b:theme) echo "etch-theme" ;;
+      *) echo "UNEXPECTED wp_remote CALL: $alias_lc $*" >&2; return 1 ;;
+    esac
+  }
   run graft_sync_stack "$run_dir" "$manifest"
+  [ "$status" -eq 0 ]
   [[ "$output" == *"wp-content/themes/etch-theme"* ]] || false
   [[ "$output" == *"theme activate etch-theme"* ]]
+}
+
+# issue #20 audit: graft_sync_theme_parent used to swallow a real wp_remote
+# failure (A unreachable, B's theme list erroring) with `|| true`, reading
+# back as an empty string — identically to "this theme genuinely has no
+# parent" (case ''|"$child_slug") return 0). Both facts used to reach the
+# exact same silent success. Fixed to distinguish "could not determine" from
+# "there is nothing to find", same family as the front-page check's "or A
+# never configured one" (design doc / CLAUDE.md's first convention).
+@test "graft_sync_theme_parent fails closed when it cannot determine A's parent theme, never silently skips the copy" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  wp_remote() {
+    local alias_lc="$1"; shift
+    [ "$alias_lc" = "a" ] || { echo "UNEXPECTED ALIAS: $alias_lc" >&2; return 1; }
+    return 1  # simulates A unreachable / wp eval failing
+  }
+  run graft_sync_theme_parent "child-theme" "$run_dir"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"could not determine whether 'child-theme' is a child theme"* ]] || false
+}
+
+@test "graft_sync_theme_parent fails closed when it cannot read B's theme list, never silently skips the copy" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  wp_remote() {
+    local alias_lc="$1"; shift
+    if [ "$alias_lc" = "a" ]; then echo "some-parent"; return 0; fi
+    return 1  # simulates B's theme list query failing
+  }
+  run graft_sync_theme_parent "child-theme" "$run_dir"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"could not determine whether 'child-theme' is a child theme"* ]] || false
+}
+
+@test "graft_sync_stack propagates graft_sync_theme_parent's failure instead of activating the theme with no parent copied" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  local manifest='{"stack":{"theme":{"slug_a":"child-theme","slug_b":null,"version_a":"1.0","version_b":null,"resolution":"copy"}}}'
+  SITE_A_WP_PATH="/site-a"; SITE_B_WP_PATH="/site-b"; SITEGRAFT_DRY_RUN=1
+  wp_remote() { return 1; }  # every real read this needs fails
+  run graft_sync_stack "$run_dir" "$manifest"
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"theme activate child-theme"* ]] || false
 }
 
 @test "graft_sync_stack treats a component name containing a space as ONE component, not two word-split fragments (issue #40)" {
