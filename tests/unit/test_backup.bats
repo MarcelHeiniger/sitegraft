@@ -1997,10 +1997,108 @@ exec "$@"')
   [ -f "${B_ROOT}/wp-content/index.php" ]
 }
 
+# _strip_bash_comments <file> — prints <file> with each line's comment
+# portion (a `#` outside single/double quotes, and not escaped by a
+# preceding `\` while outside single quotes, through end of line) removed.
+# issue #92: the self-containment check below greps restore.sh for repo
+# references, but a reference inside a COMMENT is the harmless case by
+# definition — it never executes, and naming the sitegraft function a step
+# came from is exactly the context an operator wants when reading this
+# script in a crisis. Quote-aware (not just "strip from first #") so an
+# operator-supplied path or literal that happens to contain a bare `#`
+# (baked in via sq()'s single quotes, or inside a double-quoted
+# interpolation) is not itself mistaken for a comment start.
+#
+# Backslash-aware (Viktor's review, issue #92 PR): sq() (lib/inventory.sh)
+# encodes an embedded `'` inside a single-quoted value as `'\''` — close
+# quote, escaped literal quote, re-open quote. A naive quote-toggle on
+# every `'` mis-reads that 4-char idiom as 4 toggles instead of the 3
+# effective state changes bash's own tokenizer sees, landing the parser
+# "outside quotes" in the middle of what is actually still quoted data —
+# which can turn a genuine executable reference sitting later on the same
+# line into what looks like inert stripped comment text, WEAKENING this
+# check instead of just correcting its granularity. A `\` immediately
+# before a quote character, while outside single quotes (single quotes in
+# POSIX/bash take everything literally, including backslashes -- a `\`
+# never escapes anything inside them), is treated as escaping that
+# character rather than toggling state, mirroring bash's own tokenizer.
+_strip_bash_comments() {
+  awk '
+  {
+    line = $0
+    insq = 0; indq = 0
+    out = ""
+    n = length(line)
+    for (i = 1; i <= n; i++) {
+      c = substr(line, i, 1)
+      if (c == "\\" && insq == 0 && i < n) {
+        out = out c substr(line, i + 1, 1)
+        i++
+        continue
+      }
+      if (c == "\047" && indq == 0) { insq = !insq; out = out c; continue }
+      if (c == "\"" && insq == 0) { indq = !indq; out = out c; continue }
+      if (c == "#" && insq == 0 && indq == 0) { break }
+      out = out c
+    }
+    print out
+  }
+  ' "$1"
+}
+
+# _restore_self_containment_violations <file> — the self-containment check
+# itself: strips comments (see _strip_bash_comments above), then greps the
+# remaining CODE for a sitegraft function or lib reference. grep's exit
+# status is the function's: 0 (violation found) when <file> is NOT
+# self-contained, 1 when it is clean.
+_restore_self_containment_violations() {
+  _strip_bash_comments "$1" | grep -Ei 'wp_remote|sitegraft_|backup_checksum|backup_write_wp_content_manifest|phase_backup|phase_restore|^[[:space:]]*\.[[:space:]]+.*lib/|^[[:space:]]*source[[:space:]]+.*lib/'
+}
+
 @test "the generated restore.sh stays self-contained: the prune logic adds no sitegraft function or lib reference" {
   _wrapped_fixture
-  run grep -Ei 'wp_remote|sitegraft_|backup_checksum|backup_write_wp_content_manifest|phase_backup|phase_restore|^[[:space:]]*\.[[:space:]]+.*lib/|^[[:space:]]*source[[:space:]]+.*lib/' "${RUN_DIR}/restore.sh"
+  run _restore_self_containment_violations "${RUN_DIR}/restore.sh"
   [ "$status" -ne 0 ]
+}
+
+# issue #92, direction 1: a comment naming a repo function must NOT fail the
+# check — it is inert prose, never executed.
+@test "the generated restore.sh's self-containment check tolerates a comment naming a repo function (issue #92)" {
+  _wrapped_fixture
+  printf '\n# calls backup_wp_content (lib/backup.sh) via sitegraft_mktemp_dir for its tmp dir\n' >> "${RUN_DIR}/restore.sh"
+  run _restore_self_containment_violations "${RUN_DIR}/restore.sh"
+  [ "$status" -ne 0 ]
+}
+
+# issue #92, direction 2: comment-stripping must not create a false negative
+# — a genuine EXECUTABLE reference to a repo function still fails the check.
+@test "the generated restore.sh's self-containment check still catches a genuine executable reference to a repo function (issue #92)" {
+  _wrapped_fixture
+  printf '\nsitegraft_mktemp_dir\n' >> "${RUN_DIR}/restore.sh"
+  run _restore_self_containment_violations "${RUN_DIR}/restore.sh"
+  [ "$status" -eq 0 ]
+}
+
+# issue #92, direction 3 (Viktor's review): the comment-stripper must not be
+# fooled by sq()'s own escaped-apostrophe idiom into treating a live
+# reference as stripped comment text. sq() encodes an embedded `'` as
+# `'\''` -- close-quote, escaped-literal-quote, re-open-quote. A naive
+# quote-toggle-on-every-apostrophe reading of that 4-char sequence lands
+# "outside quotes" in the middle of what bash's own tokenizer still
+# considers quoted data, turning a genuine `#` inside that data into a
+# false comment-start -- and everything after it, including a real
+# executable reference on the same line, gets silently discarded before
+# grep ever sees it. This reproduces exactly that shape: an operator-style
+# value containing both an embedded apostrophe and a `#`, sq()-quoted the
+# way backup_generate_restore_script actually emits it, immediately
+# followed on the same line by a real reference.
+@test "the generated restore.sh's self-containment check is not fooled by sq()'s escaped-apostrophe idiom into missing a same-line reference (issue #92)" {
+  _wrapped_fixture
+  local quoted
+  quoted=$(sq "/home/client's #2 backup archive")
+  printf '\nX=%s ; sitegraft_mktemp_dir\n' "$quoted" >> "${RUN_DIR}/restore.sh"
+  run _restore_self_containment_violations "${RUN_DIR}/restore.sh"
+  [ "$status" -eq 0 ]
 }
 
 # --- fail closed: a manifest that cannot be believed ---
