@@ -3767,6 +3767,95 @@ EOF
   ! grep -qF -- "[x] component-prop id references" "${RUN_DIR}/verify-report.md"
 }
 
+# --- phase_verify + verify_taxonomy_terms_present (issue #82, end-to-end) --
+# The base fixture's own "--fields=ID,post_content" pre-filter (every
+# wp_remote stub in this file inherits the same first line) already
+# short-circuits verify_id_references_resolve/verify_component_prop_
+# references_resolve to "nothing to check" regardless of id-map.tsv's
+# content -- so id-map.tsv is left untouched here (keeping the base
+# fixture's own page_on_front mapping intact) and the ONLY "eval" dispatch
+# either test's wp_remote stub needs to answer is this guard's own.
+
+@test "phase_verify's taxonomy-terms line reports a real count and stays a PASS when every declared term resolves on B (issue #82)" {
+  setup_phase_verify_fixture
+  SITEGRAFT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
+  export SITEGRAFT_ROOT
+  command -v php >/dev/null 2>&1 || skip "php CLI not available in this environment"
+
+  mkdir -p "${RUN_DIR}/export"
+  cat > "${RUN_DIR}/export/one.xml" <<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+  xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/"
+  xmlns:content="http://purl.org/rss/1.0/modules/content/"
+  xmlns:wp="http://wordpress.org/export/1.2/">
+<channel>
+<wp:wxr_version>1.2</wp:wxr_version>
+<wp:term><wp:term_id>1</wp:term_id><wp:term_taxonomy>etch_gallery</wp:term_taxonomy><wp:term_slug>landscapes</wp:term_slug><wp:term_name><![CDATA[Landscapes]]></wp:term_name></wp:term>
+</channel>
+</rss>
+XML
+
+  graft_push_remap_payload() { echo "/fake/remote/tax-payload.json"; }
+  graft_remove_file() { :; }
+  wp_remote() {
+    for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
+    local alias_lc="$1"; shift
+    case "$1" in
+      eval) echo "OK" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      db) echo "" ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 0 ]
+  grep -qF -- "- [x] taxonomy terms (issue #82) declared by the staged WXR export exist on B (1 checked, 0 missing)" "${RUN_DIR}/verify-report.md"
+}
+
+@test "phase_verify HARD FAILS when the staged WXR export declares a taxonomy term that does not exist on B (issue #82's own defect)" {
+  setup_phase_verify_fixture
+  SITEGRAFT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
+  export SITEGRAFT_ROOT
+  command -v php >/dev/null 2>&1 || skip "php CLI not available in this environment"
+
+  : > "${RUN_DIR}/id-map.tsv"
+  mkdir -p "${RUN_DIR}/export"
+  cat > "${RUN_DIR}/export/one.xml" <<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+  xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/"
+  xmlns:content="http://purl.org/rss/1.0/modules/content/"
+  xmlns:wp="http://wordpress.org/export/1.2/">
+<channel>
+<wp:wxr_version>1.2</wp:wxr_version>
+<wp:term><wp:term_id>1</wp:term_id><wp:term_taxonomy>etch_gallery</wp:term_taxonomy><wp:term_slug>landscapes</wp:term_slug><wp:term_name><![CDATA[Landscapes]]></wp:term_name></wp:term>
+</channel>
+</rss>
+XML
+
+  graft_push_remap_payload() { echo "/fake/remote/tax-payload.json"; }
+  graft_remove_file() { :; }
+  wp_remote() {
+    for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
+    local alias_lc="$1"; shift
+    case "$1" in
+      eval) echo "MISSING:etch_gallery:landscapes" ;;
+      option) echo "105" ;;
+      post) return 0 ;;
+      db) echo "" ;;
+      *) echo "" ;;
+    esac
+  }
+  graft_check_orphan_parents() { echo ""; }
+  run phase_verify --profile t --run "$RUN_DIR"
+  [ "$status" -eq 1 ]
+  grep -q "Result: HARD FAIL" "${RUN_DIR}/verify-report.md"
+  grep "HARD FAIL" "${RUN_DIR}/verify-report.md" | grep -qi "taxonomy term"
+}
+
 # --- phase_verify + content guards (issue #52, end-to-end) ------------------
 # Real WXR parsing, real php driver (lib/php/verify-content-remap-cli.php),
 # real backup_content_checksum_of_row — the highest-fidelity proof available

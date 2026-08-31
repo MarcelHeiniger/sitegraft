@@ -996,6 +996,7 @@ _issue16_stub_everything_but_ordering() {
   graft_fonts_sync() { :; }
   graft_deploy_mu_plugin() { :; }
   graft_migrate_post_type_defining_options() { echo "ORDER: register_post_type_options"; }
+  graft_migrate_taxonomy_defining_options() { echo "ORDER: register_taxonomy_options"; }
   graft_prune_previous_run() { :; }
   graft_import_attachments() { :; }
   graft_ensure_importer() { :; }
@@ -1050,6 +1051,38 @@ MANIFESTEOF
   [ "$import_line" -lt "$migrate_line" ]
 }
 
+@test "phase_graft calls graft_migrate_taxonomy_defining_options before graft_import_wxr, and before graft_migrate_options (issue #82 — the fix IS this ordering, same shape as issue #16)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  touch "${run_dir}/backup.complete"
+  cat > "${run_dir}/manifest.json" <<'MANIFESTEOF'
+{"migrate":{"etch":{"post_types":["page"],"option_keys":["etch_taxonomies"]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}
+MANIFESTEOF
+
+  _issue16_stub_everything_but_ordering
+
+  # Same SITEGRAFT_DRY_RUN=1 reasoning as the issue #16 ordering test just
+  # above -- irrelevant to the ordering under test, every function this
+  # test cares about is stubbed to unconditionally echo.
+  SITEGRAFT_DRY_RUN=1
+  run phase_graft --profile demo --run "$run_dir" --dry-run
+  [ "$status" -eq 0 ]
+
+  local register_line=-1 import_line=-1 migrate_line=-1 i
+  for i in "${!lines[@]}"; do
+    case "${lines[$i]}" in
+      "ORDER: register_taxonomy_options") register_line=$i ;;
+      "ORDER: import") import_line=$i ;;
+      "ORDER: migrate_options") migrate_line=$i ;;
+    esac
+  done
+  [ "$register_line" -ge 0 ]
+  [ "$import_line" -ge 0 ]
+  [ "$migrate_line" -ge 0 ]
+  [ "$register_line" -lt "$import_line" ]
+  [ "$import_line" -lt "$migrate_line" ]
+}
+
 # --- BLOCKER (issue #16 fix-pack review, Viktor): moving domain_from/
 # domain_to and graft_verify_domain_remap_usable's own `|| return 1` ahead
 # of `SITEGRAFT_GRAFT_RUN_DIR="$run_dir"; trap _graft_exit_trap EXIT` (as
@@ -1077,6 +1110,7 @@ _issue16_stub_everything_but_trap_and_domain_check() {
   graft_media_sync() { echo "STUB: graft_media_sync called -- should NOT happen"; }
   graft_deploy_mu_plugin() { echo "STUB: graft_deploy_mu_plugin called -- should NOT happen"; }
   graft_migrate_post_type_defining_options() { echo "STUB: graft_migrate_post_type_defining_options called -- should NOT happen"; }
+  graft_migrate_taxonomy_defining_options() { echo "STUB: graft_migrate_taxonomy_defining_options called -- should NOT happen"; }
   graft_prune_previous_run() { echo "STUB: graft_prune_previous_run called -- should NOT happen"; }
   graft_import_attachments() { echo "STUB: graft_import_attachments called -- should NOT happen"; }
   graft_ensure_importer() { echo "STUB: graft_ensure_importer called -- should NOT happen"; }
@@ -1157,6 +1191,7 @@ _issue36_stub_everything_but_ordering() {
   graft_check_stack_precondition() { return 0; }
   graft_deploy_mu_plugin() { :; }
   graft_migrate_post_type_defining_options() { :; }
+  graft_migrate_taxonomy_defining_options() { :; }
   graft_prune_previous_run() { echo "ORDER: prune"; }
   graft_media_sync() { echo "ORDER: media_sync"; }
   graft_fonts_sync() { echo "ORDER: fonts_sync"; }

@@ -126,8 +126,39 @@ function sitegraft_parse_wxr_items_from_file( $file_path ) {
 }
 
 /**
- * sitegraft_stream_wxr_items_from_string( string $xml_string, callable $emit, &$items_seen = null ): bool
- * sitegraft_stream_wxr_items_from_file( string $file_path, callable $emit, &$items_seen = null ): bool
+ * sitegraft_parse_wxr_terms_from_file( string $file_path ): array|false
+ *
+ * issue #82. The <wp:term> sibling of sitegraft_parse_wxr_items_from_file
+ * above — a WXR export's own top-level, per-taxonomy term definitions
+ * (`<wp:term><wp:term_taxonomy>…</wp:term_taxonomy><wp:term_slug>…
+ * </wp:term_slug><wp:term_name>…</wp:term_name></wp:term>`), NOT the
+ * per-<item> `<category>` tags _sitegraft_wxr_item_from_node does not
+ * read either. This is what lib/php/wxr-taxonomies-cli.php (behind
+ * lib/verify.sh's verify_taxonomy_terms_present) reads to learn exactly
+ * which (taxonomy, slug) pairs THIS export declares — a question a
+ * plugin's own option shape (e.g. Etch's etch_taxonomies) cannot answer
+ * for a check that has to stay plugin-agnostic. Same array-or-false
+ * contract as the item functions: `false` only when the document itself
+ * could not be parsed at all, never for a document that parsed fine and
+ * genuinely has zero <wp:term> elements.
+ */
+function sitegraft_parse_wxr_terms_from_file( $file_path ) {
+	$terms = array();
+	$items_seen = null;
+	$ok = sitegraft_stream_wxr_items_from_file(
+		$file_path,
+		function ( $item ) {},
+		$items_seen,
+		function ( $term ) use ( &$terms ) {
+			$terms[] = $term;
+		}
+	);
+	return $ok ? $terms : false;
+}
+
+/**
+ * sitegraft_stream_wxr_items_from_string( string $xml_string, callable $emit, &$items_seen = null, callable $emit_term = null ): bool
+ * sitegraft_stream_wxr_items_from_file( string $file_path, callable $emit, &$items_seen = null, callable $emit_term = null ): bool
  *
  * The actual streaming entry points: $emit is called once per WELL-FORMED
  * <item> (one carrying both wp:post_id and wp:post_type — see
@@ -159,8 +190,20 @@ function sitegraft_parse_wxr_items_from_file( $file_path ) {
  * driver internally always initializes it to `0` regardless, so a
  * caller that DOES pass one never reads an uninitialized value even on a
  * document with zero items or an early failure.
+ *
+ * $emit_term (issue #82) — optional, additive, `null` by default: called
+ * once per <wp:term> element that carries a non-empty wp:term_taxonomy,
+ * with `['taxonomy' => …, 'slug' => …, 'name' => …]` (slug/name default to
+ * '' when genuinely absent). A <wp:term> with no wp:term_taxonomy at all is
+ * not a term this driver can act on and is skipped, same "don't guess"
+ * refusal _sitegraft_wxr_item_from_node applies to a malformed <item> —
+ * unlike $items_seen's item-count invariant, there is no security gate
+ * built on term completeness, so no $terms_seen counterpart exists (or is
+ * needed) for this callback. Every existing caller that does not pass one
+ * is unaffected — <wp:term> elements are simply skipped over exactly as
+ * they always were before this parameter existed.
  */
-function sitegraft_stream_wxr_items_from_string( $xml_string, callable $emit, &$items_seen = null ) {
+function sitegraft_stream_wxr_items_from_string( $xml_string, callable $emit, &$items_seen = null, ?callable $emit_term = null ) {
 	// PHP 8's XMLReader::XML() throws a ValueError (a real fatal, not
 	// something `@` silences) on an empty string rather than simply
 	// failing to open -- guarded explicitly so "empty input" fails closed
@@ -172,15 +215,15 @@ function sitegraft_stream_wxr_items_from_string( $xml_string, callable $emit, &$
 	$reader = new XMLReader();
 	$previous = libxml_use_internal_errors( true );
 	$opened = @$reader->XML( $xml_string, null, LIBXML_NONET );
-	return _sitegraft_stream_wxr_reader( $reader, $opened, $previous, $emit, $items_seen );
+	return _sitegraft_stream_wxr_reader( $reader, $opened, $previous, $emit, $items_seen, $emit_term );
 }
 
-function sitegraft_stream_wxr_items_from_file( $file_path, callable $emit, &$items_seen = null ) {
+function sitegraft_stream_wxr_items_from_file( $file_path, callable $emit, &$items_seen = null, ?callable $emit_term = null ) {
 	$items_seen = 0;
 	$reader = new XMLReader();
 	$previous = libxml_use_internal_errors( true );
 	$opened = @$reader->open( (string) $file_path, null, LIBXML_NONET );
-	return _sitegraft_stream_wxr_reader( $reader, $opened, $previous, $emit, $items_seen );
+	return _sitegraft_stream_wxr_reader( $reader, $opened, $previous, $emit, $items_seen, $emit_term );
 }
 
 /**
@@ -207,7 +250,7 @@ function sitegraft_stream_wxr_items_from_file( $file_path, callable $emit, &$ite
  * LIBXML_ERR_FATAL (level 3 — the document is genuinely unusable past
  * this point) fails the parse now.
  */
-function _sitegraft_stream_wxr_reader( XMLReader $reader, $opened, $previous_error_setting, callable $emit, &$items_seen = null ) {
+function _sitegraft_stream_wxr_reader( XMLReader $reader, $opened, $previous_error_setting, callable $emit, &$items_seen = null, ?callable $emit_term = null ) {
 	if ( null === $items_seen ) {
 		$items_seen = 0;
 	}
@@ -288,6 +331,43 @@ function _sitegraft_stream_wxr_reader( XMLReader $reader, $opened, $previous_err
 			// the top of the loop must NOT also call read() here, or a
 			// tightly adjacent next <item> (no node between the two) gets
 			// stepped over and silently dropped (issue #70).
+			$advanced = @$reader->next();
+			continue;
+		}
+		// issue #82: <wp:term> is a <channel>-level sibling of <item>,
+		// never nested inside one -- same namespaced-element shape as the
+		// <item> branch above (WXR 1.2's own wp: namespace URI, see this
+		// file's own header), so it gets the identical next()/continue
+		// treatment for the identical reason (issue #70: a `read()` at the
+		// top of the loop here too would double-advance past a tightly
+		// adjacent sibling with nothing between the two). Only examined at
+		// all when a caller actually passed $emit_term -- every existing
+		// caller before this parameter existed leaves <wp:term> elements
+		// exactly as unvisited as they always were.
+		if ( null !== $emit_term
+			&& $reader->nodeType === XMLReader::ELEMENT
+			&& $reader->localName === 'term'
+			&& $reader->namespaceURI === 'http://wordpress.org/export/1.2/' ) {
+			$node = @$reader->expand();
+			if ( $node instanceof DOMNode ) {
+				$taxonomy = _sitegraft_wxr_child_text( $node, 'http://wordpress.org/export/1.2/', 'term_taxonomy' );
+				// No wp:term_taxonomy at all is not a term this driver's
+				// only consumer (the taxonomy-completeness guard) can act
+				// on -- skipped, not guessed at, same discipline
+				// _sitegraft_wxr_item_from_node applies to an <item>
+				// missing wp:post_id/wp:post_type.
+				if ( null !== $taxonomy && '' !== trim( $taxonomy ) ) {
+					$slug = _sitegraft_wxr_child_text( $node, 'http://wordpress.org/export/1.2/', 'term_slug' );
+					$name = _sitegraft_wxr_child_text( $node, 'http://wordpress.org/export/1.2/', 'term_name' );
+					$emit_term(
+						array(
+							'taxonomy' => trim( $taxonomy ),
+							'slug'     => null !== $slug ? trim( $slug ) : '',
+							'name'     => null !== $name ? $name : '',
+						)
+					);
+				}
+			}
 			$advanced = @$reader->next();
 			continue;
 		}

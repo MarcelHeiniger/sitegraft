@@ -484,3 +484,79 @@ XML
   run jq -e '.ok == true and .seen == 2 and .emitted == 1' <<< "$output"
   [ "$status" -eq 0 ]
 }
+
+# --- issue #82: sitegraft_parse_wxr_terms_from_file / $emit_term -----------
+
+@test "sitegraft_parse_wxr_terms_from_file extracts taxonomy, slug and name from <wp:term> elements" {
+  local xml_file="$BATS_TEST_TMPDIR/terms.xml"
+  wxr_wrap '<wp:term><wp:term_id>5</wp:term_id><wp:term_taxonomy>etch_gallery</wp:term_taxonomy><wp:term_slug>landscapes</wp:term_slug><wp:term_name><![CDATA[Landscapes]]></wp:term_name></wp:term>' > "$xml_file"
+  run php -r "
+    require '${PHP_LIB}';
+    echo json_encode(sitegraft_parse_wxr_terms_from_file('${xml_file}'));
+  "
+  [ "$status" -eq 0 ]
+  run jq -e '. == [{"taxonomy":"etch_gallery","slug":"landscapes","name":"Landscapes"}]' <<< "$output"
+  [ "$status" -eq 0 ]
+}
+
+@test "sitegraft_parse_wxr_terms_from_file returns an empty array, not false, for a well-formed document with zero <wp:term> elements" {
+  local xml_file="$BATS_TEST_TMPDIR/no-terms.xml"
+  wxr_wrap '<item><wp:post_id>1</wp:post_id><wp:post_type>page</wp:post_type></item>' > "$xml_file"
+  run php -r "
+    require '${PHP_LIB}';
+    echo json_encode(sitegraft_parse_wxr_terms_from_file('${xml_file}'));
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "[]" ]
+}
+
+@test "sitegraft_parse_wxr_terms_from_file returns false (never []) on a document that fails to parse at all" {
+  local xml_file="$BATS_TEST_TMPDIR/malformed.xml"
+  printf 'not xml' > "$xml_file"
+  run php -r "
+    require '${PHP_LIB}';
+    echo json_encode(sitegraft_parse_wxr_terms_from_file('${xml_file}'));
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "false" ]
+}
+
+@test "sitegraft_parse_wxr_terms_from_file skips a <wp:term> with no wp:term_taxonomy rather than guessing" {
+  local xml_file="$BATS_TEST_TMPDIR/orphan-term.xml"
+  wxr_wrap '<wp:term><wp:term_id>5</wp:term_id><wp:term_slug>orphan</wp:term_slug><wp:term_name><![CDATA[Orphan]]></wp:term_name></wp:term>' > "$xml_file"
+  run php -r "
+    require '${PHP_LIB}';
+    echo json_encode(sitegraft_parse_wxr_terms_from_file('${xml_file}'));
+  "
+  [ "$status" -eq 0 ]
+  [ "$output" = "[]" ]
+}
+
+@test "sitegraft_parse_wxr_terms_from_file does not drop a <wp:term> and an <item> adjacent with no whitespace between them" {
+  local xml_file="$BATS_TEST_TMPDIR/adjacent.xml"
+  wxr_wrap '<item><wp:post_id>1</wp:post_id><wp:post_type>page</wp:post_type></item><wp:term><wp:term_id>5</wp:term_id><wp:term_taxonomy>category</wp:term_taxonomy><wp:term_slug>news</wp:term_slug><wp:term_name><![CDATA[News]]></wp:term_name></wp:term>' > "$xml_file"
+  run php -r "
+    require '${PHP_LIB}';
+    \$items = sitegraft_parse_wxr_items_from_file('${xml_file}');
+    \$terms = sitegraft_parse_wxr_terms_from_file('${xml_file}');
+    echo json_encode(['items' => count(\$items), 'terms' => count(\$terms)]);
+  "
+  [ "$status" -eq 0 ]
+  run jq -e '.items == 1 and .terms == 1' <<< "$output"
+  [ "$status" -eq 0 ]
+}
+
+@test "sitegraft_stream_wxr_items_from_file never visits <wp:term> elements when no \$emit_term callback is passed (every pre-existing caller)" {
+  local xml_file="$BATS_TEST_TMPDIR/terms-and-items.xml"
+  wxr_wrap '<item><wp:post_id>1</wp:post_id><wp:post_type>page</wp:post_type></item>
+<wp:term><wp:term_id>5</wp:term_id><wp:term_taxonomy>category</wp:term_taxonomy><wp:term_slug>news</wp:term_slug><wp:term_name><![CDATA[News]]></wp:term_name></wp:term>' > "$xml_file"
+  run php -r "
+    require '${PHP_LIB}';
+    \$items = array();
+    \$ok = sitegraft_stream_wxr_items_from_file('${xml_file}', function (\$item) use (&\$items) { \$items[] = \$item; });
+    echo json_encode(['ok' => \$ok, 'count' => count(\$items)]);
+  "
+  [ "$status" -eq 0 ]
+  run jq -e '.ok == true and .count == 1' <<< "$output"
+  [ "$status" -eq 0 ]
+}

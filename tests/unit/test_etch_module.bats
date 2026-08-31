@@ -279,6 +279,42 @@ EOF
   done <<< "$declared_keys"
 }
 
+# --- etch_taxonomy_defining_option_keys (issue #82): the exact same
+# ordering defect as issue #16, one level down -- a taxonomy Etch
+# registers dynamically from etch_taxonomies (Etch\Services\
+# ContentTypeService::register_taxonomies(), init priority 11) must reach
+# B before the WXR import runs, or wordpress-importer silently drops
+# every term (and term relationship) that taxonomy defines, landing the
+# post it was attached to regardless.
+@test "etch_option_keys declares etch_taxonomies" {
+  run etch_option_keys
+  [[ "$output" == *"etch_taxonomies"* ]] || false
+}
+
+@test "etch_taxonomy_defining_option_keys names etch_taxonomies" {
+  run etch_taxonomy_defining_option_keys
+  [ "$output" = "etch_taxonomies" ]
+}
+
+# Same "must also be claimed by etch_option_keys" invariant as the
+# post-type-defining hook's own test above, and for the identical reason:
+# a name this function returns that etch_option_keys does not also list
+# would be pre-migrated by graft_migrate_taxonomy_defining_options but
+# never appear in plan's selection at all.
+@test "every name etch_taxonomy_defining_option_keys returns is also claimed by etch_option_keys" {
+  local declared_keys option_keys name found
+  declared_keys=$(etch_taxonomy_defining_option_keys)
+  option_keys=$(etch_option_keys)
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    found=0
+    while IFS= read -r ok; do
+      [ "$ok" = "$name" ] && found=1
+    done <<< "$option_keys"
+    [ "$found" -eq 1 ] || { echo "'${name}' is not in etch_option_keys"; false; }
+  done <<< "$declared_keys"
+}
+
 # --- etch_stack_candidates: the one addition beyond the design doc's §3.3
 # code block, flagged in the PR as a judgment call (see modules/etch.sh's
 # own comment on this function for the full reasoning).

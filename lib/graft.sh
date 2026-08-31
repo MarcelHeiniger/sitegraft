@@ -2701,8 +2701,25 @@ _graft_migrate_one_option_key() {
 # #53's completeness gate still fails loud if that leaves the type
 # unregistered and its content unimportable, exactly as it would for any
 # other cause of the same failure.
-graft_migrate_post_type_defining_options() {
-  local run_dir="$1" manifest="$2" domain_from="${3:-}" domain_to="${4:-}"
+#
+# _graft_migrate_options_named_by_hook <run_dir> <manifest> <domain_from>
+# <domain_to> <hook_suffix> <kind_label> <deselect_note> — issue #82:
+# factored out of what was graft_migrate_post_type_defining_options' own
+# body, so that function and its taxonomy-defining sibling below
+# (graft_migrate_taxonomy_defining_options) share ONE guarded
+# implementation rather than two independently-drifting copies of the
+# identical "ask each module for a hook-named list of option keys, and
+# for each one this plan actually selected, migrate it through
+# _graft_migrate_one_option_key" shape — the same discipline that already
+# produced _graft_migrate_one_option_key itself (issue #16's own
+# fix-pack): two call sites that need identical guards must never be free
+# to drift apart on which guards they apply. <hook_suffix> is appended to
+# "${mod}_" to build the module hook's own function name (e.g.
+# "post_type_defining_option_keys" -> "etch_post_type_defining_option_
+# keys"); <kind_label> and <deselect_note> are wording, not behavior —
+# see the two public wrappers below for the exact text each kind uses.
+_graft_migrate_options_named_by_hook() {
+  local run_dir="$1" manifest="$2" domain_from="$3" domain_to="$4" hook_suffix="$5" kind_label="$6" deselect_note="$7"
 
   # Same belt-and-braces reasoning as graft_migrate_options' own guard
   # just above: phase_graft already runs graft_verify_domain_remap_usable
@@ -2712,7 +2729,7 @@ graft_migrate_post_type_defining_options() {
     local options_unusable_reason
     options_unusable_reason=$(graft_domain_remap_unusable_reason "$domain_from" "$domain_to")
     if [ -n "$options_unusable_reason" ]; then
-      log_error "graft: refusing to pre-migrate post-type-defining options — ${options_unusable_reason}. Pushing a migrated option's value through this remap anyway would write a broken domain string into B's LIVE options and report success (issue #73). Rebuild the manifest: set SITE_A_URL/SITE_B_URL in the profile to each site's real public domain and re-run 'sitegraft plan' -- plan_defaults reads those in PREFERENCE to scan's own home_url guess, which a proxied/tunneled/local-dev site (DDEV's own *.ddev.site, an SSH tunnel, a reverse proxy) can get wrong in a way no re-scan fixes. Failing that: re-run 'sitegraft scan' if a value is genuinely missing, or hand-edit scan-a.json/scan-b.json's home_url yourself if scan ran cleanly but simply recorded the wrong domain."
+      log_error "graft: refusing to pre-migrate ${kind_label}-defining options — ${options_unusable_reason}. Pushing a migrated option's value through this remap anyway would write a broken domain string into B's LIVE options and report success (issue #73). Rebuild the manifest: set SITE_A_URL/SITE_B_URL in the profile to each site's real public domain and re-run 'sitegraft plan' -- plan_defaults reads those in PREFERENCE to scan's own home_url guess, which a proxied/tunneled/local-dev site (DDEV's own *.ddev.site, an SSH tunnel, a reverse proxy) can get wrong in a way no re-scan fixes. Failing that: re-run 'sitegraft scan' if a value is genuinely missing, or hand-edit scan-a.json/scan-b.json's home_url yourself if scan ran cleanly but simply recorded the wrong domain."
       return 1
     fi
   fi
@@ -2721,11 +2738,12 @@ graft_migrate_post_type_defining_options() {
   mods=$(echo "$manifest" | jq -r '.migrate | keys[]?')
   while IFS= read -r mod <&3; do
     [ -n "$mod" ] || continue
-    module_has_fn "$mod" post_type_defining_option_keys || continue
+    module_has_fn "$mod" "$hook_suffix" || continue
+    local hook_fn="${mod}_${hook_suffix}"
     local declared_keys rc=0
-    declared_keys=$("${mod}_post_type_defining_option_keys") || {
+    declared_keys=$("$hook_fn") || {
       rc=$?
-      log_error "module '${mod}': ${mod}_post_type_defining_option_keys() exited ${rc} — refusing to continue without knowing which of its option keys must reach B before the WXR import runs (an error is not an empty list)"
+      log_error "module '${mod}': ${hook_fn}() exited ${rc} — refusing to continue without knowing which of its option keys must reach B before the WXR import runs (an error is not an empty list)"
       return 1
     }
     local selected_keys key
@@ -2743,10 +2761,47 @@ graft_migrate_post_type_defining_options() {
       if printf '%s\n' "$selected_keys" | grep -qxF -- "$key"; then
         _graft_migrate_one_option_key "$run_dir" "$key" "$domain_from" "$domain_to" || return 1
       else
-        log_info "graft: '${mod}' names '${key}' as post-type-defining, but this plan does not have it selected among that module's option keys — not pre-migrating it. If that leaves a post type this plan DOES migrate content for still unregistered on B, the import-completeness gate (issue #53) will fail loud rather than let the content vanish silently."
+        log_info "graft: '${mod}' names '${key}' as ${kind_label}-defining, but this plan does not have it selected among that module's option keys — not pre-migrating it. ${deselect_note}"
       fi
     done 4<<< "$declared_keys"
   done 3<<< "$mods"
+}
+
+graft_migrate_post_type_defining_options() {
+  _graft_migrate_options_named_by_hook "$1" "$2" "${3:-}" "${4:-}" post_type_defining_option_keys "post-type" \
+    "If that leaves a post type this plan DOES migrate content for still unregistered on B, the import-completeness gate (issue #53) will fail loud rather than let the content vanish silently."
+}
+
+# graft_migrate_taxonomy_defining_options <run_dir> <manifest>
+# [domain_from] [domain_to] — issue #82, the taxonomy-registration sibling
+# of graft_migrate_post_type_defining_options just above. Same ordering
+# defect (issue #16), one level down: a module can register a taxonomy
+# dynamically from its own option (etch_taxonomies, for Etch — see
+# modules/etch.sh's own etch_taxonomy_defining_option_keys for the live
+# trace), and if that option lands on B no earlier than
+# graft_migrate_options does, wordpress-importer treats every term (and
+# term relationship) of that taxonomy as belonging to an unregistered
+# taxonomy for the whole import and silently drops them — while the POST
+# each term was attached to still lands, since its own post_type is
+# unaffected. That is precisely why issue #53's own item-count
+# completeness gate cannot see this failure at all: it counts posts, and
+# every post is still there. lib/verify.sh's verify_taxonomy_terms_present
+# is the dedicated guard this issue adds instead, asking a term-level
+# question #53 structurally cannot.
+#
+# Deliberately a SEPARATE function from graft_migrate_post_type_defining_
+# options, not a rename or a folded-in case: a taxonomy is not a post
+# type (Etch's own ContentTypeService::register_taxonomies() is a
+# different `init`-priority hook from register_post_types()'s), and
+# reusing that function's name for both would make its own name
+# inaccurate about what it migrates — exactly the "bookkeeping lies"
+# CLAUDE.md's first rule warns against, one level up in the code itself
+# rather than in a report. Both share the identical guarded
+# implementation via _graft_migrate_options_named_by_hook, immediately
+# above, so neither can drift from the other's guards.
+graft_migrate_taxonomy_defining_options() {
+  _graft_migrate_options_named_by_hook "$1" "$2" "${3:-}" "${4:-}" taxonomy_defining_option_keys "taxonomy" \
+    "If that leaves a taxonomy this plan's migrated content actually uses still unregistered on B, lib/verify.sh's verify_taxonomy_terms_present guard will fail loud rather than let the terms vanish silently."
 }
 
 # design doc §9.4: two passes (plain + JSON-escaped, since Etch stores some
@@ -3416,6 +3471,18 @@ phase_graft() {
   graft_step_done "$run_dir" register_post_type_options || {
     graft_migrate_post_type_defining_options "$run_dir" "$manifest" "$domain_from" "$domain_to"
     graft_mark_step "$run_dir" register_post_type_options
+  }
+  # Issue #82: the exact same reasoning as register_post_type_options just
+  # above, one taxonomy level down — a module's taxonomy-defining option
+  # (etch_taxonomies, for Etch) must also reach B before graft_import_wxr,
+  # or the taxonomy stays unregistered for the whole import and
+  # wordpress-importer silently drops every term (and term relationship)
+  # it defines. Its own resumability marker, separate from register_post_
+  # type_options', so a resumed run can tell the two apart the same way
+  # every other step in this phase gets its own marker.
+  graft_step_done "$run_dir" register_taxonomy_options || {
+    graft_migrate_taxonomy_defining_options "$run_dir" "$manifest" "$domain_from" "$domain_to"
+    graft_mark_step "$run_dir" register_taxonomy_options
   }
   # prune MUST run before import_attachments (bug found live): prune deletes
   # every post carrying _sitegraft_source_id as leftover from a PREVIOUS
