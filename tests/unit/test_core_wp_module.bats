@@ -139,25 +139,25 @@ EOF
   [ ! -f "$BATS_TEST_TMPDIR/calls.log" ]
 }
 
-# --- PR #61 follow-up: core_wp_post_import's lookup has no `$3` type filter,
-# so column 2 of any id-map.tsv row whose column 1 matches old_id reaches
-# `wp option update` verbatim. Dropping the wp_import_insert_term handler
-# stops this version from WRITING such rows, but an id-map.tsv already on
-# disk still carries them, and graft's step-idempotency markers make
-# resuming onto one a real path. These two tests pin the write side shut.
+# --- PR #61 / issue #98: core_wp_post_import's lookup used to have no `$3`
+# type filter, so column 2 of any id-map.tsv row whose column 1 matched
+# old_id reached `wp option update` verbatim. #61 added a digit guard
+# (kept below as defense-in-depth); #98 added the actual fix, a `$3=="page"`
+# type filter, so a colliding row of another type no longer enters the
+# lookup at all. These tests pin both the guard and the filter shut.
 #
-# Both fixtures use column 2 = "Array" because that is literally what the
-# removed handler wrote (PHP's array-to-string coercion), not an invented
-# shape.
+# The malformed-row fixtures use column 2 = "Array" because that is
+# literally what the since-removed wp_import_insert_term handler wrote
+# (PHP's array-to-string coercion), not an invented shape.
 
-@test "core_wp_post_import refuses to write a non-numeric new id to B (legacy term: row from a pre-fix id-map.tsv)" {
+@test "core_wp_post_import refuses to write a non-numeric new id to B (malformed page row -- digit guard, defense in depth after #98's type filter)" {
   local run_dir="$BATS_TEST_TMPDIR/run"
   mkdir -p "$run_dir"
   printf '"5"' > "${run_dir}/option-page_on_front.value"
   local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
-  # Column 1 is 5 because the removed handler put the newly-INSERTED post's
-  # id on B there, which can collide with A's own page_on_front value.
-  printf '5\tArray\tterm:category\n' > "$tsv"
+  # Type is "page" so #98's filter lets this row through the lookup at all
+  # -- this test is specifically about the digit guard that runs AFTER it.
+  printf '5\tArray\tpage\n' > "$tsv"
   wp_cmd_b_stub() { echo "wp_cmd_b_stub $*" >> "$BATS_TEST_TMPDIR/calls.log"; }
   run core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
   [ "$status" -eq 0 ]
@@ -170,20 +170,44 @@ EOF
   [[ "$output" != *"has no corresponding entry"* ]] || false
 }
 
-@test "core_wp_post_import refuses the write when a legacy term: row collides with a real page row (awk emits both)" {
+# Issue #98's own acceptance criterion, real row shape: the correct `page`
+# row AND a colliding `term:` row sharing the same column-1 id, together in
+# the same fixture. Mutation-tested: revert the `$3=="page"` filter on the
+# lookup (back to `$1==old{print $2}`) and this goes RED -- awk then emits
+# BOTH rows, new_id becomes the two-line string "105\nArray", the digit
+# guard's `*[!0-9]*` case matches (a newline is a non-digit), and B never
+# gets written at all (the exact "noisy instead of silent" state #69 left
+# this in). With the filter, only the "page" line is ever produced.
+@test "core_wp_post_import's page_on_front write ignores a colliding term: row of a different type sharing the same column-1 id (#98)" {
   local run_dir="$BATS_TEST_TMPDIR/run"
   mkdir -p "$run_dir"
   printf '"5"' > "${run_dir}/option-page_on_front.value"
   local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
-  # The lookup prints every matching row, so new_id here is the two-line
-  # string "105\nArray" — not one value or the other. Writing that to B is
-  # worse than either alone.
   printf '5\t105\tpage\n5\tArray\tterm:category\n' > "$tsv"
   wp_cmd_b_stub() { echo "wp_cmd_b_stub $*" >> "$BATS_TEST_TMPDIR/calls.log"; }
   run core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
   [ "$status" -eq 0 ]
+  run cat "$BATS_TEST_TMPDIR/calls.log"
+  [[ "$output" == *"option update page_on_front 105"* ]] || false
+}
+
+# The other half of the same acceptance criterion: a term:-only match (no
+# real page row at all sharing that column-1 id) must be treated as "not
+# migrated", never as a value to compare or write -- #98's filter makes the
+# term: row invisible to this lookup, so it is indistinguishable from an
+# id-map.tsv with no row for old_id at all.
+@test "core_wp_post_import treats a term:-only match on column 1 as 'no corresponding entry', not a value to write (#98)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '"5"' > "${run_dir}/option-page_on_front.value"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\tArray\tterm:category\n' > "$tsv"
+  wp_cmd_b_stub() { echo "wp_cmd_b_stub $*" >> "$BATS_TEST_TMPDIR/calls.log"; }
+  run core_wp_post_import "$run_dir" "$tsv" "wp_cmd_b_stub"
+  [ "$status" -eq 0 ]
   [ ! -f "$BATS_TEST_TMPDIR/calls.log" ]
-  [[ "$output" == *"non-numeric new id"* ]] || false
+  [[ "$output" == *"has no corresponding entry"* ]] || false
+  [[ "$output" != *"non-numeric new id"* ]] || false
 }
 
 # Fix-pack bug found live (DDEV harness, MAJOR-B's new graft --dry-run

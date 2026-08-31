@@ -257,45 +257,42 @@ core_wp_post_import() {
     # function already treats as a graceful no-op for an unmatched old_id
     # (see the header comment above), so it gets the same treatment here.
     [ -f "$id_map_tsv" ] || continue
-    # This lookup has no `$3` type filter at all -- any id-map.tsv row
-    # whose column 1 numerically matches old_id wins, whatever column 3
-    # says. That mattered for real while mu-plugins/sitegraft-id-mapper.php's
+    # Issue #98: this lookup used to have no `$3` type filter at all -- any
+    # id-map.tsv row whose column 1 numerically matched old_id won, whatever
+    # column 3 said. page_on_front/page_for_posts always hold a "page"
+    # post's id (WordPress itself enforces this), so `$3=="page"` is the
+    # correct, precise filter -- not merely an exclusion of `term:` rows.
+    # This mattered for real while mu-plugins/sitegraft-id-mapper.php's
     # wp_import_insert_term handler still existed (see that file's own
     # comment for the invariant that made a garbage term: row harmless
     # almost everywhere, and why this lookup was the one place it wasn't):
     # its term: rows' column 1 held the newly-INSERTED post's id on B, not
-    # an old/pre-migration id -- but this lookup does not distinguish that,
-    # it only compares numbers. A numeric coincidence between old_id (A's
-    # own page_on_front/page_for_posts value) and such a row's column 1
-    # would have made new_id come out as the literal string "Array" and
-    # flowed straight into `wp option update` below, unguarded by any
-    # digit check. lib/verify.sh's own page_on_front check
-    # (`expected_new_id=$(awk ... '$1==old{print $2}' ...)`) has the
-    # identical unguarded shape -- same collision, but a READ there
-    # (compared against B's live value, reported as a false HARD FAIL on
-    # mismatch), never a write. THIS lookup is the one place the same
-    # shape reached a live `wp option update`. Checked directly: no digit
-    # guard exists on $new_id before that write. Moot now that the handler
-    # is gone, but the underlying gap -- this lookup trusting column 1
-    # blindly, whatever produced it -- remains, which is why it's recorded
-    # here rather than only in the removed handler's own comment.
-    new_id=$(awk -F'\t' -v old="$old_id" '$1==old{print $2}' "$id_map_tsv" 2>/dev/null)
+    # an old/pre-migration id -- but the old, unfiltered lookup did not
+    # distinguish that, it only compared numbers. A numeric coincidence
+    # between old_id (A's own page_on_front/page_for_posts value) and such a
+    # row's column 1 would have made new_id come out as the literal string
+    # "Array" (or, with a genuine `page` row ALSO present for the same old
+    # id, a two-line result mixing the correct answer with "Array") and
+    # flowed straight into `wp option update` below, unguarded by any digit
+    # check. lib/verify.sh's own page_on_front check has the identical fix
+    # applied in the same pass -- same collision, but a READ there (compared
+    # against B's live value, reported as a false HARD FAIL on mismatch),
+    # never a write. THIS lookup is the one place the same shape reached a
+    # live `wp option update`. Moot now that the wp_import_insert_term
+    # handler is gone, but the underlying gap -- this lookup trusting column
+    # 1 blindly, whatever produced it -- was real for any id-map.tsv written
+    # before that handler was removed, and graft's step-idempotency markers
+    # (graft.*.done) mean such a file can still be resumed against today.
+    new_id=$(awk -F'\t' -v old="$old_id" '$1==old && $3=="page"{print $2}' "$id_map_tsv" 2>/dev/null)
     if [ -n "$new_id" ]; then
-      # Fail closed on a non-numeric new id, rather than writing it to B.
-      # The lookup above has no `$3` type filter (see the comment on it), so
-      # column 2 of ANY id-map.tsv row whose column 1 matches old_id lands
-      # here verbatim, and this is the one place that value reaches a live
-      # `wp option update` unguarded by a digit check or a PHP-side (int)
-      # cast. Removing the wp_import_insert_term handler stops THIS version
-      # from writing such rows; it does nothing for an id-map.tsv already on
-      # disk. That case is real, not hypothetical: graft's step-idempotency
-      # markers (graft.*.done) mean a run started under a version that still
-      # had the handler can be resumed under this one, against its existing
-      # id-map.tsv whose term: rows carry the literal string "Array" in
-      # column 2. On a numeric collision between old_id (A's own
-      # page_on_front/page_for_posts) and such a row's column 1, the write
-      # below would set B's front page to "Array" — a live, silent
-      # corruption of the option this function exists to fix.
+      # The digit guard below is now defense-in-depth rather than the
+      # primary fix (issue #98 -- see the comment on the lookup above): a
+      # `page`-typed row can only ever legitimately carry a numeric new id,
+      # so this should never fire on real data post-#98. Kept because
+      # "column 2 is not an id" is still worth catching for a hand-edited or
+      # otherwise malformed id-map.tsv (e.g. a pre-#98 file whose `page` row
+      # was itself corrupted some other way), rather than writing whatever
+      # it says to B unguarded by a digit check or a PHP-side (int) cast.
       #
       # Guarding on shape rather than on `term:` deliberately: the class is
       # "column 2 is not an id", whatever produced the row. `''` is NOT

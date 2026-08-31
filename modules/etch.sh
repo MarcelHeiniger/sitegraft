@@ -477,12 +477,12 @@ etch_post_import() {
   #
   # SCOPE NOTE: this fix is narrowly scoped to etch_post_import's own two
   # awk filters, per issue #41's own DoD. A broader sweep of every other
-  # id-map.tsv reader in lib/ and modules/ for the same missing `term:`
-  # exclusion (e.g. lib/graft.sh's graft_migrated_post_ids_json, lib/
-  # verify.sh's verify_page_on_front) is real and already tracked
-  # separately in issue #98 ("id-map.tsv: ni la lecture ni l'écriture ne
-  # filtrent sur le type en colonne 3") -- not silently missed here, but
-  # deliberately left to that issue's own scope rather than expanded here.
+  # id-map.tsv reader in lib/ and modules/ for the same missing type filter
+  # (lib/graft.sh's graft_migrated_post_ids_json and
+  # graft_remap_attachment_ids' own post_ids_json, lib/verify.sh's
+  # verify_page_on_front, modules/core-wp.sh's core_wp_post_import) was
+  # tracked separately in issue #98 ("id-map.tsv: ni la lecture ni
+  # l'écriture ne filtrent sur le type en colonne 3") and closed there.
   #
   # Issue #84: `wp:etch/dynamic-image`'s `mediaId` attribute holds an
   # ATTACHMENT id -- a different id space than "ref" above (component/

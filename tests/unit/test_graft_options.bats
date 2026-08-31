@@ -204,6 +204,34 @@ setup() {
   [[ "$output" != *"--tables"* ]] || false
 }
 
+# Issue #98: graft_migrated_post_ids_json (shared with graft_remap_
+# attachment_ids) excludes `term:` rows -- their column 2 is a TERM id, not
+# a post id (independent, both-start-at-1 sequences), so an unexcluded term
+# row could put a coincidentally-matching, unrelated real post's id into
+# this function's post_ids scope, and `wp search-replace` would then touch
+# that out-of-scope post's content -- exactly what MAJOR-2's rebuild (this
+# file's own header comment) says is structurally unreachable. wp_navigation
+# rows stay included (unlike graft_remap_attachment_ids' own, differently-
+# scoped post_ids_json): a domain leak inside a navigation-link's custom URL
+# genuinely needs the same search-replace every other migrated post gets.
+# Mutation-tested: drop the `$3 !~ /^term:/` filter from
+# graft_migrated_post_ids_json and this goes RED -- "14" reappears in
+# .post_ids alongside the three real rows.
+@test "graft_search_replace_domain's payload excludes term: rows from post_ids, but keeps wp_navigation rows (#98)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '10\t42\tattachment\n3\t14\tterm:category\n77\t177\twp_navigation\n5\t105\tpage\n' > "$tsv"
+  local captured="$BATS_TEST_TMPDIR/captured.json"
+  graft_push_remap_payload() { printf '%s' "$2" > "$captured"; echo "/fake/remote/path.json"; }
+  graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
+  wp_remote() { echo "sitegraft: domain-remap rewrote 0 post(s)"; }
+  graft_remove_file() { :; }
+  run graft_search_replace_domain "https://a.example.com" "https://b.example.com" "$tsv" "$run_dir"
+  [ "$status" -eq 0 ]
+  run jq -e '.post_ids == ["42","177","105"]' "$captured"
+  [ "$status" -eq 0 ]
+}
+
 @test "graft_search_replace_domain's wp eval call requires the shared content-remap library and calls its function, never a table-wide search-replace" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
