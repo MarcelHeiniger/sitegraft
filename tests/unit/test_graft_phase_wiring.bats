@@ -735,6 +735,74 @@ EOF
   [[ "$output" != *"WILL retry"* ]] || false
 }
 
+# issue #117: graft_export_wxr/graft_fetch_id_map used to return rc=0 on a
+# failed pull, so phase_graft's own call sites wrote the step marker
+# regardless of whether anything was actually fetched. Both leaf functions
+# are fixed to fail closed (see lib/graft.sh, issue #117); these two tests
+# are the phase-level half of the acceptance criteria -- proving phase_graft
+# itself refuses to write the marker, rather than relying solely on the two
+# functions' own unit tests (tests/unit/test_graft_pull_ssh_transfer.bats).
+# _major4_stub_everything_but_the_marker_block's own graft_export_wxr/
+# graft_fetch_id_map no-op stubs are overridden here, after loading it, to
+# simulate the exact failure this issue is about.
+@test "issue #117 acceptance: phase_graft does not write graft.export.done when graft_export_wxr fails, even with a stale .xml left in export/ from an earlier pass" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "${run_dir}/export"
+  touch "${run_dir}/backup.complete"
+  cat > "${run_dir}/manifest.json" <<'EOF'
+{"migrate":{"core-wp":{"post_types":["page"],"option_keys":[]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}
+EOF
+  # A stale .xml from an earlier, unrelated pass -- standing in for a
+  # resumed run_dir whose export step never got this far cleanly before.
+  # Without phase_graft's OWN check on graft_export_wxr's return value,
+  # the found_any/integrity-gate checks a few lines below would read this
+  # leftover file as "the export succeeded" and mark the step done anyway
+  # (the identical "stale artifact mistaken for a fresh success" shape
+  # this issue's graft_fetch_id_map half also had) -- this is what makes
+  # this test discriminate phase_graft's own explicit check, not merely
+  # the pre-existing found_any guard.
+  echo 'placeholder' > "${run_dir}/export/stale.xml"
+  local step
+  for step in stack_sync media_sync fonts_sync mu_plugin prune import_attachments importer_setup; do
+    touch "${run_dir}/graft.${step}.done"
+  done
+  [ ! -f "${run_dir}/graft.export.done" ]
+
+  _major4_stub_everything_but_the_marker_block
+  graft_export_wxr() { echo "STUB: graft_export_wxr called -- simulating a failed pull (issue #117)"; return 1; }
+  graft_integrity_gate() { echo "SHOULD NOT BE CALLED -- the stale .xml must never reach the integrity gate"; return 1; }
+
+  unset SITEGRAFT_DRY_RUN
+  run phase_graft --profile demo --run "$run_dir"
+  [ "$status" -ne 0 ]
+  [ ! -f "${run_dir}/graft.export.done" ]
+  [[ "$output" == *"WXR export from A failed"* ]] || false
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
+@test "issue #117 acceptance: phase_graft does not write graft.fetch_id_map.done when graft_fetch_id_map fails" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  touch "${run_dir}/backup.complete"
+  cat > "${run_dir}/manifest.json" <<'EOF'
+{"migrate":{"core-wp":{"post_types":["page"],"option_keys":[]}},"clean":{"enabled":false,"post_types":[]},"options":{"search_replace":{"from":"","to":""}}}
+EOF
+  local step
+  for step in stack_sync media_sync fonts_sync mu_plugin prune import_attachments importer_setup export import; do
+    touch "${run_dir}/graft.${step}.done"
+  done
+  [ ! -f "${run_dir}/graft.fetch_id_map.done" ]
+
+  _major4_stub_everything_but_the_marker_block
+  graft_fetch_id_map() { echo "STUB: graft_fetch_id_map called -- simulating a failed pull (issue #117)"; return 1; }
+
+  unset SITEGRAFT_DRY_RUN
+  run phase_graft --profile demo --run "$run_dir"
+  [ "$status" -ne 0 ]
+  [ ! -f "${run_dir}/graft.fetch_id_map.done" ]
+  [[ "$output" == *"id-map fetch from B failed"* ]] || false
+}
+
 # issue #109 fix-pack, reviewer-mandated correction: a failed
 # sitegraft_mktemp_dir inside graft_verify_import_completeness used to
 # return 1 -- the SAME code phase_graft's rc=1 branch treats as "issue
