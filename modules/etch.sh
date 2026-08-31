@@ -436,31 +436,53 @@ etch_post_import() {
   # and deliberately NOT touching the `index` template that already existed
   # on B.
   #
-  # Attachment rows are excluded from the map: `"ref"` addresses blocks, and
-  # feeding attachment ids in would only create opportunities for a numeric
+  # Attachment rows AND term rows are excluded from the map: `"ref"`
+  # addresses component/template POSTS, never attachments or terms, and
+  # feeding either in would only create opportunities for a numeric
   # coincidence to rewrite something it shouldn't.
   [ -s "$id_map_tsv" ] || return 0
 
   local map_json ids_json media_map_json
-  map_json=$(awk -F'\t' '$3 != "attachment" && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { printf "%s %s\n", $1, $2 }' "$id_map_tsv" \
+  map_json=$(awk -F'\t' '$3 != "attachment" && $3 !~ /^term:/ && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { printf "%s %s\n", $1, $2 }' "$id_map_tsv" \
     | jq -R -s -c 'split("\n") | map(select(length > 0) | split(" ")) | map({(.[0]): (.[1] | tonumber)}) | add // {}')
-  ids_json=$(awk -F'\t' '$3 != "attachment" && $2 ~ /^[0-9]+$/ { print $2 }' "$id_map_tsv" \
+  ids_json=$(awk -F'\t' '$3 != "attachment" && $3 !~ /^term:/ && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { print $2 }' "$id_map_tsv" \
     | jq -R -s -c 'split("\n") | map(select(length > 0) | tonumber) | unique')
 
-  # OBSERVATION (review of PR #87): this scope does NOT exclude `term:`
-  # rows the way lib/verify.sh's own guards do (verify_id_references_
-  # resolve's `$3 !~ /^term:/`, and this issue's own new verify_component_
-  # prop_references_resolve). Not a defect introduced here -- $ids_json
-  # predates this issue (issue #52/#84) -- and NOT proven safe either:
-  # term ids and post ids are INDEPENDENT sequences that both start at 1,
-  # so a term row's second column CAN coincidentally equal a real post id,
-  # in which case get_post_field would fetch that unrelated post's
-  # content, and $ids would additionally offer it as a rewrite candidate.
-  # This is pre-existing behavior, not something this issue's own fix
-  # introduces or is asked to correct here -- recorded as an open
-  # observation, not a settled safety claim, so a future reader does not
-  # inherit a false "harmless miss" conclusion this comment used to state.
-  # verify's own scope is the strictly narrower of the two either way.
+  # FIX (issue #41): the OBSERVATION this comment used to record -- that
+  # this scope did NOT exclude `term:` rows the way lib/verify.sh's own
+  # guards do (verify_id_references_resolve's `$3 !~ /^term:/`, and
+  # verify_component_prop_references_resolve) -- is now closed, matching
+  # modules/core-wp.sh's own `$3 !~ /^term:/` exclusion in its map_json
+  # (same fix, same shape, issue #38's identical flaw in that module).
+  # Term ids and post ids are INDEPENDENT sequences that both start at 1,
+  # so a term row's second column CAN coincidentally equal a real post
+  # id -- and `jq … | add` resolves a duplicate key by keeping the LAST
+  # row, so an unexcluded term row appearing after the real post row in
+  # id-map.tsv would silently overwrite the correct post mapping with the
+  # term's new id. mu-plugins/sitegraft-id-mapper.php's current handler
+  # does not itself emit a `term:` row with a real digit in column 2 (see
+  # that file's own header comment) -- this exclusion is defensive, the
+  # same way core-wp.sh's is: a legacy id-map.tsv written by an older
+  # sitegraft version, or any future term-row format, is not something
+  # this filter should trust by omission. $2's own `$2 ~ /^[0-9]+$/` guard
+  # does not substitute for it: tests/unit/test_etch_module.bats' own
+  # "term: row" fixture below carries a genuine digit string in column 2,
+  # which that guard does NOT exclude -- only `$3 !~ /^term:/` does.
+  # ids_json's own filter now additionally requires `$1 ~ /^[0-9]+$/`,
+  # matching map_json's guard exactly -- align requested by issue #41's
+  # own follow-up comment. Not independently exploitable on its own
+  # (ids_json only ever emits column 2, never reads column 1 as a value),
+  # but a filter this security-relevant should not silently diverge from
+  # its sibling for no stated reason.
+  #
+  # SCOPE NOTE: this fix is narrowly scoped to etch_post_import's own two
+  # awk filters, per issue #41's own DoD. A broader sweep of every other
+  # id-map.tsv reader in lib/ and modules/ for the same missing `term:`
+  # exclusion (e.g. lib/graft.sh's graft_migrated_post_ids_json, lib/
+  # verify.sh's verify_page_on_front) is real and already tracked
+  # separately in issue #98 ("id-map.tsv: ni la lecture ni l'écriture ne
+  # filtrent sur le type en colonne 3") -- not silently missed here, but
+  # deliberately left to that issue's own scope rather than expanded here.
   #
   # Issue #84: `wp:etch/dynamic-image`'s `mediaId` attribute holds an
   # ATTACHMENT id -- a different id space than "ref" above (component/
@@ -494,13 +516,12 @@ etch_post_import() {
     | jq -R -s -c 'split("\n") | map(select(length > 0) | split(" ")) | map({(.[0]): (.[1] | tonumber)}) | add // {}')
 
   if [ "$(printf '%s' "$map_json" | jq 'length')" = "0" ]; then
-    # A run whose id-map.tsv has zero non-attachment rows has, by
+    # A run whose id-map.tsv has zero non-attachment, non-term rows has, by
     # construction, zero rows in $ids_json too (both are filtered from the
-    # exact same `$3 != "attachment"` rows) -- so there is no migrated
-    # post left for a mediaId reference to even live inside, regardless of
-    # how many attachments this run also mapped. Confirmed by this
-    # function's own "does nothing when the run mapped only attachments"
-    # test.
+    # exact same rows) -- so there is no migrated post left for a mediaId
+    # reference to even live inside, regardless of how many attachments
+    # this run also mapped. Confirmed by this function's own "does nothing
+    # when the run mapped only attachments" test.
     log_info "etch post_import: no non-attachment id mappings in this run — no component or media references to remap"
     return 0
   fi

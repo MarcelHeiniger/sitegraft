@@ -377,6 +377,23 @@ _etch_capture_eval() {
   fi
 }
 
+@test "etch_post_import's ref map excludes term: rows -- a colliding term id must never overwrite a real component mapping (issue #41)" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  # Component 14468 -> 15506 is the correct mapping. A term row for a
+  # DIFFERENT taxonomy entity that happens to also carry old id 14468
+  # comes AFTER it in the file (import order, not something this
+  # function controls) and must not win via jq's `add` (last key wins).
+  printf '14468\t15506\twp_block\n14468\t999\tterm:category\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  local map_line
+  map_line=$(grep '^\$map = json_decode' "$BATS_TEST_TMPDIR/php.txt")
+  [[ "$map_line" == *'"14468":15506'* ]] || false
+  if printf '%s' "$map_line" | grep -q '"14468":999'; then
+    echo "term id leaked into the ref map, overwriting the real component mapping" >&2; return 1
+  fi
+}
+
 @test "etch_post_import scopes the rewrite to the posts this run imported" {
   local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
   printf '14468\t15506\twp_block\n14279\t15505\twp_template\n' > "$tsv"
@@ -619,6 +636,22 @@ _etch_run_captured_php() {
   run _etch_run_captured_php 105 '"ref":42 next to "mediaId":"42"'
   [[ "$output" == *'"ref":9001'* ]] || false
   [[ "$output" == *'"mediaId":"9002"'* ]] || false
+}
+
+# This is issue #41's own explicit acceptance bar: a component reference
+# whose OLD id collides with a migrated TERM row's OLD id must be rewritten
+# to the correct POST id, never the term's new id -- proven end-to-end
+# through the REAL PHP the hook hands to wp-cli, not just the bash-built map
+# (see the sibling "ref map excludes term: rows" test above, which proves
+# the map itself; this proves the map is actually used correctly too).
+@test "etch_post_import ref remap: a component reference whose old id collides with a migrated term row is rewritten to the correct POST id, not the term's new id (issue #41)" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t105\tpage\n42\t9001\twp_block\n42\t500\tterm:category\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php 105 '<!-- wp:etch/component {"ref":42,"attributes":[]} -->'
+  [[ "$output" == *'"ref":9001'* ]] || false
+  [[ "$output" != *'"ref":500'* ]] || false
 }
 
 @test "etch_post_import mediaId remap: an editor-internal data-etch-context ref (alphanumeric, quoted) is left untouched, not mistaken for a numeric component ref" {
