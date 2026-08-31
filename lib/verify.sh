@@ -706,6 +706,19 @@ verify_nav_present() {
 # this guard are at least consistent with each other about it: neither
 # would silently disagree with the other about content it can't see.
 #
+# Issue #88: the three `grep -oE` patterns below now tolerate `[[:space:]]*`
+# either side of the colon (`"mediaId"[[:space:]]*:[[:space:]]*"?[0-9]+"?`
+# and the same shape for `ref`/`parentPageID`) -- they used to match only
+# the exact compact byte sequence, same defect and same fix as
+# etch_post_import's own sentinel patterns (modules/etch.sh, that
+# function's own header comment has the full account of why this was
+# never observed live but not ruled out). The two sides matter together:
+# a spaced form the REMAP now tolerates but this GUARD still matched only
+# compact would have reported a false HARD FAIL after a graft that
+# actually succeeded; a spaced form neither side tolerated stayed the
+# silent miss #88 reports. Keeping both patterns' whitespace tolerance
+# identical is what keeps them from drifting into either failure mode.
+#
 # Reported explicitly rather than silently absorbed into "the family this
 # guard covers" (see this issue's own PR description for the fuller
 # account, including the "bild"-style case one post away that this guard
@@ -789,11 +802,11 @@ verify_id_references_resolve() {
     # description: measured as the quoted-string form on a real site; the
     # bare-number form is not ruled out for a future Etch version, so both
     # are matched here, same as the remap side).
-    printf '%s\n' "$content" | grep -oE '"mediaId":"?[0-9]+"?' | grep -oE '[0-9]+' \
+    printf '%s\n' "$content" | grep -oE '"mediaId"[[:space:]]*:[[:space:]]*"?[0-9]+"?' | grep -oE '[0-9]+' \
       | while IFS= read -r rid; do printf '%s\t%s\tmediaId\n' "$pid" "$rid" >> "$pairs_file"; done
-    printf '%s\n' "$content" | grep -oE '"ref":[0-9]+' | grep -oE '[0-9]+' \
+    printf '%s\n' "$content" | grep -oE '"ref"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' \
       | while IFS= read -r rid; do printf '%s\t%s\tref\n' "$pid" "$rid" >> "$pairs_file"; done
-    printf '%s\n' "$content" | grep -oE '"parentPageID":[0-9]+' | grep -oE '[0-9]+' \
+    printf '%s\n' "$content" | grep -oE '"parentPageID"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' \
       | while IFS= read -r rid; do printf '%s\t%s\tparentPageID\n' "$pid" "$rid" >> "$pairs_file"; done
   done 3<<< "$(echo "$live_json" | jq -c '.[]')"
 
@@ -1074,10 +1087,13 @@ function sitegraft_find_component_blocks( \$content ) {
 	return \$blocks;
 }
 function sitegraft_attributes_span( \$content, \$block_start, \$block_end ) {
-	\$needle = '"attributes":';
+	\$needle = '"attributes"';
 	\$pos = strpos( \$content, \$needle, \$block_start );
 	if ( false === \$pos || \$pos >= \$block_end ) { return null; }
 	\$val_start = \$pos + strlen( \$needle );
+	while ( \$val_start < \$block_end && ' ' === \$content[ \$val_start ] ) { \$val_start++; }
+	if ( \$val_start >= \$block_end || ':' !== \$content[ \$val_start ] ) { return null; }
+	\$val_start++;
 	while ( \$val_start < \$block_end && ' ' === \$content[ \$val_start ] ) { \$val_start++; }
 	if ( \$val_start >= \$block_end || '{' !== \$content[ \$val_start ] ) { return null; }
 	\$span = sitegraft_json_span( \$content, \$val_start );
@@ -1094,7 +1110,7 @@ foreach ( \$component_ids as \$cid ) {
 	\$cid = (int) \$cid;
 	\$cbody = get_post_field( 'post_content', \$cid );
 	if ( is_string( \$cbody ) && '' !== \$cbody ) {
-		if ( preg_match_all( '/"(mediaId|ref|parentPageID)":"\{props\.([A-Za-z0-9_]+)\}"/', \$cbody, \$pm, PREG_SET_ORDER ) ) {
+		if ( preg_match_all( '/"(mediaId|ref|parentPageID)"\s*:\s*"\{props\.([A-Za-z0-9_]+)\}"/', \$cbody, \$pm, PREG_SET_ORDER ) ) {
 			foreach ( \$pm as \$prow ) {
 				\$component_prop_map[ \$cid ][ \$prow[2] ] = \$prow[1];
 			}
@@ -1196,13 +1212,22 @@ PHP
 
   # Fix-pack (Viktor's review of PR #87, blocker 1; ordering fixed in a
   # later round, see below): a MALFORMED line means sitegraft_json_span
-  # (the PHP above) could not parse at least one wp:etch/component call
-  # site on B as balanced JSON -- the discovery/scan simply could not be
-  # trusted for that post. Checked BEFORE the NESTED case below, and both
-  # BEFORE the normal CHK/PAIR parse: a read that could not run correctly
-  # is UNKNOWN, the same fail-closed discipline every other guard in this
-  # file follows, and takes priority over the (softer) INCOMPLETE outcome
-  # NESTED produces.
+  # (the PHP above) could not extract a trustworthy call site for at least
+  # one wp:etch/component block on B -- the discovery/scan simply could not
+  # be trusted for that post. Two distinct causes collapse into this one
+  # marker: the brace scanner itself finding genuinely unbalanced braces
+  # (rare), and -- corrected wording per issue #88, this is the common one
+  # in practice -- braces that DO balance but whose content still fails
+  # `json_decode()` (a trailing comma, a bad escape, anything a hand-edited
+  # or non-WordPress-serialized call site can produce). Both are reported
+  # identically below because the guard's own confidence is identical
+  # either way: it could not build a trustworthy prop map for that post, so
+  # it will not claim to have checked references it never actually parsed.
+  # Checked BEFORE the NESTED case below, and both BEFORE the normal
+  # CHK/PAIR parse: a read that could not run correctly is UNKNOWN, the
+  # same fail-closed discipline every other guard in this file follows,
+  # and takes priority over the (softer) INCOMPLETE outcome NESTED
+  # produces.
   #
   # That priority is REAL, not merely declared here: an earlier version of
   # this PHP short-circuited on NESTED (return) BEFORE the citing-post
@@ -1220,7 +1245,7 @@ PHP
     local malformed_posts
     malformed_posts=$(printf '%s
 ' "$out" | awk -F: '$1=="MALFORMED"{printf "%s ", $2}')
-    log_error "could not parse a wp:etch/component call site as balanced JSON on B, on post(s): ${malformed_posts% } — component-prop id references on those post(s) could not be verified, treated as UNKNOWN, never as a silent pass"
+    log_error "could not build a trustworthy component-prop reference map for a wp:etch/component call site on B, on post(s): ${malformed_posts% } — most commonly balanced-looking JSON that still failed to decode, not merely unbalanced braces; whether those post(s) even contain any id-carrying prop references is unknown, since the map itself could not be built — treated as UNKNOWN, never as a silent pass"
     return 1
   fi
 

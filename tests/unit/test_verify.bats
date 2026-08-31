@@ -856,6 +856,36 @@ setup() {
   [[ "$output" == *"ID_REFS:3:0"* ]] || false
 }
 
+@test "verify_id_references_resolve detects a spaced mediaId/ref/parentPageID reference, not just the compact byte sequence (issue #88)" {
+  # MUTATION-TESTED: reverting the three `grep -oE` patterns in
+  # verify_id_references_resolve back to a literal `":` (no
+  # `[[:space:]]*`) turns this red -- none of the three would even see
+  # these references, let alone check they resolve, and the function would
+  # wrongly report ID_REFS:0:0.
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '5\t105\tpage\n' > "$tsv"
+  wp_remote() {
+    shift # alias
+    for a in "$@"; do
+      case "$a" in
+        --fields=ID,post_content)
+          echo '[{"ID":105,"post_content":"<!-- wp:etch/dynamic-image {\"attributes\":{\"mediaId\" : \"763\"}} --><!-- wp:etch/component {\"ref\"  :  40000} --><!-- wp:core/page-list {\"parentPageID\":  50} -->"}]'
+          return 0
+          ;;
+        eval)
+          printf '763\n40000\n50\n'
+          return 0
+          ;;
+      esac
+    done
+    echo "UNEXPECTED CALL: $*" >&2; return 1
+  }
+  run verify_id_references_resolve "$run_dir" "$tsv"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ID_REFS:3:0"* ]] || false
+}
+
 @test "verify_id_references_resolve fails when a mediaId does not resolve to any post on B (issue #84's own defect, reproduced)" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   local tsv="${run_dir}/id-map.tsv"
@@ -1141,6 +1171,27 @@ _verify_component_prop_run_captured_php() {
   [[ "$output" != *"titre"* ]] || false
 }
 
+@test "verify_component_prop_references_resolve: captured PHP execution-proof -- a spaced component-body declaration (\"mediaId\" : \"{props.bild}\") is still discovered (issue #88)" {
+  # MUTATION-TESTED: reverting this file's own discovery regex (the
+  # preg_match_all a few lines above verify_component_prop_references_resolve)
+  # back to a literal `":"` (no `\s*`) turns this red -- CHK:888:1 and
+  # PAIR:105:888:bild would never appear, because "bild" would never be
+  # discovered as id-bearing in the first place.
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '9\t105\tpage\n37496\t40000\twp_block\n' > "$tsv"
+  local capture="$BATS_TEST_TMPDIR/php.txt"
+  wp_remote() { shift; case "$1" in eval) printf '%s' "$2" > "$capture" ;; esac; }
+  verify_component_prop_references_resolve "$run_dir" "$tsv" >/dev/null 2>&1 || true
+  [ -s "$capture" ]
+  run _verify_component_prop_run_captured_php "$capture" \
+    105 '<!-- wp:etch/component {"ref":40000,"attributes":{"bild":"888"}} -->' \
+    40000 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId"  :  "{props.bild}"}} -->' \
+    888 ''
+  [[ "$output" == *"CHK:888:1"* ]] || false
+  [[ "$output" == *"PAIR:105:888:bild"* ]] || false
+}
+
 @test "verify_component_prop_references_resolve: captured PHP execution-proof -- reports a component prop's id as missing when it does not resolve on B" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
   local tsv="${run_dir}/id-map.tsv"
@@ -1229,7 +1280,7 @@ _verify_component_prop_run_captured_php() {
   run --separate-stderr verify_component_prop_references_resolve "$run_dir" "$tsv"
   [ "$status" -eq 1 ]
   [[ "$stderr" == *"105"* ]] || false
-  [[ "$stderr" == *"balanced JSON"* ]] || false
+  [[ "$stderr" == *"trustworthy component-prop reference map"* ]] || false
 }
 
 @test "verify_component_prop_references_resolve: NIT 5 -- NESTED from the eval reports INCOMPLETE (rc 2), never a silent pass, when component composition is detected" {
@@ -1373,7 +1424,7 @@ _verify_component_prop_run_captured_php() {
   run --separate-stderr verify_component_prop_references_resolve "$run_dir" "$tsv"
   [ "$status" -eq 1 ]
   [[ "$stderr" == *"400"* ]] || false
-  [[ "$stderr" == *"balanced JSON"* ]] || false
+  [[ "$stderr" == *"trustworthy component-prop reference map"* ]] || false
 }
 @test "verify_component_prop_references_resolve: captured PHP execution-proof -- NIT G, a malformed call site is reported even when NO migrated component declares an id-bearing prop (the components may simply not have landed on B)" {
   local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"

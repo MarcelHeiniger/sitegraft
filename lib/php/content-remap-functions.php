@@ -60,6 +60,16 @@
  * and why a plain string replace (str_replace / bash's ${var//search/replace})
  * is unsafe here too (no digit-boundary awareness at all).
  *
+ * `\s*` around the colon in the `"id":` pattern (issue #88): the ORIGINAL
+ * version of this pattern matched only the exact compact byte sequence
+ * `"id":7`, never `"id": 7` or `"id" : 7`. Never observed from WordPress's
+ * own json_encode() (which emits no whitespace by default) or from Etch's
+ * own stored block JSON — but a hand-edited or differently-serialized call
+ * site is not ruled out, and the cost of tolerating it is one `\s*` on
+ * each side of the colon. `wp-image-<old_id>` (the CSS class form, no
+ * colon involved) is not a JSON key/value pair at all, so it has no
+ * whitespace-variant to tolerate and is unchanged.
+ *
  * `(int)` on $row['old'] (review, Viktor, NIT-2): id-map.tsv's own values
  * are always WordPress-internal integer post IDs, produced entirely by this
  * tool's own mu-plugin/graft_import_attachments — not attacker-controlled
@@ -74,7 +84,7 @@ function sitegraft_remap_attachment_refs( array $attachments, $content ) {
 	foreach ( $attachments as $row ) {
 		$old_id   = (int) $row['old'];
 		$sentinel = '__SITEGRAFT_' . $old_id . '__';
-		$content  = preg_replace( '/"id":' . $old_id . '(?!\d)/', '"id":' . $sentinel, $content );
+		$content  = preg_replace( '/"id"\s*:\s*' . $old_id . '(?!\d)/', '"id":' . $sentinel, $content );
 		$content  = preg_replace( '/wp-image-' . $old_id . '(?!\d)/', 'wp-image-' . $sentinel, $content );
 	}
 	foreach ( $attachments as $row ) {

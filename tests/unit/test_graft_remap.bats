@@ -3,6 +3,7 @@
 # by the real, non-stubbed graft_remap_attachment_ids/graft_search_replace_domain)
 # calls graft_local_prefix, which reuses _backup_local_exec_prefix.
 setup() {
+  REPO_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/../.." && pwd)"
   load '../../lib/core.sh'
   load '../../lib/inventory.sh'
   load '../../lib/backup.sh'
@@ -165,6 +166,118 @@ setup() {
   # the substitution itself must live in the required file, not inline here
   [[ "$output" != *"preg_replace"* ]] || false
   [[ "$output" != *"search-replace"* ]] || false
+}
+
+# --- issue #88: the cheap interim "decided but text unchanged" guard ------
+#
+# graft_remap_attachment_ids's own eval script already knows, for every
+# (post, old attachment id) pair, that it decided that id might need
+# remapping -- it is iterating payload["attachments"], built from exactly
+# the ids this run migrated. If that old id is still textually present,
+# digit-bounded, in the post's own content/excerpt AFTER
+# sitegraft_remap_attachment_refs ran on it, that is a case this pass tried
+# to fix and apparently did not (an unrecognized JSON formatting) --
+# reported as a named WARNING rather than nothing at all.
+#
+# Run via a REAL `php` execution of the CAPTURED eval text (never a
+# hand-copied reimplementation of it) against a tiny stub WordPress, same
+# discipline as tests/unit/test_content_remap_write.bats and
+# modules/etch.sh's own _etch_run_captured_php[_multi].
+
+# _graft_run_captured_remap_eval <wp_content_dir> <post_id> <content> <excerpt>
+# -- executes the REAL PHP text captured at "$BATS_TEST_TMPDIR/eval.php" by
+# a `wp_remote` stub (set up by the caller), against a stub get_post()/
+# $wpdb, with WP_CONTENT_DIR pointed at a temp dir already carrying a copy
+# of the real lib/php/content-remap-functions.php (named the same way
+# graft_push_remap_lib's real transfer names it on B) and the real payload
+# JSON graft_push_remap_payload was asked to push. Prints "WRITTEN:<content
+# $wpdb->update() was actually called with, or NO-WRITE>" followed by
+# whatever else the eval script itself echoed (the UNMATCHED-guard's
+# WARNING line, or the final "rewrote N post(s)" line).
+_graft_run_captured_remap_eval() {
+  local wp_content="$1" post_id="$2" content="$3" excerpt="$4"
+  php -r '
+    define("WP_CONTENT_DIR", $argv[1]);
+    $test_post_id = (int) $argv[2];
+    $test_content = $argv[3];
+    $test_excerpt = $argv[4];
+    function get_post( $id ) {
+      global $test_post_id, $test_content, $test_excerpt;
+      if ( (int) $id !== $test_post_id ) { return null; }
+      return (object) [ "ID" => $test_post_id, "post_content" => $test_content, "post_excerpt" => $test_excerpt ];
+    }
+    function clean_post_cache( $id ) {}
+    class _GraftTestWpdb {
+      public $posts = "wp_posts";
+      public $last_update = null;
+      public function update( $table, $data, $where ) {
+        $this->last_update = $data;
+        return 1;
+      }
+    }
+    $GLOBALS["wpdb"] = new _GraftTestWpdb();
+    ob_start();
+    eval( file_get_contents( $argv[5] ) );
+    $echoed = ob_get_clean();
+    $written = ( $GLOBALS["wpdb"]->last_update !== null ) ? $GLOBALS["wpdb"]->last_update["post_content"] : "NO-WRITE";
+    echo "WRITTEN:" . $written . "\n";
+    echo $echoed;
+  ' -- "$wp_content" "$post_id" "$content" "$excerpt" "$BATS_TEST_TMPDIR/eval.php"
+}
+
+# _graft_remap_setup_capture <run_dir> <wp_content_dir> <tsv> -- stubs
+# graft_push_remap_payload/graft_push_remap_lib/graft_remove_file/wp_remote
+# so that calling the REAL graft_remap_attachment_ids writes the REAL
+# payload JSON it builds and a real copy of the remap library into
+# <wp_content_dir> (exactly where the eval script it hands to `wp_remote`
+# expects to find them via WP_CONTENT_DIR), and captures that eval script
+# itself at "$BATS_TEST_TMPDIR/eval.php" for _graft_run_captured_remap_eval
+# to execute afterward.
+_graft_remap_setup_capture() {
+  local wp_content="$1"
+  mkdir -p "$wp_content"
+  graft_push_remap_payload() { printf '%s' "$2" > "${wp_content}/sitegraft-id-remap-payload.json"; echo "${wp_content}/sitegraft-id-remap-payload.json"; }
+  graft_push_remap_lib() { cp "${REPO_ROOT}/lib/php/content-remap-functions.php" "${wp_content}/sitegraft-content-remap-functions.php"; echo "${wp_content}/sitegraft-content-remap-functions.php"; }
+  graft_remove_file() { :; }
+  wp_remote() {
+    if [ "$2" = "eval" ]; then printf '%s' "$3" > "$BATS_TEST_TMPDIR/eval.php"; fi
+    echo "sitegraft: id-remap rewrote 0 post(s)"
+  }
+}
+
+@test "graft_remap_attachment_ids rewrites a spaced \"id\" : X JSON attribute (issue #88) and the UNMATCHED-guard stays silent on success" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '35199\t763\tattachment\n5\t105\tpage\n' > "$tsv"
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local wp_content="$BATS_TEST_TMPDIR/wp-content"
+  _graft_remap_setup_capture "$wp_content"
+  run graft_remap_attachment_ids "$tsv" "$run_dir"
+  [ "$status" -eq 0 ]
+  [ -s "$BATS_TEST_TMPDIR/eval.php" ]
+
+  run _graft_run_captured_remap_eval "$wp_content" 105 '<!-- wp:etch/image {"id" : 35199} -->' ''
+  [[ "$output" == *'WRITTEN:<!-- wp:etch/image {"id":763} -->'* ]] || false
+  [[ "$output" != *"WARNING"* ]] || false
+}
+
+@test "graft_remap_attachment_ids's UNMATCHED-guard: warns by post id and old attachment id when a reference survives in a form no pattern recognizes (issue #88 interim guard, mutation-tested)" {
+  # MUTATION-TESTED: removing the UNMATCHED-guard foreach block added to
+  # lib/graft.sh's graft_remap_attachment_ids turns this red -- with the
+  # guard gone, this content (curly/smart quotes around the id, e.g.
+  # pasted from a rich text editor -- a shape no \s*-tolerant pattern
+  # matches either) produces only "WRITTEN:NO-WRITE" and no warning at all,
+  # the exact silent #88 failure mode.
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '35199\t763\tattachment\n5\t105\tpage\n' > "$tsv"
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local wp_content="$BATS_TEST_TMPDIR/wp-content"
+  _graft_remap_setup_capture "$wp_content"
+  run graft_remap_attachment_ids "$tsv" "$run_dir"
+  [ "$status" -eq 0 ]
+
+  run _graft_run_captured_remap_eval "$wp_content" 105 '<!-- wp:etch/image {“id”:35199} -->' ''
+  [[ "$output" == *'WRITTEN:NO-WRITE'* ]] || false
+  [[ "$output" == *'WARNING post 105 still references old attachment id 35199'* ]] || false
 }
 
 # MAJOR-1 (review, Viktor): wordpress-importer's native _thumbnail_id remap

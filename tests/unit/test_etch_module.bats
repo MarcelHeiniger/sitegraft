@@ -641,6 +641,163 @@ _etch_run_captured_php() {
   [[ "$output" == *'data-etch-context="eyJyZWYiOiJiNzUzY3BkIn0="'* ]] || false
 }
 
+# --- issue #88: whitespace-tolerant JSON matching -------------------------
+#
+# Every pattern below that matches a JSON key/value pair used to match ONLY
+# the exact compact byte sequence -- zero whitespace either side of the
+# colon (or, for the HTML-attribute mediaId form, the `=`). Real Etch/
+# WordPress content never emits the spaced form (json_encode()'s default has
+# no whitespace), so this was never observed live -- but a hand-edited call
+# site was silently left holding A's old id, with no error and no warning.
+# These tests are MUTATION-TESTED: reverting any one of the `\s*`
+# insertions in modules/etch.sh's etch_post_import back to a literal `:`
+# (or `=`) turns the matching test below red.
+
+@test "etch_post_import ref remap: tolerates whitespace around the colon (issue #88)" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t105\tpage\n14468\t15506\twp_block\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php 105 '<!-- wp:etch/component {"ref" : 14468,"attributes":[]} -->'
+  [[ "$output" == *'"ref":15506'* ]] || false
+  [[ "$output" != *'14468'* ]] || false
+}
+
+@test "etch_post_import mediaId remap: quoted-string form tolerates whitespace around the colon (issue #88)" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t105\tpage\n35199\t763\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php 105 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId"   :   "35199"}} -->'
+  [[ "$output" == *'"mediaId":"763"'* ]] || false
+  [[ "$output" != *'35199'* ]] || false
+}
+
+@test "etch_post_import mediaId remap: bare-number form tolerates whitespace around the colon (issue #88)" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t105\tpage\n35199\t763\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php 105 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":  35199}} -->'
+  [[ "$output" == *'"mediaId":763'* ]] || false
+  [[ "$output" != *'35199'* ]] || false
+}
+
+@test "etch_post_import mediaId remap: HTML-attribute form tolerates whitespace around the '=' (issue #88)" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t105\tpage\n35199\t763\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php 105 '<etch:img mediaId = "35199" useSrcSet="true" />'
+  [[ "$output" == *'mediaId="763"'* ]] || false
+  [[ "$output" != *'35199'* ]] || false
+}
+
+@test "etch_post_import component-prop remap: a spaced call-site attribute (\"bild\" : \"35253\") is still discovered and remapped (issue #88)" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t105\tpage\n37496\t40000\twp_block\n35253\t888\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php_multi \
+    105 '<!-- wp:etch/component {"ref":37496,"attributes":{"text":"Alpha","bild"  :  "35253"}} -->' \
+    40000 '<!-- wp:etch/dynamic-image {"attributes":{"class":"item-card__image","mediaId":"{props.bild}"}} -->'
+  local write_105
+  write_105=$(printf '%s\n' "$output" | grep '^WRITE:105:')
+  [[ "$write_105" == *'"bild":"888"'* ]] || false
+  [[ "$write_105" != *'35253'* ]] || false
+}
+
+@test "etch_post_import component-prop remap: space BEFORE the outer \"attributes\" colon is still found and rewritten (issue #88, Viktor's blocking repro)" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t105\tpage\n37496\t40000\twp_block\n35253\t888\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php_multi \
+    105 '<!-- wp:etch/component {"ref":37496,"attributes" : {"bild":"35253"}} -->' \
+    40000 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"{props.bild}"}} -->'
+  local write_105
+  write_105=$(printf '%s\n' "$output" | grep '^WRITE:105:')
+  [[ "$write_105" == *'"bild":"888"'* ]] || false
+  [[ "$write_105" != *'35253'* ]] || false
+}
+
+@test "etch_post_import component-prop discovery: a spaced component-body declaration (\"mediaId\" : \"{props.bild}\") is still discovered (issue #88)" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t105\tpage\n37496\t40000\twp_block\n35253\t888\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php_multi \
+    105 '<!-- wp:etch/component {"ref":37496,"attributes":{"bild":"35253"}} -->' \
+    40000 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId"  :  "{props.bild}"}} -->'
+  local write_105
+  write_105=$(printf '%s\n' "$output" | grep '^WRITE:105:')
+  [[ "$write_105" == *'"bild":"888"'* ]] || false
+  [[ "$write_105" != *'35253'* ]] || false
+}
+
+# --- issue #88: the cheap interim "decided but text unchanged" guard ------
+#
+# The remap already KNOWS, for every (post, old id) pair it looks at, that
+# it decided that id might need rewriting -- it is iterating $map/$media_map,
+# built from exactly the ids this run migrated. If that old id is still
+# textually present, digit-bounded, in the post's content after every
+# sentinel pass ran, this hook cannot silently move on: it echoes
+# `UNMATCHED_ID_REF:<pid>:<old>:<kind>`, surfaced by the bash side as a
+# named `log_warn`. This is the documented fallback for exactly the forms
+# whitespace-tolerance above does not anticipate (curly/smart quotes from a
+# pasted edit, here) -- not a hypothetical, CLAUDE.md's own "prove the check
+# can fail" rule applied to this fix-pack.
+@test "etch_post_import UNMATCHED-guard PHP proof: a mediaId reference in curly/smart quotes (a pasted-from-rich-text edit, not valid JSON quoting) is neither rewritten nor silently dropped -- it is named" {
+  # MUTATION-TESTED: removing the UNMATCHED_ID_REF foreach block from
+  # modules/etch.sh's etch_post_import turns this red -- with the guard gone
+  # the captured PHP produces no output at all for this content (the
+  # smart-quoted form was never a shape any \s*-tolerant pattern matches
+  # either, before or after this fix-pack).
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t105\tpage\n35199\t763\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php 105 '<!-- wp:etch/dynamic-image {"attributes":{“mediaId”:“35199”}} -->'
+  [[ "$output" == *'UNMATCHED_ID_REF:105:35199:mediaId'* ]] || false
+  # Correctly NOT rewritten -- the guard reports, it never invents a fix.
+  [[ "$output" == *'35199'* ]] || false
+}
+
+@test "etch_post_import UNMATCHED-guard PHP proof: stays silent when the mediaId remap actually succeeded (no false-positive noise on the common case)" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t105\tpage\n35199\t763\tattachment\n' > "$tsv"
+  run etch_post_import "$BATS_TEST_TMPDIR" "$tsv" "_etch_capture_eval"
+  [ "$status" -eq 0 ]
+  run _etch_run_captured_php 105 '<!-- wp:etch/dynamic-image {"attributes":{"mediaId":"35199"}} -->'
+  [[ "$output" != *'UNMATCHED_ID_REF'* ]] || false
+}
+
+@test "etch_post_import UNMATCHED-guard bash wiring: an UNMATCHED_ID_REF marker from the eval becomes a named log_warn, never a recorded content rewrite" {
+  # Mirrors this file's own NESTED_COMPONENT wiring test just above: the
+  # eval's marker line is hand-supplied here (a realistic canned line, not a
+  # real PHP execution) specifically to isolate and pin the BASH side's
+  # reaction to it, independent of the PHP-level proof above.
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '5\t105\tpage\n35199\t763\tattachment\n' > "$tsv"
+  _etch_capture_eval_unmatched() {
+    case "$1" in
+      option) echo '{}' ;;
+      eval)
+        printf '%s' "$2" > "$BATS_TEST_TMPDIR/php.txt"
+        echo "UNMATCHED_ID_REF:105:35199:mediaId"
+        ;;
+    esac
+  }
+  run --separate-stderr etch_post_import "$run_dir" "$tsv" "_etch_capture_eval_unmatched"
+  [ "$status" -eq 0 ]
+  [[ "$stderr" == *"post 105"* ]] || false
+  [[ "$stderr" == *"old mediaId id 35199"* ]] || false
+  [[ "$stderr" == *"issue #88"* ]] || false
+  # A warning marker, not a post id -- must never be counted as a rewrite.
+  [ ! -f "${run_dir}/module-content-rewrites.tsv" ]
+}
+
 # --- etch_post_import: component PROPS with an operator-chosen name (#86) ---
 #
 # Follow-up to #84/PR #85: `bild` is a name only the referenced component's

@@ -105,6 +105,23 @@ php_run() {
   [[ "$output" == "OK" ]]
 }
 
+@test "sitegraft_remap_attachment_refs rewrites a spaced \"id\" : X JSON attribute (issue #88 -- WordPress/Etch never emit this, but a hand-edited call site is not ruled out)" {
+  # MUTATION-TESTED: reverting the pattern to '/"id":' . $old_id . '(?!\d)/'
+  # (no \s*) turns this red -- the old exact-byte-sequence pattern cannot
+  # match a colon with a space on either side.
+  run php_run '
+    $out = sitegraft_remap_attachment_refs(
+      [["old" => "7", "new" => "42"]],
+      "<!-- wp:etch/image {\"id\" : 7} -->"
+    );
+    if (strpos($out, "\"id\":42") === false) { fwrite(STDERR, "spaced id attribute not remapped: $out\n"); exit(1); }
+    if (strpos($out, "\"id\" : 7") !== false) { fwrite(STDERR, "old spaced id survived: $out\n"); exit(1); }
+    echo "OK";
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == "OK" ]]
+}
+
 @test "sitegraft_remap_domain rewrites both the plain and JSON-escaped-slash forms of the domain string" {
   run php_run '
     $out = sitegraft_remap_domain(

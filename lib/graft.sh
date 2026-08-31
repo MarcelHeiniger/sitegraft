@@ -2058,6 +2058,22 @@ graft_remap_attachment_ids() {
   # is $wpdb->update(), NOT wp_update_post() (issue #43) — see
   # sitegraft_write_remapped_post's own docblock for why the array form of
   # wp_update_post() silently ate every backslash this remap writes.
+  # Issue #88's own cheap interim guard, doable regardless of whether the
+  # whitespace-tolerance fix above closes every case: this loop already
+  # knows, for every (post, old attachment id) pair, that it DECIDED the id
+  # might need remapping -- it is iterating $payload["attachments"], built
+  # from exactly the ids this run migrated. If that old id is still
+  # textually present, digit-bounded, in the post's own content/excerpt
+  # AFTER sitegraft_remap_attachment_refs ran on it, that is a case this
+  # pass tried to fix and apparently did not (an unrecognized JSON
+  # formatting, most plausibly) -- reported by post AND by attachment id,
+  # turning issue #88's own "total invisibility" into a named line in the
+  # run's output, rather than nothing at all. A false positive is possible
+  # (the digit sequence could coincidentally appear elsewhere in the post
+  # for an unrelated reason) -- deliberately accepted: CLAUDE.md's own
+  # rule is "report unknown, never OK," and a warning an operator can
+  # dismiss after a two-second look is strictly better than the silence
+  # #88 itself reports.
   run_or_echo wp_remote b eval '
     require_once WP_CONTENT_DIR . "/sitegraft-content-remap-functions.php";
     $payload_path = WP_CONTENT_DIR . "/sitegraft-id-remap-payload.json";
@@ -2068,10 +2084,21 @@ graft_remap_attachment_ids() {
       $post_id = (int) $post_id;
       $post = get_post( $post_id );
       if ( ! $post ) { continue; }
-      $content = sitegraft_remap_attachment_refs( $payload["attachments"], $post->post_content );
-      $excerpt = sitegraft_remap_attachment_refs( $payload["attachments"], $post->post_excerpt );
+      $before_content = $post->post_content;
+      $before_excerpt = $post->post_excerpt;
+      $content = sitegraft_remap_attachment_refs( $payload["attachments"], $before_content );
+      $excerpt = sitegraft_remap_attachment_refs( $payload["attachments"], $before_excerpt );
       if ( sitegraft_write_remapped_post( $post, array( "post_content" => $content, "post_excerpt" => $excerpt ) ) ) {
         $count++;
+      }
+      foreach ( $payload["attachments"] as $row ) {
+        $old_id = (int) $row["old"];
+        $digit_bounded = "/(?<!\\d)" . $old_id . "(?!\\d)/";
+        $was_present = preg_match( $digit_bounded, $before_content ) || preg_match( $digit_bounded, $before_excerpt );
+        $still_present = preg_match( $digit_bounded, $content ) || preg_match( $digit_bounded, $excerpt );
+        if ( $was_present && $still_present ) {
+          echo "sitegraft: WARNING post {$post_id} still references old attachment id {$old_id} after id-remap decided to look for it -- content unchanged (possible unrecognized JSON formatting, issue #88)\n";
+        }
       }
     }
     echo "sitegraft: id-remap rewrote {$count} post(s)\n";

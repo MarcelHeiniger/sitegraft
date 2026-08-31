@@ -21,12 +21,29 @@
       Same defect as #16 one level up, and **worse**: the completeness gate counts
       items, so a post whose terms were dropped still lands and the gate passes.
       Not triggered on the pilot site (the option does not exist there).
-- [ ] **#88 — spaced JSON.** Every rewrite pass matches the compact form only; a
-      spaced call site is left untouched, by two independent causes. Pre-existing
-      (#84/#85 miss it identically), never emitted by WordPress's serializer.
-      Contains a cheap sub-task worth doing regardless: the remap decodes each
-      block, so it knows when it *decided* to rewrite — reporting "decided, but the
-      raw text did not change" turns total silence into a named post id.
+- [x] **#88 — spaced JSON.** Every rewrite/guard pattern that matched a JSON
+      key/value pair (attachment `"id"`, `"ref"`, `"mediaId"` in both its
+      quoted/bare/HTML-attribute forms, the component-prop discovery regex, and
+      the component-prop call-site rewrite) used to match ONLY the exact compact
+      byte sequence — the two independent causes being a `preg_replace`/`grep`
+      pattern with zero whitespace tolerance around the colon, and a `str_replace`
+      exact-string match at the component-prop call site that no amount of
+      whitespace tolerance can fix (it needs a real pattern, not a literal). Fixed
+      at every one of those call sites (`lib/php/content-remap-functions.php`,
+      `modules/etch.sh`, `lib/verify.sh`) with `\s*`-tolerant regex, and the
+      component-prop call site's `str_replace` was replaced with a `preg_replace`
+      for the same reason. NOT a full JSON decode/re-encode (the issue's own
+      stated ideal) — that remains materially larger, since most of these call
+      sites match raw bytes across a post's full content rather than a single
+      already-isolated JSON span. In its place: the cheap guard the issue itself
+      calls out as doable regardless — both `graft_remap_attachment_ids`
+      (`lib/graft.sh`) and `etch_post_import` (`modules/etch.sh`) already know,
+      per (post, old id) pair, that they *decided* that id needed rewriting; if
+      it is still textually present, digit-bounded, in the post's content after
+      every pass ran, that is now a named `log_warn` (post id + old id), never
+      silence. Mutation-tested in `tests/unit/test_content_remap_functions.bats`,
+      `tests/unit/test_etch_module.bats`, `tests/unit/test_verify.bats` and
+      `tests/unit/test_graft_remap.bats`.
 - [ ] **#79 — the harness fixture misses the shapes that matter.** It went green
       on three separate broken builds this session. Needs: an ssh-remote target, a
       post type outside `get_post_types(['exclude_from_search' => false])`, and
