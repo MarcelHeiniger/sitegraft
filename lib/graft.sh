@@ -532,30 +532,6 @@ graft_check_stack_precondition() {
   fi
 }
 
-# Pure argv-inspection helpers (design doc §6.4 step 1) — NOT what
-# graft_media_sync itself calls for the wrapped-local case (it needs the
-# tar-through-the-wrapper technique above, which isn't expressible as a
-# single rsync argv); these exist so the two-hop shape (ssh vs. no-ssh,
-# never scp, never --ignore-existing missing on the push side) is directly
-# unit-testable without a live site.
-graft_media_pull_cmd() {
-  local site_a_ssh_host="$1" src="$2" dst="$3"
-  if [ -n "$site_a_ssh_host" ]; then
-    printf 'rsync\n-avz\n%s:%s\n%s\n' "$site_a_ssh_host" "$src" "$dst"
-  else
-    printf 'rsync\n-avz\n%s\n%s\n' "$src" "$dst"
-  fi
-}
-
-graft_media_push_cmd() {
-  local site_b_ssh_host="$1" src="$2" dst="$3"
-  if [ -n "$site_b_ssh_host" ]; then
-    printf 'rsync\n-avz\n--ignore-existing\n%s\n%s:%s\n' "$src" "$site_b_ssh_host" "$dst"
-  else
-    printf 'rsync\n-avz\n--ignore-existing\n%s\n%s\n' "$src" "$dst"
-  fi
-}
-
 # design doc §6.4 step 1 / review finding A4: A's uploads are pulled to the
 # orchestrator's run directory first, then pushed to B — A is never assumed
 # reachable from B directly, exactly like the WXR transfer in step 5.

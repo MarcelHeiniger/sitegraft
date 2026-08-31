@@ -205,10 +205,10 @@ _backup_local_exec_prefix() {
 # directory" against a real DDEV project, then fixed by streaming a tar
 # archive through the same wrapper prefix wp-cli commands already use.
 #
-# Step 4's media sync (`graft_media_pull_cmd`/`graft_media_push_cmd`, design
-# doc §6.4 step 1) will face this identical problem — reuse
-# _backup_local_exec_prefix there rather than rediscovering this the hard way
-# a second time.
+# Step 4's media sync (`graft_media_sync`, design doc §6.4 step 1) faced this
+# identical problem — resolved not by reusing _backup_local_exec_prefix
+# directly, but by `graft_pull_dir`/`graft_push_dir` (lib/graft.sh) handling
+# all three site shapes internally, which `graft_media_sync` routes through.
 backup_wp_content() {
   local dest_dir="$1"
   log_info "archiving B wp-content to ${dest_dir} ..."
