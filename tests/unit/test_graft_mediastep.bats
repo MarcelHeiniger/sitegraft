@@ -1,7 +1,10 @@
 # tests/unit/test_graft_mediastep.bats — the media step of `sitegraft graft`
-# (design doc §6.4 step 1): the pure argv-inspection halves of the media
-# file sync (graft_media_pull_cmd/graft_media_push_cmd), and the batched
-# attachment-import orchestration (graft_import_attachments, issue #11)
+# (design doc §6.4 step 1): graft_media_sync's own exit-status guarding
+# (its command shape over ssh is pinned in tests/unit/test_graft_ssh_file_
+# transfer.bats and test_graft_pull_ssh_transfer.bats, added by #78 when
+# graft_media_sync was collapsed onto the shared graft_pull_dir/
+# graft_push_dir transfer helpers), and the batched attachment-import
+# orchestration (graft_import_attachments, issue #11)
 # that replaced roughly 2000 per-attachment container invocations with two
 # `wp eval` calls. The actual import/remap logic those two calls run lives
 # in lib/php/media-import-functions.php — see
@@ -109,25 +112,6 @@ php_eval_captured() {
 
   [ "$rc" -ne 0 ]
 }
-
-@test "graft_media_pull_cmd routes A's uploads to a local staging dir via ssh when A is remote" {
-  run graft_media_pull_cmd "user@host-a.example.com" "/site-a/wp-content/uploads/" "/run/media-staging/"
-  [[ "$output" == *"rsync"* ]] || false
-  [[ "$output" == *"user@host-a.example.com"* ]] || false
-  [[ "$output" != *"scp"* ]]
-}
-
-@test "graft_media_pull_cmd has no ssh hop when A is local" {
-  run graft_media_pull_cmd "" "/site-a/wp-content/uploads/" "/run/media-staging/"
-  [[ "$output" != *"ssh"* ]] || [[ "$output" != *"@"* ]]
-}
-
-@test "graft_media_push_cmd never overwrites existing files on B" {
-  run graft_media_push_cmd "user@host-b.example.com" "/run/media-staging/" "/site-b/wp-content/uploads/"
-  [[ "$output" == *"--ignore-existing"* ]] || false
-  [[ "$output" != *"scp"* ]]
-}
-
 
 # _capture_b_eval — drives graft_import_attachments once with everything
 # stubbed, purely to capture the exact PHP it hands to B, and echoes the
