@@ -1733,6 +1733,219 @@ EOF
   [ "$status" -eq 1 ]
 }
 
+# --- issue #62 (M2): single-jq-pass join, proven byte-identical to the ------
+# --- old per-row loop it replaced --------------------------------------
+#
+# _reference_content_match_join is the OLD implementation, verbatim (the
+# exact loop lib/verify.sh's verify_migrated_content_matches_source used
+# to run before issue #62's fix), kept here ONLY as an independent oracle
+# to diff the new single-jq-pass join against — never re-imported by
+# production code. Given the same (checkable_json, items_json, live_json)
+# triple, it must always agree with what the real function reports for
+# <compared> and for which ids land in the mismatched set: this is the
+# correctness-preservation proof issue #62 asks for (a pure performance
+# rewrite must not be trusted on "it still passes the existing tests"
+# alone, since none of those existing tests were written to distinguish
+# an O(N^2) join from an O(N) one that happens to compute the same
+# answer on their small fixtures — this section is what actually proves
+# the two are the same function).
+_reference_content_match_join() {
+  local checkable_json="$1" items_json="$2" live_json="$3"
+  local compared=0 mismatched=""
+  local row old_id new_id expected_content expected_excerpt live_row actual_content actual_excerpt found
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    old_id=$(echo "$row" | jq -r '.old_id')
+    new_id=$(echo "$row" | jq -r '.new_id')
+    found=$(echo "$items_json" | jq --argjson id "$old_id" '[.[] | select(.post_id == $id)] | length')
+    if [ "$found" -eq 0 ]; then
+      mismatched="${mismatched}${new_id}(no-source-item) "
+      continue
+    fi
+    expected_content=$(echo "$items_json" | jq -r --argjson id "$old_id" '[.[] | select(.post_id == $id)][0].post_content')
+    expected_excerpt=$(echo "$items_json" | jq -r --argjson id "$old_id" '[.[] | select(.post_id == $id)][0].post_excerpt')
+    live_row=$(echo "$live_json" | jq -c --argjson id "$new_id" '[.[] | select(.ID == $id)][0] // empty')
+    if [ -z "$live_row" ]; then
+      mismatched="${mismatched}${new_id}(not-found-on-b) "
+      continue
+    fi
+    compared=$((compared + 1))
+    actual_content=$(echo "$live_row" | jq -r '.post_content')
+    actual_excerpt=$(echo "$live_row" | jq -r '.post_excerpt')
+    if [ "$actual_content" != "$expected_content" ] || [ "$actual_excerpt" != "$expected_excerpt" ]; then
+      mismatched="${mismatched}${new_id} "
+    fi
+  done <<< "$(echo "$checkable_json" | jq -c '.[]')"
+  jq -n --argjson c "$compared" --arg m "$mismatched" '{compared: $c, mismatched: $m}'
+}
+
+@test "issue #62 (M2): reference oracle agrees with itself on a trivial fixture (sanity-checks the oracle, not lib/verify.sh)" {
+  run _reference_content_match_join \
+    '[{"old_id":5,"new_id":105,"post_type":"page"}]' \
+    '[{"post_id":5,"post_type":"page","post_content":"hello","post_excerpt":""}]' \
+    '[{"ID":105,"post_content":"hello","post_excerpt":""}]'
+  [ "$status" -eq 0 ]
+  run jq -e '.compared == 1 and .mismatched == ""' <<< "$output"
+  [ "$status" -eq 0 ]
+}
+
+@test "issue #62 (M2): the real function's <compared> and mismatched-id set match the reference oracle for multiple rows all matching, including unicode/tab/newline content" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  printf '5\t105\tpage\n6\t106\tpage\n7\t107\tpost\n' > "${run_dir}/id-map.tsv"
+  : > "${run_dir}/module-content-rewrites.tsv"
+  local manifest='{"migrate":{"core-wp":{"post_types":["page","post"]}}}'
+  local checkable='[{"old_id":5,"new_id":105,"post_type":"page"},{"old_id":6,"new_id":106,"post_type":"page"},{"old_id":7,"new_id":107,"post_type":"post"}]'
+  local items='[{"post_id":5,"post_type":"page","post_content":"hello world","post_excerpt":""},{"post_id":6,"post_type":"page","post_content":"line1\nline2\ttabbed","post_excerpt":"same"},{"post_id":7,"post_type":"post","post_content":"emoji üé content","post_excerpt":"y"}]'
+  local live='[{"ID":105,"post_content":"hello world","post_excerpt":""},{"ID":106,"post_content":"line1\nline2\ttabbed","post_excerpt":"same"},{"ID":107,"post_content":"emoji üé content","post_excerpt":"y"}]'
+  _verify_wxr_items_remapped() { printf '%s' "$items"; }
+  wp_remote() { printf '%s' "$live"; }
+
+  local reference
+  reference=$(_reference_content_match_join "$checkable" "$items" "$live")
+  local expected_compared; expected_compared=$(echo "$reference" | jq -r '.compared')
+
+  run verify_migrated_content_matches_source "$run_dir" "${run_dir}/id-map.tsv" "$manifest"
+  [ "$status" -eq 0 ]
+  [ "$expected_compared" -eq 3 ]
+  [[ "$output" == *"CONTENT_MATCH:${expected_compared}:3:0"* ]] || false
+}
+
+@test "issue #62 (M2): the real function's <compared> and mismatched-id set match the reference oracle for multiple rows with a real mismatch mixed among matches" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  printf '5\t105\tpage\n6\t106\tpage\n7\t107\tpost\n' > "${run_dir}/id-map.tsv"
+  : > "${run_dir}/module-content-rewrites.tsv"
+  local manifest='{"migrate":{"core-wp":{"post_types":["page","post"]}}}'
+  local checkable='[{"old_id":5,"new_id":105,"post_type":"page"},{"old_id":6,"new_id":106,"post_type":"page"},{"old_id":7,"new_id":107,"post_type":"post"}]'
+  # 105 matches; 106's B content genuinely differs (real mismatch); 107's
+  # B EXCERPT genuinely differs (mismatch on the excerpt field alone,
+  # content otherwise identical -- the old loop's OR condition, exercised
+  # here so the oracle and the real function are compared on that branch
+  # too, not just the post_content one).
+  local items='[{"post_id":5,"post_type":"page","post_content":"hello world","post_excerpt":""},{"post_id":6,"post_type":"page","post_content":"original","post_excerpt":""},{"post_id":7,"post_type":"post","post_content":"same","post_excerpt":"old excerpt"}]'
+  local live='[{"ID":105,"post_content":"hello world","post_excerpt":""},{"ID":106,"post_content":"CHANGED ON B","post_excerpt":""},{"ID":107,"post_content":"same","post_excerpt":"DIFFERENT excerpt"}]'
+  _verify_wxr_items_remapped() { printf '%s' "$items"; }
+  wp_remote() { printf '%s' "$live"; }
+
+  local reference
+  reference=$(_reference_content_match_join "$checkable" "$items" "$live")
+  local expected_compared expected_mismatched
+  expected_compared=$(echo "$reference" | jq -r '.compared')
+  expected_mismatched=$(echo "$reference" | jq -r '.mismatched')
+
+  run verify_migrated_content_matches_source "$run_dir" "${run_dir}/id-map.tsv" "$manifest"
+  [ "$status" -eq 1 ]
+  [ "$expected_compared" -eq 3 ]
+  [[ "$expected_mismatched" == *"106"* ]] || false
+  [[ "$expected_mismatched" == *"107"* ]] || false
+  [[ "$output" == *"CONTENT_MATCH:${expected_compared}:3:0"* ]] || false
+  [[ "$output" == *"106"* ]] || false
+  [[ "$output" == *"107"* ]] || false
+  [[ "$output" != *"105(not-found-on-b)"* ]] || false
+}
+
+@test "issue #62 (M2): the real function's mismatched set matches the reference oracle's no-source-item/not-found-on-b annotations" {
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  printf '5\t105\tpage\n6\t106\tpage\n' > "${run_dir}/id-map.tsv"
+  : > "${run_dir}/module-content-rewrites.tsv"
+  local manifest='{"migrate":{"core-wp":{"post_types":["page"]}}}'
+  # old_id 5's WXR item exists but live has no ID 105 at all -- "105
+  # (not-found-on-b)". old_id 6 has no WXR item at all (never reaches the
+  # live lookup) -- "106(no-source-item)".
+  local checkable='[{"old_id":5,"new_id":105,"post_type":"page"},{"old_id":6,"new_id":106,"post_type":"page"}]'
+  local items='[{"post_id":5,"post_type":"page","post_content":"hello","post_excerpt":""}]'
+  local live='[]'
+  _verify_wxr_items_remapped() { printf '%s' "$items"; }
+  wp_remote() { printf '%s' "$live"; }
+
+  local reference
+  reference=$(_reference_content_match_join "$checkable" "$items" "$live")
+  local expected_mismatched
+  expected_mismatched=$(echo "$reference" | jq -r '.mismatched')
+  [[ "$expected_mismatched" == *"105(not-found-on-b)"* ]] || false
+  [[ "$expected_mismatched" == *"106(no-source-item)"* ]] || false
+
+  run verify_migrated_content_matches_source "$run_dir" "${run_dir}/id-map.tsv" "$manifest"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"105(not-found-on-b)"* ]] || false
+  [[ "$output" == *"106(no-source-item)"* ]] || false
+}
+
+@test "issue #62 (M2): a live row missing post_content/post_excerpt entirely (JSON null) is flagged as a mismatch against real source text, not compared as jq's own null (the rawtext gap Viktor's mutation testing found no existing test for)" {
+  # A live row from wp_remote's own JSON output can legitimately lack a
+  # field (a post row that never had post_excerpt set, or an upstream
+  # shape change) -- that field decodes to JSON `null`, not an empty
+  # string. The OLD per-row loop read it with `jq -r`, which prints a
+  # string RAW but anything else (including null) as jq's own encoding of
+  # it -- i.e. `jq -r 'null'` prints the four characters "null", a bash
+  # string that can never equal a real post's actual content. The
+  # rewritten single-jq-pass join must reproduce that exact stringification
+  # (its own `rawtext` helper), not compare `null == null` natively, which
+  # would make a live row that's missing the field ENTIRELY compare equal
+  # to a live row genuinely holding an empty string on the source side --
+  # a real regression this test pins down.
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  printf '5\t105\tpage\n' > "${run_dir}/id-map.tsv"
+  : > "${run_dir}/module-content-rewrites.tsv"
+  local manifest='{"migrate":{"core-wp":{"post_types":["page"]}}}'
+  local checkable='[{"old_id":5,"new_id":105,"post_type":"page"}]'
+  local items='[{"post_id":5,"post_type":"page","post_content":"real content","post_excerpt":""}]'
+  # live's row has NO post_content key at all -- decodes to JSON null, not "".
+  local live='[{"ID":105,"post_excerpt":""}]'
+  _verify_wxr_items_remapped() { printf '%s' "$items"; }
+  wp_remote() { printf '%s' "$live"; }
+
+  local reference
+  reference=$(_reference_content_match_join "$checkable" "$items" "$live")
+  local expected_mismatched
+  expected_mismatched=$(echo "$reference" | jq -r '.mismatched')
+  [[ "$expected_mismatched" == *"105"* ]] || false
+
+  run verify_migrated_content_matches_source "$run_dir" "${run_dir}/id-map.tsv" "$manifest"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"105"* ]] || false
+}
+
+@test "issue #62 (M2), Viktor's review: the single-jq-pass join does not hit the OS's ARG_MAX at realistic content size (the --argjson regression the first version of this fix shipped)" {
+  # The FIRST version of this rewrite passed all three JSON blobs to jq via
+  # `--argjson`, which hands them to jq as execve() COMMAND-LINE ARGUMENTS
+  # -- bounded by the OS's ARG_MAX (~1MB combined with the environment on a
+  # typical box). ~100 real pages at a realistic ~3KB post_content each
+  # already overflowed it ("jq: Argument list too long", exit 126) -- a
+  # crash, not a slowdown, at a FRACTION of the 400+-post scale this issue
+  # exists to make merely-fast-instead-of-slow. Piping the combined
+  # document through jq's stdin instead has no such bound. This fixture
+  # reproduces the exact scale Viktor's review found the regression at:
+  # 200 posts, ~3KB of content each (~1.2MB combined JSON), matching real
+  # Etch/ACSS block markup weight, not the few-byte fixtures the rest of
+  # this section uses for readability.
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local id_map="" checkable_entries="" item_entries="" live_entries=""
+  local big_content
+  big_content=$(head -c 3000 /dev/zero | tr '\0' 'x')
+  local i old_id new_id
+  for i in $(seq 1 200); do
+    old_id=$i
+    new_id=$((i + 1000))
+    id_map="${id_map}${old_id}\t${new_id}\tpage\n"
+    checkable_entries="${checkable_entries}{\"old_id\":${old_id},\"new_id\":${new_id},\"post_type\":\"page\"},"
+    item_entries="${item_entries}{\"post_id\":${old_id},\"post_type\":\"page\",\"post_content\":\"${big_content}\",\"post_excerpt\":\"\"},"
+    live_entries="${live_entries}{\"ID\":${new_id},\"post_content\":\"${big_content}\",\"post_excerpt\":\"\"},"
+  done
+  printf "%b" "$id_map" > "${run_dir}/id-map.tsv"
+  : > "${run_dir}/module-content-rewrites.tsv"
+  local manifest='{"migrate":{"core-wp":{"post_types":["page"]}}}'
+  local checkable="[${checkable_entries%,}]"
+  local items="[${item_entries%,}]"
+  local live="[${live_entries%,}]"
+  _verify_wxr_items_remapped() { printf '%s' "$items"; }
+  wp_remote() { printf '%s' "$live"; }
+
+  run verify_migrated_content_matches_source "$run_dir" "${run_dir}/id-map.tsv" "$manifest"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"CONTENT_MATCH:200:200"* ]] || false
+  [[ "$output" != *"Argument list too long"* ]] || false
+}
+
 # --- verify_migrated_content_changed_from_pregraft (guard 2, issue #52) -----
 # The mutation-target guard: ADR 0008 says this guard, ALONE, must catch the
 # observed defect (a colliding item wordpress-importer silently skipped —

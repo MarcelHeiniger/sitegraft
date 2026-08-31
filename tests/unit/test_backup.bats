@@ -2656,3 +2656,73 @@ exec "$@"')
   run backup_compute_content_checksums b "$manifest"
   [ "$status" -eq 1 ]
 }
+
+# --- issue #62 (M3): batch jq/shasum rewrite, proven byte-identical to -----
+# --- the old per-row jq+shasum-fork implementation --------------------
+#
+# backup_content_checksum_of_row (lib/backup.sh, above) is untouched and
+# is STILL the canonical single-row reference (also called by
+# lib/verify.sh's post-graft recompute) -- these tests use it directly as
+# the oracle for what backup_compute_content_checksums' new batch path
+# (one jq pass to canonicalize, N cheap file writes, ONE shasum call over
+# all of them, one jq pass to assemble) must produce for each row, proving
+# the rewrite did not change a single output byte even though it changed
+# every mechanism that produces them.
+
+@test "issue #62 (M3): backup_compute_content_checksums returns {} for zero rows on B, not merely for zero post_types selected" {
+  local manifest='{"migrate":{"core-wp":{"post_types":["page"]}}}'
+  wp_remote() { echo '[]'; }
+  run backup_compute_content_checksums b "$manifest"
+  [ "$status" -eq 0 ]
+  [ "$output" = "{}" ]
+}
+
+@test "issue #62 (M3): backup_compute_content_checksums matches backup_content_checksum_of_row's own digest for a single row" {
+  local manifest='{"migrate":{"core-wp":{"post_types":["page"]}}}'
+  local row='{"ID":16,"post_content":"hello","post_excerpt":"world"}'
+  wp_remote() { printf '[%s]' "$row"; }
+  run backup_compute_content_checksums b "$manifest"
+  [ "$status" -eq 0 ]
+  local batch_output="$output"
+
+  run backup_content_checksum_of_row "$row"
+  [ "$status" -eq 0 ]
+  local expected="sha256:${output}"
+
+  run jq -e --arg id "16" --arg expected "$expected" '.[$id] == $expected' <<< "$batch_output"
+  [ "$status" -eq 0 ]
+}
+
+@test "issue #62 (M3): every entry in backup_compute_content_checksums' batch digest map matches backup_content_checksum_of_row computed independently per row, across ordinary, empty, unicode, tab/newline, quote/backslash, and missing-excerpt content" {
+  local manifest='{"migrate":{"core-wp":{"post_types":["page","post"]}}}'
+  # Five rows, each an edge case the old per-row shasum pipe and the new
+  # batch file-based shasum could plausibly disagree on if the
+  # canonicalization or the file-write round-trip lost or altered a byte.
+  local row1='{"ID":16,"post_content":"hello","post_excerpt":"world"}'
+  local row2='{"ID":17,"post_content":"","post_excerpt":""}'
+  local row3='{"ID":18,"post_content":"emoji 🎉 unicode üé","post_excerpt":"more üñíçødé"}'
+  local row4='{"ID":19,"post_content":"line1\nline2\ttabbed \"quoted\" \\backslash\\","post_excerpt":"excerpt\\with\\backslashes"}'
+  local row5='{"ID":20,"post_content":"no excerpt key at all"}'
+  local rows_json
+  rows_json=$(jq -n --argjson r1 "$row1" --argjson r2 "$row2" --argjson r3 "$row3" --argjson r4 "$row4" --argjson r5 "$row5" '[$r1,$r2,$r3,$r4,$r5]')
+  wp_remote() { printf '%s' "$rows_json"; }
+
+  run backup_compute_content_checksums b "$manifest"
+  [ "$status" -eq 0 ]
+  local batch_output="$output"
+
+  local row id expected
+  for row in "$row1" "$row2" "$row3" "$row4" "$row5"; do
+    id=$(echo "$row" | jq -r '.ID')
+    run backup_content_checksum_of_row "$row"
+    [ "$status" -eq 0 ]
+    expected="sha256:${output}"
+    run jq -e --arg id "$id" --arg expected "$expected" '.[$id] == $expected' <<< "$batch_output"
+    [ "$status" -eq 0 ]
+  done
+
+  # And no extra/missing keys -- exactly 5 entries, not 4 (a dropped row)
+  # or 6 (a phantom one).
+  run jq -e 'keys | length == 5' <<< "$batch_output"
+  [ "$status" -eq 0 ]
+}

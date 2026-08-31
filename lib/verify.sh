@@ -1708,6 +1708,44 @@ _verify_wxr_items_remapped() {
 # import (lib/graft.sh) creating it unconditionally, or a kill mid-hook
 # lost it — see this function's own B2 section below for why that must
 # never be read the same as "present and genuinely empty".
+#
+# Issue #62 (M2): the old<->new<->live join below used to run FIVE `jq`
+# sub-processes PER ROW of $checkable_json, each one re-parsing the WHOLE
+# of $items_json and/or $live_json from scratch just to find the one
+# element it needed — O(checkable_total * (items_total + live_total)).
+# Measured: 50 posts -> 2s, 100 -> 3s, 200 -> 12s, 400 -> 40s, extrapolating
+# to roughly 40 minutes at 3000 posts. Not wrong (every one of those jq
+# calls returned the right answer), just doesn't scale to the sites this
+# guard exists to check exhaustively.
+#
+# Rebuilt as ONE jq invocation that builds $items_json/$live_json into
+# id-keyed lookup objects (a single linear pass each, `reduce ... //=` so a
+# duplicate id keeps the FIRST occurrence — the exact same result
+# `[.[] | select(...)][0]` picked in the old per-row query) and then walks
+# $checkable_json once, doing an O(1) lookup instead of an O(N) re-scan for
+# every row. Emits `{compared, mismatched}` on stdout — <compared> and the
+# space-joined <mismatched> string (each entry already carrying its own
+# trailing space, matching the old loop's own `"${mismatched}${x} "`
+# accumulation byte-for-byte) are read back below exactly like the
+# multi-line accumulator variables the old loop built directly in bash.
+#
+# `rawtext` mirrors what `jq -r` printed for each old per-row extraction:
+# a string prints raw (unquoted); anything else (most notably JSON `null`
+# for a field the live/source row never had) prints as its own JSON
+# encoding, so `null` prints as the four characters `null` — the same text
+# the old code's bash `[ "$actual_content" != "$expected_content" ]`
+# compared. Without this, a live row missing post_content entirely (JSON
+# `null`) would compare as jq's *native* null against a real source
+# string, a strictly different (and, for this one theoretical shape, less
+# permissive) comparison than the byte-string one this is a pure
+# performance rewrite of, not a behavior change.
+#
+# Proven byte-identical output to the old per-row loop, across 0/1/many
+# rows and every branch (match, content mismatch, excerpt-only mismatch,
+# no-source-item, not-found-on-b, a live row missing a field entirely,
+# unicode content) — see tests/unit/test_verify.bats' own "single-jq-pass
+# join" section, each test of which runs BOTH implementations against the
+# same fixture and asserts equal results.
 verify_migrated_content_matches_source() {
   local run_dir="$1" id_map_tsv="$2" manifest="$3"
 
@@ -1813,36 +1851,55 @@ verify_migrated_content_matches_source() {
     return 1
   }
 
-  local compared=0 mismatched=""
-  local row old_id new_id expected_content expected_excerpt live_row actual_content actual_excerpt found
-  # fd 3, not stdin — same convention/reason as every other id-map.tsv-
-  # derived loop in this codebase (lib/graft.sh's own comment on this
-  # exact pattern): nothing in this loop shells out to ssh today, but
-  # matching the established convention up front costs nothing and keeps
-  # a future edit from silently reintroducing that class of bug.
-  while IFS= read -r row <&3; do
-    [ -n "$row" ] || continue
-    old_id=$(echo "$row" | jq -r '.old_id')
-    new_id=$(echo "$row" | jq -r '.new_id')
-    found=$(echo "$items_json" | jq --argjson id "$old_id" '[.[] | select(.post_id == $id)] | length')
-    if [ "$found" -eq 0 ]; then
-      mismatched="${mismatched}${new_id}(no-source-item) "
-      continue
-    fi
-    expected_content=$(echo "$items_json" | jq -r --argjson id "$old_id" '[.[] | select(.post_id == $id)][0].post_content')
-    expected_excerpt=$(echo "$items_json" | jq -r --argjson id "$old_id" '[.[] | select(.post_id == $id)][0].post_excerpt')
-    live_row=$(echo "$live_json" | jq -c --argjson id "$new_id" '[.[] | select(.ID == $id)][0] // empty')
-    if [ -z "$live_row" ]; then
-      mismatched="${mismatched}${new_id}(not-found-on-b) "
-      continue
-    fi
-    compared=$((compared + 1))
-    actual_content=$(echo "$live_row" | jq -r '.post_content')
-    actual_excerpt=$(echo "$live_row" | jq -r '.post_excerpt')
-    if [ "$actual_content" != "$expected_content" ] || [ "$actual_excerpt" != "$expected_excerpt" ]; then
-      mismatched="${mismatched}${new_id} "
-    fi
-  done 3<<< "$(echo "$checkable_json" | jq -c '.[]')"
+  # Issue #62 (M2): ONE jq pass joins $checkable_json x $items_json x
+  # $live_json, replacing the old per-row loop's five jq forks times
+  # $checkable_total — see this function's own header comment above for
+  # the full reasoning (why `//=` for first-wins lookup construction, why
+  # `rawtext` exists, and where the equivalence proof lives).
+  #
+  # Viktor's review, issue #62: the first version of this rewrite passed
+  # all three JSON blobs to jq via `--argjson`, which hands them to jq as
+  # execve() COMMAND-LINE ARGUMENTS -- bounded by the OS's ARG_MAX (~1MB
+  # combined with the environment on a typical box). Reproduced directly:
+  # ~100 real pages at a realistic ~3KB post_content each already
+  # overflows it ("jq: Argument list too long", exit 126) -- a crash, not
+  # a slowdown, at a FRACTION of the very scale (400+ posts) this issue
+  # exists to make merely-fast-instead-of-slow. Piping the combined
+  # document through jq's STDIN instead has no such bound (this matches
+  # how backup_compute_content_checksums, right below this function's own
+  # M3 sibling fix, already passes $rows -- via `echo "$rows" | jq`, never
+  # via --argjson).
+  local join_result compared mismatched
+  join_result=$(printf '{"checkable":%s,"items":%s,"live":%s}' "$checkable_json" "$items_json" "$live_json" | jq '
+    def rawtext: if type == "string" then . else tojson end;
+    .checkable as $checkable | .items as $items | .live as $live
+    | (reduce $items[] as $it ({}; .[$it.post_id | tostring] //= {c: $it.post_content, e: $it.post_excerpt})) as $items_by_id
+    | (reduce $live[] as $lv ({}; .[$lv.ID | tostring] //= {c: $lv.post_content, e: $lv.post_excerpt})) as $live_by_id
+    | reduce $checkable[] as $row (
+        {compared: 0, mismatched: []};
+        ($row.old_id | tostring) as $oid
+        | ($row.new_id | tostring) as $nid
+        | ($items_by_id[$oid]) as $item
+        | if $item == null then
+            .mismatched += [$nid + "(no-source-item)"]
+          else
+            ($live_by_id[$nid]) as $lrow
+            | if $lrow == null then
+                .mismatched += [$nid + "(not-found-on-b)"]
+              else
+                .compared += 1
+                | if (($item.c | rawtext) != ($lrow.c | rawtext)) or (($item.e | rawtext) != ($lrow.e | rawtext)) then
+                    .mismatched += [$nid]
+                  else
+                    .
+                  end
+              end
+          end
+      )
+    | {compared, mismatched: ((.mismatched | map(. + " ") | join("")))}
+  ')
+  compared=$(echo "$join_result" | jq -r '.compared')
+  mismatched=$(echo "$join_result" | jq -r '.mismatched')
 
   echo "CONTENT_MATCH:${compared}:${checkable_total}:${excluded}"
   if [ -n "$mismatched" ]; then
