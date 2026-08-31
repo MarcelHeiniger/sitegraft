@@ -86,6 +86,24 @@
  *      lib/php/content-remap-functions.php for why that distinction is
  *      load-bearing.
  *
+ *   4. wp_generate_attachment_metadata()'s stub (in the generated fake
+ *      wp-admin/includes/image.php below, see the ABSPATH block) collapses
+ *      production's `is_array( $metadata ) && ! empty( $metadata )` guard
+ *      to just `! empty( $metadata )` -- the stub has no filter system to
+ *      make a plugin return something non-array. Not equivalent: real
+ *      wp_generate_attachment_metadata() ends on
+ *      `apply_filters( 'wp_generate_attachment_metadata', ... )`, so a
+ *      plugin genuinely could return non-array. Left un-fixed because the
+ *      consequence in the stub's absence of that path is near-nil -- stored
+ *      garbage at worst, never a false success.
+ *
+ *   5. wp_check_filetype( $filename, null ) here ignores its `$mimes`
+ *      argument entirely, and wp_basename() below just forwards to PHP's
+ *      own basename(). Both are artificial simplifications rather than
+ *      modelled behaviour, so a mutant that swaps either one for something
+ *      trivial (`array()`, `basename` unwrapped) survives -- there is
+ *      nothing left in the stub for such a mutant to diverge from.
+ *
  * The `the_title` divergence is load-bearing, not decoration: real
  * WordPress runs get_the_title() through the `the_title` filter (core
  * hangs wptexturize, convert_chars and trim on it, and prefixes
@@ -406,33 +424,6 @@ function wp_insert_attachment( $postarr, $file = false ) {
 	return $new_id;
 }
 
-/**
- * Models real wp_generate_attachment_metadata()'s EMPTY result, which was the
- * fifth permissivity found in this stub. Verified against
- * wp-admin/includes/image.php: the function opens with `$metadata = array();`
- * and only fills it on three branches — a displayable image (or HEIC), a
- * video, or an audio file. A .zip, .doc, .csv or .txt hits none of them and
- * comes back EMPTY, and so does an ordinary JPEG when
- * file_is_displayable_image() says no, which is what happens when GD and
- * Imagick are both missing — routine on the elderly hosting this tool exists
- * to migrate.
- *
- * Returning a non-empty array unconditionally (this stub used to) left
- * sitegraft_media_import_one's `! empty( $metadata )` guard completely
- * unpinned: without that guard, one non-image anywhere in a media library
- * fails the whole step, and the suite stayed green while it did.
- *
- * Only image types are modelled as producing metadata, matching the mime map
- * wp_check_filetype uses above — loose in the SAFE direction.
- */
-function wp_generate_attachment_metadata( $id, $file ) {
-	$filetype = wp_check_filetype( wp_basename( $file ), null );
-	if ( empty( $filetype['type'] ) || 0 !== strpos( $filetype['type'], 'image/' ) ) {
-		return array();
-	}
-	return array( 'file' => $file );
-}
-
 /** Real core just forwards update_post_meta(), so it inherits the same
  * ambiguous return -- and the same ability to write nothing at all. */
 function wp_update_attachment_metadata( $id, $metadata ) {
@@ -487,14 +478,66 @@ function clean_post_cache( $id ) {
 }
 
 // sitegraft_media_import_one does `require_once ABSPATH .
-// 'wp-admin/includes/image.php'` (as wp-cli's own media commands do),
-// so ABSPATH has to point at a tree where that file really exists.
+// 'wp-admin/includes/image.php'` (as wp-cli's own media commands do), so
+// ABSPATH has to point at a tree where that file really exists — and, issue
+// #47, where wp_generate_attachment_metadata() is defined INSIDE it, not at
+// this file's global scope. A global definition would mask the require_once
+// being deleted from production entirely: the stub would keep answering the
+// call and the suite would stay green over a change that kills every graft
+// on a real site (wp_generate_attachment_metadata() genuinely lives only in
+// this admin-only file — that's the load-bearing fact production's own
+// docblock calls out, and wp-cli's own media commands require_once the same
+// file for the same reason). Writing the function's body into the generated
+// file, exactly as real WordPress ships it in a real file, pins the
+// require_once: remove it from production and this suite goes red instead
+// of staying green over a fatal "Call to undefined function".
 if ( ! defined( 'ABSPATH' ) ) {
 	$wpstub_abspath = sys_get_temp_dir() . '/wpstub-abspath-' . getmypid() . '/';
 	if ( ! is_dir( $wpstub_abspath . 'wp-admin/includes' ) ) {
 		mkdir( $wpstub_abspath . 'wp-admin/includes', 0700, true );
 	}
-	file_put_contents( $wpstub_abspath . 'wp-admin/includes/image.php', "<?php\n// wpstub: wp_generate_attachment_metadata is defined above.\n" );
+	$wpstub_fake_image_php = <<<'PHP'
+<?php
+/**
+ * wpstub's fake wp-admin/includes/image.php — deliberately not required by
+ * wpstub.php itself, only written to disk for production's own
+ * require_once to load, so that require_once is what actually puts
+ * wp_generate_attachment_metadata() in scope during a test run (issue #47).
+ *
+ * Models real wp_generate_attachment_metadata()'s EMPTY result, which was
+ * the fifth permissivity found in this stub. Verified against
+ * wp-admin/includes/image.php: the function opens with `$metadata =
+ * array();` and only fills it on three branches — a displayable image (or
+ * HEIC), a video, or an audio file. A .zip, .doc, .csv or .txt hits none of
+ * them and comes back EMPTY, and so does an ordinary JPEG when
+ * file_is_displayable_image() says no, which is what happens when GD and
+ * Imagick are both missing — routine on the elderly hosting this tool
+ * exists to migrate.
+ *
+ * Returning a non-empty array unconditionally (this stub used to) left
+ * sitegraft_media_import_one's `! empty( $metadata )` guard completely
+ * unpinned: without that guard, one non-image anywhere in a media library
+ * fails the whole step, and the suite stayed green while it did.
+ *
+ * Only image types are modelled as producing metadata, matching the mime
+ * map wp_check_filetype() (defined at wpstub.php's global scope, same as
+ * real core's wp-includes/functions.php) uses — loose in the SAFE
+ * direction. wp_check_filetype() and wp_basename() stay at global scope on
+ * purpose: unlike wp_generate_attachment_metadata(), real core ships both
+ * of those in wp-includes, not wp-admin, so they are already loaded by the
+ * time this file's require_once runs and moving them here would model a
+ * dependency that does not exist.
+ */
+function wp_generate_attachment_metadata( $id, $file ) {
+	$filetype = wp_check_filetype( wp_basename( $file ), null );
+	if ( empty( $filetype['type'] ) || 0 !== strpos( $filetype['type'], 'image/' ) ) {
+		return array();
+	}
+	return array( 'file' => $file );
+}
+
+PHP;
+	file_put_contents( $wpstub_abspath . 'wp-admin/includes/image.php', $wpstub_fake_image_php );
 	define( 'ABSPATH', $wpstub_abspath );
 
 	// Remove it again when this php process ends. Every test spawns its own
