@@ -1915,9 +1915,21 @@ backup_compute_protected_checksums() {
 # recomputed post-graft (lib/verify.sh's verify_migrated_content_changed_
 # from_pregraft) — never two independently-drifting copies of "how do you
 # checksum a post's content".
+#
+# The canonicalization filter itself lives in the
+# $_SITEGRAFT_CONTENT_CHECKSUM_JQ variable, right below, not inlined
+# directly in this function's own body — issue #62's batch rewrite of
+# backup_compute_content_checksums
+# below needs the IDENTICAL jq source to canonicalize an entire array in
+# one pass instead of calling this function once per row (which would
+# just reintroduce the per-row fork this function's own single-row shape
+# is unsuitable for at scale). Sharing the literal filter as one variable,
+# not a hand-copied second literal, is what keeps this a single
+# implementation in substance, not just in name.
+_SITEGRAFT_CONTENT_CHECKSUM_JQ='{c: (.post_content // ""), e: (.post_excerpt // "")}'
 backup_content_checksum_of_row() {
   local row_json="$1"
-  echo "$row_json" | jq -c '{c: (.post_content // ""), e: (.post_excerpt // "")}' | shasum -a 256 | awk '{print $1}'
+  echo "$row_json" | jq -c "$_SITEGRAFT_CONTENT_CHECKSUM_JQ" | shasum -a 256 | awk '{print $1}'
 }
 
 # backup_compute_content_checksums <alias> <manifest_json> — issue #52 /
@@ -1962,6 +1974,50 @@ backup_content_checksum_of_row() {
 # identical "a query error is not the same as a confirmed empty result"
 # discipline backup_compute_protected_checksums and lib/verify.sh's own
 # checks already apply throughout this codebase.
+#
+# Issue #62 (M3): the row loop used to run one `jq` PLUS one `shasum` fork
+# PER POST, plus a full-object `jq` rebuild of the whole growing
+# accumulator on EVERY iteration. Measured: 100 -> 1s, 500 -> 8s,
+# 1000 -> 17s, 3000 -> 62s added to every backup.
+#
+# The issue's preferred direction — a single `wp eval` on B, so digests are
+# computed server-side and only tiny hex strings cross the wire — is NOT
+# what this is: that idiom (graft_push_remap_payload/graft_push_file/
+# graft_remove_file, lib/graft.sh) needs graft.sh loaded, and
+# bin/sitegraft's own require_lib ordering never sources graft.sh (step 4)
+# for a standalone `sitegraft backup` (step 3 only; graft.sh itself
+# already depends on backup.sh being loaded first, for
+# _backup_local_exec_prefix — see lib/graft.sh's own comment on reusing
+# it — so the dependency cannot run the other way without a real layering
+# change). Reimplementing a second, backup.sh-local push-file transport
+# (ssh/rsync wrapper-awareness, cleanup, the same escaping hazards
+# backup_generate_restore_script's own lengthy comments document) just for
+# this one read-only checksum pass is disproportionate to what it buys:
+# this rewrite already removes every fork that scaled with the post
+# count, which is the actual, measured problem. That is the jq-pass
+# minimum the issue names as an acceptable alternative.
+#
+# Two jq passes over the WHOLE $rows array (never per row) split it into
+# two same-order NDJSON streams — post IDs, and each row's canonicalized
+# {c,e} pair via $_SITEGRAFT_CONTENT_CHECKSUM_JQ (the SAME filter
+# backup_content_checksum_of_row uses — see that function's own comment
+# for why this must never be two independently-drifting definitions of
+# "how do you checksum a post's content"). Read back in lockstep on fd 3/
+# fd 4 and written one canonical blob per post to its own file (a plain
+# `printf > file` redirect, not a fork) under one sitegraft_mktemp_dir —
+# the same registered-for-cleanup temp-dir primitive lib/graft.sh's own
+# tmp_dir callers already use. `shasum` accepts multiple FILE arguments
+# and prints one digest per file, so ONE shasum invocation over all of
+# them replaces N forks. A final jq pass turns shasum's own "<hex>
+# <path>" output lines into the {id: "sha256:<hex>"} map this function
+# has always returned. Nothing here scales the number of forked processes
+# with the post count any more — only the (cheap, in-process) file writes
+# do.
+#
+# Proven byte-identical to the old per-row path — including tabs,
+# newlines, embedded quotes/backslashes, and non-ASCII content, where a
+# naive re-encoding could most plausibly drift — in this function's own
+# tests below.
 backup_compute_content_checksums() {
   local alias_lc="$1" manifest="$2"
   local post_types_csv
@@ -1978,20 +2034,44 @@ backup_compute_content_checksums() {
     return 1
   }
 
-  local checksums='{}'
-  local row id sum
-  # Read on fd 3, not stdin (same convention, same reason, as this file's
-  # own _unclaimed loop immediately above and lib/graft.sh's id-map loops):
-  # nothing inside this particular loop body shells out to ssh, so stdin
-  # isn't actually at risk here today, but a future edit that adds a
-  # wp_remote call inside the loop must not silently reintroduce that
-  # class of bug — matching the established pattern up front costs nothing.
-  while IFS= read -r row <&3; do
-    [ -n "$row" ] || continue
-    id=$(echo "$row" | jq -r '.ID')
-    sum=$(backup_content_checksum_of_row "$row")
-    checksums=$(echo "$checksums" | jq --arg id "$id" --arg s "sha256:${sum}" '.[$id] = $s')
-  done 3<<< "$(echo "$rows" | jq -c '.[]')"
+  local total; total=$(echo "$rows" | jq 'length')
+  [ "$total" -gt 0 ] || { echo '{}'; return 0; }
+
+  local ids_nl canon_nl
+  ids_nl=$(echo "$rows" | jq -r '.[].ID')
+  canon_nl=$(echo "$rows" | jq -c ".[] | (${_SITEGRAFT_CONTENT_CHECKSUM_JQ})")
+
+  local tmp_dir
+  tmp_dir=$(sitegraft_mktemp_dir) || {
+    log_error "could not create a temp directory to compute the pre-graft content-checksum snapshot"
+    return 1
+  }
+  local id canon
+  # fd 3 (ids) / fd 4 (canon), lockstep, not stdin — same convention/reason
+  # as every other id-map-derived loop in this codebase: two independent
+  # jq passes over the SAME array, in the SAME (guaranteed deterministic)
+  # order, so reading them back together produces the same (id, canon)
+  # pairing the old single-pass-per-row loop built directly.
+  while IFS= read -r id <&3 && IFS= read -r canon <&4; do
+    [ -n "$id" ] || continue
+    printf '%s\n' "$canon" > "${tmp_dir}/${id}"
+  done 3<<< "$ids_nl" 4<<< "$canon_nl"
+
+  local sums
+  sums=$(shasum -a 256 "${tmp_dir}"/*) || {
+    log_error "could not compute sha256 checksums for the pre-graft content-checksum snapshot"
+    return 1
+  }
+
+  local checksums
+  checksums=$(printf '%s\n' "$sums" | jq -R -s --arg dir "${tmp_dir}/" '
+    split("\n") | map(select(length > 0) | capture("^(?<h>\\S+)\\s+(?<f>.+)$"))
+    | map({(.f | ltrimstr($dir)): ("sha256:" + .h)})
+    | add // {}
+  ') || {
+    log_error "could not assemble the pre-graft content-checksum snapshot from computed checksums"
+    return 1
+  }
   printf '%s' "$checksums"
 }
 
