@@ -2074,8 +2074,21 @@ verify_http_smoke() {
   [ -n "$url" ] || return 0
   command -v curl >/dev/null 2>&1 || { log_warn "curl not found — skipping the HTTP smoke check (best-effort only)"; echo "HTTP_SMOKE:no-curl"; return 0; }
 
+  # Issue #68: `code=$(curl ... -w '%{http_code}' ... || echo "000")` was a
+  # SINGLE command substitution around `cmd1 || cmd2` — on a curl failure,
+  # curl's own -w output (curl still emits "000" for a request that got no
+  # response, even on a hard failure like DNS/connection refusal) and the
+  # `|| echo "000"` fallback both land in the same captured stdout, back to
+  # back with no separator, concatenating into "000000" rather than
+  # replacing it. Harmless to the `!= "200"` comparison below (neither
+  # string equals "200"), but wrong in the message an operator reads.
+  # Splitting the assignment from the failure branch discards whatever curl
+  # itself printed on failure and replaces it outright, so the fallback can
+  # never concatenate with it.
   local code
-  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$url" 2>/dev/null || echo "000")
+  if ! code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$url" 2>/dev/null); then
+    code="000"
+  fi
   if [ "$code" != "200" ]; then
     log_error "HTTP smoke check: ${url} returned ${code}, expected 200"
     return 1

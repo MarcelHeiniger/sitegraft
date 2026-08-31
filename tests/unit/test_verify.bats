@@ -1524,6 +1524,26 @@ _verify_component_prop_run_captured_php() {
   [ "$status" -eq 1 ]
 }
 
+@test "verify_http_smoke's failure message reports exactly '000', never '000000' (issue #68)" {
+  # Reproduces curl's real behavior on a hard failure (DNS/connection
+  # refused/etc): it still emits its -w format string ("000" for "no HTTP
+  # response was received") on stdout before exiting non-zero. A single
+  # `code=$(curl ... -w ... || echo "000")` command substitution would
+  # concatenate that with the fallback's own "000" into "000000".
+  curl() {
+    for a in "$@"; do
+      case "$a" in
+        -o) printf '000'; return 7 ;; # curl's own exit code for "couldn't connect"
+      esac
+    done
+    return 7
+  }
+  run verify_http_smoke "https://b.example.com" "Home"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"returned 000,"* ]] || false
+  [[ "$output" != *"000000"* ]] || false
+}
+
 @test "verify_http_smoke fails on 200 with a body missing the expected marker (build green != route OK)" {
   curl() {
     for a in "$@"; do
