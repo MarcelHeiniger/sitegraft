@@ -95,6 +95,27 @@ setup() {
   [ -f "${wp_content}/sitegraft-id-map.log" ]
 }
 
+@test "graft_prune_previous_run does not misreport its own [dry-run] placeholder text as a leftover post to prune (issue #76)" {
+  # Unlike the two tests above, wp_remote is left UNSTUBBED here on purpose:
+  # this reproduces the actual bug mechanism rather than assuming it fixed.
+  # wp_remote (lib/inventory.sh) wraps every real invocation in run_or_echo
+  # (lib/core.sh), which under SITEGRAFT_DRY_RUN=1 returns the literal text
+  # "[dry-run] wp --path=... post list ..." instead of running wp-cli at
+  # all. Before this fix, graft_prune_previous_run read that placeholder
+  # straight into `ids` with no override, so a dry run against a B with
+  # ZERO matching posts still counted one "ID" (the placeholder line
+  # itself) and warned about pruning a post that does not exist.
+  local wp_path="$BATS_TEST_TMPDIR/site-b"
+  mkdir -p "$wp_path"
+  SITE_B_WP_PATH="$wp_path"
+  unset SITE_B_SSH_HOST SITE_B_WP_CMD
+  SITEGRAFT_DRY_RUN=1
+  run graft_prune_previous_run "page,post"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"pruning"* ]] || false
+  [[ "$output" != *"post delete"* ]] || false
+}
+
 @test "graft_prune_previous_run still no-ops entirely (log included) when post_types_csv is empty" {
   local wp_content="$BATS_TEST_TMPDIR/site-b/wp-content"
   mkdir -p "$wp_content"
