@@ -148,7 +148,7 @@ looks for "Home" in a German page).
     broke `./bin/sitegraft --help`/`-h`/`--version` until caught by a new test
     file (`tests/unit/test_bin_sitegraft.bats`, the first to exercise the real
     executable as a subprocess rather than loading `lib/*.sh` functions directly).
-  - **Durcissement** (tracked from Viktor's Step 2 review, non-blocking then):
+  - **Hardening** (tracked from Viktor's Step 2 review, non-blocking then):
     `_plan_prompt_items`' plain (no-gum/no-fzf) fallback used `${ans:-y}` for its
     `[Y/n]` default, which couldn't distinguish a real Enter keystroke (safe:
     `read` returns 0) from stdin hitting genuine EOF (`read` returns non-zero) —

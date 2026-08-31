@@ -225,7 +225,7 @@
     ignoring `--dry-run` entirely, and `bin/sitegraft` itself never handling
     `--dry-run` globally (only per-phase), which also surfaced a real bash 3.2
     `set -u`/empty-array bug in the fix (`./bin/sitegraft --help` was broken).
-  - Durcissement: `_plan_prompt_items`' plain (no-gum/no-fzf) selection fallback
+  - Hardening: `_plan_prompt_items`' plain (no-gum/no-fzf) selection fallback
     used to default an unanswerable EOF prompt to "kept/migrate" — the least
     conservative of the two wrong answers. Now aborts the whole selection on EOF
     instead of guessing (tracked from Viktor's Step 2 review).
