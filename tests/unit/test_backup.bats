@@ -931,6 +931,32 @@ _wrapped_fixture() {
     ln -s "$BATS_TEST_TMPDIR/media-volume" "${B_ROOT}/wp-content/uploads"
   fi
 
+  # Opt-in: a backed-up "themes/B" directory (capital B), present BEFORE the
+  # backup runs so it lands in both the archive and the manifest. Its only
+  # purpose is issue #48's collation test below: "themes/B" sorts BEFORE
+  # "themes/a" under LC_ALL=C (byte order) and AFTER it under en_US.UTF-8
+  # (case-insensitive-ish dictionary order) -- the exact adversarial pair the
+  # issue's own worked example uses. Off by default, same reasoning as
+  # B_ROOT_EXTRA_NFC above.
+  if [ -n "${B_ROOT_EXTRA_COLLATION_DIR:-}" ]; then
+    mkdir -p "${B_ROOT}/wp-content/themes/B"
+    printf 'kept\n' > "${B_ROOT}/wp-content/themes/B/marker.css"
+  fi
+
+  # Opt-in: the same pair, "themes/B" and "themes/a", but BOTH already backed
+  # up (kept, not added) -- so the collation-sensitive pair sits entirely
+  # WITHIN the archive's own listing, not between the archive and an
+  # addition. This is what a decollated archive-side sort (as opposed to the
+  # live-side sort B_ROOT_EXTRA_COLLATION_DIR above targets) needs in order
+  # to show up at all: with only one of the two names backed up, nothing
+  # about the archive's OWN internal order is collation-sensitive, so
+  # decollating just its sort has nothing to corrupt.
+  if [ -n "${B_ROOT_EXTRA_COLLATION_PAIR_KEPT:-}" ]; then
+    mkdir -p "${B_ROOT}/wp-content/themes/B" "${B_ROOT}/wp-content/themes/a"
+    printf 'kept\n' > "${B_ROOT}/wp-content/themes/B/marker.css"
+    printf 'kept\n' > "${B_ROOT}/wp-content/themes/a/marker.css"
+  fi
+
   SITE_B_SSH_HOST=""
   SITE_B_WP_PATH="$B_ROOT"
   SITE_B_WP_CMD="${wrapper} wp"
@@ -1556,6 +1582,123 @@ EOS
   [ "$status" -eq 0 ]
   [[ "$output" == *"will be REMOVED"* ]] || false
   [[ "$output" == *"GRAFTED.css"* ]] || false
+}
+
+# --- issue #48: two invariants held only by a downstream net -----------------
+#
+# Both gaps were coverage gaps, not defects (found during the closing review
+# of #31): the behaviour below is already correct, but nothing pinned it at
+# the point it is actually made until these two tests.
+
+# _sg_collation_flip_locale — the alternate locale the collation test below
+# needs, or empty if this machine cannot reproduce the premise. A test must
+# build its own premise (see _force_archive_nfc's own comment on the same
+# principle for the NFC/NFD tests): "en_US.UTF-8" is spelled differently
+# across platforms (macOS: "en_US.UTF-8", glibc: usually "en_US.utf8"), and
+# whichever spelling is installed must ACTUALLY sort "themes/B" and
+# "themes/a" in the opposite order from LC_ALL=C on this machine, or the test
+# would pass for the wrong reason.
+_sg_collation_flip_locale() {
+  local loc
+  for loc in $(locale -a 2>/dev/null | grep -iE '^en_US\.(utf-?8)$'); do
+    local c_order en_order
+    c_order=$(printf 'themes/B\nthemes/a\n' | LC_ALL=C sort | tr '\n' ' ')
+    en_order=$(printf 'themes/B\nthemes/a\n' | LC_ALL="$loc" sort | tr '\n' ' ')
+    if [ "$c_order" != "$en_order" ]; then
+      printf '%s' "$loc"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# comm -13 archive.sorted live.sorted (_sg_scan_prune, lib/backup.sh) assumes
+# both inputs are sorted under the SAME collation -- both sides are sorted
+# with an explicit LC_ALL=C for exactly that reason. Today, dropping LC_ALL=C
+# from either sort is caught only because a different, unrelated check
+# (_sg_assert_backup_landed) structurally happens to also refuse in that
+# case -- nothing tests the collation guarantee itself. This test exercises
+# --dry-run, which runs _sg_prune_preflight (where the comm call and both
+# sorts actually live) and stops BEFORE the extraction and BEFORE
+# _sg_assert_backup_landed ever runs -- so a wrong preview here cannot be
+# rescued, or hidden, by that downstream net.
+@test "the generated wrapped-local restore.sh's --dry-run preview stays correct under a non-C ambient locale that could flip comm's collation (issue #48)" {
+  local alt_locale
+  alt_locale=$(_sg_collation_flip_locale) || skip "no installed locale sorts themes/B and themes/a in a different order than LC_ALL=C on this machine"
+
+  B_ROOT_EXTRA_COLLATION_DIR=1 _wrapped_fixture
+  mkdir -p "${B_ROOT}/wp-content/themes/a"
+  printf 'grafted\n' > "${B_ROOT}/wp-content/themes/a/marker.css"
+
+  run env LC_ALL="$alt_locale" "${RUN_DIR}/restore.sh" --dry-run
+  [ "$status" -eq 0 ]
+  # the addition is previewed for removal ...
+  [[ "$output" == *"${B_ROOT}/wp-content/themes/a"* ]] || false
+  # ... and the backed-up directory is never mistaken for one, whatever order
+  # the ambient locale would have sorted "B" and "a" in.
+  [[ "$output" != *"${B_ROOT}/wp-content/themes/B"* ]] || false
+  [ -f "${B_ROOT}/wp-content/themes/B/marker.css" ]
+  [ -f "${B_ROOT}/wp-content/themes/a/marker.css" ]
+}
+
+# The sibling of the test above, for the OTHER sort feeding the same comm
+# call: archive.sorted (line ~1229 of lib/backup.sh), not live.sorted. The
+# preview computed by --dry-run never reads archive.sorted at all (it reads
+# accounted.sorted, sorted independently -- see _sg_load_keep_sets), so a
+# decollated archive-side sort cannot be caught by that test; it only ever
+# feeds to-remove.txt/missing.txt, which are computed for real in
+# _sg_apply_prune, AFTER the extraction. So this one runs restore.sh for
+# real. "themes/B" and "themes/a" are BOTH already backed up here (see
+# B_ROOT_EXTRA_COLLATION_PAIR_KEPT's own comment) -- with only one of the two
+# names backed up, archive.txt alone has nothing collation-sensitive in it to
+# corrupt, and a mutated archive-side sort would slip through unnoticed even
+# though live.sorted's sort is untouched.
+@test "the generated wrapped-local restore.sh's real removal stays correct under a non-C ambient locale, for the archive-side sort too (issue #48)" {
+  local alt_locale
+  alt_locale=$(_sg_collation_flip_locale) || skip "no installed locale sorts themes/B and themes/a in a different order than LC_ALL=C on this machine"
+
+  B_ROOT_EXTRA_COLLATION_PAIR_KEPT=1 _wrapped_fixture
+  mkdir -p "${B_ROOT}/wp-content/plugins/grafted-plugin"
+  printf 'x\n' > "${B_ROOT}/wp-content/plugins/grafted-plugin/main.php"
+
+  run env LC_ALL="$alt_locale" "${RUN_DIR}/restore.sh"
+  [ "$status" -eq 0 ]
+  # the addition is removed ...
+  [ ! -e "${B_ROOT}/wp-content/plugins/grafted-plugin" ]
+  # ... and neither backed-up directory is ever mistaken for one, whatever
+  # order the ambient locale would have sorted "B" and "a" in.
+  [ -f "${B_ROOT}/wp-content/themes/B/marker.css" ]
+  [ -f "${B_ROOT}/wp-content/themes/a/marker.css" ]
+}
+
+# cmp -s to-preview.txt to-remove.txt is tested, and the removal COUNT is
+# tested, but neither catches a mutation that makes the printed preview list
+# a DIFFERENT set of paths than the one actually removed, as long as the two
+# sets have the same size (or, per the issue's own example, cmp against a
+# superset that the count check never sees because it counts the wrong file
+# too). This test compares the preview PATH BY PATH against B's real
+# before/after directory contents -- not against another file this script
+# itself produced -- so a preview that lists paths the removal does not act
+# on (or omits ones it does) fails here regardless of which of the script's
+# internal files a mutation makes it agree or disagree with.
+@test "the generated wrapped-local restore.sh's preview lists exactly the paths the removal acts on, path by path (issue #48)" {
+  _wrapped_fixture
+  printf 'grafted\n' > "${B_ROOT}/wp-content/themes/GRAFTED.css"
+  mkdir -p "${B_ROOT}/wp-content/plugins/grafted-plugin"
+  printf 'x\n' > "${B_ROOT}/wp-content/plugins/grafted-plugin/main.php"
+
+  local before after removed previewed
+  before=$(find "${B_ROOT}/wp-content" -mindepth 1 | LC_ALL=C sort)
+
+  run "${RUN_DIR}/restore.sh"
+  [ "$status" -eq 0 ]
+
+  after=$(find "${B_ROOT}/wp-content" -mindepth 1 | LC_ALL=C sort)
+  removed=$(LC_ALL=C comm -23 <(printf '%s\n' "$before") <(printf '%s\n' "$after"))
+  [ -n "$removed" ]
+
+  previewed=$(printf '%s\n' "$output" | grep -F "  ${B_ROOT}/wp-content/" | sed 's/^  //' | LC_ALL=C sort)
+  [ "$previewed" = "$removed" ]
 }
 
 @test "the generated wrapped-local restore.sh never wipes wp-content itself (the un-removable-mount constraint)" {
