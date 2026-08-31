@@ -1943,12 +1943,26 @@ graft_push_remap_lib() {
 
 # graft_migrated_post_ids_json <id_map_tsv> — every NEW post ID this run
 # imported, as a JSON array of strings, in id-map.tsv's own row order.
-# Shared by graft_remap_attachment_ids/graft_search_replace_domain below —
-# both need exactly this same "which posts did THIS run actually touch"
-# scope, so it's computed once instead of twice.
+# Used by graft_search_replace_domain below (graft_remap_attachment_ids has
+# its own, differently-scoped post_ids_json — see that function's own
+# comment for why it can't share this one).
+#
+# Issue #98: excludes `term:`-tagged rows -- their column 2 is a TERM id,
+# never a post id, and term ids/post ids are independent sequences that
+# both start at 1 on a fresh WordPress site. Before this fix, a term row's
+# new id could numerically coincide with a real, unrelated post already on
+# B (one this run never touched, possibly a protected plugin's own post) —
+# graft_search_replace_domain would then fetch and potentially rewrite that
+# post's content for a domain-string match, which is exactly the
+# out-of-scope write its own header comment (MAJOR-2) says is structurally
+# unreachable. wp_navigation rows stay included on purpose (unlike
+# graft_remap_attachment_ids' scope): a domain leak inside a
+# wp_navigation post's custom-link URL genuinely needs the same
+# search-replace every other migrated post gets, and wp_navigation ids are
+# real post ids, not a foreign id space the way term ids are.
 graft_migrated_post_ids_json() {
   local id_map_tsv="$1"
-  awk -F'\t' '{print $2}' "$id_map_tsv" | jq -R -s -c 'split("\n") | map(select(length > 0))'
+  awk -F'\t' '$3 !~ /^term:/{print $2}' "$id_map_tsv" | jq -R -s -c 'split("\n") | map(select(length > 0))'
 }
 
 # graft_push_remap_payload <run_dir> <json> <remote_filename> — writes
@@ -2022,9 +2036,9 @@ graft_remap_attachment_ids() {
     | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {old: .[0], new: .[1]})')
   [ "$(echo "$attach_map_json" | jq 'length')" != "0" ] || return 0
   # B2 (Viktor's review of issue #17/PR #38, execution-proven): NOT
-  # graft_migrated_post_ids_json (below) unfiltered -- that shared helper is
-  # correct for graft_search_replace_domain's own use (a domain leak inside
-  # a wp_navigation post's custom-link URL genuinely needs the same
+  # graft_migrated_post_ids_json (below) -- that shared helper is correct
+  # for graft_search_replace_domain's own use (a domain leak inside a
+  # wp_navigation post's custom-link URL genuinely needs the same
   # search-replace every other migrated post gets), but wrong here.
   # sitegraft_remap_attachment_refs substitutes `"id":<old_attachment_id>`
   # for every post in scope with zero awareness of what that "id" MEANS in
@@ -2057,7 +2071,14 @@ graft_remap_attachment_ids() {
   # THAT block's attachment-id remap too, not just its navigation blocks'
   # ids -- an acceptable trade against corrupting a taxonomy-kind id, and
   # not a shape any real Navigation-block editing flow produces.
-  post_ids_json=$(awk -F'\t' '$3 != "wp_navigation"{print $2}' "$id_map_tsv" \
+  # Issue #98: also excludes `term:`-tagged rows, the same class of gap as
+  # the wp_navigation exclusion just above but for a different failure
+  # mode -- a term row's column 2 is a TERM id, not a post id (independent,
+  # both-start-at-1 id spaces), so an unexcluded term row could put a
+  # coincidentally-matching, unrelated real post's id into this function's
+  # content-scan/write-back scope, the exact out-of-scope write the header
+  # comment above (MAJOR-2) says is structurally unreachable.
+  post_ids_json=$(awk -F'\t' '$3 != "wp_navigation" && $3 !~ /^term:/{print $2}' "$id_map_tsv" \
     | jq -R -s -c 'split("\n") | map(select(length > 0))')
   payload_json=$(jq -n --argjson attachments "$attach_map_json" --argjson post_ids "$post_ids_json" \
     '{attachments: $attachments, post_ids: $post_ids}')

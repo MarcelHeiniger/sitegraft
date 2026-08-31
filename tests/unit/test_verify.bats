@@ -705,28 +705,71 @@ setup() {
   [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }
 
-# --- Issue #69: the id-map.tsv lookup has no `$3` type filter and no digit
-# guard on column 2 — the identical unguarded shape closed on the WRITE side
-# in modules/core-wp.sh (PR #61's fix-pack). A legacy id-map.tsv written
-# before that fix can carry a `term:` row whose column 2 is the literal
-# string "Array" (PHP's array-to-string coercion from the since-removed
-# wp_import_insert_term handler). On a numeric collision between A's real
-# old_front_id and such a row's column 1, the OLD code would compare "Array"
-# against B's live page_on_front and report a FALSE HARD FAIL — never a
-# corrupting write (this is a read), but a false alarm that sends someone
-# hunting a migration bug that does not exist. The exact fixture shape is
-# the issue's own: `5\tArray\tterm:category`, column 2 = "Array".
-@test "verify_page_on_front refuses a non-numeric id-map.tsv entry rather than comparing it against B's live value (issue #69)" {
+# --- Issue #69 / #98: the id-map.tsv lookup used to have no `$3` type
+# filter and no digit guard on column 2 — the identical unguarded shape
+# closed on the WRITE side in modules/core-wp.sh (PR #61's fix-pack). #69
+# added the digit guard here (kept below, now defense-in-depth); #98 added
+# the actual fix, a `$3=="page"` type filter, so a `term:` row can no
+# longer enter this lookup at all — never mind produce a false HARD FAIL.
+
+@test "verify_page_on_front still refuses a non-numeric id-map.tsv entry when the row itself is type page (digit guard, defense in depth after #98's type filter)" {
   local run_dir="$BATS_TEST_TMPDIR/run"
   mkdir -p "$run_dir"
   printf '"5"' > "${run_dir}/option-page_on_front.value" # A's front page: page 5
   local tsv="${run_dir}/id-map.tsv"
-  printf '5\tArray\tterm:category\n' > "$tsv" # legacy garbage row, column 1 numerically collides with old_front_id
+  # Type is "page" so #98's filter lets this row through the lookup at all
+  # -- this test is specifically about the digit guard that runs AFTER it.
+  printf '5\tArray\tpage\n' > "$tsv"
   wp_remote() { echo "SHOULD NOT BE CALLED — a non-numeric map entry must never reach a live comparison against B"; }
   run verify_page_on_front "$run_dir" "$tsv" '{"migrate":{"core-wp":{"option_keys":["page_on_front"]}}}'
   [ "$status" -eq 2 ]
   [[ "$output" == *"non-numeric"* ]] || false
   [[ "$output" == *"PAGE_ON_FRONT:non-numeric-map-entry"* ]] || false
+  [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
+}
+
+# Issue #98's own acceptance criterion, real row shape: the correct `page`
+# row AND a colliding `term:` row sharing the same column-1 id, together in
+# the same fixture. Mutation-tested: revert the `$3=="page"` filter on the
+# lookup (back to `$1==old{print $2}`) and this goes RED -- awk then emits
+# BOTH rows, expected_new_id becomes the two-line string "105\nArray", the
+# digit guard's `*[!0-9]*` case matches (a newline is a non-digit), and the
+# check returns INCOMPLETE ("non-numeric") instead of comparing 105 against
+# B's live value -- exactly the noisy-not-silent state #69 left this in,
+# for a result that CONTAINED the correct answer. With the filter, only the
+# "page" line is ever produced and the comparison proceeds normally.
+@test "verify_page_on_front's lookup ignores a colliding term: row of a different type sharing the same column-1 id (#98)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '"5"' > "${run_dir}/option-page_on_front.value"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '5\t105\tpage\n5\tArray\tterm:category\n' > "$tsv"
+  wp_remote() {
+    shift # alias
+    if [ "$1" = "option" ]; then echo "105";
+    elif [ "$1" = "post" ]; then return 0; fi
+  }
+  run verify_page_on_front "$run_dir" "$tsv" '{"migrate":{"core-wp":{"option_keys":["page_on_front"]}}}'
+  [ "$status" -eq 0 ]
+}
+
+# The other half of the same acceptance criterion: a term:-only match (no
+# real page row at all sharing that column-1 id) must be treated as "not
+# migrated" (a HARD FAIL, same as any other missing entry), never compared
+# against B's live value -- #98's filter makes the term: row invisible to
+# this lookup, so it is indistinguishable from an id-map.tsv with no row
+# for old_front_id at all.
+@test "verify_page_on_front treats a term:-only match on column 1 as 'no corresponding entry', not a value to compare (#98)" {
+  local run_dir="$BATS_TEST_TMPDIR/run"
+  mkdir -p "$run_dir"
+  printf '"5"' > "${run_dir}/option-page_on_front.value"
+  local tsv="${run_dir}/id-map.tsv"
+  printf '5\tArray\tterm:category\n' > "$tsv"
+  wp_remote() { echo "SHOULD NOT BE CALLED — a term:-only match must never reach a live comparison against B"; }
+  run verify_page_on_front "$run_dir" "$tsv" '{"migrate":{"core-wp":{"option_keys":["page_on_front"]}}}'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"has no corresponding entry"* ]] || false
+  [[ "$output" != *"non-numeric"* ]] || false
   [[ "$output" != *"SHOULD NOT BE CALLED"* ]] || false
 }
 
@@ -3170,9 +3213,16 @@ EOF
 # The stub below makes the live `wp_remote b option get page_on_front` call
 # an immediate test failure if reached at all -- proving the guard stops the
 # comparison before it ever gets there, not merely that the wording changed.
+#
+# Row type is "page" (not the original `term:category`) because issue #98
+# added a `$3=="page"` filter to this lookup: a `term:` row no longer
+# enters it at all, so it can no longer produce this INCOMPLETE branch --
+# see tests/unit/test_verify.bats' own "#98" tests on verify_page_on_front
+# for that. This test now exercises the digit guard as pure defense in
+# depth, against a malformed row of the RIGHT type.
 @test "phase_verify's page_on_front line says NON-NUMERIC MAP ENTRY, distinctly, when id-map.tsv's entry for A's front page is not a numeric id (issue #69)" {
   setup_phase_verify_fixture
-  printf '5\tArray\tterm:category\n' > "${RUN_DIR}/id-map.tsv" # legacy garbage row, replaces the shared fixture's clean 5->105 mapping
+  printf '5\tArray\tpage\n' > "${RUN_DIR}/id-map.tsv" # malformed page row, replaces the shared fixture's clean 5->105 mapping
   wp_remote() {
   for __idref_a in "$@"; do [ "$__idref_a" = "--fields=ID,post_content" ] && { echo "[]"; return 0; }; done
     local alias_lc="$1"; shift

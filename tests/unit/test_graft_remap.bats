@@ -85,10 +85,11 @@ setup() {
 
 # B2 (Viktor's review of PR #38/#17, execution-proven): wp_navigation posts
 # entered id-map.tsv for the first time once #17 started migrating them, and
-# graft_migrated_post_ids_json (used by graft_search_replace_domain too, and
-# correctly unfiltered THERE — a domain leak inside a navigation-link's
-# custom-URL is exactly the kind of thing that DOES need remapping) takes
-# EVERY row regardless of post_type. sitegraft_remap_attachment_refs
+# graft_migrated_post_ids_json (used by graft_search_replace_domain too,
+# where wp_navigation rows are correctly kept — a domain leak inside a
+# navigation-link's custom-URL is exactly the kind of thing that DOES need
+# remapping; only `term:` rows are excluded there, per issue #98) takes
+# EVERY non-term row regardless of post_type. sitegraft_remap_attachment_refs
 # (lib/php/content-remap-functions.php) substitutes `"id":<old>` for every
 # ATTACHMENT old id, with zero awareness of a navigation-link's own "kind"
 # attribute -- so a "kind":"taxonomy" link whose id happens to numerically
@@ -105,7 +106,7 @@ setup() {
 # introduced here survives untouched. wp_navigation posts are excluded from
 # THIS function's post_ids scope specifically -- not from
 # graft_migrated_post_ids_json itself, which graft_search_replace_domain
-# still needs unfiltered.
+# keeps them in (only `term:` rows are excluded there, per issue #98).
 @test "graft_remap_attachment_ids excludes wp_navigation posts from its post_ids scope -- a navigation-link's taxonomy-kind id must never be corrupted by an unrelated attachment remap (B2)" {
   local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
   printf '10	42	attachment
@@ -124,6 +125,32 @@ setup() {
   # pre-existing behavior -- an attachment's own post_content/post_excerpt
   # can reference OTHER attachments, e.g. a media description). Only the
   # wp_navigation row's new id (177) is excluded.
+  run jq -e '.post_ids == ["42","105"]' "$captured"
+  [ "$status" -eq 0 ]
+}
+
+# Issue #98: a `term:` row's column 2 is a TERM id, not a post id -- term
+# ids and post ids are independent sequences that both start at 1 on a
+# fresh WordPress site, so an unexcluded term row could put a
+# coincidentally-matching, unrelated real post's id into this function's
+# post_ids scope (the exact out-of-scope fetch/write-back its own MAJOR-2
+# header comment says is structurally unreachable). Mutation-tested: drop
+# the `&& $3 !~ /^term:/` half of the filter and this goes RED -- "14"
+# reappears in .post_ids alongside the two real rows.
+@test "graft_remap_attachment_ids excludes term: rows from its post_ids scope -- a term id must never be treated as a migrated post id (#98)" {
+  local tsv="$BATS_TEST_TMPDIR/id-map.tsv"
+  printf '10	42	attachment
+3	14	term:category
+5	105	page
+' > "$tsv"
+  local run_dir="$BATS_TEST_TMPDIR/run"; mkdir -p "$run_dir"
+  local captured="$BATS_TEST_TMPDIR/captured.json"
+  graft_push_remap_payload() { printf '%s' "$2" > "$captured"; echo "/fake/remote/path.json"; }
+  graft_push_remap_lib() { echo "/fake/remote/lib.php"; }
+  wp_remote() { echo "sitegraft: id-remap rewrote 0 post(s)"; }
+  graft_remove_file() { :; }
+  run graft_remap_attachment_ids "$tsv" "$run_dir"
+  [ "$status" -eq 0 ]
   run jq -e '.post_ids == ["42","105"]' "$captured"
   [ "$status" -eq 0 ]
 }

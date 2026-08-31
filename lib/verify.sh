@@ -533,28 +533,37 @@ verify_page_on_front() {
     ''|null|false|0) echo "PAGE_ON_FRONT:a-had-none"; return 0 ;; # A never had a front page configured — nothing to check
   esac
   local expected_new_id
-  expected_new_id=$(awk -F'\t' -v old="$old_front_id" '$1==old{print $2}' "$id_map_tsv" 2>/dev/null)
+  # Issue #98: the lookup used to be `$1==old{print $2}`, with no `$3` type
+  # filter -- ANY id-map.tsv row whose column 1 numerically matched
+  # old_front_id won, whatever column 3 said. page_on_front/page_for_posts
+  # always hold a "page" post's id (WordPress itself enforces this -- a
+  # front page can only ever be a Page), so `$3=="page"` is the correct,
+  # precise filter, not merely an exclusion. Identical shape to
+  # core_wp_post_import's own page_on_front/page_for_posts WRITE lookup
+  # (modules/core-wp.sh), fixed there in the same pass. Before this fix, a
+  # legacy id-map.tsv carrying a `term:` row whose column 1 numerically
+  # collided with old_front_id (term ids and post ids are independent
+  # sequences that both start at 1) would have made awk emit BOTH rows --
+  # the correct "page" line and the colliding `term:` line's column 2 (the
+  # literal string "Array", PHP's array-to-string coercion from the
+  # since-removed wp_import_insert_term handler) -- landing a two-line,
+  # non-numeric $expected_new_id in the guard below even though the correct
+  # answer was right there in the result. #69 made that noisy (a false HARD
+  # FAIL/INCOMPLETE hunting a migration bug that doesn't exist) instead of
+  # silent; this closes it: the `term:` row no longer enters the lookup at
+  # all, so the true answer is the ONLY thing that can come back.
+  expected_new_id=$(awk -F'\t' -v old="$old_front_id" '$1==old && $3=="page"{print $2}' "$id_map_tsv" 2>/dev/null)
   if [ -z "$expected_new_id" ]; then
     log_error "A's page_on_front (page ${old_front_id}) has no corresponding entry in id-map.tsv — the remap did not happen (or the ID mapper was missing, or the imported post silently failed), so B's page_on_front cannot be verified against it"
     return 1
   fi
-  # Issue #69: this lookup has no `$3` type filter -- any id-map.tsv row
-  # whose column 1 numerically matches old_front_id wins, whatever column 3
-  # says. Identical shape to core_wp_post_import's own page_on_front/
-  # page_for_posts WRITE lookup (modules/core-wp.sh), closed there for #61:
-  # a legacy id-map.tsv written before that fix can carry a `term:` row
-  # whose column 2 is the literal string "Array" (PHP's array-to-string
-  # coercion from the since-removed wp_import_insert_term handler — see that
-  # function's own comment for the full history). A numeric collision
-  # between old_front_id and such a row's column 1 would land "Array" in
-  # expected_new_id here too. Unlike the write side, this is a READ: the
-  # value is only ever compared against B's live option, so the worst case
-  # is a FALSE HARD FAIL on the collision, never a corrupting write — which
-  # is why this was split out as non-blocking (issue #69). Still worth
-  # closing: a false hard fail sends someone hunting a migration bug that
-  # does not exist. Guarded on shape, same as the write side: a non-numeric
-  # column 2 is reported as uncheckable (INCOMPLETE, not a hard fail),
-  # rather than compared against B's live value as though it were a real id.
+  # The digit guard below is now defense-in-depth rather than the primary
+  # fix (issue #98 -- see the comment on the lookup above): a `page`-typed
+  # row can only ever legitimately carry a numeric new id, so this should
+  # never fire on real data post-#98. Kept because "column 2 is not an id"
+  # is still worth catching for a hand-edited or otherwise malformed
+  # id-map.tsv, and to stay symmetric with the write side's identical
+  # guard.
   case "$expected_new_id" in
     *[!0-9]*)
       log_error "A's page_on_front (page ${old_front_id}) maps to a non-numeric id in id-map.tsv ('${expected_new_id}') — refusing to treat this as B's expected page_on_front. This row was almost certainly written by an older sitegraft version (see modules/core-wp.sh's identical guard on the write side); report this with the run directory."
