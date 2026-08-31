@@ -106,6 +106,40 @@ setup() {
   [[ "$output" == *"rsync called with: -avz --no-old-args a.example.com:"* ]] || false
 }
 
+# issue #117: with only the rsync/transfer leg failing, this used to return
+# rc=0 -- the remote `rm -rf` cleanup runs AFTER the pull and, as the last
+# command in this branch, its own (always-successful) exit status silently
+# overwrote the pull's real failure. `ssh` and `wp_remote` both succeed
+# here; only `rsync` (the pull itself) is stubbed to fail, isolating that
+# one leg the same way the reviewer measured it while closing #75/#94.
+@test "graft_export_wxr (ssh-remote) fails when the pull itself fails, even though the remote cleanup afterward succeeds (issue #117)" {
+  SITE_A_SSH_HOST="a.example.com"
+  unset SITE_A_SSH_KEY
+  ssh() { echo "ssh called with: $*"; return 0; }
+  rsync() { echo "rsync called with: $*"; return 1; }
+  wp_remote() { echo "wp_remote called with: $*"; return 0; }
+  run graft_export_wxr "post,page" "$BATS_TEST_TMPDIR/run"
+  [ "$status" -ne 0 ]
+  # The cleanup ssh call still ran (this fix does not skip cleanup) -- what
+  # changed is that its success no longer masks the pull's failure.
+  [[ "$output" == *"rm -rf"* ]] || false
+}
+
+# Same defect, same fix, in the wrapped-local (DDEV-style container) branch:
+# graft_pull_dir's own tar-through-the-wrapper pull is followed by
+# graft_remove_dir's cleanup `rm -rf`, the identical "cleanup runs last"
+# shape as the ssh-remote branch above.
+@test "graft_export_wxr (wrapped-local) fails when the pull itself fails, even though the container cleanup afterward succeeds (issue #117)" {
+  unset SITE_A_SSH_HOST
+  SITE_A_WP_CMD="ddev exec --raw -p sitegraft-test-a -- wp"
+  wp_remote() { echo "wp_remote called with: $*"; return 0; }
+  graft_pull_dir() { echo "STUB: graft_pull_dir called -- simulating a failed pull"; return 1; }
+  graft_remove_dir() { echo "STUB: graft_remove_dir called (cleanup)"; return 0; }
+  run graft_export_wxr "post,page" "$BATS_TEST_TMPDIR/run"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"STUB: graft_remove_dir called"* ]] || false
+}
+
 # --- graft_import_wxr (push side: key only, issue #75 — issue #94 is
 # pull-side only, see that issue and ADR 0010) --------------------------
 
@@ -186,4 +220,26 @@ setup() {
   [[ "$output" == *"rsync called with: -avz --no-old-args b.example.com:/site-b/wp-content/sitegraft-id-map.log"* ]] || false
   [[ "$output" != *" -i "* ]] || false
   [[ "$output" != *"-e ssh"* ]] || false
+}
+
+# issue #117: this used to return rc=0 on a failed pull -- the closing
+# `[ -f "$tmp" ]` is an existence check, not a status check, and
+# ${run_dir}/.id-map-fetch.tmp is a FIXED path (not mktemp'd), so a file
+# left behind by an earlier run can satisfy it even when THIS run's own
+# transfer never populated it. Reproduced here directly: a stale tmp file
+# (pre-seeded, standing in for a leftover from an earlier pass) is sitting
+# at the exact path the real transfer would have written, and the fake
+# `rsync` fails outright without touching it -- exactly the shape the old
+# code could not tell apart from a genuine success.
+@test "graft_fetch_id_map (ssh-remote) fails when the pull itself fails, even when a stale tmp file from an earlier run satisfies the old file-existence check (issue #117)" {
+  SITE_B_SSH_HOST="b.example.com"
+  SITE_B_WP_PATH="/site-b"
+  mkdir -p "$BATS_TEST_TMPDIR/run"
+  printf '999\t9999\tpage\n' > "${BATS_TEST_TMPDIR}/run/.id-map-fetch.tmp"
+  rsync() { echo "rsync called with: $*"; return 1; }
+  run graft_fetch_id_map "$BATS_TEST_TMPDIR/run"
+  [ "$status" -ne 0 ]
+  # The acceptance criterion this issue exists for: the stale row must
+  # never reach id-map.tsv on a failed pull.
+  [ ! -f "${BATS_TEST_TMPDIR}/run/id-map.tsv" ]
 }

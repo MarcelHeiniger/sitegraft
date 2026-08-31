@@ -1319,6 +1319,7 @@ graft_export_wxr() {
   local post_types_csv="$1" run_dir="$2"
   local staging="${run_dir}/export"
   mkdir -p "$staging"
+  local rc=0
   if [ -n "${SITE_A_SSH_HOST:-}" ]; then
     local remote_dir="/tmp/sitegraft-export-$$"
     # issues #75/#94: ssh_remote_run/rsync_pull_remote (lib/inventory.sh)
@@ -1327,7 +1328,14 @@ graft_export_wxr() {
     # rsync as a `host:path` source.
     ssh_remote_run a "$SITE_A_SSH_HOST" "mkdir -p $(sq "$remote_dir")"
     run_or_echo wp_remote a export --post_type="$post_types_csv" --dir="$remote_dir"
-    rsync_pull_remote a "$SITE_A_SSH_HOST" "${remote_dir}/" "${staging}/"
+    # issue #117: the remote `rm -rf` cleanup below runs unconditionally,
+    # whether or not the pull just above actually fetched anything -- as
+    # the LAST command in this branch, ITS exit status (always 0 on a
+    # successful removal) used to become this function's own return value,
+    # silently overwriting a real pull failure. The pull's own status is
+    # captured here, before cleanup runs, and returned explicitly at the
+    # bottom instead of falling through to the cleanup's.
+    rsync_pull_remote a "$SITE_A_SSH_HOST" "${remote_dir}/" "${staging}/" || rc=$?
     ssh_remote_run a "$SITE_A_SSH_HOST" "rm -rf $(sq "$remote_dir")"
   else
     local prefix; prefix=$(graft_local_prefix a)
@@ -1336,12 +1344,16 @@ graft_export_wxr() {
       # shellcheck disable=SC2086 # intentionally unquoted: prefix may be a multi-word wrapper (e.g. ddev exec ... wp) and must word-split
       run_or_echo $prefix mkdir -p "$container_dir"
       run_or_echo wp_remote a export --post_type="$post_types_csv" --dir="$container_dir"
-      graft_pull_dir a "$container_dir" "$staging"
+      # Same shape, same fix, as the ssh-remote branch just above:
+      # graft_remove_dir's own cleanup must not be allowed to overwrite a
+      # failed pull's status.
+      graft_pull_dir a "$container_dir" "$staging" || rc=$?
       graft_remove_dir a "$container_dir"
     else
-      run_or_echo wp_remote a export --post_type="$post_types_csv" --dir="$staging"
+      run_or_echo wp_remote a export --post_type="$post_types_csv" --dir="$staging" || rc=$?
     fi
   fi
+  return "$rc"
 }
 
 # DEVIATION from the plan's literal pseudocode: that version passed a glob
@@ -1514,19 +1526,32 @@ graft_restore_importer_state() {
 # (attachments never go through the mu-plugin/WXR-import log at all, see its
 # own comment) — this function must never truncate those. A missing log (no
 # post/term was actually imported by the mu-plugin — should not happen once
-# the integrity gate requires >=1 <item>, but fails safe rather than
-# aborting the whole run on a `cat`/rsync error) is a no-op: whatever
-# id-map.tsv already had (possibly just attachment rows, possibly nothing)
-# is left exactly as-is.
+# the integrity gate requires >=1 <item>) is a legitimate no-op, detected
+# BEFORE the transfer is even attempted (the two `test -f`/`[ -f ]` probes
+# below) and returning early: whatever id-map.tsv already had (possibly just
+# attachment rows, possibly nothing) is left exactly as-is.
+#
+# issue #117: that early "legitimate absence" probe is NOT the same check as
+# "did the transfer that was actually attempted succeed", and conflating the
+# two was this function's bug. The closing `[ -f "$tmp" ]` used to be the
+# ONLY thing gating whether id-map.tsv got appended — an existence check on
+# a fixed, non-mktemp'd path that a stale file from an earlier run can
+# satisfy even when THIS run's own transfer command failed outright,
+# reporting success on a pull that never happened. The transfer's own exit
+# status is now captured and required to be 0 in addition to the file
+# existing — the file check stays (it's a legitimate belt-and-braces read
+# of what actually landed), it just no longer stands in for the status of
+# the command that was supposed to produce it.
 graft_fetch_id_map() {
   local run_dir="$1"
   local src="${SITE_B_WP_PATH}/wp-content/sitegraft-id-map.log"
   local dest="${run_dir}/id-map.tsv"
   local tmp="${run_dir}/.id-map-fetch.tmp"
+  local rc=0
   if [ -n "${SITE_B_SSH_HOST:-}" ]; then
     # issues #75/#94: rsync_pull_remote (lib/inventory.sh) carries B's
     # dedicated SSH key and forces rsync's default arg-escaping.
-    rsync_pull_remote b "$SITE_B_SSH_HOST" "$src" "$tmp"
+    rsync_pull_remote b "$SITE_B_SSH_HOST" "$src" "$tmp" || rc=$?
   else
     local prefix; prefix=$(graft_local_prefix b)
     if [ -n "$prefix" ]; then
@@ -1534,14 +1559,18 @@ graft_fetch_id_map() {
         log_warn "no id-map.log found on B — id-map.tsv left as-is. This is legitimate only if the WXR import inserted NOTHING (every item already existed on B). If it did import posts, the mapping mu-plugin was not running, and EVERY remap that follows is now a no-op against an incomplete map: attachment ids inside content, featured images, page_on_front, and every module post_import hook. Check the import output above before trusting this run."
         return 0
       fi
-      run_or_echo bash -c "${prefix} cat '${src}' > '${tmp}'"
+      run_or_echo bash -c "${prefix} cat '${src}' > '${tmp}'" || rc=$?
     else
       if ! is_dry_run && [ ! -f "$src" ]; then
         log_warn "no id-map.log found on B — id-map.tsv left as-is. This is legitimate only if the WXR import inserted NOTHING (every item already existed on B). If it did import posts, the mapping mu-plugin was not running, and EVERY remap that follows is now a no-op against an incomplete map: attachment ids inside content, featured images, page_on_front, and every module post_import hook. Check the import output above before trusting this run."
         return 0
       fi
-      run_or_echo rsync -avz "$src" "$tmp"
+      run_or_echo rsync -avz "$src" "$tmp" || rc=$?
     fi
+  fi
+  if [ "$rc" -ne 0 ]; then
+    log_error "failed to fetch B's id-map.log (transfer exited ${rc}) — id-map.tsv left as-is, NOT appended from a possibly-stale ${tmp}. Every remap that follows would run against an incomplete map if this were ignored. Re-run to retry."
+    return "$rc"
   fi
   if ! is_dry_run && [ -f "$tmp" ]; then
     cat "$tmp" >> "$dest"
@@ -3731,7 +3760,17 @@ phase_graft() {
   { [ -z "$prune_will_rerun" ] && graft_step_done "$run_dir" import_attachments; } || { graft_import_attachments "$run_dir"; graft_mark_step "$run_dir" import_attachments; }
   graft_step_done "$run_dir" importer_setup || { graft_ensure_importer "$run_dir"; graft_mark_step "$run_dir" importer_setup; }
   graft_step_done "$run_dir" export        || {
-    graft_export_wxr "$wxr_post_types_csv" "$run_dir"
+    # issue #117: graft_export_wxr's own return value is checked explicitly
+    # here, rather than relying on the found_any/integrity-gate checks below
+    # to catch a failed pull indirectly -- a resumed run_dir can have stale
+    # .xml file(s) left over from an EARLIER pass sitting in export/ already,
+    # which would make found_any read true even though THIS pull produced
+    # nothing at all, the same "leftover artifact mistaken for a fresh
+    # success" shape this issue's graft_fetch_id_map half also had.
+    graft_export_wxr "$wxr_post_types_csv" "$run_dir" || {
+      log_error "WXR export from A failed (pull/transfer error) -- nothing on B was touched by this step. Rerun the same command with --run ${run_dir} and this step will run again."
+      return 1
+    }
     if ! is_dry_run; then
       local f found_any=0
       for f in "${run_dir}/export"/*.xml; do
@@ -3744,7 +3783,16 @@ phase_graft() {
     graft_mark_step "$run_dir" export
   }
   { [ -z "$prune_will_rerun" ] && graft_step_done "$run_dir" import; } || { graft_import_wxr "$run_dir"; graft_mark_step "$run_dir" import; }
-  { [ -z "$prune_will_rerun" ] && graft_step_done "$run_dir" fetch_id_map; } || { graft_fetch_id_map "$run_dir"; graft_mark_step "$run_dir" fetch_id_map; }
+  # issue #117: graft_fetch_id_map's own return value is checked explicitly
+  # -- a failed pull must not reach graft_mark_step, the same fail-closed
+  # treatment as the export step just above.
+  { [ -z "$prune_will_rerun" ] && graft_step_done "$run_dir" fetch_id_map; } || {
+    graft_fetch_id_map "$run_dir" || {
+      log_error "id-map fetch from B failed (pull/transfer error) -- id-map.tsv left as-is, nothing on B was touched by this step. Rerun the same command with --run ${run_dir} and this step will run again."
+      return 1
+    }
+    graft_mark_step "$run_dir" fetch_id_map
+  }
   # Issue #53: unconditional, no marker of its own. This is a correctness
   # gate, not an expensive side-effecting step — it only reads the WXR files
   # and id-map.tsv this run already staged/fetched, both still sitting in
