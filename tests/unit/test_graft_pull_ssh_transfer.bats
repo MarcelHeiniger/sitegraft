@@ -129,6 +129,26 @@ setup() {
   [[ "$output" == *"ssh called with: -i /home/op/.ssh/b-key -- b.example.com rm -rf"* ]] || false
 }
 
+# review round 4: graft_export_wxr/graft_fetch_id_map (this file's own
+# sibling functions) each have an "omits -i/-e when the key is unset"
+# regression test; graft_import_wxr never got one. Forcing e_arg to a
+# non-empty value here, unconditionally, left all 1132 tests green --
+# the [ -n "$ssh_key" ]  ->  [ -n "$e_arg" ] indirection the round-3
+# ordering fix introduced was itself an uncovered link.
+@test "graft_import_wxr omits -i/-e entirely when SITE_B_SSH_KEY is unset (regression, unchanged by this fix)" {
+  SITE_B_SSH_HOST="b.example.com"
+  unset SITE_B_SSH_KEY
+  mkdir -p "$BATS_TEST_TMPDIR/run/export"
+  ssh() { echo "ssh called with: $*"; }
+  rsync() { echo "rsync called with: $*"; }
+  wp_remote() { :; }
+  run graft_import_wxr "$BATS_TEST_TMPDIR/run"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *" -i "* ]] || false
+  [[ "$output" != *"-e ssh"* ]] || false
+  [[ "$output" == *"rsync called with: -avz ${BATS_TEST_TMPDIR}/run/export/ b.example.com:"* ]] || false
+}
+
 @test "graft_import_wxr refuses BEFORE creating the remote directory when SITE_B_SSH_KEY contains a literal double-quote (review round 3, same ordering fix as graft_push_dir/graft_push_file)" {
   SITE_B_SSH_HOST="b.example.com"
   SITE_B_SSH_KEY='/home/op/.ssh/my "quoted" key'

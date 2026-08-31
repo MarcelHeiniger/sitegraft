@@ -147,39 +147,45 @@ ssh_remote_run() {
 #     apostrophe'd key path round-trips correctly as one argument.
 #
 # Residual, deliberately not covered: a key path containing a literal `"`
-# character. Measured live: embedding it UNENCODED (a bare `"` inside the
-# double-quoted span) is silently DROPPED from the argument, not preserved
-# and not rejected — `-i "/…/say "hi"/id"` reaches rsync's own remote
-# command as `/…/say hi/id`, a DIFFERENT path, with no error anywhere.
-# That silent corruption, not an absence of any escape mechanism, is why
-# this refuses rather than embeds. A real escape mechanism DOES exist and
-# was found by review: rsync's `-e` tokenizer accepts a doubled quote
-# character as a literal instance of that character within an
-# identically-quoted span (`-e 'ssh -i "a""b"'` -> the argument `a"b`;
-# `-e "ssh -i 'a''b'"` -> `a'b` — both measured live). Deliberately NOT
-# used here anyway: it appears nowhere in `man rsync`, was only measured
-# against GNU rsync 3.4.4, and this project's own compatibility target
-# (docs/decisions/0003) is explicitly macOS, where the shipped binary is
-# openrsync — a different codebase (OpenBSD's), whose `-e` tokenizer has
-# never been shown to double-escape the same way. Depending on an
-# undocumented behavior of the one implementation this codebase does NOT
-# ship on, to handle a key-path shape (an embedded literal double-quote
-# character in an SSH private key's own file path) nobody has ever asked
-# this tool to support, is exactly the kind of bet this repo has spent
-# multiple review rounds undoing elsewhere (ADR 0010's own History and
-# Extension sections). Refusing loudly costs one rare, easily-renamed key
-# path; embedding on an unverified assumption risks the same silent,
-# wrong-destination corruption this whole function exists to close. A key
-# FILE path containing a literal double-quote character is not a case this
-# codebase has ever seen or been asked to support; an apostrophe (a real
-# name, a real word) is the case worth closing, and is closed. See
+# character. `man rsync`, under `--rsh=COMMAND, -e`, DOES document an
+# escape for exactly this: "you can use single- and/or double-quotes to
+# preserve spaces in an argument (but not backslashes)... doubling a
+# single-quote inside a single-quoted string gives you a single-quote;
+# likewise for double-quotes." Round-trip byte-exact, measured live on
+# BOTH implementations this codebase cares about: GNU rsync 3.4.4
+# (`-e 'ssh -i "a""b"'` -> the argument `a"b`) and openrsync, the actual
+# `/usr/bin/rsync` macOS ships (identical: `a"b`) — an earlier version of
+# this comment claimed the doubling escape was undocumented and unverified
+# on openrsync; both halves of that claim were themselves measured wrong,
+# by review, and are corrected here (round 4 of the same lesson this
+# function's whole history is made of: verify the claim, not just the
+# code). The SAME man page paragraph is also, independently, why the
+# round-1 version of this fix (sq()'s `'''` single-quote escaping) could
+# never have worked here: rsync's own tokenizer does not escape
+# backslashes at all ("but not backslashes") — sq()'s encoding is
+# backslash-based, so it was never going to mean anything to this parser,
+# whatever quote style wrapped it.
+#
+# So the escape exists and works. Refused anyway, on purpose: nobody has
+# asked this codebase to support a literal `"` inside an SSH private key's
+# own file path — an already-obscure shape one order of magnitude rarer
+# than the apostrophe case this function DOES close — and a second,
+# doubling-based quoting mode on this one hot path costs more to keep
+# correct and reviewable than the case it would ever unblock is worth.
+# What refusing avoids, and what IS measured: the NAIVE, unencoded
+# embedding this function used to consider — a bare `"` inside the
+# double-quoted span, no doubling — is silently DROPPED from the
+# resulting argument, not rejected: `-i "/…/say "hi"/id"` reaches rsync's
+# remote command as `/…/say hi/id`, a DIFFERENT path, with no error
+# anywhere. That silent, wrong-destination corruption is the actual
+# failure mode a refusal here closes. See
 # docs/decisions/0010-ssh-remote-rsync-protect-args.md's Extension section
 # for the fuller measurement writeup.
 rsync_ssh_e_arg() {
   local ssh_key="$1"
   case "$ssh_key" in
     *'"'*)
-      log_error "SITE_*_SSH_KEY (${ssh_key}) contains a literal double-quote character. This codebase's rsync -e construction refuses to carry it unencoded: measured live, an embedded \" is silently DROPPED from the resulting argument rather than preserved or rejected -- e.g. a key path '/x/say \"hi\"/id' would silently become '/x/say hi/id', a DIFFERENT path, with no error anywhere. rsync's -e tokenizer does support a doubled-quote escape for this (undocumented in 'man rsync', measured only against GNU rsync 3.4.4) but this codebase deliberately does not depend on it -- unverified on openrsync, the rsync macOS actually ships, which this project explicitly targets. Rename the key file/path to avoid a literal \" and re-run."
+      log_error "SITE_*_SSH_KEY (${ssh_key}) contains a literal double-quote character. rsync's -e tokenizer does support a doubled-quote escape for this (documented in 'man rsync' under --rsh; measured live on both GNU rsync and openrsync), but this codebase deliberately does not use it -- nobody has asked to support a literal \" in an SSH key's own file path, and a second quoting mode on this hot path costs more to keep correct than that case is worth. Embedding it unencoded instead would silently corrupt the path (an unencoded \" is dropped, not rejected -- e.g. '/x/say \"hi\"/id' would silently become '/x/say hi/id', a DIFFERENT path, with no error anywhere), so this refuses instead. Rename the key file/path to avoid a literal \" and re-run."
       return 1
       ;;
   esac
