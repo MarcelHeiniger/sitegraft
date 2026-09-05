@@ -173,7 +173,8 @@ profile_load() {
     # message's "not wired until Task 2.3" was itself stale (that task
     # finished steps ago without landing this). Deliberately left as a
     # documented v1 gap rather than rushed in during this polish pass — see
-    # docs/status.md and docs/todo.md. Not a broken state in practice: no
+    # docs/status.md (tasks live in the app.agency-atelier.ch registry).
+    # Not a broken state in practice: no
     # SSH_KEY set just means wp_remote falls back to ssh's own default
     # identity resolution (ssh-agent / ~/.ssh/config), which works fine for
     # the common case — this is a missing convenience, not a missing
