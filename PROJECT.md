@@ -97,7 +97,7 @@ two such guards (`verify_id_references_resolve`,
       separate broken builds this session.
 - [ ] Backlog: `modules/acss.sh` legacy slug, §5.2 interactive credentials,
       `motopress`/`classic-menus` modules, the `clean` sub-step of `graft`.
-→ Detail: [`docs/todo.md`](docs/todo.md)
+→ Detail: les tâches vivent dans le registre app.agency-atelier.ch (projet sitegraft)
 
 ## 6. Definition of Done
 

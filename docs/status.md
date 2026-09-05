@@ -93,7 +93,7 @@ case-insensitive/glob-safe (`graft_ci_glob`/`graft_ci_remove_all`,
 `lib/graft.sh`), verified and mutation-tested in both directions. Covers
 option values only, is a heuristic substring search, and does not touch post
 content (`#88` below is a different mechanism, still open). See
-`docs/todo.md`'s own "Done" entry for the full detail, including the precise
+the app.agency-atelier.ch registry's own entry for the full detail, including the precise
 (non-overclaimed) percent-encoding scope note.
 
 ### Done by hand on the pilot target, outside the tool
@@ -164,7 +164,7 @@ looks for "Home" in a German page).
     design doc, plus one small addition (`etch_stack_candidates`) flagged in
     the PR as a judgment call); `modules/acss.sh` (§3.4) and the §5.2
     interactive-credentials-prompt are confirmed genuine, deliberate v1 gaps
-    — documented in the design doc and `docs/todo.md` rather than rushed or
+    — documented in the design doc and the app.agency-atelier.ch registry rather than rushed or
     silently left inconsistent. `docs/definition-of-done.md`'s "3 v1 modules"
     line corrected to reflect 2 shipped (`core-wp`, `etch`).
   - `docs/usage.md` written (install, profile setup, all six phases with exact
@@ -227,7 +227,7 @@ looks for "Home" in a German page).
   pair (design doc §0.2's R2/R4) — Marcel's call, on a real pair, not something
   any further DDEV-only work can close. See `docs/definition-of-done.md`.
 - `modules/acss.sh`: needs someone with a real pre-4.0 Automatic.css install to
-  confirm the legacy plugin-folder name before it can ship (see `docs/todo.md`).
+  confirm the legacy plugin-folder name before it can ship (see the app.agency-atelier.ch registry, project sitegraft).
 
 ## Recent decisions
 

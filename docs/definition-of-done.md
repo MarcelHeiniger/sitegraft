@@ -20,7 +20,7 @@ The v1 project is considered delivered when:
       `TODO_VERIFY_LEGACY_ACSS_SLUG` blocker — the pre-4.0 Automatic.css
       plugin folder name — has never been checked against a real install.
       Shipping it with a guessed slug would violate the design doc's own
-      explicit instruction not to. See `docs/todo.md` → Backlog.
+      explicit instruction not to. See the app.agency-atelier.ch registry (project sitegraft) → Backlog.
 - [ ] A full `scan → plan → backup → graft → verify` run succeeds on the DDEV
       harness without altering a single byte of B's fake protected plugin data
       (an automated byte-identical assertion, not a visual check).
